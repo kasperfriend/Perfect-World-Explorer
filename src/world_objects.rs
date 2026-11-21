@@ -833,6 +833,78 @@ fn run(
     });
     Ok(())
 }
+/// Compact world-space triangle extracted from a `Page` for Raywatcher's
+/// near-camera real-mesh ray tracing (preserving actual geometry normals and
+/// baked diffuse albedo).
+#[derive(Clone, Copy, Debug)]
+pub struct RtMeshTriangle {
+    pub a: [f32; 3],
+    pub b: [f32; 3],
+    pub c: [f32; 3],
+    pub normal: [f32; 3],
+    pub albedo: [f32; 3],
+}
+
+/// Hard per-page cap on retained CPU triangles so whole-world preloads across
+/// hundreds of pages stay within a few megabytes of RAM while near-camera
+/// buildings and props retain real mesh silhouettes for shadows & reflections.
+const MAX_RT_TRIS_PER_PAGE: usize = 512;
+
+fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32]) -> Vec<RtMeshTriangle> {
+    let tri_count = indices.len() / 3;
+    if tri_count == 0 {
+        return Vec::new();
+    }
+    let step = (tri_count / MAX_RT_TRIS_PER_PAGE).max(1);
+    let mut out = Vec::with_capacity(tri_count.min(MAX_RT_TRIS_PER_PAGE));
+    let mut t = 0usize;
+    while t < tri_count && out.len() < MAX_RT_TRIS_PER_PAGE {
+        let i0 = indices[t * 3] as usize;
+        let i1 = indices[t * 3 + 1] as usize;
+        let i2 = indices[t * 3 + 2] as usize;
+        if let (Some(v0), Some(v1), Some(v2)) =
+            (vertices.get(i0), vertices.get(i1), vertices.get(i2))
+        {
+            let a = v0.pos;
+            let b = v1.pos;
+            let c = v2.pos;
+            let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let nx = e1[1] * e2[2] - e1[2] * e2[1];
+            let ny = e1[2] * e2[0] - e1[0] * e2[2];
+            let nz = e1[0] * e2[1] - e1[1] * e2[0];
+            let len2 = nx * nx + ny * ny + nz * nz;
+            if len2 > 1e-8 {
+                let inv = len2.sqrt().recip();
+                // Average baked vertex diffuse RGB (0xAARRGGBB) into linear albedo.
+                let decode = |d: u32| -> [f32; 3] {
+                    let r = ((d >> 16) & 0xff) as f32 / 255.0;
+                    let g = ((d >> 8) & 0xff) as f32 / 255.0;
+                    let bl = (d & 0xff) as f32 / 255.0;
+                    [r * r, g * g, bl * bl]
+                };
+                let c0 = decode(v0.diffuse);
+                let c1 = decode(v1.diffuse);
+                let c2 = decode(v2.diffuse);
+                let albedo = [
+                    ((c0[0] + c1[0] + c2[0]) / 3.0).clamp(0.08, 0.92),
+                    ((c0[1] + c1[1] + c2[1]) / 3.0).clamp(0.08, 0.92),
+                    ((c0[2] + c1[2] + c2[2]) / 3.0).clamp(0.08, 0.92),
+                ];
+                out.push(RtMeshTriangle {
+                    a,
+                    b,
+                    c,
+                    normal: [nx * inv, ny * inv, nz * inv],
+                    albedo,
+                });
+            }
+        }
+        t += step;
+    }
+    out
+}
+
 pub struct GpuPage {
     vertex: wgpu::Buffer,
     index: wgpu::Buffer,
@@ -844,6 +916,7 @@ pub struct GpuPage {
     page_min: [f32; 3],
     page_max: [f32; 3],
     page_has_sdr: bool,
+    rt_triangles: Vec<RtMeshTriangle>,
 }
 #[derive(Clone)]
 struct WorldPageMeta {
@@ -995,6 +1068,18 @@ impl GpuPage {
             Self::upload(device, queue, layout, sampler, normal, reflected, page)
         }
     }
+    pub fn rt_triangles(&self) -> &[RtMeshTriangle] {
+        &self.rt_triangles
+    }
+
+    pub fn page_bounds(&self) -> ([f32; 3], [f32; 3]) {
+        (self.page_min, self.page_max)
+    }
+
+    pub fn placement_bounds(&self) -> &[PlacementBounds] {
+        &self.bounds
+    }
+
     fn geometry(
         device: &wgpu::Device,
         page: Page,
@@ -1002,6 +1087,7 @@ impl GpuPage {
         reflected: Arc<wgpu::BindGroup>,
     ) -> Self {
         use wgpu::util::DeviceExt;
+        let rt_triangles = extract_rt_triangles(&page.vertices, &page.indices);
         let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("whole-world object vertices"),
             contents: bytemuck::cast_slice(&page.vertices),
@@ -1023,6 +1109,7 @@ impl GpuPage {
             page_min: page.page_min,
             page_max: page.page_max,
             page_has_sdr: page.page_has_sdr,
+            rt_triangles,
         }
     }
     /// Submits only the placements the recovered EC-BSD flags admit in this

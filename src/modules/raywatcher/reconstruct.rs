@@ -100,6 +100,9 @@ pub struct DlssRrInputs<'a> {
     pub grid_normals: &'a wgpu::TextureView,
     pub grid_albedo: &'a wgpu::TextureView,
     pub depth: &'a wgpu::TextureView,
+    /// Untouched full raster world render (`None` only in opt-in replace mode).
+    pub raster: Option<&'a wgpu::TextureView>,
+    pub layered: bool,
     pub motion: &'a wgpu::Texture,
     pub jitter: (f32, f32),
     pub reset: bool,
@@ -209,6 +212,8 @@ mod dlss_rr {
 @group(0) @binding(3) var src_albedo: texture_2d<f32>;
 @group(0) @binding(4) var src_depth: texture_depth_2d;
 @group(0) @binding(5) var lin_samp: sampler;
+@group(0) @binding(6) var src_raster: texture_2d<f32>;
+@group(0) @binding(7) var<uniform> prep_flags: vec4<f32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -240,16 +245,19 @@ struct FOut {
 
 @fragment
 fn fs(i: VOut) -> FOut {
-    let c = textureSampleLevel(src_colour, lin_samp, i.uv, 0.0).rgb;
+    let c = textureSampleLevel(src_colour, lin_samp, i.uv, 0.0);
     let r = textureSampleLevel(src_reflection, lin_samp, i.uv, 0.0);
     let n = textureSampleLevel(src_normals, lin_samp, i.uv, 0.0);
     let a = textureSampleLevel(src_albedo, lin_samp, i.uv, 0.0);
+    let raster_rgb = textureSampleLevel(src_raster, lin_samp, i.uv, 0.0).rgb;
     let depth_dim = vec2<f32>(textureDimensions(src_depth));
     let dcoord = vec2<i32>(clamp(i.uv * depth_dim, vec2<f32>(0.0), depth_dim - vec2<f32>(1.0)));
     let d = textureLoad(src_depth, dcoord, 0);
 
     var out: FOut;
-    out.color = vec4<f32>(c + r.rgb, 1.0);
+    let layered = prep_flags.x > 0.5;
+    let base_rgb = select(c.rgb, raster_rgb * c.a + c.rgb, layered);
+    out.color = vec4<f32>(base_rgb + r.rgb, 1.0);
     let n_len = length(n.xyz);
     let unit_n = select(vec3<f32>(0.0, 1.0, 0.0), n.xyz / n_len, n_len > 1e-4);
     out.depth = d;
@@ -265,6 +273,7 @@ fn fs(i: VOut) -> FOut {
         layout: wgpu::BindGroupLayout,
         pipeline: wgpu::RenderPipeline,
         sampler: wgpu::Sampler,
+        flags_buf: wgpu::Buffer,
     }
 
     impl PrepPipeline {
@@ -304,6 +313,17 @@ fn fs(i: VOut) -> FOut {
                         binding: 5,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    tex(6),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     },
                 ],
@@ -351,10 +371,17 @@ fn fs(i: VOut) -> FOut {
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             });
+            let flags_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("raywatcher dlss-rr prep flags"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
             Self {
                 layout,
                 pipeline,
                 sampler,
+                flags_buf,
             }
         }
     }
@@ -605,6 +632,9 @@ fn fs(i: VOut) -> FOut {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("raywatcher dlss-rr prep"),
             });
+            let flags = [if inputs.layered { 1.0f32 } else { 0.0 }, 0.0, 0.0, 0.0];
+            queue.write_buffer(&self.prep.flags_buf, 0, bytemuck::bytes_of(&flags));
+            let raster_view = inputs.raster.unwrap_or(inputs.grid_colour);
             let bg = self.prep_bg.get_or_insert_with(|| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("raywatcher dlss-rr prep"),
@@ -633,6 +663,14 @@ fn fs(i: VOut) -> FOut {
                         wgpu::BindGroupEntry {
                             binding: 5,
                             resource: wgpu::BindingResource::Sampler(&self.prep.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(raster_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: self.prep.flags_buf.as_entire_binding(),
                         },
                     ],
                 })

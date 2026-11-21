@@ -3733,7 +3733,7 @@ impl Renderer {
             return RasterOverrides::NONE;
         }
         self.raywatcher_frame_plan = plan;
-        RasterOverrides::for_effects(plan.effects, plan.trace)
+        RasterOverrides::for_plan(&plan)
     }
 
     /// Trace and filter this frame's rays, then write the result into the world
@@ -3762,51 +3762,157 @@ impl Renderer {
         }
         let reset_history = reset_history || self.modules.raywatcher_mut().take_history_reset();
         let settings = self.modules.raywatcher().settings().clone();
-        // --- The scene. Rebuilt only when the world it came from changed.
+        // --- The scene. Frustum-wide chunked LOD terrain + real near meshes +
+        //     per-chunk building/tree proxies + reflective water planes out to
+        //     `camera.far`, rebuilt only when the camera chunk, view sector, or
+        //     loaded world pages change.
         let config = crate::modules::raywatcher::harvest::HarvestConfig::default();
-        let scene = {
-            // Placed models become box proxies; the harvest radius bounds them.
-            let proxies = Vec::new();
-            // Fast path: skip sampling up to 256x256 terrain heights when the
-            // camera anchor cell, terrain generation, and proxies are unchanged.
-            if let Some(cached) = self
-                .raywatcher_harvest
-                .cached_if_unchanged(config, camera.pos, 0, &proxies)
-            {
-                cached
+        let view_forward = camera.direction();
+        let view_distance = if settings.ray_length > 0. {
+            settings.ray_length
+        } else {
+            camera.far
+        };
+        let content_hash = ((self.local_pages.len() as u64) << 32)
+            ^ ((self.world_pages.len() as u64) << 16)
+            ^ (self.water_batches.len() as u64)
+            ^ (u64::from(self.world_done) << 62);
+        let scene = if let Some(cached) = self.raywatcher_harvest.cached_if_unchanged_frustum(
+            config,
+            camera.pos,
+            view_forward,
+            view_distance,
+            0,
+            content_hash,
+        ) {
+            cached
+        } else {
+            use crate::modules::raywatcher::harvest::{
+                Frustum, InstanceProxy, MeshTriangle, WaterSurface,
+            };
+            let frustum = Frustum::from_view_projection(matrix);
+            let detail_radius = config.radius.max(128.0) * 1.5;
+            let detail_radius_sq = detail_radius * detail_radius;
+
+            // Real mesh triangles from resident scenery pages near the camera
+            // so near buildings, bridges and props cast exact mesh shadows and
+            // match baked surface colours in reflections.
+            let mut real_meshes = Vec::new();
+            let pages_iter = if self.world_done {
+                self.world_pages.iter()
             } else {
-                let heights;
-                let field = match map_space {
-                    Some(space) => {
-                        let radius = config.radius.max(1.);
-                        let cell = space.spacing.max(0.5) * config.stride.max(1) as f32;
-                        let side = (((2. * radius) / cell).ceil().max(2.) as u32 + 2).min(256);
-                        let origin = Vec3::new(
-                            ((camera.pos.x - radius) / cell).floor() * cell,
-                            0.,
-                            ((camera.pos.z - radius) / cell).floor() * cell,
-                        );
-                        heights = crate::modules::raywatcher::harvest::sample_heights(
-                            side,
-                            side,
-                            origin,
-                            cell,
-                            |x, z| space.ground(x, z),
-                        );
-                        Some(crate::modules::raywatcher::harvest::HeightField {
-                            heights: &heights,
-                            width: side,
-                            height: side,
-                            origin,
-                            cell,
-                            generation: 0,
-                        })
-                    }
-                    None => None,
-                };
-                self.raywatcher_harvest
-                    .scene(config, camera.pos, field.as_ref(), &proxies)
+                self.local_pages.iter()
+            };
+            for page in pages_iter {
+                let (pmin, pmax) = page.page_bounds();
+                let bmin = Vec3::from_array(pmin);
+                let bmax = Vec3::from_array(pmax);
+                let center = (bmin + bmax) * 0.5;
+                let half = (bmax - bmin) * 0.5;
+                let dist_sq = (camera.pos - center).abs().max(half).distance_squared(half);
+                if dist_sq > detail_radius_sq {
+                    continue;
+                }
+                if !frustum.intersects_aabb(bmin, bmax) {
+                    continue;
+                }
+                for t in page.rt_triangles() {
+                    real_meshes.push(MeshTriangle {
+                        a: Vec3::from_array(t.a),
+                        b: Vec3::from_array(t.b),
+                        c: Vec3::from_array(t.c),
+                        normal: Vec3::from_array(t.normal),
+                        albedo: t.albedo,
+                        roughness: 0.72,
+                    });
+                }
             }
+
+            // Distant scenery & trees use compact box proxies (cheaper than
+            // full distant/foliage triangle soups while preserving silhouettes
+            // and shadow casting out to the far frustum edge). `max_instances`
+            // is enforced per chunk inside `scene_frustum`.
+            let mut proxies = Vec::new();
+            if self.world_done {
+                let main_slot = crate::world_objects::GpuPage::world_view_slot(
+                    crate::scenery_visibility::Pass::Main,
+                );
+                for cmd in &self.world_draw_cmds[main_slot].cmds {
+                    let bmin = Vec3::from_array(cmd.min);
+                    let bmax = Vec3::from_array(cmd.max);
+                    let centre = (bmin + bmax) * 0.5;
+                    let half = (bmax - bmin) * 0.5;
+                    if centre.distance_squared(camera.pos) > detail_radius_sq {
+                        proxies.push(InstanceProxy {
+                            centre,
+                            half,
+                            albedo: [0.46, 0.44, 0.40],
+                            yaw: 0.0,
+                        });
+                    }
+                }
+            } else {
+                for page in &self.local_pages {
+                    for b in page.placement_bounds() {
+                        let bmin = Vec3::from_array(b.min);
+                        let bmax = Vec3::from_array(b.max);
+                        let centre = (bmin + bmax) * 0.5;
+                        let half = (bmax - bmin) * 0.5;
+                        if centre.distance_squared(camera.pos) > detail_radius_sq {
+                            proxies.push(InstanceProxy {
+                                centre,
+                                half,
+                                albedo: [0.46, 0.44, 0.40],
+                                yaw: 0.0,
+                            });
+                        }
+                    }
+                }
+            }
+            // Trees across frustum-visible scene blocks: canopy box proxies
+            // give soft tree shadows and reflections without per-leaf geometry.
+            for block in &self.model_scene.blocks {
+                for tree in &block.trees {
+                    let pos = Vec3::from_array(tree.position);
+                    proxies.push(InstanceProxy {
+                        centre: pos + Vec3::new(0.0, 5.5, 0.0),
+                        half: Vec3::new(2.8, 5.5, 2.8),
+                        albedo: [0.18, 0.30, 0.14],
+                        yaw: 0.0,
+                    });
+                }
+            }
+
+            // Reflective water surfaces across the visible frustum.
+            let water: Vec<WaterSurface> = self
+                .water_batches
+                .iter()
+                .map(|w| WaterSurface {
+                    bounds: w.bounds,
+                    height: w.height,
+                })
+                .collect();
+
+            let base_cell = map_space.map(|s| s.spacing).unwrap_or(2.0);
+            let ground_closure =
+                |x: f32, z: f32| -> f32 { map_space.map(|s| s.ground(x, z)).unwrap_or(0.0) };
+            let ground_ref: Option<&dyn Fn(f32, f32) -> f32> =
+                map_space.map(|_| &ground_closure as &dyn Fn(f32, f32) -> f32);
+
+            self.raywatcher_harvest.scene_frustum(
+                config,
+                camera.pos,
+                view_forward,
+                matrix,
+                view_distance,
+                base_cell,
+                0,
+                content_hash,
+                ground_ref,
+                &real_meshes,
+                &proxies,
+                &water,
+            )
         };
         let same_world = self
             .raywatcher_scene
@@ -3881,6 +3987,12 @@ impl Renderer {
         };
         let hardware_mode = self.modules.raywatcher().effective_mode()
             == crate::modules::raywatcher::plan::RayTracingMode::Hardware;
+        let layered = !plan.replace_raster;
+        if layered {
+            // Snapshot the untouched full raster world target before tracing or
+            // DLSS RR so the RT lighting layer composites cleanly on top of it.
+            gpu.capture_raster(&self.device, encoder, destination);
+        }
         gpu.record(
             &self.device,
             &self.queue,
@@ -3893,6 +4005,7 @@ impl Renderer {
             &self.object_mv,
             &self.depth,
         );
+        let mut dlss_rr_ran = false;
         if plan.reconstruction
             == crate::modules::raywatcher::plan::RayReconstruction::DlssRayReconstruction
         {
@@ -3911,7 +4024,7 @@ impl Renderer {
             let view = camera.view_matrix();
             let proj = matrix * view.inverse();
             if let Some(gpu) = self.raywatcher_gpu.as_mut() {
-                let ran = gpu.reconstruct_dlss_rr(
+                dlss_rr_ran = gpu.reconstruct_dlss_rr(
                     &self.device,
                     &self.queue,
                     encoder,
@@ -3919,35 +4032,22 @@ impl Renderer {
                     &params,
                     &self.object_mv,
                     reset_history,
+                    layered,
                     view.to_cols_array_2d(),
                     proj.to_cols_array_2d(),
                 );
-                if !ran {
+                if !dlss_rr_ran {
                     gpu.record_denoise(&self.queue, encoder, &params, &denoise, &self.object_mv);
                 }
             }
         }
-        // The trace ran at the ray grid; the temporal/compose passes (or DLSS
-        // Ray Reconstruction) wrote `render_extent`, which we blit into the
-        // upscaler's world target.
-        let (rw, rh) = (render_extent.0.max(1), render_extent.1.max(1));
-        self.raywatcher_copy_out(encoder, (rw, rh), destination);
+        // Composite the denoised RT lighting layer over the untouched raster
+        // world target (or blit directly when DLSS RR already composited or
+        // when `replace_raster` was explicitly opted into).
+        if let Some(gpu) = self.raywatcher_gpu.as_mut() {
+            gpu.composite_to(&self.device, encoder, destination, layered, dlss_rr_ran);
+        }
         self.modules.raywatcher_mut().next_frame();
-    }
-
-    /// Copy or blit Raywatcher's filtered image into the world target the
-    /// upscaler reads (handling format conversion such as `Rgba16Float` to
-    /// `Bgra8UnormSrgb`).
-    fn raywatcher_copy_out(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        _extent: (u32, u32),
-        destination: &wgpu::Texture,
-    ) {
-        let Some(gpu) = self.raywatcher_gpu.as_mut() else {
-            return;
-        };
-        gpu.blit_to(&self.device, encoder, destination);
     }
 
     fn render(

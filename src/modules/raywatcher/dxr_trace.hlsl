@@ -16,7 +16,7 @@ struct Params {
     float4 extents; // x: grid_w, y: grid_h, z: render_w, w: render_h
     float4 frame;   // x: frame_index, y: samples, z: bounces, w: history_valid
     float4 tuning;  // x: jitter_x, y: jitter_y, z: ambient_strength, w: bounce_strength
-    float4 effects; // x: roughness_cutoff, y: effect_bits, z: bias, w: unused
+    float4 effects; // x: roughness_cutoff, y: effect_bits, z: bias, w: layered_mode (1=layer over raster, 0=replace)
     float4 fog;     // x: fog_start, y: fog_end, z: ao_radius, w: unused
     float4 counts;  // x: tri_count, y: node_count, z: mat_count, w: unused
 };
@@ -151,6 +151,7 @@ Material material_of(uint tri_index) {
 
 struct Surface {
     float3 colour;
+    float light_factor;
     float3 reflection;
     float visibility;
     float depth;
@@ -161,8 +162,10 @@ struct Surface {
 };
 
 Surface shade(float3 origin, float3 dir, inout uint state) {
+    bool layered = params.effects.w > 0.5;
     Surface surface;
     surface.colour = float3(0.0, 0.0, 0.0);
+    surface.light_factor = 1.0;
     surface.reflection = float3(0.0, 0.0, 0.0);
     surface.visibility = 1.0;
     surface.reflection_distance = params.lens.y;
@@ -173,12 +176,14 @@ Surface shade(float3 origin, float3 dir, inout uint state) {
 
     Hit hit = closest_hit(origin, dir, params.effects.z, params.lens.y);
     if (hit.index == 0xffffffffu) {
-        float fog_start = params.fog.x;
-        float fog_end = params.fog.y;
-        if (fog_end > fog_start && fog_start >= 0.0) {
-            surface.colour = params.fog_colour.xyz;
-        } else {
-            surface.colour = environment();
+        if (!layered) {
+            float fog_start = params.fog.x;
+            float fog_end = params.fog.y;
+            if (fog_end > fog_start && fog_start >= 0.0) {
+                surface.colour = params.fog_colour.xyz;
+            } else {
+                surface.colour = environment();
+            }
         }
         surface.depth = params.lens.y;
         return surface;
@@ -228,9 +233,9 @@ Surface shade(float3 origin, float3 dir, inout uint state) {
 
     // `params.sun_colour.xyz` already includes `sun.intensity`.
     float n_dot_l = max(dot(hit.normal, params.sun_dir.xyz), 0.0);
+    float shadow = 1.0;
     float3 direct = float3(0.0, 0.0, 0.0);
-    if (bits_lighting && n_dot_l > 0.0) {
-        float shadow = 1.0;
+    if ((bits_lighting || (layered && bits_shadows)) && n_dot_l > 0.0) {
         if (bits_shadows) {
             float3 shadow_dir = params.lens.z > 1e-4
                 ? cone_direction(state, params.sun_dir.xyz, params.lens.z)
@@ -239,10 +244,13 @@ Surface shade(float3 origin, float3 dir, inout uint state) {
                 shadow = 0.0;
             }
         }
-        direct = params.sun_colour.xyz * (n_dot_l * shadow);
+        if (bits_lighting) {
+            direct = params.sun_colour.xyz * (n_dot_l * shadow);
+        }
     }
     float3 ambient = params.ambient.xyz * (open * params.tuning.z);
     float3 diffuse = albedo * (bits_lighting ? (direct + ambient) : ambient);
+    float3 gi_bounce = float3(0.0, 0.0, 0.0);
 
     if (bits_reflections && roughness <= params.effects.x) {
         float3 reflect_dir = reflect(dir, hit.normal);
@@ -289,18 +297,34 @@ Surface shade(float3 origin, float3 dir, inout uint state) {
                 break;
             }
         }
-        diffuse = diffuse + bounce * params.tuning.w;
+        gi_bounce = bounce * params.tuning.w;
+        diffuse = diffuse + gi_bounce;
     }
 
+    float fog_t = 0.0;
     float fog_start = params.fog.x;
     float fog_end = params.fog.y;
     if (fog_end > fog_start && fog_start >= 0.0) {
-        float fog_t = saturate((hit.t - fog_start) / (fog_end - fog_start));
+        fog_t = saturate((hit.t - fog_start) / (fog_end - fog_start));
         diffuse = lerp(diffuse, params.fog_colour.xyz, fog_t);
         surface.reflection *= (1.0 - fog_t);
     }
 
-    surface.colour = diffuse;
+    if (layered) {
+        // Layered mode: modulate the full textured raster world by RT shadow
+        // and AO visibility (attenuated by fog so distant silhouettes stay
+        // consistent with raster fog), and output GI bounce as additive light.
+        float shadow_mod = 1.0;
+        if (bits_shadows && n_dot_l > 0.05) {
+            shadow_mod = lerp(0.45, 1.0, shadow);
+        }
+        float ao_mod = bits_ao ? lerp(0.65, 1.0, open) : 1.0;
+        surface.light_factor = lerp(shadow_mod * ao_mod, 1.0, fog_t);
+        surface.colour = gi_bounce * (0.25 * (1.0 - fog_t));
+    } else {
+        surface.colour = diffuse;
+        surface.light_factor = 1.0;
+    }
     return surface;
 }
 
@@ -313,6 +337,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float2 grid = params.extents.xy;
     uint samples = max(uint(params.frame.y), 1u);
     float3 accum = float3(0.0, 0.0, 0.0);
+    float accum_light_factor = 0.0;
     float3 accum_reflection = float3(0.0, 0.0, 0.0);
     float accum_visibility = 0.0;
     float accum_depth = 0.0;
@@ -335,6 +360,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float3 dir = normalize(far_p.xyz / far_p.w - near_p.xyz / near_p.w);
         Surface surface = shade(params.eye.xyz, dir, state);
         accum += surface.colour;
+        accum_light_factor += surface.light_factor;
         accum_reflection += surface.reflection;
         accum_visibility += surface.visibility;
         accum_depth += surface.depth;
@@ -352,7 +378,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float3 avg_albedo = accum_albedo * inv;
     float spec_f0 = 0.04 + 0.06 * (1.0 - avg_rough);
 
-    out_colour[id.xy] = float4(accum * inv, 1.0);
+    out_colour[id.xy] = float4(accum * inv, accum_light_factor * inv);
     out_guide[id.xy] = float4(accum_visibility * inv, (accum_depth * inv) / params.lens.y, 0.0, 0.0);
     out_reflection[id.xy] = float4(accum_reflection * inv, (accum_reflection_distance * inv) / params.lens.y);
     out_normals[id.xy] = float4(avg_n, avg_rough);

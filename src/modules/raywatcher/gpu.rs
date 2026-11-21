@@ -129,7 +129,7 @@ impl RayParams {
                 config.reflection_roughness_cutoff,
                 Self::effect_bits(plan.effects) as f32,
                 config.bias,
-                0.,
+                if plan.replace_raster { 0. } else { 1. },
             ],
             fog: [fog.0, fog.1, (params.far * 0.05).clamp(2., 120.), 0.],
             counts: [counts[0] as f32, counts[1] as f32, counts[2] as f32, 0.],
@@ -460,6 +460,7 @@ fn material_of(index: u32) -> Material {
 
 struct Surface {
     colour: vec3<f32>,
+    light_factor: f32,
     reflection: vec3<f32>,
     visibility: f32,
     depth: f32,
@@ -470,8 +471,10 @@ struct Surface {
 };
 
 fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surface {
+    let layered = params.effects.w > 0.5;
     var surface: Surface;
     surface.colour = vec3<f32>(0.0);
+    surface.light_factor = 1.0;
     surface.reflection = vec3<f32>(0.0);
     surface.visibility = 1.0;
     surface.reflection_distance = params.lens.y;
@@ -481,12 +484,14 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
     surface.albedo = vec3<f32>(0.0);
     let hit = closest_hit(origin, dir, params.effects.z, params.lens.y);
     if (hit.index == 0xffffffffu) {
-        let fog_start = params.fog.x;
-        let fog_end = params.fog.y;
-        if (fog_end > fog_start && fog_start >= 0.0) {
-            surface.colour = params.fog_colour.xyz;
-        } else {
-            surface.colour = environment();
+        if (!layered) {
+            let fog_start = params.fog.x;
+            let fog_end = params.fog.y;
+            if (fog_end > fog_start && fog_start >= 0.0) {
+                surface.colour = params.fog_colour.xyz;
+            } else {
+                surface.colour = environment();
+            }
         }
         surface.depth = params.lens.y;
         return surface;
@@ -535,9 +540,9 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
     // Sun (`params.sun_colour.xyz` already includes `sun.intensity`), skipping
     // the shadow ray when facing away and jittering within the sun angular disc.
     let n_dot_l = max(dot(hit.normal, params.sun_dir.xyz), 0.0);
+    var shadow = 1.0;
     var direct = vec3<f32>(0.0);
-    if (bits_lighting && n_dot_l > 0.0) {
-        var shadow = 1.0;
+    if ((bits_lighting || (layered && bits_shadows)) && n_dot_l > 0.0) {
         if (bits_shadows) {
             let shadow_dir = select(
                 params.sun_dir.xyz,
@@ -548,10 +553,13 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
                 shadow = 0.0;
             }
         }
-        direct = params.sun_colour.xyz * (n_dot_l * shadow);
+        if (bits_lighting) {
+            direct = params.sun_colour.xyz * (n_dot_l * shadow);
+        }
     }
     let ambient = params.ambient.xyz * (open * params.tuning.z);
     var diffuse = albedo * select(ambient, direct + ambient, bits_lighting);
+    var gi_bounce = vec3<f32>(0.0);
 
     if (bits_reflections && roughness <= params.effects.x) {
         let reflect_dir = reflect(dir, hit.normal);
@@ -596,16 +604,29 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
                 break;
             }
         }
-        diffuse = diffuse + bounce * params.tuning.w;
+        gi_bounce = bounce * params.tuning.w;
+        diffuse = diffuse + gi_bounce;
     }
+    var fog_t = 0.0;
     let fog_start = params.fog.x;
     let fog_end = params.fog.y;
     if (fog_end > fog_start && fog_start >= 0.0) {
-        let fog_t = clamp((hit.t - fog_start) / (fog_end - fog_start), 0.0, 1.0);
+        fog_t = clamp((hit.t - fog_start) / (fog_end - fog_start), 0.0, 1.0);
         diffuse = mix(diffuse, params.fog_colour.xyz, fog_t);
         surface.reflection = surface.reflection * (1.0 - fog_t);
     }
-    surface.colour = diffuse;
+    if (layered) {
+        var shadow_mod = 1.0;
+        if (bits_shadows && n_dot_l > 0.05) {
+            shadow_mod = mix(0.45, 1.0, shadow);
+        }
+        let ao_mod = select(1.0, mix(0.65, 1.0, open), bits_ao);
+        surface.light_factor = mix(shadow_mod * ao_mod, 1.0, fog_t);
+        surface.colour = gi_bounce * (0.25 * (1.0 - fog_t));
+    } else {
+        surface.colour = diffuse;
+        surface.light_factor = 1.0;
+    }
     return surface;
 }
 
@@ -618,6 +639,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let grid = vec2<f32>(params.extents.xy);
     let samples = max(u32(params.frame.y), 1u);
     var accum = vec3<f32>(0.0);
+    var accum_light_factor = 0.0;
     var accum_reflection = vec3<f32>(0.0);
     var accum_visibility = 0.0;
     var accum_depth = 0.0;
@@ -642,6 +664,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let dir = normalize(far.xyz / far.w - near.xyz / near.w);
         let surface = shade(params.eye.xyz, dir, &state);
         accum = accum + surface.colour;
+        accum_light_factor = accum_light_factor + surface.light_factor;
         accum_reflection = accum_reflection + surface.reflection;
         accum_visibility = accum_visibility + surface.visibility;
         accum_depth = accum_depth + surface.depth;
@@ -656,7 +679,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let avg_rough = clamp(accum_roughness * inv, 0.02, 1.0);
     let avg_albedo = accum_albedo * inv;
     let spec_f0 = 0.04 + 0.06 * (1.0 - avg_rough);
-    textureStore(out_colour, vec2<i32>(id.xy), vec4<f32>(accum * inv, 1.0));
+    textureStore(out_colour, vec2<i32>(id.xy), vec4<f32>(accum * inv, accum_light_factor * inv));
     textureStore(out_guide, vec2<i32>(id.xy), vec4<f32>(accum_visibility * inv, (accum_depth * inv) / params.lens.y, 0.0, 0.0));
     textureStore(out_reflection, vec2<i32>(id.xy), vec4<f32>(accum_reflection * inv, (accum_reflection_distance * inv) / params.lens.y));
     textureStore(out_normals, vec2<i32>(id.xy), vec4<f32>(avg_n, avg_rough));
@@ -704,6 +727,7 @@ fn grid_coord(pixel: vec2<i32>, render_size: vec2<i32>, grid_dim: vec2<u32>) -> 
 
 struct ReprojectResult {
     colour: vec3<f32>,
+    light_factor: f32,
     moments: vec2<f32>,
     length: f32,
 };
@@ -713,6 +737,7 @@ struct ReprojectResult {
 fn reproject(pixel: vec2<i32>, size: vec2<i32>) -> ReprojectResult {
     var empty: ReprojectResult;
     empty.colour = vec3<f32>(0.0);
+    empty.light_factor = 1.0;
     empty.moments = vec2<f32>(0.0);
     empty.length = 0.0;
     let motion = textureLoad(src_motion, pixel, 0).xy;
@@ -732,8 +757,10 @@ fn reproject(pixel: vec2<i32>, size: vec2<i32>) -> ReprojectResult {
     } else if ((previous_depth > 0.0) != (current_depth > 0.0)) {
         return empty;
     }
+    let prev_c = textureLoad(history_colour, index, 0);
     var out: ReprojectResult;
-    out.colour = textureLoad(history_colour, index, 0).rgb;
+    out.colour = prev_c.rgb;
+    out.light_factor = prev_c.a;
     out.moments = prev_m.xy;
     out.length = prev_m.w;
     return out;
@@ -749,12 +776,15 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let gdim = textureDimensions(src_colour);
     let gmax = vec2<i32>(i32(gdim.x) - 1, i32(gdim.y) - 1);
     let gp = grid_coord(pixel, size, gdim);
-    let current = textureLoad(src_colour, gp, 0).rgb + textureLoad(src_reflection, gp, 0).rgb;
+    let cur_raw = textureLoad(src_colour, gp, 0);
+    let current = cur_raw.rgb + textureLoad(src_reflection, gp, 0).rgb;
+    let current_lf = cur_raw.a;
     let depth = textureLoad(src_depth, pixel, 0);
     let prev = reproject(pixel, size);
     let n = min(prev.length, params.misc.z);
     let valid = params.misc.w > 0.5 && n > 0.0;
     var blended = current;
+    var blended_lf = current_lf;
     var length = 1.0;
     var m1 = luminance(current);
     var m2 = m1 * m1;
@@ -779,12 +809,13 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let history = clamp(prev.colour, mean - stddev, mean + stddev);
         let alpha = max(1.0 / (n + 1.0), params.extent.w);
         blended = mix(history, current, alpha);
+        blended_lf = clamp(mix(prev.light_factor, current_lf, alpha), 0.0, 1.0);
         length = min(n + 1.0, params.misc.z);
         let lum = luminance(blended);
         m1 = mix(prev.moments.x, lum, alpha);
         m2 = mix(prev.moments.y, lum * lum, alpha);
     }
-    textureStore(out_colour, pixel, vec4<f32>(blended, 1.0));
+    textureStore(out_colour, pixel, vec4<f32>(blended, blended_lf));
     textureStore(out_moments, pixel, vec4<f32>(m1, m2, depth, length));
 }
 
@@ -825,12 +856,14 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let centre_variance = variance_of(centre_moments);
     let inv_sigma = 1.0 / max(params.weights.x * sqrt(centre_variance), 1e-6);
     let inv_depth_denom = 1.0 / max(params.weights.z * max(abs(centre_depth), 1e-3), 1e-6);
-    let centre = textureLoad(history_colour, pixel, 0).rgb;
+    let centre_raw = textureLoad(history_colour, pixel, 0);
+    let centre = centre_raw.rgb;
     let centre_lum = luminance(centre);
 
     // Seed accumulation with the centre tap (skipping redundant exp(0)/pow(1)).
     let w0 = 0.375 * 0.375;
     var sum = centre * w0;
+    var sum_lf = centre_raw.a * w0;
     var weight_sum = w0;
     var moment1 = centre_moments.x * w0;
     var moment2 = centre_moments.y * w0;
@@ -859,13 +892,15 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             if (wn < 1e-4) {
                 continue;
             }
-            let sample = textureLoad(history_colour, p, 0).rgb;
+            let sample_raw = textureLoad(history_colour, p, 0);
+            let sample = sample_raw.rgb;
             let w_colour = exp(-abs(centre_lum - luminance(sample)) * inv_sigma);
             let w = wy * kernel_weight(dx) * wn * wd * w_colour;
             if (w <= 1e-6) {
                 continue;
             }
             sum = sum + sample * w;
+            sum_lf = sum_lf + sample_raw.a * w;
             weight_sum = weight_sum + w;
             let moments = textureLoad(history_moments, p, 0);
             moment1 = moment1 + moments.x * w;
@@ -873,7 +908,7 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     let inv_w = 1.0 / weight_sum;
-    textureStore(out_colour, pixel, vec4<f32>(sum * inv_w, 1.0));
+    textureStore(out_colour, pixel, vec4<f32>(sum * inv_w, sum_lf * inv_w));
     textureStore(out_moments, pixel, vec4<f32>(moment1 * inv_w, moment2 * inv_w, centre_moments.z, centre_moments.w));
 }
 "#;
@@ -894,13 +929,13 @@ fn compose_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = vec2<i32>(i32(extent.x), i32(extent.y));
     let pixel = vec2<i32>(i32(id.x), i32(id.y));
     if (id.x >= u32(size.x) || id.y >= u32(size.y)) { return; }
-    let c = textureLoad(colour, pixel, 0).rgb;
+    let c = textureLoad(colour, pixel, 0);
     let m = textureLoad(moments, pixel, 0);
     let gdim = vec2<f32>(textureDimensions(guide));
     let gcoord = vec2<i32>(clamp((vec2<f32>(pixel) + vec2<f32>(0.5)) / extent.xy * gdim, vec2<f32>(0.0), gdim - vec2<f32>(1.0)));
     let g = textureLoad(guide, gcoord, 0);
     let r = textureLoad(reflection, gcoord, 0);
-    textureStore(out_colour, pixel, vec4<f32>(c, 1.0));
+    textureStore(out_colour, pixel, c);
     let variance = max(m.y - m.x * m.x, 0.0);
     textureStore(out_guide, pixel, vec4<f32>(m.z, g.x, r.w, variance));
 }
@@ -932,6 +967,43 @@ fn vs(@builtin(vertex_index) idx: u32) -> VOut {
 @fragment
 fn fs(i: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(textureSampleLevel(src_tex, src_samp, i.uv, 0.0).rgb, 1.0);
+}
+"#;
+
+/// Fullscreen layered composite shader: modulates the untouched full raster
+/// world render by Raywatcher's denoised shadow*AO light factor (`src_rt.a`)
+/// and adds denoised RT reflections + indirect GI bounce (`src_rt.rgb`).
+const COMPOSITE_SHADER: &str = r#"
+@group(0) @binding(0) var src_raster: texture_2d<f32>;
+@group(0) @binding(1) var src_rt: texture_2d<f32>;
+@group(0) @binding(2) var src_samp: sampler;
+
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) idx: u32) -> VOut {
+    var p = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(3.0, 1.0),
+        vec2<f32>(-1.0, 1.0),
+    );
+    var out: VOut;
+    let xy = p[idx];
+    out.pos = vec4<f32>(xy, 0.0, 1.0);
+    out.uv = vec2<f32>(xy.x * 0.5 + 0.5, 0.5 - xy.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs(i: VOut) -> @location(0) vec4<f32> {
+    let raster = textureSampleLevel(src_raster, src_samp, i.uv, 0.0);
+    let rt = textureSampleLevel(src_rt, src_samp, i.uv, 0.0);
+    let light_factor = clamp(rt.a, 0.0, 1.0);
+    let layered = max(raster.rgb * light_factor + rt.rgb, vec3<f32>(0.0));
+    return vec4<f32>(layered, raster.a);
 }
 "#;
 
@@ -978,6 +1050,8 @@ struct Pipelines {
     blit_module: wgpu::ShaderModule,
     blit_layout: wgpu::BindGroupLayout,
     blit_sampler: wgpu::Sampler,
+    composite_module: wgpu::ShaderModule,
+    composite_layout: wgpu::BindGroupLayout,
 }
 
 impl Pipelines {
@@ -1178,6 +1252,41 @@ impl Pipelines {
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
+            }),
+            composite_module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("raywatcher composite"),
+                source: wgpu::ShaderSource::Wgsl(COMPOSITE_SHADER.into()),
+            }),
+            composite_layout: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("raywatcher composite"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
             }),
         }
     }
@@ -1382,6 +1491,14 @@ pub struct RaywatcherGpu {
     dlss_rr_failed: bool,
     blit_pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     blit_bind_group: wgpu::BindGroup,
+    composite_pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+    raster_copy: Option<(
+        wgpu::TextureFormat,
+        (u32, u32),
+        wgpu::Texture,
+        wgpu::TextureView,
+        wgpu::BindGroup,
+    )>,
     grid: GridTargets,
     grid_extent: (u32, u32),
     render_extent: (u32, u32),
@@ -1549,6 +1666,8 @@ impl RaywatcherGpu {
             dlss_rr_failed: false,
             blit_pipeline: None,
             blit_bind_group,
+            composite_pipeline: None,
+            raster_copy: None,
             grid,
             grid_extent,
             render_extent: (w, h),
@@ -2049,6 +2168,7 @@ impl RaywatcherGpu {
         self.depth = depth;
         self._depth_tex = depth_tex;
         self.blit_bind_group = Self::blit_binding(device, &self.pipelines, &output_view);
+        self.raster_copy = None;
         self.output = output;
         self.output_view = output_view;
         self.guide = guide;
@@ -2302,6 +2422,7 @@ impl RaywatcherGpu {
         params: &FrameParams,
         motion: &wgpu::Texture,
         reset: bool,
+        layered: bool,
         world_to_view: [[f32; 4]; 4],
         view_to_clip: [[f32; 4]; 4],
     ) -> bool {
@@ -2328,6 +2449,8 @@ impl RaywatcherGpu {
             grid_normals: &self.grid.normals_view,
             grid_albedo: &self.grid.albedo_view,
             depth: &self.depth,
+            raster: self.raster_copy.as_ref().map(|r| &r.3),
+            layered,
             motion,
             jitter: params.jitter,
             reset,
@@ -2343,6 +2466,159 @@ impl RaywatcherGpu {
                 false
             }
         }
+    }
+
+    /// Snapshot the untouched full raster world target into an internal copy so
+    /// Raywatcher can composite shadows, reflections, AO and GI on top of it
+    /// (and feed it into DLSS Ray Reconstruction) without overwriting it.
+    pub fn capture_raster(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::Texture,
+    ) {
+        let fmt = source.format();
+        let ext = (source.width().max(1), source.height().max(1));
+        let needs_alloc = self
+            .raster_copy
+            .as_ref()
+            .is_none_or(|(f, e, _, _, _)| *f != fmt || *e != ext);
+        if needs_alloc {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("raywatcher raster snapshot"),
+                size: wgpu::Extent3d {
+                    width: ext.0,
+                    height: ext.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: fmt,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("raywatcher composite"),
+                layout: &self.pipelines.composite_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.output_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.pipelines.blit_sampler),
+                    },
+                ],
+            });
+            self.raster_copy = Some((fmt, ext, tex, view, bg));
+            if let Some(rr) = self.dlss_rr.as_mut() {
+                rr.invalidate_prep();
+            }
+        }
+        if let Some((_, _, ref tex, _, _)) = self.raster_copy {
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: source,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: ext.0,
+                    height: ext.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    /// Composite Raywatcher's denoised lighting layer on top of the untouched
+    /// raster world render (`layered && !dlss_rr_ran`), or blit `self.output`
+    /// directly when DLSS RR already produced the composited image or when the
+    /// user explicitly opted into `replace_raster`.
+    pub fn composite_to(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        destination: &wgpu::Texture,
+        layered: bool,
+        dlss_rr_ran: bool,
+    ) {
+        if !layered || dlss_rr_ran || self.raster_copy.is_none() {
+            self.blit_to(device, encoder, destination);
+            return;
+        }
+        let target_format = destination.format();
+        if self
+            .composite_pipeline
+            .as_ref()
+            .is_none_or(|(fmt, _)| *fmt != target_format)
+        {
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("raywatcher composite"),
+                bind_group_layouts: &[&self.pipelines.composite_layout],
+                push_constant_ranges: &[],
+            });
+            let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("raywatcher composite"),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &self.pipelines.composite_module,
+                    entry_point: "vs",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.pipelines.composite_module,
+                    entry_point: "fs",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+            self.composite_pipeline = Some((target_format, pipe));
+        }
+        let (Some((_, ref pipe)), Some((_, _, _, _, ref bg))) =
+            (&self.composite_pipeline, &self.raster_copy)
+        else {
+            return;
+        };
+        let dst_view = destination.create_view(&Default::default());
+        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("raywatcher composite"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &dst_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        rp.set_pipeline(pipe);
+        rp.set_bind_group(0, bg, &[]);
+        rp.draw(0..3, 0..1);
     }
 
     /// Copy or blit `self.output` (`Rgba16Float`) into `destination`, converting

@@ -64,6 +64,20 @@ impl RasterOverrides {
     /// * `reflections` owns the reflection submissions and `ambient_occlusion`
     ///   the fog occlusion term;
     /// * `refraction` is water-only and has no raster equivalent to remove.
+    /// Raster overrides for a planned frame.
+    ///
+    /// By default (`plan.replace_raster == false`) Raywatcher layers ray-traced
+    /// shadows, reflections, AO and GI over the untouched raster world, so this
+    /// returns [`Self::NONE`]. Raster terms are only removed when the user
+    /// explicitly opts into `replace_raster`.
+    pub fn for_plan(plan: &crate::modules::raywatcher::plan::Plan) -> Self {
+        if !plan.trace || !plan.replace_raster {
+            return Self::NONE;
+        }
+        Self::for_effects(plan.effects, true)
+    }
+
+    /// The overrides implied when explicit raster replacement is enabled.
     pub fn for_effects(effects: crate::modules::raywatcher::plan::Effects, trace: bool) -> Self {
         if !trace {
             return Self::NONE;

@@ -225,6 +225,11 @@ pub struct Settings {
     /// vectors, off by default: a debug switch that proves the reprojection is
     /// real.
     pub show_denoiser_input: bool,
+    /// Explicit opt-in to zero/replace raster lighting terms instead of
+    /// layering ray tracing over the full original world render. Defaults to
+    /// `false` so textured terrain, buildings, trees, water, effects, sky and
+    /// fog stay intact.
+    pub replace_raster: bool,
     /// Folder the reconstruction SDKs are loaded from. Empty means
     /// `PW_UPSCALER_SDK_DIR`, then `<exe>/sdk`, the same rule the upscalers use.
     pub sdk_dir: String,
@@ -245,6 +250,7 @@ impl Default for Settings {
             bounce_strength: 1.,
             reflection_roughness_cutoff: 0.4,
             show_denoiser_input: false,
+            replace_raster: false,
             sdk_dir: String::new(),
         }
     }
@@ -315,6 +321,9 @@ pub struct Plan {
     pub grid: (u32, u32),
     /// Render extent the rays are reconstructed into.
     pub render: (u32, u32),
+    /// Explicit opt-in to replace raster lighting terms. `false` (default)
+    /// keeps the full raster world render untouched and composites RT on top.
+    pub replace_raster: bool,
 }
 
 impl Plan {
@@ -336,6 +345,7 @@ impl Plan {
         reconstruction: RayReconstruction::Off,
         grid: (0, 0),
         render: (0, 0),
+        replace_raster: false,
     };
 
     /// Largest ray grid edge a software trace can be asked for at 1 sample. A
@@ -389,6 +399,7 @@ impl Plan {
             reconstruction,
             grid: ((render.0 / ray_scale).max(1), (render.1 / ray_scale).max(1)),
             render,
+            replace_raster: settings.replace_raster,
         }
     }
 }

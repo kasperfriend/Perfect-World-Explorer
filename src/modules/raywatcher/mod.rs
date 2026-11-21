@@ -135,6 +135,7 @@ impl Raywatcher {
         if settings.mode != self.settings.mode
             || settings.reconstruction != self.settings.reconstruction
             || settings.samples != self.settings.samples
+            || settings.replace_raster != self.settings.replace_raster
         {
             self.pending_reset = true;
         }
@@ -249,7 +250,7 @@ impl Raywatcher {
     /// Build this frame's status and remember it for the tab.
     pub fn status(&mut self, render_extent: (u32, u32), history_valid: bool) -> Status {
         let plan = self.plan(render_extent, history_valid);
-        let overrides = frame::RasterOverrides::for_effects(plan.effects, plan.trace);
+        let overrides = frame::RasterOverrides::for_plan(&plan);
         let note = if !self.settings.mode.enabled() {
             None
         } else if !plan.trace {
@@ -383,6 +384,10 @@ impl Raywatcher {
             .on_hover_text(
                 "Draws the raw one-sample-per-pixel ray image instead of the filtered one. A debug switch: it makes the denoiser's work visible.",
             );
+        ui.checkbox(&mut settings.replace_raster, "Replace raster lighting (opt-in)")
+            .on_hover_text(
+                "Off by default: Raywatcher layers ray-traced shadows, reflections, AO and GI over the full textured raster world. Enable only to zero raster lighting and draw raw RT geometry.",
+            );
         ui.separator();
         ui.heading("Ray reconstruction");
         ui.horizontal(|ui| {
@@ -482,6 +487,11 @@ impl Raywatcher {
             "show_denoiser_input={}",
             u8::from(self.settings.show_denoiser_input)
         );
+        let _ = writeln!(
+            out,
+            "replace_raster={}",
+            u8::from(self.settings.replace_raster)
+        );
         let effects = self.settings.effects;
         for (name, on) in [
             ("shadows", effects.shadows),
@@ -535,6 +545,9 @@ impl Raywatcher {
         if let Some(v) = get("show_denoiser_input").and_then(parse_flag) {
             s.show_denoiser_input = v;
         }
+        if let Some(v) = get("replace_raster").and_then(parse_flag) {
+            s.replace_raster = v;
+        }
         let mut effects = s.effects;
         for (name, slot) in [
             ("shadows", &mut effects.shadows),
@@ -555,7 +568,8 @@ impl Raywatcher {
         s.sanitise();
         let reset = s.mode != self.settings.mode
             || s.reconstruction != self.settings.reconstruction
-            || s.samples != self.settings.samples;
+            || s.samples != self.settings.samples
+            || s.replace_raster != self.settings.replace_raster;
         self.settings = s;
         if reset {
             self.pending_reset = true;
@@ -619,23 +633,53 @@ mod tests {
     }
 
     #[test]
-    fn software_mode_replaces_lighting_and_keeps_a_plan_the_upscaler_can_use() {
+    fn default_enabled_frame_preserves_raster_terms_identical_to_disabled() {
+        let mut off_mod = module();
+        off_mod.configure(true, (true, true));
+        let disabled = off_mod.status((1920, 1080), false);
+
+        let mut on_mod = module();
+        on_mod.configure(true, (true, true));
+        let mut s = on_mod.settings().clone();
+        s.mode = RayTracingMode::Hardware;
+        assert!(!s.replace_raster, "layered mode must be the default");
+        on_mod.set_settings(s);
+        let enabled = on_mod.status((1920, 1080), false);
+
+        assert!(enabled.active);
+        assert_eq!(
+            enabled.overrides, disabled.overrides,
+            "default enabled Raywatcher must leave every raster term identical to disabled"
+        );
+        assert_eq!(enabled.overrides, frame::RasterOverrides::NONE);
+        assert_eq!(enabled.plan.render, (1920, 1080));
+        assert_eq!(enabled.plan.grid, (1920, 1080));
+    }
+
+    #[test]
+    fn software_mode_layers_by_default_and_only_replaces_when_opted_in() {
         let mut m = module();
         m.configure(false, (false, false));
         let mut s = m.settings().clone();
         s.mode = RayTracingMode::Software;
         m.set_settings(s);
-        let status = m.status((1920, 1080), false);
-        assert!(status.active);
-        // The raster sun term and ambient are gone, and the ray image is at the
-        // render extent the upscaler consumes.
-        assert!(status.overrides.directional_light);
-        assert!(status.overrides.ambient);
-        assert!(status.overrides.reflection_pass);
-        assert_eq!(status.plan.render, (1920, 1080));
-        assert_eq!(status.plan.grid, (960, 540));
-        assert!(status.summary.contains("Software"));
-        assert!(status.summary.contains("960x540"));
+        let layered = m.status((1920, 1080), false);
+        assert!(layered.active);
+        assert_eq!(layered.overrides, frame::RasterOverrides::NONE);
+        assert_eq!(layered.plan.render, (1920, 1080));
+        assert_eq!(layered.plan.grid, (960, 540));
+        assert!(layered.summary.contains("Software"));
+        assert!(layered.summary.contains("960x540"));
+
+        // Opting into `replace_raster` removes the raster sun/ambient/reflection terms.
+        let mut s = m.settings().clone();
+        s.replace_raster = true;
+        m.set_settings(s);
+        let replaced = m.status((1920, 1080), false);
+        assert!(replaced.active);
+        assert!(replaced.overrides.directional_light);
+        assert!(replaced.overrides.ambient);
+        assert!(replaced.overrides.reflection_pass);
     }
 
     #[test]
@@ -692,11 +736,12 @@ mod tests {
     }
 
     #[test]
-    fn every_effect_switch_reaches_the_overrides() {
+    fn every_effect_switch_reaches_the_overrides_when_replace_opted_in() {
         let mut m = module();
         m.configure(false, (false, false));
         let mut s = m.settings().clone();
         s.mode = RayTracingMode::Software;
+        s.replace_raster = true;
         m.set_settings(s);
         let all = m.status((640, 360), false);
         assert!(all.overrides.any());
