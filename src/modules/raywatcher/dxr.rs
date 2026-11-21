@@ -922,7 +922,7 @@ mod imp {
 
                 let geom = GeometryDesc {
                     ty: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
-                    flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+                    flags: 0, // Allow non-opaque alpha-tested foliage queries (Phase 4)
                     triangles: GeometryTrianglesDesc {
                         transform3x4: 0,
                         index_format: DXGI_FORMAT_UNKNOWN,

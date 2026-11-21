@@ -875,6 +875,9 @@ fn push_instances_chunked(
             );
             let material = *palette.entry(key).or_insert_with(|| {
                 let id = materials.len() as u32;
+                let is_foliage = instance.albedo[1] > instance.albedo[0] * 1.2
+                    && instance.albedo[1] > instance.albedo[2] * 1.2;
+                let opacity = if is_foliage { 0.62 } else { 1.0 };
                 materials.push(RayMaterial {
                     albedo: [
                         instance.albedo[0],
@@ -882,7 +885,7 @@ fn push_instances_chunked(
                         instance.albedo[2],
                         1.0,
                     ],
-                    surface: [0.75, 0.05, 0.0, 1.0],
+                    surface: [0.75, 0.05, 0.0, opacity],
                 });
                 id
             });

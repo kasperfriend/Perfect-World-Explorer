@@ -565,7 +565,24 @@ fn closest_hit(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> Hit
     return hit;
 }
 
-fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> bool {
+fn ign(px: vec2<u32>, frame: u32) -> f32 {
+    let p = vec2<f32>(px) + vec2<f32>(f32(frame & 63u), f32((frame * 7u) & 63u)) * 5.588238;
+    return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715))));
+}
+
+fn accept_opacity(tri_index: u32, bary_u: f32, seed: u32) -> bool {
+    let mat_count = max(u32(params.counts.z), 1u);
+    let mat_idx = min(u32(round(tris[tri_index].b.w)), mat_count - 1u);
+    let opacity = materials[mat_idx].surface.w;
+    if (opacity >= 0.99) {
+        return true;
+    }
+    var h = tri_index * 747796405u ^ u32(bary_u * 4096.0) * 2891336453u ^ seed;
+    h = h ^ (h >> 16u);
+    return f32(h & 0xffffu) / 65536.0 < opacity;
+}
+
+fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32, seed: u32) -> bool {
     if (params.counts.y < 1.0) {
         return false;
     }
@@ -587,7 +604,9 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> bool {
             let count = u32(node.bounds_min.w);
             let first = u32(node.bounds_max.w);
             for (var i = 0u; i < count; i = i + 1u) {
-                if (triangle_hit(tris[order[first + i]], origin, dir, t_min, t_max).x >= 0.0) {
+                let tid = order[first + i];
+                let hit_res = triangle_hit(tris[tid], origin, dir, t_min, t_max);
+                if (hit_res.x >= 0.0 && accept_opacity(tid, hit_res.y, seed)) {
                     return true;
                 }
             }
@@ -676,20 +695,29 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var accum_gi = vec3<f32>(0.0);
 
     let ao_radius = clamp(params.fog.z, 2.0, 6.0);
-    let ao_samples = select(2u, 1u, samples > 1u);
+    let ao_samples = 8u;
+    let rot_angle = ign(id.xy, u32(params.frame.x)) * (2.0 * PI);
     let onb = orthonormal_basis(normal);
+    let sun_onb = orthonormal_basis(params.sun_dir.xyz);
 
     for (var s = 0u; s < samples; s = s + 1u) {
         var shadow = 1.0;
         if (bits_shadows && n_dot_l > 0.02) {
-            let shadow_dir = select(
-                params.sun_dir.xyz,
-                cone_direction(&state, params.sun_dir.xyz, params.lens.z),
-                params.lens.z > 1e-4,
-            );
-            if (occluded(ray_origin, shadow_dir, bias * 0.5, params.lens.y)) {
-                shadow = 0.0;
+            let sun_taps = select(1u, 4u, params.lens.z > 1e-4);
+            var sun_hits = 0u;
+            let spread_tan = tan(params.lens.z);
+            for (var k = 0u; k < sun_taps; k = k + 1u) {
+                var shadow_dir = params.sun_dir.xyz;
+                if (sun_taps > 1u) {
+                    let r = sqrt((f32(k) + 0.5) / f32(sun_taps)) * spread_tan;
+                    let theta = f32(k) * 2.39996323 + rot_angle + f32(s) * 1.6180339;
+                    shadow_dir = normalize(params.sun_dir.xyz + sun_onb * vec3<f32>(cos(theta) * r, sin(theta) * r, 0.0));
+                }
+                if (occluded(ray_origin, shadow_dir, bias * 0.5, params.lens.y, state ^ k)) {
+                    sun_hits = sun_hits + 1u;
+                }
             }
+            shadow = 1.0 - f32(sun_hits) / f32(sun_taps);
         }
         accum_shadow = accum_shadow + shadow;
 
@@ -697,11 +725,11 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         if (bits_ao) {
             var hits = 0u;
             for (var i = 0u; i < ao_samples; i = i + 1u) {
-                let u1 = next_f32(&state);
+                let u1 = (f32(i) + next_f32(&state)) / f32(ao_samples);
+                let phi = f32(i) * 2.39996323 + rot_angle + f32(s) * 0.7548776;
                 let r = sqrt(u1);
-                let phi = next_f32(&state) * 2.0 * PI;
                 let d = onb * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
-                if (occluded(ray_origin, d, bias * 0.5, ao_radius)) {
+                if (occluded(ray_origin, d, bias * 0.5, ao_radius, state ^ i)) {
                     hits = hits + 1u;
                 }
             }

@@ -101,6 +101,33 @@ struct Hit {
     float3 normal;
 };
 
+Material material_of(uint tri_index) {
+    uint mat_count = max(uint(params.counts.z), 1u);
+    uint mat_idx = min(uint(round(tris[tri_index].b.w)), mat_count - 1u);
+    return materials[mat_idx];
+}
+
+// Interleaved Gradient Noise for per-pixel decorrelation of shadow and AO disks.
+float ign(uint2 px, uint frame) {
+    float2 p = float2(px) + float2(frame & 63u, (frame * 7u) & 63u) * 5.588238;
+    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+bool accept_opacity(uint prim, float2 bary, uint seed) {
+    uint tri_count = uint(params.counts.x);
+    if (prim >= tri_count) {
+        return false;
+    }
+    float opacity = material_of(prim).surface.w;
+    if (opacity >= 0.99) {
+        return true;
+    }
+    uint h = prim * 747796405u ^ uint(bary.x * 4096.0) * 2891336453u ^ uint(bary.y * 4096.0) * 1664525u ^ seed;
+    h ^= h >> 16u;
+    float r = float(h & 0xffffu) / 65536.0;
+    return r < opacity;
+}
+
 Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
     Hit hit;
     hit.index = 0xffffffffu;
@@ -113,9 +140,14 @@ Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
     ray.TMin = t_min;
     ray.TMax = t_max;
 
-    RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
-    q.TraceRayInline(scene_tlas, RAY_FLAG_FORCE_OPAQUE, 0xffu, ray);
+    RayQuery<RAY_FLAG_NONE> q;
+    q.TraceRayInline(scene_tlas, RAY_FLAG_NONE, 0xffu, ray);
     while (q.Proceed()) {
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
+            if (accept_opacity(q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), 0u)) {
+                q.CommitNonOpaqueTriangleHit();
+            }
+        }
     }
 
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
@@ -134,24 +166,23 @@ Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
     return hit;
 }
 
-bool occluded(float3 origin, float3 dir, float t_min, float t_max) {
+bool occluded(float3 origin, float3 dir, float t_min, float t_max, uint seed) {
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = dir;
     ray.TMin = t_min;
     ray.TMax = t_max;
 
-    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER> q;
-    q.TraceRayInline(scene_tlas, RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xffu, ray);
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER> q;
+    q.TraceRayInline(scene_tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xffu, ray);
     while (q.Proceed()) {
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
+            if (accept_opacity(q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), seed)) {
+                q.CommitNonOpaqueTriangleHit();
+            }
+        }
     }
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
-}
-
-Material material_of(uint tri_index) {
-    uint mat_count = max(uint(params.counts.z), 1u);
-    uint mat_idx = min(uint(round(tris[tri_index].b.w)), mat_count - 1u);
-    return materials[mat_idx];
 }
 
 [numthreads(8, 8, 1)]
@@ -215,41 +246,57 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float accum_refl_dist = 0.0;
     float3 accum_gi = float3(0.0, 0.0, 0.0);
 
-    // Short-range contact AO radius (4..6 world units) for crisp crevice
-    // darkening without tracing expensive 100+ unit occlusion rays.
+    // Phase 6: 8 stratified cosine-weighted hemisphere AO samples within
+    // world-space contact radius (eliminates coarse 2-tap circle blotches).
     float ao_radius = clamp(params.fog.z, 2.0, 6.0);
-    uint ao_samples = samples > 1u ? 1u : 2u;
+    uint ao_samples = 8u;
+    float rot_angle = ign(id.xy, uint(params.frame.x)) * (2.0 * PI);
 
     float3 up = abs(normal.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
     float3 t_axis = normalize(cross(up, normal));
     float3 b_axis = cross(normal, t_axis);
 
+    float3 sun_up = abs(params.sun_dir.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 sun_t = normalize(cross(sun_up, params.sun_dir.xyz));
+    float3 sun_b = cross(params.sun_dir.xyz, sun_t);
+
     for (uint s = 0u; s < samples; s = s + 1u) {
-        // 1. Real RT sun shadows (soft penumbra within sun angular disc).
+        // Phase 5: Decorrelated 4-sample Vogel-disk soft sun shadow penumbra.
         float shadow = 1.0;
         if (bits_shadows && n_dot_l > 0.02) {
-            float3 shadow_dir = params.lens.z > 1e-4
-                ? cone_direction(state, params.sun_dir.xyz, params.lens.z)
-                : params.sun_dir.xyz;
-            if (occluded(ray_origin, shadow_dir, bias * 0.5, params.lens.y)) {
-                shadow = 0.0;
+            uint sun_taps = params.lens.z > 1e-4 ? 4u : 1u;
+            uint sun_hits = 0u;
+            float spread_tan = tan(params.lens.z);
+            for (uint k = 0u; k < sun_taps; k = k + 1u) {
+                float3 shadow_dir = params.sun_dir.xyz;
+                if (sun_taps > 1u) {
+                    float r = sqrt((float(k) + 0.5) / float(sun_taps)) * spread_tan;
+                    float theta = float(k) * 2.39996323 + rot_angle + float(s) * 1.6180339;
+                    float s_th, c_th;
+                    sincos(theta, s_th, c_th);
+                    shadow_dir = normalize(params.sun_dir.xyz + (sun_t * c_th + sun_b * s_th) * r);
+                }
+                if (occluded(ray_origin, shadow_dir, bias * 0.5, params.lens.y, state ^ k)) {
+                    sun_hits = sun_hits + 1u;
+                }
             }
+            shadow = 1.0 - float(sun_hits) / float(sun_taps);
         }
         accum_shadow += shadow;
 
-        // 2. Short-range contact ambient occlusion.
+        // Phase 6: 8-sample stratified cosine-weighted contact ambient occlusion.
         float open = 1.0;
         if (bits_ao) {
             uint hits = 0u;
             for (uint i = 0u; i < ao_samples; i = i + 1u) {
-                float u1 = rand01(state);
-                float u2 = rand01(state);
+                float u1 = (float(i) + rand01(state)) / float(ao_samples);
+                float phi = float(i) * 2.39996323 + rot_angle + float(s) * 0.7548776;
                 float r = sqrt(u1);
                 float s_phi, c_phi;
-                sincos(2.0 * PI * u2, s_phi, c_phi);
+                sincos(phi, s_phi, c_phi);
                 float z = sqrt(max(0.0, 1.0 - u1));
                 float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + normal * z;
-                if (occluded(ray_origin, d, bias * 0.5, ao_radius)) {
+                if (occluded(ray_origin, d, bias * 0.5, ao_radius, state ^ i)) {
                     hits = hits + 1u;
                 }
             }
