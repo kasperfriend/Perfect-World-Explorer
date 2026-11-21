@@ -445,13 +445,10 @@ mod imp {
     }
 
     struct DxrScene {
-        _vertices: RawBuffer,
         tris: RawBuffer,
         materials: RawBuffer,
         _blas: RawBuffer,
         tlas: RawBuffer,
-        _instance_desc: RawBuffer,
-        _scratch: RawBuffer,
         tri_count: u32,
         mat_count: u32,
     }
@@ -774,23 +771,39 @@ mod imp {
                 )?;
                 vertices.write_upload(bytemuck::cast_slice(&verts))?;
 
+                let tris_bytes = (tris_data.len() * size_of::<RayTriangle>()) as u64;
+                let tris_upload = RawBuffer::create(
+                    dev_ptr,
+                    tris_bytes,
+                    d12::D3D12_HEAP_TYPE_UPLOAD,
+                    d12::D3D12_RESOURCE_FLAG_NONE,
+                    d12::D3D12_RESOURCE_STATE_GENERIC_READ,
+                )?;
+                tris_upload.write_upload(bytemuck::cast_slice(&tris_data))?;
                 let tris = RawBuffer::create(
                     dev_ptr,
-                    (tris_data.len() * size_of::<RayTriangle>()) as u64,
+                    tris_bytes,
+                    d12::D3D12_HEAP_TYPE_DEFAULT,
+                    d12::D3D12_RESOURCE_FLAG_NONE,
+                    d12::D3D12_RESOURCE_STATE_COPY_DEST,
+                )?;
+
+                let mats_bytes = (mats_data.len() * size_of::<RayMaterial>()) as u64;
+                let mats_upload = RawBuffer::create(
+                    dev_ptr,
+                    mats_bytes,
                     d12::D3D12_HEAP_TYPE_UPLOAD,
                     d12::D3D12_RESOURCE_FLAG_NONE,
                     d12::D3D12_RESOURCE_STATE_GENERIC_READ,
                 )?;
-                tris.write_upload(bytemuck::cast_slice(&tris_data))?;
-
+                mats_upload.write_upload(bytemuck::cast_slice(&mats_data))?;
                 let materials = RawBuffer::create(
                     dev_ptr,
-                    (mats_data.len() * size_of::<RayMaterial>()) as u64,
-                    d12::D3D12_HEAP_TYPE_UPLOAD,
+                    mats_bytes,
+                    d12::D3D12_HEAP_TYPE_DEFAULT,
                     d12::D3D12_RESOURCE_FLAG_NONE,
-                    d12::D3D12_RESOURCE_STATE_GENERIC_READ,
+                    d12::D3D12_RESOURCE_STATE_COPY_DEST,
                 )?;
-                materials.write_upload(bytemuck::cast_slice(&mats_data))?;
 
                 let geom = GeometryDesc {
                     ty: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
@@ -912,18 +925,47 @@ mod imp {
                 uav_barrier.u.UAV_mut().pResource = tlas.resource;
                 (*list_ptr).ResourceBarrier(1, &uav_barrier);
 
+                // Copy triangles & materials into high-bandwidth DEFAULT VRAM
+                // and transition them to NON_PIXEL_SHADER_RESOURCE.
+                (*list_ptr).CopyBufferRegion(tris.resource, 0, tris_upload.resource, 0, tris_bytes);
+                (*list_ptr).CopyBufferRegion(
+                    materials.resource,
+                    0,
+                    mats_upload.resource,
+                    0,
+                    mats_bytes,
+                );
+                let mut copy_barriers: [d12::D3D12_RESOURCE_BARRIER; 2] = zeroed();
+                for (b, res) in copy_barriers
+                    .iter_mut()
+                    .zip([tris.resource, materials.resource])
+                {
+                    b.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    *b.u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: res,
+                        Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: d12::D3D12_RESOURCE_STATE_COPY_DEST,
+                        StateAfter: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    };
+                }
+                (*list_ptr).ResourceBarrier(2, copy_barriers.as_ptr());
+
                 com_release(list4);
                 ring.retire(slot_idx, raw_queue, "DXR-AS")?;
                 ring.wait_idle();
 
+                // Staging/upload/scratch buffers drop here now that the GPU is idle.
+                drop(vertices);
+                drop(tris_upload);
+                drop(mats_upload);
+                drop(instance_desc);
+                drop(scratch);
+
                 Ok(DxrScene {
-                    _vertices: vertices,
                     tris,
                     materials,
                     _blas: blas,
                     tlas,
-                    _instance_desc: instance_desc,
-                    _scratch: scratch,
                     tri_count,
                     mat_count,
                 })

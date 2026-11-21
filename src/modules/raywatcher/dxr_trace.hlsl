@@ -77,9 +77,7 @@ float3 cosine_hemisphere(inout uint state, float3 n) {
 }
 
 float3 environment() {
-    float3 sun = max(params.sun_colour.xyz, float3(0.0, 0.0, 0.0));
-    float3 amb = max(params.ambient.xyz, float3(0.0, 0.0, 0.0));
-    return amb * 0.65 + sun * 0.15;
+    return max(params.fog_colour.xyz, params.ambient.xyz * 0.85);
 }
 
 struct Hit {
@@ -100,8 +98,8 @@ Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
     ray.TMin = t_min;
     ray.TMax = t_max;
 
-    RayQuery<RAY_FLAG_NONE> q;
-    q.TraceRayInline(scene_tlas, RAY_FLAG_NONE, 0xffu, ray);
+    RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+    q.TraceRayInline(scene_tlas, RAY_FLAG_FORCE_OPAQUE, 0xffu, ray);
     while (q.Proceed()) {
     }
 
@@ -128,8 +126,8 @@ bool occluded(float3 origin, float3 dir, float t_min, float t_max) {
     ray.TMin = t_min;
     ray.TMax = t_max;
 
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-    q.TraceRayInline(scene_tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xffu, ray);
+    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER> q;
+    q.TraceRayInline(scene_tlas, RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xffu, ray);
     while (q.Proceed()) {
     }
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
@@ -193,13 +191,24 @@ Surface shade(float3 origin, float3 dir, inout uint state) {
     bool bits_gi = (effects & 16u) != 0u;
     float bias = params.effects.z;
 
+    float3 ray_origin = hit_point + hit.normal * bias;
     float open = 1.0;
     if (bits_ao) {
+        float3 up = abs(hit.normal.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+        float3 t_axis = normalize(cross(up, hit.normal));
+        float3 b_axis = cross(hit.normal, t_axis);
         uint hits = 0u;
         const uint ao_samples = 8u;
         for (uint i = 0u; i < ao_samples; i = i + 1u) {
-            float3 d = cosine_hemisphere(state, hit.normal);
-            if (occluded(hit_point + hit.normal * bias, d, bias, params.fog.z)) {
+            float u1 = rand01(state);
+            float u2 = rand01(state);
+            float r = sqrt(u1);
+            float phi = 2.0 * PI * u2;
+            float s_phi, c_phi;
+            sincos(phi, s_phi, c_phi);
+            float z = sqrt(max(0.0, 1.0 - u1));
+            float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + hit.normal * z;
+            if (occluded(ray_origin, d, bias, params.fog.z)) {
                 hits = hits + 1u;
             }
         }
@@ -209,10 +218,10 @@ Surface shade(float3 origin, float3 dir, inout uint state) {
 
     float n_dot_l = max(dot(hit.normal, params.sun_dir.xyz), 0.0);
     float3 direct = float3(0.0, 0.0, 0.0);
-    if (bits_lighting) {
+    if (bits_lighting && n_dot_l > 0.0) {
         float shadow = 1.0;
         if (bits_shadows) {
-            if (occluded(hit_point + hit.normal * bias, params.sun_dir.xyz, bias, params.lens.y)) {
+            if (occluded(ray_origin, params.sun_dir.xyz, bias, params.lens.y)) {
                 shadow = 0.0;
             }
         }

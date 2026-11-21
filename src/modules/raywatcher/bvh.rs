@@ -554,12 +554,12 @@ impl<'a> BuildState<'a> {
                 axis = a;
             }
         }
-        partition.sort_unstable_by(|&l, &r| {
+        let mid = partition.len() / 2;
+        partition.select_nth_unstable_by(mid, |&l, &r| {
             let lc = self.centroids[l as usize][axis];
             let rc = self.centroids[r as usize][axis];
             lc.total_cmp(&rc).then_with(|| l.cmp(&r))
         });
-        let mid = partition.len() / 2;
         let (left, right) = partition.split_at_mut(mid);
         self.build_node(left, depth + 1);
         let right_child = self.build_node(right, depth + 1);

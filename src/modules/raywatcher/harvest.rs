@@ -171,6 +171,34 @@ impl Harvester {
     /// `instances` must be in the order the caller wants ties broken by
     /// distance; it does not matter, because the harvester sorts by distance
     /// itself, but a stable input makes the cache hash stable too.
+    /// Fast-path cache check that lets callers skip sampling the terrain height
+    /// field when neither the camera anchor cell, the terrain generation, nor
+    /// the instance list changed.
+    pub fn cached_if_unchanged(
+        &self,
+        config: HarvestConfig,
+        eye: Vec3,
+        terrain_generation: u64,
+        instances: &[InstanceProxy],
+    ) -> Option<std::sync::Arc<SceneGeometry>> {
+        let anchor = (
+            (eye.x / (config.radius.max(1.) / 64.)).round() as i32,
+            (eye.z / (config.radius.max(1.) / 64.)).round() as i32,
+        );
+        let signature = Signature {
+            config,
+            anchor,
+            instances: hash_instances(instances, eye, config),
+            terrain: terrain_generation,
+        };
+        let (cached, scene) = self.cached.as_ref()?;
+        if *cached == signature {
+            Some(scene.clone())
+        } else {
+            None
+        }
+    }
+
     pub fn scene(
         &mut self,
         config: HarvestConfig,
@@ -275,8 +303,11 @@ fn push_instances(
             )
         })
         .collect();
-    order.sort_by(|a, b| a.0.total_cmp(&b.0));
-    order.truncate(config.max_instances);
+    if order.len() > config.max_instances && config.max_instances > 0 {
+        order.select_nth_unstable_by(config.max_instances, |a, b| a.0.total_cmp(&b.0));
+        order.truncate(config.max_instances);
+    }
+    order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     let mut pushed = 0;
     for (_, index) in order {
         let instance = instances[index];

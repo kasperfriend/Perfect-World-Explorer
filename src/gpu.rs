@@ -3766,42 +3766,48 @@ impl Renderer {
         // --- The scene. Rebuilt only when the world it came from changed.
         let config = crate::modules::raywatcher::harvest::HarvestConfig::default();
         let scene = {
-            // The terrain window follows the camera; the grid is sampled from the
-            // map's own ground function, so the harvest agrees with the raster
-            // terrain by construction.
-            let heights;
-            let field = match map_space {
-                Some(space) => {
-                    let radius = config.radius.max(1.);
-                    let cell = space.spacing.max(0.5) * config.stride.max(1) as f32;
-                    let side = (((2. * radius) / cell).ceil().max(2.) as u32 + 2).min(256);
-                    let origin = Vec3::new(
-                        ((camera.pos.x - radius) / cell).floor() * cell,
-                        0.,
-                        ((camera.pos.z - radius) / cell).floor() * cell,
-                    );
-                    heights = crate::modules::raywatcher::harvest::sample_heights(
-                        side,
-                        side,
-                        origin,
-                        cell,
-                        |x, z| space.ground(x, z),
-                    );
-                    Some(crate::modules::raywatcher::harvest::HeightField {
-                        heights: &heights,
-                        width: side,
-                        height: side,
-                        origin,
-                        cell,
-                        generation: 0,
-                    })
-                }
-                None => None,
-            };
             // Placed models become box proxies; the harvest radius bounds them.
             let proxies = Vec::new();
-            self.raywatcher_harvest
-                .scene(config, camera.pos, field.as_ref(), &proxies)
+            // Fast path: skip sampling up to 256x256 terrain heights when the
+            // camera anchor cell, terrain generation, and proxies are unchanged.
+            if let Some(cached) = self
+                .raywatcher_harvest
+                .cached_if_unchanged(config, camera.pos, 0, &proxies)
+            {
+                cached
+            } else {
+                let heights;
+                let field = match map_space {
+                    Some(space) => {
+                        let radius = config.radius.max(1.);
+                        let cell = space.spacing.max(0.5) * config.stride.max(1) as f32;
+                        let side = (((2. * radius) / cell).ceil().max(2.) as u32 + 2).min(256);
+                        let origin = Vec3::new(
+                            ((camera.pos.x - radius) / cell).floor() * cell,
+                            0.,
+                            ((camera.pos.z - radius) / cell).floor() * cell,
+                        );
+                        heights = crate::modules::raywatcher::harvest::sample_heights(
+                            side,
+                            side,
+                            origin,
+                            cell,
+                            |x, z| space.ground(x, z),
+                        );
+                        Some(crate::modules::raywatcher::harvest::HeightField {
+                            heights: &heights,
+                            width: side,
+                            height: side,
+                            origin,
+                            cell,
+                            generation: 0,
+                        })
+                    }
+                    None => None,
+                };
+                self.raywatcher_harvest
+                    .scene(config, camera.pos, field.as_ref(), &proxies)
+            }
         };
         let same_world = self
             .raywatcher_scene
@@ -3906,7 +3912,7 @@ impl Renderer {
             let view = camera.view_matrix();
             let proj = matrix * view.inverse();
             if let Some(gpu) = self.raywatcher_gpu.as_mut() {
-                gpu.reconstruct_dlss_rr(
+                let ran = gpu.reconstruct_dlss_rr(
                     &self.device,
                     &self.queue,
                     &sdk_dir,
@@ -3916,6 +3922,9 @@ impl Renderer {
                     view.to_cols_array_2d(),
                     proj.to_cols_array_2d(),
                 );
+                if !ran {
+                    gpu.record_denoise(&self.queue, encoder, &params, &denoise);
+                }
             }
         }
         // The trace ran at the ray grid; the temporal/compose passes (or DLSS

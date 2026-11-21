@@ -291,35 +291,20 @@ fn cone_direction(state: ptr<function, u32>, axis: vec3<f32>, radius: f32) -> ve
     return normalize(axis + orthonormal_basis(axis) * vec3<f32>(cos(phi) * spread, sin(phi) * spread, 0.0));
 }
 
-fn box_hit(minimum: vec3<f32>, maximum: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> f32 {
-    var t0 = t_min;
-    var t1 = t_max;
-    for (var axis = 0u; axis < 3u; axis = axis + 1u) {
-        let o = origin[axis];
-        let d = dir[axis];
-        let lo = minimum[axis];
-        let hi = maximum[axis];
-        if (abs(d) < 1e-12) {
-            if (o < lo || o > hi) {
-                return -1.0;
-            }
-            continue;
-        }
-        let inv = 1.0 / d;
-        var near = (lo - o) * inv;
-        var far = (hi - o) * inv;
-        if (near > far) {
-            let tmp = near;
-            near = far;
-            far = tmp;
-        }
-        t0 = max(t0, near);
-        t1 = min(t1, far);
-        if (t0 > t1) {
-            return -1.0;
-        }
-    }
-    return t0;
+fn safe_inv_dir(dir: vec3<f32>) -> vec3<f32> {
+    let eps = vec3<f32>(1e-12);
+    let clamped = select(dir, select(vec3<f32>(-1e-12), eps, dir >= vec3<f32>(0.0)), abs(dir) < eps);
+    return vec3<f32>(1.0) / clamped;
+}
+
+fn box_hit(minimum: vec3<f32>, maximum: vec3<f32>, origin: vec3<f32>, inv_dir: vec3<f32>, t_min: f32, t_max: f32) -> f32 {
+    let t0s = (minimum - origin) * inv_dir;
+    let t1s = (maximum - origin) * inv_dir;
+    let tsmaller = min(t0s, t1s);
+    let tbigger = max(t0s, t1s);
+    let t0 = max(t_min, max(tsmaller.x, max(tsmaller.y, tsmaller.z)));
+    let t1 = min(t_max, min(tbigger.x, min(tbigger.y, tbigger.z)));
+    return select(-1.0, t0, t0 <= t1);
 }
 
 fn triangle_hit(tri: Tri, origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> vec2<f32> {
@@ -367,10 +352,13 @@ fn closest_hit(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> Hit
     if (params.counts.y < 1.0) {
         return hit;
     }
+    let inv_dir = safe_inv_dir(dir);
+    if (box_hit(nodes[0].bounds_min.xyz, nodes[0].bounds_max.xyz, origin, inv_dir, t_min, hit.t) < 0.0) {
+        return hit;
+    }
     var stack: array<u32, 64>;
-    var sp = 0u;
+    var sp = 1u;
     stack[0] = 0u;
-    sp = 1u;
     loop {
         if (sp == 0u) {
             break;
@@ -378,9 +366,6 @@ fn closest_hit(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> Hit
         sp = sp - 1u;
         let node_index = stack[sp];
         let node = nodes[node_index];
-        if (box_hit(node.bounds_min.xyz, node.bounds_max.xyz, origin, dir, t_min, hit.t) < 0.0) {
-            continue;
-        }
         if (node.bounds_min.w >= 0.0) {
             let count = u32(node.bounds_min.w);
             let first = u32(node.bounds_max.w);
@@ -390,47 +375,38 @@ fn closest_hit(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> Hit
                 if (result.x >= 0.0) {
                     hit.t = result.x;
                     hit.index = tri_index;
-                    var geo = normalize(cross(tris[tri_index].b.xyz - tris[tri_index].a.xyz, tris[tri_index].c.xyz - tris[tri_index].a.xyz));
-                    hit.normal = select(-geo, geo, dot(geo, dir) <= 0.0);
                 }
             }
         } else {
             let left = node_index + 1u;
             let right = u32(node.bounds_max.w);
-            let lh = box_hit(nodes[left].bounds_min.xyz, nodes[left].bounds_max.xyz, origin, dir, t_min, hit.t);
-            let rh = box_hit(nodes[right].bounds_min.xyz, nodes[right].bounds_max.xyz, origin, dir, t_min, hit.t);
-            // Push the far child so the near one pops first.
-            var near = 0u;
-            var far = 0u;
-            var have_near = false;
-            var have_far = false;
+            let lh = box_hit(nodes[left].bounds_min.xyz, nodes[left].bounds_max.xyz, origin, inv_dir, t_min, hit.t);
+            let rh = box_hit(nodes[right].bounds_min.xyz, nodes[right].bounds_max.xyz, origin, inv_dir, t_min, hit.t);
             if (lh >= 0.0 && rh >= 0.0) {
-                if (lh <= rh) {
-                    near = left; far = right;
-                } else {
-                    near = right; far = left;
-                }
-                have_near = true; have_far = true;
+                let near = select(right, left, lh <= rh);
+                let far = select(left, right, lh <= rh);
+                if (sp < 63u) { stack[sp] = far; sp = sp + 1u; }
+                if (sp < 63u) { stack[sp] = near; sp = sp + 1u; }
             } else if (lh >= 0.0) {
-                near = left; have_near = true;
+                if (sp < 63u) { stack[sp] = left; sp = sp + 1u; }
             } else if (rh >= 0.0) {
-                near = right; have_near = true;
-            }
-            if (have_far && sp < 63u) {
-                stack[sp] = far;
-                sp = sp + 1u;
-            }
-            if (have_near && sp < 63u) {
-                stack[sp] = near;
-                sp = sp + 1u;
+                if (sp < 63u) { stack[sp] = right; sp = sp + 1u; }
             }
         }
+    }
+    if (hit.index != 0xffffffffu) {
+        let geo = normalize(tris[hit.index].n.xyz);
+        hit.normal = select(-geo, geo, dot(geo, dir) <= 0.0);
     }
     return hit;
 }
 
 fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> bool {
     if (params.counts.y < 1.0) {
+        return false;
+    }
+    let inv_dir = safe_inv_dir(dir);
+    if (box_hit(nodes[0].bounds_min.xyz, nodes[0].bounds_max.xyz, origin, inv_dir, t_min, t_max) < 0.0) {
         return false;
     }
     var stack: array<u32, 64>;
@@ -443,9 +419,6 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> bool {
         sp = sp - 1u;
         let node_index = stack[sp];
         let node = nodes[node_index];
-        if (box_hit(node.bounds_min.xyz, node.bounds_max.xyz, origin, dir, t_min, t_max) < 0.0) {
-            continue;
-        }
         if (node.bounds_min.w >= 0.0) {
             let count = u32(node.bounds_min.w);
             let first = u32(node.bounds_max.w);
@@ -455,12 +428,16 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> bool {
                 }
             }
         } else {
-            if (sp + 2u > 64u) {
-                continue;
+            let left = node_index + 1u;
+            let right = u32(node.bounds_max.w);
+            if (box_hit(nodes[left].bounds_min.xyz, nodes[left].bounds_max.xyz, origin, inv_dir, t_min, t_max) >= 0.0 && sp < 63u) {
+                stack[sp] = left;
+                sp = sp + 1u;
             }
-            stack[sp] = node_index + 1u;
-            stack[sp + 1u] = u32(node.bounds_max.w);
-            sp = sp + 2u;
+            if (box_hit(nodes[right].bounds_min.xyz, nodes[right].bounds_max.xyz, origin, inv_dir, t_min, t_max) >= 0.0 && sp < 63u) {
+                stack[sp] = right;
+                sp = sp + 1u;
+            }
         }
     }
     return false;
@@ -528,15 +505,21 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
     let bits_gi = (effects & 16u) != 0u;
     let bias = params.effects.z;
 
-    // Occlusion: a hemisphere fan, exactly the CPU reference's `ao_samples`
-    // count, so the two images match.
+    // Occlusion: a hemisphere fan with hoisted orthonormal basis.
+    let ray_origin = point + hit.normal * bias;
     var open = 1.0;
     if (bits_ao) {
+        let onb = orthonormal_basis(hit.normal);
         var hits = 0u;
         let ao_samples = 8u;
         for (var i = 0u; i < ao_samples; i = i + 1u) {
-            let d = cosine_hemisphere(state, hit.normal);
-            if (occluded(point + hit.normal * bias, d, bias, params.fog.z)) {
+            let r = sqrt(next_f32(state));
+            let phi = next_f32(state) * 2.0 * PI;
+            let x = r * cos(phi);
+            let y = r * sin(phi);
+            let z = sqrt(max(1.0 - x * x - y * y, 0.0));
+            let d = onb * vec3<f32>(x, y, z);
+            if (occluded(ray_origin, d, bias, params.fog.z)) {
                 hits = hits + 1u;
             }
         }
@@ -544,21 +527,13 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
     }
     surface.visibility = open;
 
-    // Sun, with a shadow ray per tap. The shadow ray is the only place
-    // `bits_shadows` matters: a lighting-only frame still gets the sun term.
+    // Sun, skipping the shadow ray completely when the surface faces away.
     let n_dot_l = max(dot(hit.normal, params.sun_dir.xyz), 0.0);
     var direct = vec3<f32>(0.0);
-    if (bits_lighting) {
-        var visible = 0u;
-        let shadow_samples = 1u;
-        for (var i = 0u; i < shadow_samples; i = i + 1u) {
-            if (!occluded(point + hit.normal * bias, params.sun_dir.xyz, bias, params.lens.y)) {
-                visible = visible + 1u;
-            }
-        }
-        var shadow = f32(visible) / f32(shadow_samples);
-        if (!bits_shadows) {
-            shadow = 1.0;
+    if (bits_lighting && n_dot_l > 0.0) {
+        var shadow = 1.0;
+        if (bits_shadows && occluded(ray_origin, params.sun_dir.xyz, bias, params.lens.y)) {
+            shadow = 0.0;
         }
         direct = params.sun_colour.xyz * (n_dot_l * params.lens.w * shadow);
     }
@@ -689,6 +664,8 @@ struct Params {
 // one history pair each.
 @group(0) @binding(6) var history_colour: texture_2d<f32>;
 @group(0) @binding(7) var history_moments: texture_2d<f32>;
+// World-space normal (.xyz) + roughness (.w) from the trace pass.
+@group(0) @binding(8) var src_normals: texture_2d<f32>;
 // Destinations.
 @group(0) @binding(9) var out_colour: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(10) var out_moments: texture_storage_2d<rgba16float, write>;
@@ -697,28 +674,48 @@ fn luminance(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
-// Reproject with the motion vector and validate the depth. Returns the source
-// pixel and a flag; the caller resets on a mismatch.
-fn reproject(pixel: vec2<i32>, size: vec2<i32>) -> vec3<f32> {
+// Map a render-extent pixel to the ray-grid texel coordinate.
+fn grid_coord(pixel: vec2<i32>, render_size: vec2<i32>, grid_dim: vec2<u32>) -> vec2<i32> {
+    let g = vec2<f32>(grid_dim);
+    let mapped = (vec2<f32>(pixel) + vec2<f32>(0.5)) / vec2<f32>(render_size) * g;
+    return vec2<i32>(clamp(mapped, vec2<f32>(0.0), g - vec2<f32>(1.0)));
+}
+
+struct ReprojectResult {
+    colour: vec3<f32>,
+    moments: vec2<f32>,
+    length: f32,
+};
+
+// Reproject with the motion vector and validate against the previous frame's
+// depth stored in `history_moments.z`.
+fn reproject(pixel: vec2<i32>, size: vec2<i32>) -> ReprojectResult {
+    var empty: ReprojectResult;
+    empty.colour = vec3<f32>(0.0);
+    empty.moments = vec2<f32>(0.0);
+    empty.length = 0.0;
     let motion = textureLoad(src_motion, pixel, 0).xy;
     let source = vec2<f32>(pixel) + vec2<f32>(0.5) - motion;
     if (source.x < 0.0 || source.y < 0.0 || source.x >= f32(size.x) || source.y >= f32(size.y)) {
-        return vec3<f32>(0.0, 0.0, 0.0);
+        return empty;
     }
     let index = vec2<i32>(source);
-    let previous_depth = textureLoad(history_moments, index, 0).w;
+    let prev_m = textureLoad(history_moments, index, 0);
+    let previous_depth = prev_m.z;
     let current_depth = textureLoad(src_depth, pixel, 0);
     let both = previous_depth > 0.0 && current_depth > 0.0;
     if (both) {
         if (abs(previous_depth - current_depth) / max(current_depth, 1e-3) > 0.1) {
-            return vec3<f32>(0.0, 0.0, 0.0);
+            return empty;
         }
     } else if ((previous_depth > 0.0) != (current_depth > 0.0)) {
-        return vec3<f32>(0.0, 0.0, 0.0);
+        return empty;
     }
-    let colour = textureLoad(history_colour, index, 0).rgb;
-    let length = textureLoad(history_moments, index, 0).w;
-    return vec3<f32>(colour.r, colour.g, length);
+    var out: ReprojectResult;
+    out.colour = textureLoad(history_colour, index, 0).rgb;
+    out.moments = prev_m.xy;
+    out.length = prev_m.w;
+    return out;
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -728,46 +725,36 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= u32(size.x) || id.y >= u32(size.y)) {
         return;
     }
-    let current = textureLoad(src_colour, pixel, 0).rgb + textureLoad(src_reflection, pixel, 0).rgb;
-    // Local 3x3 mean and standard deviation, the clamp box.
+    let gdim = textureDimensions(src_colour);
+    let gmax = vec2<i32>(i32(gdim.x) - 1, i32(gdim.y) - 1);
+    let gp = grid_coord(pixel, size, gdim);
+    let current = textureLoad(src_colour, gp, 0).rgb + textureLoad(src_reflection, gp, 0).rgb;
+    // Local 3x3 mean and standard deviation in ray-grid space for variance clamping.
     var sum = vec3<f32>(0.0);
     var sum_sq = vec3<f32>(0.0);
     var count = 0.0;
     for (var dy = -1; dy <= 1; dy = dy + 1) {
         for (var dx = -1; dx <= 1; dx = dx + 1) {
-            let p = pixel + vec2<i32>(dx, dy);
-            if (p.x < 0 || p.y < 0 || p.x >= size.x || p.y >= size.y) {
-                continue;
-            }
+            let p = clamp(gp + vec2<i32>(dx, dy), vec2<i32>(0), gmax);
             let c = textureLoad(src_colour, p, 0).rgb + textureLoad(src_reflection, p, 0).rgb;
             sum = sum + c;
             sum_sq = sum_sq + c * c;
             count = count + 1.0;
         }
     }
-    var mean = vec3<f32>(0.0);
-    var stddev = vec3<f32>(0.0);
-    if (count > 0.0) {
-        mean = sum / count;
-        stddev = sqrt(max(sum_sq / count - mean * mean, vec3<f32>(0.0))) * params.weights.w;
-    }
-    let previous = reproject(pixel, size);
-    let history = clamp(previous.xyz, mean - stddev, mean + stddev);
-    let n = min(previous.z, params.misc.z);
+    let mean = sum / count;
+    let stddev = sqrt(max(sum_sq / count - mean * mean, vec3<f32>(0.0))) * params.weights.w;
+
+    let prev = reproject(pixel, size);
+    let history = clamp(prev.colour, mean - stddev, mean + stddev);
+    let n = min(prev.length, params.misc.z);
     let valid = params.misc.w > 0.5 && n > 0.0;
     let alpha = select(1.0, max(1.0 / (n + 1.0), params.extent.w), valid);
     let blended = mix(history, current, alpha);
-    let length = min(n + 1.0, params.misc.z);
+    let length = min(select(0.0, n, valid) + 1.0, params.misc.z);
     let lum = luminance(blended);
-    // The moments are stored in `out_moments.x`/`.y`; `z` carries the current
-    // depth so the next frame's reprojection can validate against it.
-    let previous_moments = textureLoad(history_moments, pixel, 0);
-    var m1 = lum;
-    var m2 = lum * lum;
-    if (valid) {
-        m1 = mix(previous_moments.x, lum, alpha);
-        m2 = mix(previous_moments.y, lum * lum, alpha);
-    }
+    let m1 = select(lum, mix(prev.moments.x, lum, alpha), valid);
+    let m2 = select(lum * lum, mix(prev.moments.y, lum * lum, alpha), valid);
     let depth = textureLoad(src_depth, pixel, 0);
     textureStore(out_colour, pixel, vec4<f32>(blended, 1.0));
     textureStore(out_moments, pixel, vec4<f32>(m1, m2, depth, length));
@@ -775,29 +762,24 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
 
 fn variance_at(pixel: vec2<i32>) -> f32 {
     let moments = textureLoad(history_moments, pixel, 0);
-    // The history length rides in the moments' alpha so the atrous pass needs
-    // one history texture instead of two.
     let length = moments.w;
     let variance = max(moments.y - moments.x * moments.x, 0.0);
     let bias = select(1.0, 1.0 / max(sqrt(length), 0.25), length > 0.0);
     return max(variance * bias, params.misc.y);
 }
 
-fn normal_at(pixel: vec2<i32>) -> vec3<f32> {
-    return normalize(textureLoad(src_guide, pixel, 0).xyz * 2.0 - vec3<f32>(1.0));
+fn normal_at(pixel: vec2<i32>, size: vec2<i32>, ndim: vec2<u32>) -> vec3<f32> {
+    let gp = grid_coord(pixel, size, ndim);
+    let n = textureLoad(src_normals, gp, 0).xyz;
+    let len = length(n);
+    return select(vec3<f32>(0.0, 1.0, 0.0), n / len, len > 1e-4);
 }
 
-fn depth_at(pixel: vec2<i32>) -> f32 {
-    return textureLoad(src_guide, pixel, 0).y;
-}
-
-fn edge_weight(centre: vec2<i32>, sample: vec2<i32>, centre_depth: f32) -> f32 {
-    let n0 = normal_at(centre);
-    let n1 = normal_at(sample);
-    let wn = pow(max(dot(n0, n1), 0.0), params.weights.y);
-    let d1 = depth_at(sample);
-    let wd = exp(-abs(centre_depth - d1) / max(params.weights.z * max(abs(centre_depth), 1e-3), 1e-6));
-    return wn * wd;
+fn kernel_weight(d: i32) -> f32 {
+    let a = abs(d);
+    if (a == 0) { return 0.375; }
+    if (a == 1) { return 0.25; }
+    return 0.0625;
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -807,27 +789,41 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= u32(size.x) || id.y >= u32(size.y)) {
         return;
     }
-    let centre_depth = depth_at(pixel);
+    let ndim = textureDimensions(src_normals);
+    let centre_depth = textureLoad(src_depth, pixel, 0);
+    let centre_normal = normal_at(pixel, size, ndim);
     let centre_variance = variance_at(pixel);
     let sigma = max(params.weights.x * sqrt(centre_variance), 1e-6);
+    let depth_denom = max(params.weights.z * max(abs(centre_depth), 1e-3), 1e-6);
     let centre = textureLoad(history_colour, pixel, 0).rgb;
     let centre_lum = luminance(centre);
-    var sum = vec3<f32>(0.0);
-    var weight_sum = 0.0;
-    var moment1 = 0.0;
-    var moment2 = 0.0;
+    let centre_moments = textureLoad(history_moments, pixel, 0);
+
+    // Seed accumulation with the centre tap (skipping redundant exp(0)/pow(1)).
+    let w0 = 0.375 * 0.375;
+    var sum = centre * w0;
+    var weight_sum = w0;
+    var moment1 = centre_moments.x * w0;
+    var moment2 = centre_moments.y * w0;
     let step = i32(params.misc.x);
     for (var dy = -2; dy <= 2; dy = dy + 1) {
+        let wy = kernel_weight(dy);
         for (var dx = -2; dx <= 2; dx = dx + 1) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
             let p = pixel + vec2<i32>(dx * step, dy * step);
             if (p.x < 0 || p.y < 0 || p.x >= size.x || p.y >= size.y) {
                 continue;
             }
+            let d1 = textureLoad(src_depth, p, 0);
+            let wd = exp(-abs(centre_depth - d1) / depth_denom);
+            let n1 = normal_at(p, size, ndim);
+            let wn = pow(max(dot(centre_normal, n1), 0.0), params.weights.y);
             let sample = textureLoad(history_colour, p, 0).rgb;
-            let w_edge = edge_weight(pixel, p, centre_depth);
             let w_colour = exp(-abs(centre_lum - luminance(sample)) / sigma);
-            let w = w_edge * w_colour;
-            if (w <= 0.0) {
+            let w = wy * kernel_weight(dx) * wn * wd * w_colour;
+            if (w <= 1e-6) {
                 continue;
             }
             sum = sum + sample * w;
@@ -837,21 +833,14 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             moment2 = moment2 + moments.y * w;
         }
     }
-    let centre_moments = textureLoad(history_moments, pixel, 0);
-    if (weight_sum > 1e-8) {
-        textureStore(out_colour, pixel, vec4<f32>(sum / weight_sum, 1.0));
-        textureStore(out_moments, pixel, vec4<f32>(moment1 / weight_sum, moment2 / weight_sum, centre_moments.z, centre_moments.w));
-    } else {
-        textureStore(out_colour, pixel, vec4<f32>(centre, 1.0));
-        textureStore(out_moments, pixel, centre_moments);
-    }
+    let inv_w = 1.0 / weight_sum;
+    textureStore(out_colour, pixel, vec4<f32>(sum * inv_w, 1.0));
+    textureStore(out_moments, pixel, vec4<f32>(moment1 * inv_w, moment2 * inv_w, centre_moments.z, centre_moments.w));
 }
 "#;
 
-/// The compose shader: bilinearly resamples the filtered ray image from the ray
-/// grid up to the render extent (which the temporal upscaler then reconstructs
-/// to the display), and writes the guide planes the ray reconstruction
-/// providers and the debug view read.
+/// The compose shader: writes the final render-extent colour and guide planes
+/// (resampling the ray-grid guides cleanly onto render-extent pixels).
 pub const COMPOSE_SHADER: &str = r#"
 @group(0) @binding(0) var colour: texture_2d<f32>;
 @group(0) @binding(1) var moments: texture_2d<f32>;
@@ -866,26 +855,18 @@ fn compose_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = vec2<i32>(i32(extent.x), i32(extent.y));
     let pixel = vec2<i32>(i32(id.x), i32(id.y));
     if (id.x >= u32(size.x) || id.y >= u32(size.y)) { return; }
-    // Map the render-extent pixel into the ray grid's texel space. The ray
-    // grid is the render extent divided by a power of two, so the centre of a
-    // render pixel lands between texels exactly the way a box downsample would.
-    let source = (vec2<f32>(pixel) + vec2<f32>(0.5)) / extent.zw * vec2<f32>(textureDimensions(colour));
-    let coord = vec2<i32>(clamp(source, vec2<f32>(0.5), vec2<f32>(textureDimensions(colour)) - vec2<f32>(0.5)));
-    let c = textureLoad(colour, coord, 0).rgb;
-    let m = textureLoad(moments, coord, 0);
-    let g = textureLoad(guide, coord, 0);
-    let r = textureLoad(reflection, coord, 0);
+    let c = textureLoad(colour, pixel, 0).rgb;
+    let m = textureLoad(moments, pixel, 0);
+    let gdim = vec2<f32>(textureDimensions(guide));
+    let gcoord = vec2<i32>(clamp((vec2<f32>(pixel) + vec2<f32>(0.5)) / extent.xy * gdim, vec2<f32>(0.0), gdim - vec2<f32>(1.0)));
+    let g = textureLoad(guide, gcoord, 0);
+    let r = textureLoad(reflection, gcoord, 0);
     textureStore(out_colour, pixel, vec4<f32>(c, 1.0));
-    // x: scene depth (0 for sky), y: sky visibility, z: reflection hit
-    // distance, w: variance. The ray reconstruction providers want exactly the
-    // first three; the debug view reads the fourth.
     let variance = max(m.y - m.x * m.x, 0.0);
     textureStore(out_guide, pixel, vec4<f32>(m.z, g.x, r.w, variance));
 }
 "#;
 
-/// Intermediate formats. Half-float keeps the guide in a range where
-/// normal-space encoding stays precise, and matches what the upscalers accept.
 const BLIT_SHADER: &str = r#"
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var src_samp: sampler;
@@ -1054,6 +1035,7 @@ impl Pipelines {
                 texture_entry(5, wgpu::TextureSampleType::Depth),
                 texture_entry(6, wgpu::TextureSampleType::Float { filterable: true }),
                 texture_entry(7, wgpu::TextureSampleType::Float { filterable: true }),
+                texture_entry(8, wgpu::TextureSampleType::Float { filterable: true }),
                 storage_texture_entry(9, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
                 storage_texture_entry(10, wgpu::StorageTextureAccess::WriteOnly, GUIDE_FORMAT),
             ],
@@ -1341,7 +1323,8 @@ pub struct RaywatcherGpu {
     // Ping-pong planes: index 0 and 1 alternate as the filter advances.
     filter_colour: [wgpu::TextureView; 2],
     filter_moments: [wgpu::TextureView; 2],
-    temporal_bind_group: wgpu::BindGroup,
+    temporal_bind_groups: [wgpu::BindGroup; 2],
+    last_output_plane: usize,
     atrous_bind_groups: Vec<wgpu::BindGroup>,
     compose_bind_groups: [wgpu::BindGroup; 2],
     compose_uniforms: wgpu::Buffer,
@@ -1426,18 +1409,32 @@ impl RaywatcherGpu {
 
         let trace_bind_group =
             Self::trace_bindings(device, &pipelines, &uniforms, &scene_buffers, &grid);
-        let temporal_bind_group = Self::temporal_binding(
-            device,
-            &pipelines,
-            &temporal_uniforms,
-            &grid,
-            &motion,
-            &depth,
-            &filter_colour[0],
-            &filter_moments[0],
-            &temporal_colour,
-            &temporal_moments,
-        );
+        let temporal_bind_groups = [
+            Self::temporal_binding(
+                device,
+                &pipelines,
+                &temporal_uniforms,
+                &grid,
+                &motion,
+                &depth,
+                &filter_colour[0],
+                &filter_moments[0],
+                &temporal_colour,
+                &temporal_moments,
+            ),
+            Self::temporal_binding(
+                device,
+                &pipelines,
+                &temporal_uniforms,
+                &grid,
+                &motion,
+                &depth,
+                &filter_colour[1],
+                &filter_moments[1],
+                &temporal_colour,
+                &temporal_moments,
+            ),
+        ];
         let atrous_bind_groups = Self::atrous_bindings(
             device,
             &pipelines,
@@ -1490,7 +1487,8 @@ impl RaywatcherGpu {
             trace_bind_group,
             filter_colour,
             filter_moments,
-            temporal_bind_group,
+            temporal_bind_groups,
+            last_output_plane: 0,
             atrous_bind_groups,
             compose_bind_groups,
             compose_uniforms,
@@ -1618,6 +1616,10 @@ impl RaywatcherGpu {
                     resource: wgpu::BindingResource::TextureView(history_moments),
                 },
                 wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&grid.normals_view),
+                },
+                wgpu::BindGroupEntry {
                     binding: 9,
                     resource: wgpu::BindingResource::TextureView(out_colour),
                 },
@@ -1692,6 +1694,10 @@ impl RaywatcherGpu {
                     wgpu::BindGroupEntry {
                         binding: 7,
                         resource: wgpu::BindingResource::TextureView(read_moments),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::TextureView(&grid.normals_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 9,
@@ -1792,18 +1798,33 @@ impl RaywatcherGpu {
         let (guide, guide_view) = plane(device, "raywatcher output guide", w, h, GUIDE_FORMAT);
         self.trace_bind_group =
             Self::trace_bindings(device, pipelines, &self.uniforms, &self.scene, &self.grid);
-        self.temporal_bind_group = Self::temporal_binding(
-            device,
-            pipelines,
-            &self.temporal_uniforms,
-            &self.grid,
-            &motion,
-            &depth,
-            &filter_colour[0],
-            &filter_moments[0],
-            &temporal_colour,
-            &temporal_moments,
-        );
+        self.temporal_bind_groups = [
+            Self::temporal_binding(
+                device,
+                pipelines,
+                &self.temporal_uniforms,
+                &self.grid,
+                &motion,
+                &depth,
+                &filter_colour[0],
+                &filter_moments[0],
+                &temporal_colour,
+                &temporal_moments,
+            ),
+            Self::temporal_binding(
+                device,
+                pipelines,
+                &self.temporal_uniforms,
+                &self.grid,
+                &motion,
+                &depth,
+                &filter_colour[1],
+                &filter_moments[1],
+                &temporal_colour,
+                &temporal_moments,
+            ),
+        ];
+        self.last_output_plane = 0;
         self.atrous_bind_groups = Self::atrous_bindings(
             device,
             pipelines,
@@ -2017,7 +2038,25 @@ impl RaywatcherGpu {
             },
         );
 
-        // Temporal accumulation.
+        let skip_inhouse = plan.reconstruction
+            == super::plan::RayReconstruction::DlssRayReconstruction
+            && !self.dlss_rr_failed;
+        if !skip_inhouse {
+            self.record_denoise(queue, encoder, params, config);
+        }
+        self.frames = self.frames.saturating_add(1);
+        self.traced_last_frame = true;
+    }
+
+    /// Record the in-house temporal + à-trous + compose denoiser passes.
+    pub fn record_denoise(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &FrameParams,
+        config: &DenoiseConfig,
+    ) {
+        let (rw, rh) = self.render_extent;
         queue.write_buffer(
             &self.temporal_uniforms,
             0,
@@ -2029,11 +2068,9 @@ impl RaywatcherGpu {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipelines.temporal);
-            pass.set_bind_group(0, &self.temporal_bind_group, &[]);
+            pass.set_bind_group(0, &self.temporal_bind_groups[self.last_output_plane], &[]);
             pass.dispatch_workgroups(rw.div_ceil(8), rh.div_ceil(8), 1);
         }
-        // One pass per iteration; each pass has its own uniform buffer so
-        // `queue.write_buffer` never overwrites an earlier iteration's step.
         let iterations = config.iterations.clamp(1, MAX_PASSES as u32);
         for iteration in 0..iterations {
             queue.write_buffer(
@@ -2054,9 +2091,8 @@ impl RaywatcherGpu {
             pass.set_bind_group(0, &self.atrous_bind_groups[iteration as usize], &[]);
             pass.dispatch_workgroups(rw.div_ceil(8), rh.div_ceil(8), 1);
         }
-        // Resample to the render extent, reading whichever ping-pong plane the
-        // final à-trous pass wrote.
         let final_plane = ((iterations - 1) % 2) as usize;
+        self.last_output_plane = final_plane;
         queue.write_buffer(
             &self.compose_uniforms,
             0,
@@ -2076,8 +2112,6 @@ impl RaywatcherGpu {
             pass.set_bind_group(0, &self.compose_bind_groups[final_plane], &[]);
             pass.dispatch_workgroups(rw.div_ceil(8), rh.div_ceil(8), 1);
         }
-        self.frames = self.frames.saturating_add(1);
-        self.traced_last_frame = true;
     }
 
     /// Run NVIDIA DLSS Ray Reconstruction (`nvngx_dlssd.dll`) over the freshly
