@@ -247,6 +247,34 @@ pub struct GbufPrepParams {
     pub water_heights: [[f32; 4]; 4],
 }
 
+/// CPU mirror of [`GBUF_PREP_SHADER`]'s reversed-Z water-vs-land roughness
+/// classification (`0.06` on water, `0.92` on matte land).
+pub fn classify_surface_roughness(
+    z: f32,
+    z_pre: f32,
+    world_pos: glam::Vec3,
+    water: &[super::harvest::WaterSurface],
+) -> f32 {
+    if water.is_empty() || z <= 1e-6 || z <= z_pre + 1e-6 {
+        return 0.92;
+    }
+    if z_pre > 1e-6 {
+        return 0.06;
+    }
+    for w in water.iter().take(16) {
+        let [x0, x1, z0, z1] = w.bounds;
+        if world_pos.x >= x0 - 1.0
+            && world_pos.x <= x1 + 1.0
+            && world_pos.z >= z0 - 1.0
+            && world_pos.z <= z1 + 1.0
+            && (world_pos.y - w.height).abs() <= 1.0
+        {
+            return 0.06;
+        }
+    }
+    0.92
+}
+
 impl GbufPrepParams {
     pub fn pack(
         params: &FrameParams,
@@ -388,16 +416,38 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Phase 1: Use the real raster water mask instead of rectangular AABB
-    // bounds. The raster water pass writes closer reversed-Z depth than the
-    // pre-water opaque depth (`z > z_pre + 1e-6`) ONLY on actual water pixels;
-    // dry ground inside a water body's rectangular AABB has `z == z_pre` and
-    // stays matte (`0.92`), so it never traces mirror reflections.
+    // Phase R1: Only actual water pixels become glossy (`roughness = 0.06`).
+    // Land pixels stay matte (`0.92`) with their depth-reconstructed normal.
+    // A pixel qualifies as water only when:
+    //  1) The scene has at least one water plane (`prep.water_count.x >= 0.5`),
+    //  2) The post-water reversed-Z depth is strictly closer than the pre-water
+    //     opaque depth (`z > z_pre + 1e-6`), and
+    //  3) Either real opaque depth exists behind it (`z_pre > 1e-6`) or the
+    //     reconstructed world point sits on an active water plane (open-sea
+    //     horizon where no terrain sits underneath).
     var roughness = 0.92;
     let z_pre = textureLoad(src_pre_water_depth, px, 0);
-    if (z > z_pre + 1e-6) {
-        roughness = 0.06;
-        n = vec3<f32>(0.0, 1.0, 0.0);
+    let water_count = u32(round(prep.water_count.x));
+    if (water_count > 0u && z > z_pre + 1e-6) {
+        var is_water = z_pre > 1e-6;
+        if (!is_water) {
+            let n_planes = min(water_count, 16u);
+            for (var wi = 0u; wi < n_planes; wi = wi + 1u) {
+                let b = prep.water_planes[wi];
+                let wh = prep.water_heights[wi / 4u][wi % 4u];
+                if (p.x >= b.x - 1.0 && p.x <= b.y + 1.0
+                    && p.z >= b.z - 1.0 && p.z <= b.w + 1.0
+                    && abs(p.y - wh) <= 1.0)
+                {
+                    is_water = true;
+                    break;
+                }
+            }
+        }
+        if (is_water) {
+            roughness = 0.06;
+            n = vec3<f32>(0.0, 1.0, 0.0);
+        }
     }
 
     textureStore(out_pos, vec2<i32>(id.xy), vec4<f32>(p, dist));
@@ -3882,5 +3932,48 @@ impl RaywatcherGpu {
     /// The ray grid the trace pass runs at.
     pub fn grid_extent(&self) -> (u32, u32) {
         self.grid_extent
+    }
+}
+
+#[cfg(test)]
+mod phase_r1_tests {
+    use super::*;
+
+    #[test]
+    fn phase_r1_land_pixel_with_reversed_z_is_not_tagged_as_water() {
+        let water = [super::super::harvest::WaterSurface {
+            bounds: [-100.0, 100.0, -100.0, 100.0],
+            height: 10.0,
+        }];
+        // Dry land pixel with reversed-Z depth (z == z_pre == 0.25), even inside
+        // the water body's rectangular AABB and at water height: MUST stay matte.
+        let land_r =
+            classify_surface_roughness(0.25, 0.25, glam::Vec3::new(0.0, 10.0, 0.0), &water);
+        assert!(
+            (land_r - 0.92).abs() < 1e-5,
+            "land pixel with reversed-Z depth must stay matte (0.92), got {land_r}"
+        );
+        // Land pixel when scene has no water planes at all (even if pre-water
+        // depth were 0.0): MUST stay matte.
+        let no_water_r =
+            classify_surface_roughness(0.25, 0.0, glam::Vec3::new(0.0, 12.0, 0.0), &[]);
+        assert!(
+            (no_water_r - 0.92).abs() < 1e-5,
+            "land pixel without water planes must stay matte (0.92), got {no_water_r}"
+        );
+        // Actual water pixel: water pass wrote closer reversed-Z depth (0.30 > 0.25).
+        let water_r =
+            classify_surface_roughness(0.30, 0.25, glam::Vec3::new(0.0, 10.0, 0.0), &water);
+        assert!(
+            (water_r - 0.06).abs() < 1e-5,
+            "water pixel closer than pre-water depth must be glossy (0.06), got {water_r}"
+        );
+        // Open-sea water pixel with no terrain underneath (z_pre == 0.0) on water plane.
+        let sea_r =
+            classify_surface_roughness(0.05, 0.0, glam::Vec3::new(10.0, 10.0, 10.0), &water);
+        assert!(
+            (sea_r - 0.06).abs() < 1e-5,
+            "open-sea water pixel on water plane must be glossy (0.06), got {sea_r}"
+        );
     }
 }
