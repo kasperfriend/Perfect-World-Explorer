@@ -367,6 +367,7 @@ pub struct PlacementCounters {
     pub names_not_resolved: usize,
     pub versions_refused: Vec<(String, usize)>,
     pub archives_not_indexed: Vec<(String, String)>,
+    pub lossy_gbk_names: usize,
     pub hidden_by_view: usize,
     pub merged_contiguous: usize,
     pub culled_by_sdr: usize,
@@ -400,13 +401,14 @@ impl PlacementCounters {
                 .join(", ")
         };
         format!(
-            "placements in map: {}, selected: {}, drawn: {}, names not resolved: {}, versions refused: {}, archives not indexed: {}",
+            "placements in map: {}, selected: {}, drawn: {}, names not resolved: {}, versions refused: {}, archives not indexed: {}, lossy gbk names: {}",
             self.placements_in_map,
             self.selected,
             self.drawn,
             self.names_not_resolved,
             versions,
             archives,
+            self.lossy_gbk_names,
         )
     }
 }
@@ -759,6 +761,7 @@ fn run(
     let mut skipped = 0usize;
     let mut names_not_resolved = 0usize;
     let mut drawn_placements = 0usize;
+    let mut lossy_gbk_names = 0usize;
     let mut refused_mesh_messages: Vec<String> = Vec::new();
     let mut pages = 0usize;
     let mut atlas_pages = 0usize;
@@ -797,6 +800,16 @@ fn run(
             let y = basis(model.up);
             let x = y.cross(z).normalize_or_zero();
             for (mesh_index, mesh) in model.meshes.iter().enumerate() {
+                if mesh.texture_lossy_gbk || mesh.name_lossy_gbk {
+                    lossy_gbk_names += 1;
+                }
+                if crate::bmd::colour_log_enabled() {
+                    crate::diag!(
+                        SceneOrnaments,
+                        "{}",
+                        mesh.colour_log_line(&objects.ornaments[id].model, mesh_index)
+                    );
+                }
                 // Stage, culling and alpha state come from the single recovered
                 // table, not from per-asset guesses.
                 let mut kind = match crate::bmd_baked::classify(

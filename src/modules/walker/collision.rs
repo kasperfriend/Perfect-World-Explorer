@@ -1526,8 +1526,17 @@ mod tests {
                 texture: String::new(),
                 vertices,
                 indices,
+                color_branch: None,
+                b_support_lightmap: false,
+                b_use_lightmap: false,
+                opaque_day_words: 0,
+                opaque_night_words: 0,
+                name_lossy_gbk: false,
+                texture_lossy_gbk: false,
             }],
             collision: Vec::new(),
+            lossy_gbk_diagnostics: Vec::new(),
+            v300_branch_counters: crate::bmd::V300BranchCounters::default(),
         }
     }
 

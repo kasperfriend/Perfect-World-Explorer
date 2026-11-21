@@ -13,11 +13,6 @@ Every place a loader can lose a value without saying so, classified. Generated b
 
 | file | line | pattern | category | code |
 |---|---|---|---|---|
-| `src/bmd.rs` | 177 | `ok-question` | **probe** | `ambient: color(start).ok()?,` |
-| `src/bmd.rs` | 178 | `ok-question` | **probe** | `diffuse: color(start + 16).ok()?,` |
-| `src/bmd.rs` | 179 | `ok-question` | **probe** | `emissive: color(start + 32).ok()?,` |
-| `src/bmd.rs` | 180 | `ok-question` | **probe** | `specular: color(start + 48).ok()?,` |
-| `src/bmd.rs` | 181 | `ok-question` | **probe** | `power: f(tail, start + 64).ok()?,` |
 | `src/client_detect.rs` | 181 | `ok-question` | **probe** | `let word = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 182 | `ok-question` | **probe** | `let timestamp = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 184 | `ok-question` | **probe** | `short: u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?),` |
@@ -173,12 +168,12 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/world_handoff.rs` | 274 | `let-underscore` | **unreachable** | `let _ = fs::write(path, message.as_bytes());` |
 | `src/world_handoff.rs` | 282 | `let-underscore` | **unreachable** | `let _ = fs::write(path, format!("{FAILED_PREFIX}{reason}"));` |
 | `src/world_handoff.rs` | 298 | `let-underscore` | **unreachable** | `let _ = fs::write(path, b"ready");` |
-| `src/world_objects.rs` | 651 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Error(e));` |
-| `src/world_objects.rs` | 679 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
-| `src/world_objects.rs` | 694 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
-| `src/world_objects.rs` | 704 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
-| `src/world_objects.rs` | 710 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Done {` |
-| `src/world_objects.rs` | 945 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Done {` |
+| `src/world_objects.rs` | 653 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Error(e));` |
+| `src/world_objects.rs` | 681 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
+| `src/world_objects.rs` | 696 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
+| `src/world_objects.rs` | 706 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
+| `src/world_objects.rs` | 712 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Done {` |
+| `src/world_objects.rs` | 958 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Done {` |
 | `src/world_page_cache.rs` | 53 | `ok-question` | **probe** | `let root = element.canonicalize().ok()?;` |
 | `src/world_page_cache.rs` | 62 | `ok-question` | **probe** | `let metadata = fs::metadata(root.join(name)).ok()?;` |
 | `src/world_page_cache.rs` | 65 | `ok-question` | **probe** | `let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;` |

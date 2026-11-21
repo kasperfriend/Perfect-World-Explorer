@@ -44,12 +44,12 @@ src/world_handoff.rs:226 unreachable child.wait after kill; the exit status of a
 src/world_handoff.rs:228 unreachable mpsc failure to the UI: a closed receiver means the window is gone
 src/world_handoff.rs:237 unreachable child.kill on a process we are abandoning
 src/world_handoff.rs:238 unreachable child.wait after kill; the exit status of an abandoned child carries nothing
-src/world_objects.rs:651 unreachable mpsc error to the UI: a closed receiver means the window is gone
-src/world_objects.rs:679 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
-src/world_objects.rs:694 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
-src/world_objects.rs:704 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
-src/world_objects.rs:710 unreachable mpsc done to the UI: a closed receiver means the window is gone
-src/world_objects.rs:945 unreachable mpsc done to the UI: a closed receiver means the window is gone
+src/world_objects.rs:653 unreachable mpsc error to the UI: a closed receiver means the window is gone
+src/world_objects.rs:681 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
+src/world_objects.rs:696 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
+src/world_objects.rs:706 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
+src/world_objects.rs:712 unreachable mpsc done to the UI: a closed receiver means the window is gone
+src/world_objects.rs:958 unreachable mpsc done to the UI: a closed receiver means the window is gone
 src/gpu.rs:7717 unreachable mpsc send of a worker result whose receiver is the caller that already returned
 src/gpu.rs:8052 unreachable mpsc send of a worker result whose receiver is the caller that already returned
 src/dlss/fg.rs:200 unreachable an SDK destroy call's status: the context is being torn down

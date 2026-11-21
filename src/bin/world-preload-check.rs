@@ -7,6 +7,8 @@ mod bmd;
 mod angelica_pck;
 #[path = "../bmd_baked.rs"]
 mod bmd_baked;
+#[path = "support/diag_stub.rs"]
+mod diag_stub;
 #[path = "../objects.rs"]
 mod objects;
 #[path = "../pck.rs"]
@@ -19,6 +21,7 @@ mod scenery_visibility;
 mod texture_atlas;
 #[path = "../texture_resolution.rs"]
 mod texture_resolution;
+pub use diag_stub::diagnostics;
 #[path = "../world_objects.rs"]
 mod world_objects;
 #[path = "../world_page_cache.rs"]

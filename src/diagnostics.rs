@@ -1072,11 +1072,14 @@ pub fn mask_from_keys(keys: &str) -> u64 {
 /// once at startup and by the headless preview, so one environment variable is
 /// enough to make a build say what it is doing.
 pub fn apply_env() {
-    let Some(keys) = std::env::var_os("PWE_LOG") else {
-        return;
-    };
-    let keys = keys.to_string_lossy();
-    let mask = mask_from_keys(&keys) | MASK.load(Ordering::Relaxed);
+    let mut mask = MASK.load(Ordering::Relaxed);
+    if let Some(keys) = std::env::var_os("PWE_LOG") {
+        let keys = keys.to_string_lossy();
+        mask |= mask_from_keys(&keys);
+    }
+    if std::env::var_os("PWE_BMD_COLOUR_LOG").is_some_and(|v| v == "1") {
+        mask |= 1u64 << Channel::SceneOrnaments.index();
+    }
     if mask != 0 {
         set_mask(mask);
     }

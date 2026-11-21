@@ -124,6 +124,7 @@ pub struct WorldModelStatus {
     pub names_not_resolved: usize,
     pub versions_refused: Vec<(String, usize)>,
     pub archives_not_indexed: Vec<(String, String)>,
+    pub lossy_gbk_names: usize,
     pub scene_effect_transform_errors: usize,
     pub scene_effect_insert_errors: usize,
     pub model_transform_errors: usize,
@@ -196,13 +197,14 @@ impl WorldModelStatus {
             + self.draw_errors
             + self.alpha_errors;
         format!(
-            "World models — placements in map: {}, selected: {}, drawn: {}, names not resolved: {}, versions refused: {}, archives not indexed: {}, skips: {}, reported errors: {}",
+            "World models — placements in map: {}, selected: {}, drawn: {}, names not resolved: {}, versions refused: {}, archives not indexed: {}, lossy gbk names: {}, skips: {}, reported errors: {}",
             self.placements_in_map,
             self.selected,
             self.drawn,
             self.names_not_resolved,
             versions,
             archives,
+            self.lossy_gbk_names,
             total_skips,
             total_errors,
         )
