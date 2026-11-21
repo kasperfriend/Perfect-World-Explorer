@@ -184,19 +184,19 @@ fn rotate(log_dir: &Path) -> io::Result<PathBuf> {
         let _ = fs::remove_file(path);
     }
 
-    // Find the active log file (newest one under the size limit).
-    let active = candidates
-        .iter()
-        .find(|(_, size, _)| *size < MAX_FILE_BYTES);
-    if let Some((path, _, _)) = active {
-        return Ok(path.clone());
+    // Always prefer the canonical `lighter.log` inside the Lighter folder while
+    // it is under the size limit; rotate to a timestamped archive once full.
+    let primary = log_dir.join("lighter.log");
+    match fs::metadata(&primary) {
+        Ok(meta) if meta.len() >= MAX_FILE_BYTES => {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let _ = fs::rename(&primary, base.with_extension(format!("{ts}.log")));
+        }
+        _ => {}
     }
-
-    // Otherwise create a new file with a timestamp.
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    Ok(base.with_extension(format!("{ts}.log")))
+    Ok(primary)
 }
 
 /// Rotating log writer. Opens the active log file on each write (so rotation
@@ -207,32 +207,54 @@ pub struct Logger {
     frame_count: Mutex<u64>,
 }
 
+fn dir_writable(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".lighter-write-test");
+    if fs::write(&probe, b"").is_ok() {
+        let _ = fs::remove_file(&probe);
+        true
+    } else {
+        false
+    }
+}
+
 fn default_log_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("PW_LIGHTER_LOG_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
     if let Some(dir) = std::env::var_os("PW_CACHE_DIR").filter(|v| !v.is_empty()) {
         return PathBuf::from(dir).join("lighter-logs");
+    }
+    // Primary location: the Modules/Lighter folder next to the executable (or CWD).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let lighter_dir = exe_dir.join("Modules").join("Lighter");
+            if lighter_dir.is_dir() || exe_dir.join("Modules").is_dir() {
+                if dir_writable(&lighter_dir) {
+                    return lighter_dir;
+                }
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let lighter_dir = cwd.join("Modules").join("Lighter");
+        if lighter_dir.is_dir() && dir_writable(&lighter_dir) {
+            return lighter_dir;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let lighter_dir = exe_dir.join("Modules").join("Lighter");
+            if dir_writable(&lighter_dir) {
+                return lighter_dir;
+            }
+        }
     }
     #[cfg(windows)]
     if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
         return PathBuf::from(local)
-            .join("PerfectWorldViewer")
-            .join("lighter-logs");
-    }
-    #[cfg(windows)]
-    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
-        return PathBuf::from(profile)
-            .join("AppData")
-            .join("Local")
-            .join("PerfectWorldViewer")
-            .join("lighter-logs");
-    }
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(xdg)
-            .join("PerfectWorldViewer")
-            .join("lighter-logs");
-    }
-    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home)
-            .join(".cache")
             .join("PerfectWorldViewer")
             .join("lighter-logs");
     }
@@ -459,6 +481,36 @@ impl Logger {
 
     pub fn frame_count(&self) -> u64 {
         *self.frame_count.lock().unwrap()
+    }
+
+    /// Write a timestamped lifecycle event line when logging is enabled.
+    pub fn info(&self, stage: &str, message: &str) -> bool {
+        if self.level() == LogLevel::Off {
+            return false;
+        }
+        let log_dir = match &self.log_dir {
+            Some(d) => d.clone(),
+            None => return false,
+        };
+        let path = match rotate(&log_dir) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let line = format!(
+            "[{ts}] {stage}: {message}
+"
+        );
+        let file = match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut writer = std::io::BufWriter::new(file);
+        let _ = writer.write_all(line.as_bytes());
+        let _ = writer.flush();
+        true
     }
 }
 

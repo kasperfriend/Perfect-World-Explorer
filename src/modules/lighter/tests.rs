@@ -5000,9 +5000,7 @@ fn dlss_rr_enabled_on_nvidia_rtx_and_logger_writes_files() {
     assert!(Denoiser::DlssRr
         .unavailable_reason_for(true, false)
         .is_some());
-    assert!(Denoiser::DlssRr
-        .unavailable_reason_for(false, true)
-        .is_some());
+    assert_eq!(Denoiser::DlssRr.unavailable_reason_for(false, true), None);
 
     let logger = log::Logger::new();
     assert!(

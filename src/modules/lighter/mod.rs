@@ -1300,16 +1300,23 @@ impl Default for Lighter {
 impl Lighter {
     pub fn new(settings: Settings, adapter: &wgpu::Adapter, device: &wgpu::Device) -> Self {
         let rt = device_features(adapter, settings.mode);
+        let info = adapter.get_info();
+        let name_lc = info.name.to_ascii_lowercase();
+        let adapter_is_nvidia = info.vendor == 0x10DE
+            || name_lc.contains("nvidia")
+            || name_lc.contains("rtx")
+            || name_lc.contains("geforce");
         let bc_pages = settings.mode == Mode::Hardware
             && textures::bc_pages_requested()
             && device
                 .features()
                 .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
-        Self {
+        let mut lighter = Self {
             armed: settings.mode != Mode::Off,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             paced_startup: settings.mode == Mode::Hardware
-                && (std::env::var("PW_RAY_PACED_STARTUP").as_deref() == Ok("1")
+                && (!settings.reference
+                    || std::env::var("PW_RAY_PACED_STARTUP").as_deref() == Ok("1")
                     || std::env::var("PW_RAY_COMPACT_BLAS").as_deref() == Ok("1")),
             compact_terrain: bc_pages || textures::compact_terrain_enabled(),
             bc_pages,
@@ -1323,16 +1330,30 @@ impl Lighter {
             .flatten(),
             settings,
             saved_mode: settings.mode,
-            adapter_is_nvidia: adapter.get_info().vendor == 0x10DE,
-            adapter_name: adapter.get_info().name,
-            adapter_driver: adapter.get_info().driver_info,
-            native_backend: adapter.get_info().backend,
+            adapter_is_nvidia,
+            adapter_name: info.name,
+            adapter_driver: info.driver_info,
+            native_backend: info.backend,
             adapter_supports_compute: adapter.get_downlevel_capabilities().flags.contains(
                 wgpu::DownlevelFlags::COMPUTE_SHADERS | wgpu::DownlevelFlags::FRAGMENT_STORAGE,
             ),
             has_hardware_device: !rt.is_empty() && device.features().contains(rt),
             ..Self::default()
-        }
+        };
+        lighter.log_session_if_needed();
+        lighter.logger.info(
+            "INIT",
+            &format!(
+                "mode={} denoiser={} nvidia={} hw_rt={} backend={:?} gpu={}",
+                lighter.settings.mode.label(),
+                lighter.settings.denoiser.label(),
+                lighter.adapter_is_nvidia,
+                lighter.has_hardware_device,
+                lighter.native_backend,
+                lighter.adapter_name,
+            ),
+        );
+        lighter
     }
 
     /// Booting Native doesn't discard the last committed ray selection.
@@ -1995,6 +2016,10 @@ impl Lighter {
                     // Arc. There is no queue work or imported image to drain.
                     let _ = tx.send(ColdRayBuild::Done(made));
                 }).map_err(|e| format!("start Lighter pipeline worker: {e}"))?;
+                self.logger.info(
+                    "COLD_RAY",
+                    "started background Vulkan RT pipeline compilation",
+                );
                 self.cold_ray = Some(rx);
                 return Ok(false);
             }
@@ -2036,6 +2061,10 @@ impl Lighter {
                     self.reconstruction = None;
                 }
                 self.hardware = Some(renderer);
+                self.logger.info(
+                    "COLD_RAY",
+                    "Vulkan RT pipeline ready; staging initial BLAS chunks",
+                );
                 crate::gpu::first_frame_progress(
                     "Ray pipeline worker completed; staging initial chunk",
                 );
@@ -2201,7 +2230,7 @@ impl Lighter {
     #[allow(clippy::too_many_arguments)]
     pub fn render_overlay(
         &mut self,
-        device: &wgpu::Device,
+        device: &std::sync::Arc<wgpu::Device>,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
@@ -2211,13 +2240,43 @@ impl Lighter {
         moving: &Packet,
     ) -> Result<bool, String> {
         if let Some(reason) = self.unavailable() {
+            self.logger
+                .info("OVERLAY", &format!("unavailable: {reason}"));
             return Err(reason.into());
         }
         if !self.settings.shadows && !self.settings.lighting && !self.settings.reflections {
             return Ok(false);
         }
         let [_, _, w, h] = frame.extent;
-        if !self.prepare_frame(device, w, h)? {
+        // Non-blocking startup in Hardware mode: compiles the Vulkan RT pipeline on
+        // the background `lighter-pipeline-startup` thread and stages BLASes across
+        // frames so the first Native world frame presents immediately (never timing
+        // out Reload World).
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let ready = if self.settings.mode == Mode::Hardware && !self.capture {
+            let needs_bg = self.hardware.is_none() || self.cold_ray.is_some();
+            if needs_bg {
+                self.status = Some("Compiling Hardware RT pipeline in background…".into());
+            }
+            match self.prepare_window_frame(device, w, h, true) {
+                Ok(false) => {
+                    if self.hardware.is_some() && self.cold_ray.is_none() {
+                        self.status = Some("Staging initial RT acceleration structures…".into());
+                    }
+                    return Ok(false);
+                }
+                Ok(true) => true,
+                Err(e) => {
+                    self.logger.info("OVERLAY_INIT_ERR", &e);
+                    return Err(e);
+                }
+            }
+        } else {
+            self.prepare_frame(device, w, h)?
+        };
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let ready = self.prepare_frame(device, w, h)?;
+        if !ready {
             return Ok(false);
         }
         self.log_session_if_needed();
@@ -2485,7 +2544,8 @@ impl Lighter {
             world.packet.triangles(),
             moving.triangles(),
         );
-        if self.status.is_none() {
+        if self.frame_index == 1 {
+            self.logger.info("OVERLAY_ACTIVE", &message);
             eprintln!("Lighter: {message}");
         }
         self.status = Some(message);
