@@ -63,10 +63,10 @@ impl Default for DenoiseConfig {
             phi_colour: 4.,
             phi_normal: 32.,
             phi_depth: 0.5,
-            temporal_floor: 0.05,
+            temporal_floor: 0.10,
             variance_gamma: 3.,
             variance_floor: 1e-4,
-            max_history: 64.,
+            max_history: 16.,
         }
     }
 }

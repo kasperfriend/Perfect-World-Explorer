@@ -20,7 +20,10 @@ struct Params {
     float4 tuning;  // x: jitter_x, y: jitter_y, z: ambient_strength, w: bounce_strength
     float4 effects; // x: roughness_cutoff, y: effect_bits, z: bias, w: layered_mode (1=layer over raster, 0=replace)
     float4 fog;     // x: fog_start, y: fog_end, z: ao_radius, w: unused
-    float4 counts;  // x: tri_count, y: node_count, z: mat_count, w: unused
+    float4 counts;  // x: tri_count, y: node_count, z: mat_count, w: debug_view
+    float4 point_light_meta;           // x: active point light count (<= 16)
+    float4 point_lights_pos_rad[16];   // xyz: world pos, w: radius
+    float4 point_lights_col_int[16];   // rgb: colour, w: intensity
 };
 
 struct Tri {
@@ -166,6 +169,34 @@ Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
     return hit;
 }
 
+float point_light_falloff(float dist, float radius) {
+    if (radius <= 1e-4 || dist >= radius) {
+        return 0.0;
+    }
+    float ratio = dist / radius;
+    float r2 = ratio * ratio;
+    float r4 = r2 * r2;
+    float w = max(1.0 - r4, 0.0);
+    return (w * w) / (dist * dist + 1.0);
+}
+
+float3 ggx_sample(float3 normal, float roughness, float u1, float u2) {
+    if (roughness < 0.06) {
+        return normal;
+    }
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float phi = 2.0 * PI * u1;
+    float cos_theta = sqrt(max((1.0 - u2) / (1.0 + (a2 - 1.0) * u2), 0.0));
+    float sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
+    float s_phi, c_phi;
+    sincos(phi, s_phi, c_phi);
+    float3 up = abs(normal.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 t = normalize(cross(up, normal));
+    float3 b = cross(normal, t);
+    return normalize(t * (c_phi * sin_theta) + b * (s_phi * sin_theta) + normal * cos_theta);
+}
+
 bool occluded(float3 origin, float3 dir, float t_min, float t_max, uint seed) {
     RayDesc ray;
     ray.Origin = origin;
@@ -304,19 +335,29 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
         accum_open += open;
 
-        // 3. Crisp RT reflections on water / glossy surfaces (geometry hits
-        //    only — sky misses emit 0 so raster sky reflections stay clean).
+        // Phase 8: GGX importance-sampled rough reflections with shadowed hit shading + Fresnel.
         float refl_dist = params.lens.y;
         if (bits_reflections && roughness <= params.effects.x) {
-            float3 reflect_dir = reflect(view_dir, normal);
+            float3 h = ggx_sample(normal, roughness, rand01(state), rand01(state));
+            float3 reflect_dir = reflect(view_dir, h);
+            if (dot(reflect_dir, normal) <= 0.0) {
+                reflect_dir = reflect(view_dir, normal);
+            }
             Hit rhit = closest_hit(ray_origin, reflect_dir, bias, params.lens.y);
             if (rhit.index != 0xffffffffu) {
                 Material rmat = material_of(rhit.index);
                 float r_ndl = max(dot(rhit.normal, params.sun_dir.xyz), 0.0);
+                float r_shadow = 1.0;
+                if (bits_shadows && r_ndl > 0.02) {
+                    float3 rhit_pos = ray_origin + reflect_dir * rhit.t + rhit.normal * bias;
+                    if (occluded(rhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y, state ^ 0x517cc1b7u)) {
+                        r_shadow = 0.0;
+                    }
+                }
                 float3 lit = rmat.albedo.rgb * (params.ambient.xyz * params.tuning.z +
-                    params.sun_colour.xyz * r_ndl);
+                    params.sun_colour.xyz * (r_ndl * r_shadow));
                 float f0 = 0.04 + 0.16 * (1.0 - roughness);
-                float m = 1.0 - saturate(dot(-view_dir, normal));
+                float m = 1.0 - saturate(dot(-view_dir, h));
                 float m2 = m * m;
                 float fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
                 accum_reflection += lit * fresnel * (1.0 - fog_t);
@@ -325,20 +366,60 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
         accum_refl_dist += refl_dist;
 
-        // 4. Local colored indirect GI bounce (geometry hits ONLY — sky escape
-        //    emits 0 so it never adds a white/sky veil over the raster world).
+        // Phase 9: 2-tap shadowed indirect GI bounce (geometry hits ONLY).
         if (bits_gi && params.frame.z >= 1.0 && params.tuning.w > 0.0) {
-            float3 d = cosine_hemisphere(state, normal);
-            Hit bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 48.0));
-            if (bhit.index != 0xffffffffu) {
-                Material bmat = material_of(bhit.index);
-                float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
-                if (b_ndl > 0.01) {
-                    float3 incoming = bmat.albedo.rgb * params.sun_colour.xyz * b_ndl;
-                    accum_gi += raster_rgb * incoming * (params.tuning.w * 0.30 * (1.0 - fog_t));
+            uint gi_taps = 2u;
+            float3 gi_sum = float3(0.0, 0.0, 0.0);
+            for (uint g = 0u; g < gi_taps; g = g + 1u) {
+                float3 d = cosine_hemisphere(state, normal);
+                Hit bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 48.0));
+                if (bhit.index != 0xffffffffu) {
+                    Material bmat = material_of(bhit.index);
+                    float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
+                    if (b_ndl > 0.01) {
+                        float b_shadow = 1.0;
+                        if (bits_shadows) {
+                            float3 bhit_pos = ray_origin + d * bhit.t + bhit.normal * bias;
+                            if (occluded(bhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y, state ^ (g * 73u + 11u))) {
+                                b_shadow = 0.0;
+                            }
+                        }
+                        if (b_shadow > 0.0) {
+                            float3 incoming = bmat.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow);
+                            gi_sum += raster_rgb * incoming * (params.tuning.w * 0.30 * (1.0 - fog_t));
+                        }
+                    }
+                }
+            }
+            accum_gi += gi_sum * (1.0 / float(gi_taps));
+        }
+    }
+
+    // Phase 7: Scene point / local lights with smooth inverse-square falloff and shadow rays.
+    float3 point_lighting = float3(0.0, 0.0, 0.0);
+    if (bits_lighting) {
+        uint pl_count = min(uint(round(params.point_light_meta.x)), 16u);
+        for (uint li = 0u; li < pl_count; li = li + 1u) {
+            float4 pl_pr = params.point_lights_pos_rad[li];
+            float4 pl_ci = params.point_lights_col_int[li];
+            float3 to_l = pl_pr.xyz - world_pos;
+            float pl_dist = length(to_l);
+            if (pl_dist > 1e-3 && pl_dist < pl_pr.w) {
+                float3 l_dir = to_l / pl_dist;
+                float pl_ndl = max(dot(normal, l_dir), 0.0);
+                if (pl_ndl > 0.001) {
+                    float atten = point_light_falloff(pl_dist, pl_pr.w);
+                    if (atten > 1e-5) {
+                        float pl_vis = 1.0;
+                        if (bits_shadows && occluded(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias), state ^ (li * 131u + 17u))) {
+                            pl_vis = 0.0;
+                        }
+                        point_lighting += raster_rgb * pl_ci.rgb * (pl_ci.w * atten * pl_ndl * pl_vis);
+                    }
                 }
             }
         }
+        point_lighting *= (1.0 - fog_t);
     }
 
     float inv = 1.0 / float(samples);
@@ -352,17 +433,17 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float out_lf;
     if (layered) {
         // Modulate the 1:1 raster world by RT sun shadow and contact AO
-        // (attenuated smoothly into raster fog), plus colored GI bounce.
+        // (attenuated smoothly into raster fog), plus colored GI bounce & point lights.
         float shadow_mod = (bits_shadows && n_dot_l > 0.02) ? lerp(0.30, 1.0, avg_shadow) : 1.0;
         float ao_mod = bits_ao ? lerp(0.58, 1.0, avg_open) : 1.0;
         out_lf = lerp(shadow_mod * ao_mod, 1.0, fog_t);
-        out_rgb = avg_gi;
+        out_rgb = avg_gi + point_lighting;
     } else {
         // Opt-in replace_raster mode: keep 1:1 raster world textures/albedo
-        // instead of low-poly proxy boxes, relit purely by RT sun + RT ambient.
+        // instead of low-poly proxy boxes, relit purely by RT sun + RT ambient + point lights.
         float3 direct = bits_lighting ? (params.sun_colour.xyz * (n_dot_l * avg_shadow)) : float3(0.0, 0.0, 0.0);
         float3 ambient = params.ambient.xyz * (avg_open * params.tuning.z);
-        float3 relit = raster_rgb * (direct + ambient) + avg_gi;
+        float3 relit = raster_rgb * (direct + ambient) + avg_gi + point_lighting;
         out_rgb = lerp(relit, params.fog_colour.xyz, fog_t);
         out_lf = 1.0;
     }
@@ -390,7 +471,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         out_lf = 1.0;
         store_refl = float3(0.0, 0.0, 0.0);
     } else if (debug_mode == 6u) {
-        out_rgb = float3(0.0, 0.0, 0.0);
+        out_rgb = point_lighting;
         out_lf = 1.0;
         store_refl = float3(0.0, 0.0, 0.0);
     }

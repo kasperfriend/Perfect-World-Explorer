@@ -4025,6 +4025,44 @@ impl Renderer {
                 + ((b.bounds[2] + b.bounds[3]) * 0.5 - camera.pos.z).powi(2);
             da.total_cmp(&db)
         });
+        let mut point_lights: Vec<(f32, crate::modules::raywatcher::frame::PointLight)> = self
+            .model_lights
+            .lights
+            .iter()
+            .filter_map(|l| {
+                let radius = l.range.max(0.0);
+                if radius <= 0.05 {
+                    return None;
+                }
+                let pos = glam::Vec3::from_array(l.position);
+                let dist_sq = pos.distance_squared(camera.pos);
+                let max_d = params.far + radius;
+                if dist_sq > max_d * max_d {
+                    return None;
+                }
+                let colour = glam::Vec3::new(
+                    l.diffuse[0].max(0.0),
+                    l.diffuse[1].max(0.0),
+                    l.diffuse[2].max(0.0),
+                );
+                if colour.length_squared() <= 1e-5 {
+                    return None;
+                }
+                Some((
+                    dist_sq,
+                    crate::modules::raywatcher::frame::PointLight {
+                        position: pos,
+                        radius,
+                        colour,
+                        intensity: l.diffuse[3].clamp(0.25, 4.0),
+                        casts_shadow: true,
+                    },
+                ))
+            })
+            .collect();
+        point_lights.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let active_point_lights: Vec<crate::modules::raywatcher::frame::PointLight> =
+            point_lights.into_iter().take(16).map(|(_, l)| l).collect();
         gpu.record(
             &self.device,
             &self.queue,
@@ -4037,6 +4075,7 @@ impl Renderer {
             &self.object_mv,
             &self.depth,
             &active_water,
+            &active_point_lights,
         );
         let mut dlss_rr_ran = false;
         if plan.reconstruction

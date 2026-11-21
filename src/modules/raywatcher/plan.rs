@@ -327,7 +327,7 @@ impl Default for Settings {
             effects: Effects::default(),
             bounces: 2,
             samples: 1,
-            denoise_iterations: 3,
+            denoise_iterations: 2,
             sun_radius_degrees: 0.6,
             ray_length: 0.,
             ambient_strength: 1.,

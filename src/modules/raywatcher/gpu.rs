@@ -52,8 +52,14 @@ pub struct RayParams {
     pub effects: [f32; 4],
     /// `x` fog start, `y` fog end, `z` AO radius, `w` unused.
     pub fog: [f32; 4],
-    /// `x` triangle count, `y` node count, `z` material count, `w` unused.
+    /// `x` triangle count, `y` node count, `z` material count, `w` debug view mode.
     pub counts: [f32; 4],
+    /// `x` active point light count (<= 16), `y`/`z`/`w` unused.
+    pub point_light_meta: [f32; 4],
+    /// Up to 16 nearest scene point lights: `xyz` world position, `w` radius.
+    pub point_lights_pos_rad: [[f32; 4]; 16],
+    /// Matching point light colours: `rgb` colour, `w` intensity.
+    pub point_lights_col_int: [[f32; 4]; 16],
 }
 
 impl RayParams {
@@ -89,8 +95,16 @@ impl RayParams {
         plan: &super::plan::Plan,
         config: &super::shade::TransportConfig,
         counts: [u32; 3],
+        point_lights: &[super::frame::PointLight],
     ) -> Self {
         let fog = config.lighting.fog_range;
+        let mut pl_pos_rad = [[0.0f32; 4]; 16];
+        let mut pl_col_int = [[0.0f32; 4]; 16];
+        let pl_count = point_lights.len().min(16);
+        for (i, l) in point_lights.iter().take(pl_count).enumerate() {
+            pl_pos_rad[i] = [l.position.x, l.position.y, l.position.z, l.radius.max(0.0)];
+            pl_col_int[i] = [l.colour.x, l.colour.y, l.colour.z, l.intensity.max(0.0)];
+        }
         Self {
             inv_view_projection: params.inv_view_projection.to_cols_array_2d(),
             view_projection: params.view_projection.to_cols_array_2d(),
@@ -138,6 +152,9 @@ impl RayParams {
                 counts[2] as f32,
                 plan.debug_view.as_u32() as f32,
             ],
+            point_light_meta: [pl_count as f32, 0.0, 0.0, 0.0],
+            point_lights_pos_rad: pl_pos_rad,
+            point_lights_col_int: pl_col_int,
         }
     }
 }
@@ -372,6 +389,9 @@ struct Params {
     effects: vec4<f32>,
     fog: vec4<f32>,
     counts: vec4<f32>,
+    point_light_meta: vec4<f32>,
+    point_lights_pos_rad: array<vec4<f32>, 16>,
+    point_lights_col_int: array<vec4<f32>, 16>,
 };
 
 struct Tri {
@@ -640,6 +660,30 @@ fn material_of(index: u32) -> Material {
     return materials[mat_idx];
 }
 
+fn point_light_falloff(dist: f32, radius: f32) -> f32 {
+    if (radius <= 1e-4 || dist >= radius) {
+        return 0.0;
+    }
+    let ratio = dist / radius;
+    let r2 = ratio * ratio;
+    let r4 = r2 * r2;
+    let w = max(1.0 - r4, 0.0);
+    return (w * w) / (dist * dist + 1.0);
+}
+
+fn ggx_sample(normal: vec3<f32>, roughness: f32, u1: f32, u2: f32) -> vec3<f32> {
+    if (roughness < 0.06) {
+        return normal;
+    }
+    let a = roughness * roughness;
+    let a2 = a * a;
+    let phi = 2.0 * PI * u1;
+    let cos_theta = sqrt(max((1.0 - u2) / (1.0 + (a2 - 1.0) * u2), 0.0));
+    let sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
+    let local_h = vec3<f32>(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
+    return normalize(orthonormal_basis(normal) * local_h);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let extent = vec2<u32>(u32(params.extents.x), u32(params.extents.y));
@@ -737,16 +781,28 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         accum_open = accum_open + open;
 
+        // Phase 8: GGX importance-sampled rough reflections with shadowed hit shading + Fresnel.
         var refl_dist = params.lens.y;
         if (bits_reflections && roughness <= params.effects.x) {
-            let reflect_dir = reflect(view_dir, normal);
+            let h = ggx_sample(normal, roughness, next_f32(&state), next_f32(&state));
+            var reflect_dir = reflect(view_dir, h);
+            if (dot(reflect_dir, normal) <= 0.0) {
+                reflect_dir = reflect(view_dir, normal);
+            }
             let rhit = closest_hit(ray_origin, reflect_dir, bias, params.lens.y);
             if (rhit.index != 0xffffffffu) {
                 let rmaterial = material_of(rhit.index);
                 let r_ndl = max(dot(rhit.normal, params.sun_dir.xyz), 0.0);
-                let lit = rmaterial.albedo.rgb * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * r_ndl);
+                var r_shadow = 1.0;
+                if (bits_shadows && r_ndl > 0.02) {
+                    let rhit_pos = ray_origin + reflect_dir * rhit.t + rhit.normal * bias;
+                    if (occluded(rhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y, state ^ 0x517cc1b7u)) {
+                        r_shadow = 0.0;
+                    }
+                }
+                let lit = rmaterial.albedo.rgb * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * (r_ndl * r_shadow));
                 let f0 = 0.04 + 0.16 * (1.0 - roughness);
-                let m = 1.0 - clamp(dot(-view_dir, normal), 0.0, 1.0);
+                let m = 1.0 - clamp(dot(-view_dir, h), 0.0, 1.0);
                 let m2 = m * m;
                 let fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
                 accum_reflection = accum_reflection + lit * fresnel * (1.0 - fog_t);
@@ -755,18 +811,60 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         accum_refl_dist = accum_refl_dist + refl_dist;
 
+        // Phase 9: 2-tap shadowed indirect GI bounce (geometry hits only).
         if (bits_gi && params.frame.z >= 1.0 && params.tuning.w > 0.0) {
-            let d = cosine_hemisphere(&state, normal);
-            let bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 48.0));
-            if (bhit.index != 0xffffffffu) {
-                let bmaterial = material_of(bhit.index);
-                let b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
-                if (b_ndl > 0.01) {
-                    let incoming = bmaterial.albedo.rgb * params.sun_colour.xyz * b_ndl;
-                    accum_gi = accum_gi + raster_rgb * incoming * (params.tuning.w * 0.30 * (1.0 - fog_t));
+            let gi_taps = 2u;
+            var gi_sum = vec3<f32>(0.0);
+            for (var g = 0u; g < gi_taps; g = g + 1u) {
+                let d = cosine_hemisphere(&state, normal);
+                let bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 48.0));
+                if (bhit.index != 0xffffffffu) {
+                    let bmaterial = material_of(bhit.index);
+                    let b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
+                    if (b_ndl > 0.01) {
+                        var b_shadow = 1.0;
+                        if (bits_shadows) {
+                            let bhit_pos = ray_origin + d * bhit.t + bhit.normal * bias;
+                            if (occluded(bhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y, state ^ (g * 73u + 11u))) {
+                                b_shadow = 0.0;
+                            }
+                        }
+                        if (b_shadow > 0.0) {
+                            let incoming = bmaterial.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow);
+                            gi_sum = gi_sum + raster_rgb * incoming * (params.tuning.w * 0.30 * (1.0 - fog_t));
+                        }
+                    }
+                }
+            }
+            accum_gi = accum_gi + gi_sum * (1.0 / f32(gi_taps));
+        }
+    }
+
+    // Phase 7: Scene point / local lights with smooth inverse-square falloff and shadow rays.
+    var point_lighting = vec3<f32>(0.0);
+    if (bits_lighting) {
+        let pl_count = min(u32(round(params.point_light_meta.x)), 16u);
+        for (var li = 0u; li < pl_count; li = li + 1u) {
+            let pl_pr = params.point_lights_pos_rad[li];
+            let pl_ci = params.point_lights_col_int[li];
+            let to_l = pl_pr.xyz - point;
+            let pl_dist = length(to_l);
+            if (pl_dist > 1e-3 && pl_dist < pl_pr.w) {
+                let l_dir = to_l / pl_dist;
+                let pl_ndl = max(dot(normal, l_dir), 0.0);
+                if (pl_ndl > 0.001) {
+                    let atten = point_light_falloff(pl_dist, pl_pr.w);
+                    if (atten > 1e-5) {
+                        var pl_vis = 1.0;
+                        if (bits_shadows && occluded(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias), state ^ (li * 131u + 17u))) {
+                            pl_vis = 0.0;
+                        }
+                        point_lighting = point_lighting + raster_rgb * pl_ci.rgb * (pl_ci.w * atten * pl_ndl * pl_vis);
+                    }
                 }
             }
         }
+        point_lighting = point_lighting * (1.0 - fog_t);
     }
 
     let inv = 1.0 / f32(samples);
@@ -782,11 +880,11 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let shadow_mod = select(1.0, mix(0.30, 1.0, avg_shadow), bits_shadows && n_dot_l > 0.02);
         let ao_mod = select(1.0, mix(0.58, 1.0, avg_open), bits_ao);
         out_lf = mix(shadow_mod * ao_mod, 1.0, fog_t);
-        out_rgb = avg_gi;
+        out_rgb = avg_gi + point_lighting;
     } else {
         let direct = select(vec3<f32>(0.0), params.sun_colour.xyz * (n_dot_l * avg_shadow), bits_lighting);
         let ambient = params.ambient.xyz * (avg_open * params.tuning.z);
-        let relit = raster_rgb * (direct + ambient) + avg_gi;
+        let relit = raster_rgb * (direct + ambient) + avg_gi + point_lighting;
         out_rgb = mix(relit, params.fog_colour.xyz, fog_t);
         out_lf = 1.0;
     }
@@ -814,7 +912,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         out_lf = 1.0;
         store_refl = vec3<f32>(0.0);
     } else if (debug_mode == 6u) {
-        out_rgb = vec3<f32>(0.0);
+        out_rgb = point_lighting;
         out_lf = 1.0;
         store_refl = vec3<f32>(0.0);
     }
@@ -892,7 +990,7 @@ fn reproject(pixel: vec2<i32>, size: vec2<i32>) -> ReprojectResult {
     let current_depth = textureLoad(src_depth, pixel, 0);
     let both = previous_depth > 0.0 && current_depth > 0.0;
     if (both) {
-        if (abs(previous_depth - current_depth) / max(current_depth, 1e-3) > 0.1) {
+        if (abs(previous_depth - current_depth) / max(current_depth, 1e-3) > 0.05) {
             return empty;
         }
     } else if ((previous_depth > 0.0) != (current_depth > 0.0)) {
@@ -2462,6 +2560,7 @@ impl RaywatcherGpu {
         motion: &wgpu::Texture,
         depth: &wgpu::Texture,
         water: &[super::harvest::WaterSurface],
+        point_lights: &[super::frame::PointLight],
     ) {
         if !plan.trace {
             self.traced_last_frame = false;
@@ -2558,6 +2657,7 @@ impl RaywatcherGpu {
                 self.scene.counts.nodes,
                 self.scene.counts.materials,
             ],
+            point_lights,
         );
 
         let skip_inhouse = plan.reconstruction

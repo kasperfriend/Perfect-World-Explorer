@@ -171,6 +171,30 @@ pub fn distance_scaled_bias(base_bias: f32, distance: f32) -> f32 {
     base_bias.max((distance * 0.0025).max(0.08))
 }
 
+/// One local/point light uploaded from the game's `SceneLights` for Phase 7
+/// shadowed point-light shading.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PointLight {
+    pub position: Vec3,
+    pub radius: f32,
+    pub colour: Vec3,
+    pub intensity: f32,
+    pub casts_shadow: bool,
+}
+
+/// Phase 7 smooth windowed inverse-square falloff for local point lights:
+/// returns `0.0` at `distance >= radius`, decays smoothly with distance, and
+/// avoids singularities near `distance = 0`.
+pub fn point_light_falloff(distance: f32, radius: f32) -> f32 {
+    if radius <= 1e-4 || distance >= radius {
+        return 0.0;
+    }
+    let ratio = (distance / radius).clamp(0.0, 1.0);
+    let r2 = ratio * ratio;
+    let window = (1.0 - r2 * r2).max(0.0);
+    (window * window) / (1.0 + distance * distance * 0.08)
+}
+
 /// Phase 2 layered composite reference formula: modulates the untouched raster
 /// colour by sun shadow visibility and ambient occlusion (faded into fog), and
 /// adds indirect GI, local point lights, and specular reflections. When all RT
