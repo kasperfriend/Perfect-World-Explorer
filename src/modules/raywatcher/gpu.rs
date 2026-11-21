@@ -1387,10 +1387,10 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let centre = centre_raw.rgb;
     let centre_lum = luminance(centre);
 
-    // Phase 7: Separate-signal edge-stopping accumulation.
-    // - `light_factor` (sun shadow * AO) is filtered only on narrow passes
-    //   (`step <= 2`) with a tight edge-stopping kernel so hard shadow edges
-    //   stay crisp without blanket blur.
+    // Phase 7: Tightened separate-signal edge-stopping accumulation.
+    // - `light_factor` (sun shadow + AO) filters only on the narrowest pass
+    //   (`step <= 1`) with a steep edge-stopping kernel (`* 24.0` + `ndot > 0.85`)
+    //   so hard shadow edges stay crisp with zero blanket blur.
     // - `rgb` (GI + reflections) uses full variance-guided multi-pass smoothing.
     let w0 = 0.375 * 0.375;
     var sum = centre * w0;
@@ -1400,7 +1400,7 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var moment1 = centre_moments.x * w0;
     var moment2 = centre_moments.y * w0;
     let step = i32(params.misc.x);
-    let filter_lf = step <= 2;
+    let filter_lf = step <= 1;
     for (var dy = -2; dy <= 2; dy = dy + 1) {
         let wy = kernel_weight(dy);
         for (var dx = -2; dx <= 2; dx = dx + 1) {
@@ -1439,8 +1439,8 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 moment1 = moment1 + moments.x * w_rgb;
                 moment2 = moment2 + moments.y * w_rgb;
             }
-            if (filter_lf) {
-                let w_lf = base_w * exp(-abs(centre_raw.a - sample_raw.a) * 12.0);
+            if (filter_lf && ndot > 0.85) {
+                let w_lf = base_w * exp(-abs(centre_raw.a - sample_raw.a) * 24.0);
                 if (w_lf > 1e-6) {
                     sum_lf = sum_lf + sample_raw.a * w_lf;
                     weight_sum_lf = weight_sum_lf + w_lf;
