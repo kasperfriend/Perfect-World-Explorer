@@ -176,14 +176,14 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         return;
     }
 
-    float3 point = pos_d.xyz;
+    float3 world_pos = pos_d.xyz;
     float4 norm_r = src_gbuf_norm.Load(int3(id.xy, 0));
     float3 normal = norm_r.xyz;
     float nlen = length(normal);
     normal = nlen > 1e-4 ? (normal / nlen) : float3(0.0, 1.0, 0.0);
     float roughness = clamp(norm_r.w, 0.04, 1.0);
     float3 raster_rgb = src_gbuf_raster.Load(int3(id.xy, 0)).rgb;
-    float3 view_dir = normalize(point - params.eye.xyz);
+    float3 view_dir = normalize(world_pos - params.eye.xyz);
 
     bool layered = params.effects.w > 0.5;
     uint effects = uint(round(params.effects.y));
@@ -196,7 +196,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     // Distance-scaled bias prevents self-intersection between the exact 1:1
     // raster depth surface and the BVH/BLAS geometry at all view distances.
     float bias = max(params.effects.z, max(0.15, dist * 0.003));
-    float3 ray_origin = point + normal * bias - view_dir * (bias * 0.35);
+    float3 ray_origin = world_pos + normal * bias - view_dir * (bias * 0.35);
     float n_dot_l = max(dot(normal, params.sun_dir.xyz), 0.0);
 
     float fog_t = 0.0;
