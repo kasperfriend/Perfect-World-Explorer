@@ -782,12 +782,58 @@ struct TlasInstance {
     address: u64,
 }
 
+/// Run a potentially long shader/pipeline compile while emitting start, 1-second
+/// elapsed heartbeat progress events, and completion timing so the main thread
+/// sees live activity and never misclassifies an active compile as a stall.
+pub(crate) fn run_with_compile_heartbeat<T, F, P>(
+    pipeline_name: &str,
+    interval: std::time::Duration,
+    progress: &P,
+    work: F,
+) -> T
+where
+    F: FnOnce() -> T,
+    P: Fn(&str) + Sync,
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let started = std::time::Instant::now();
+    progress(&format!("Compiling {pipeline_name}…"));
+    let done = AtomicBool::new(false);
+    let result = std::thread::scope(|scope| {
+        let done_ref = &done;
+        scope.spawn(move || {
+            let poll_step = interval.min(std::time::Duration::from_millis(50));
+            let mut next_tick = started + interval;
+            while !done_ref.load(Ordering::Acquire) {
+                std::thread::sleep(poll_step);
+                if done_ref.load(Ordering::Acquire) {
+                    break;
+                }
+                let now = std::time::Instant::now();
+                if now >= next_tick {
+                    let elapsed = now.duration_since(started).as_secs();
+                    progress(&format!("Compiling {pipeline_name}… ({elapsed}s)"));
+                    next_tick = now + interval;
+                }
+            }
+        });
+        let out = work();
+        done.store(true, Ordering::Release);
+        out
+    });
+    let secs = started.elapsed().as_secs_f32();
+    progress(&format!("Compiling {pipeline_name}… done in {secs:.1}s"));
+    result
+}
+
 fn pipeline(
     d: &ash::Device,
     layout: vk::PipelineLayout,
     cache: vk::PipelineCache,
     spirv: &[u32],
     entry: &CStr,
+    pipeline_name: &str,
+    progress: &(impl Fn(&str) + Sync),
 ) -> R<vk::Pipeline> {
     unsafe {
         let shader = d
@@ -797,13 +843,15 @@ fn pipeline(
             .module(shader)
             .stage(vk::ShaderStageFlags::COMPUTE)
             .name(entry);
-        let result = d.create_compute_pipelines(
-            cache,
-            &[vk::ComputePipelineCreateInfo::builder()
-                .stage(*stage)
-                .layout(layout)
-                .build()],
-            None,
+        let info = [vk::ComputePipelineCreateInfo::builder()
+            .stage(*stage)
+            .layout(layout)
+            .build()];
+        let result = run_with_compile_heartbeat(
+            pipeline_name,
+            std::time::Duration::from_secs(1),
+            progress,
+            || d.create_compute_pipelines(cache, &info, None),
         );
         d.destroy_shader_module(shader, None);
         match result {
@@ -837,7 +885,8 @@ impl Core {
         ctx: Arc<Context>,
         spirv: &[u32],
         bc: usize,
-        progress: &impl Fn(&'static str),
+        variant_label: &str,
+        progress: &(impl Fn(&str) + Sync),
     ) -> R<Self> {
         progress("Opening the Vulkan RT pipeline cache…");
         let (vendor, device, uuid) = ctx.identity;
@@ -951,13 +1000,15 @@ impl Core {
                     None,
                 )
                 .map_err(vkerr("create pipeline layout"))?;
-            progress("Compiling the Vulkan RT compute pipeline…");
+            let pipe_name = format!("Hardware RT trace pipeline (variant: {variant_label})");
             c.pipeline = pipeline(
                 d,
                 c.layout,
                 c.cache.handle,
                 spirv,
                 CStr::from_bytes_with_nul(b"render\0").unwrap(),
+                &pipe_name,
+                progress,
             )?;
         }
         progress("Saving the Vulkan RT pipeline cache…");
@@ -1114,7 +1165,7 @@ impl Renderer {
         pages: Option<&super::textures::bc_pages::Plans>,
         temporal: bool,
         game: bool,
-        progress: &impl Fn(&'static str),
+        progress: &(impl Fn(&str) + Sync),
     ) -> R<Self> {
         progress("Preparing the Vulkan ray-query context…");
         let ctx = Context::new(device)?;
@@ -1162,7 +1213,8 @@ impl Renderer {
             } else {
                 source
             };
-            let core = Core::new(ctx.clone(), &spirv, bc.len(), progress)?;
+            let variant_label = if temporal { "temporal" } else { "overlay" };
+            let core = Core::new(ctx.clone(), &spirv, bc.len(), variant_label, progress)?;
             progress("Preparing Vulkan RT buffers…");
             Ok((source, core))
         };
@@ -1517,16 +1569,22 @@ impl Renderer {
 
     // Called during preflight, before swapchain acquisition. Both the raw
     // Vulkan code and the optional raster sibling share the driver cache.
-    pub(super) fn prewarm_primary(&mut self, progress: &impl Fn(&'static str)) {
+    pub(super) fn prewarm_primary(&mut self, progress: &(impl Fn(&str) + Sync)) {
         let Some(source) = self.primary_source.take() else {
             return;
         };
-        progress("Compiling the optional raster primary pipeline…");
-        match primary::Primary::new(
-            &self.core.ctx,
-            self.core.layout,
-            self.core.cache.handle,
-            &source,
+        match run_with_compile_heartbeat(
+            "Hardware RT raster primary pipeline",
+            std::time::Duration::from_secs(1),
+            progress,
+            || {
+                primary::Primary::new(
+                    &self.core.ctx,
+                    self.core.layout,
+                    self.core.cache.handle,
+                    &source,
+                )
+            },
         ) {
             Ok(primary) => {
                 self.primary = Some(primary);
@@ -1552,7 +1610,7 @@ impl Renderer {
         &mut self,
         device: &wgpu::Device,
         size: u64,
-        progress: &impl Fn(&'static str),
+        progress: &(impl Fn(&str) + Sync),
     ) -> R<bool> {
         // Retire a cancelled candidate, but live frames read independent
         // buffers and needn't wait on the residency fence to record/submit.

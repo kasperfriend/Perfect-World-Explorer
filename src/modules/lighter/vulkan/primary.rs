@@ -175,6 +175,8 @@ impl Primary {
             cache,
             &compute,
             CStr::from_bytes_with_nul(b"render_hybrid\0").unwrap(),
+            "Hardware RT hybrid primary trace pipeline",
+            &|_| {},
         )?;
         let d = &ctx.device;
         let attachment = |format, store, final_layout| {

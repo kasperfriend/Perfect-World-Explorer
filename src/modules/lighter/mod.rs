@@ -1124,7 +1124,7 @@ impl PresentOverlay {
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 enum ColdRayBuild {
-    Progress(u64, &'static str),
+    Progress(u64, String),
     Done(Result<(vulkan::Renderer, bool), String>),
 }
 
@@ -2164,7 +2164,12 @@ impl Lighter {
                 let stage: u64 = 0;
                 self.cold_ray_deadline = Some(ColdRayDeadline::start(Instant::now()));
                 std::thread::Builder::new().name("lighter-pipeline-startup".into()).spawn(move || {
-                    let progress = |step| { let _ = tx.send(ColdRayBuild::Progress(stage, step)); };
+                    let tx_prog = std::sync::Mutex::new(tx.clone());
+                    let progress = |step: &str| {
+                        if let Ok(guard) = tx_prog.lock() {
+                            let _ = guard.send(ColdRayBuild::Progress(stage, step.to_owned()));
+                        }
+                    };
                     let build = |temporal| vulkan::Renderer::new(&device, compact, reuse, pages.as_ref(), temporal, game, &progress);
                     let made = match build(temporal) {
                         Err(error) if temporal && !crate::gpu::reconstruction_device_lost(&error) => {
@@ -2200,7 +2205,9 @@ impl Lighter {
                     }
                     match rx.try_recv() {
                         Ok(ColdRayBuild::Progress(_, stage_msg)) => {
-                            crate::gpu::first_frame_progress(stage_msg);
+                            crate::gpu::first_frame_progress(&stage_msg);
+                            self.logger.info("COLD_RAY", &stage_msg);
+                            self.status_line = Some(stage_msg);
                             if let Some(deadline) = self.cold_ray_deadline.as_mut() {
                                 deadline.on_progress(Instant::now());
                             }
@@ -2281,7 +2288,7 @@ impl Lighter {
         device: &wgpu::Device,
         w: u32,
         h: u32,
-        progress: impl Fn(&'static str),
+        progress: impl Fn(&str) + Sync,
     ) -> Result<bool, String> {
         if self.settings.mode != Mode::Off && self.capture && self.timings.is_none() {
             self.timings = profile::Timings::new(device);

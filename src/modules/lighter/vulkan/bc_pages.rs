@@ -360,6 +360,7 @@ fn render(@builtin(global_invocation_id) id: vec3<u32>) {{
         ctx.clone(),
         &super::shader(&source).unwrap(),
         atlases.len(),
+        "bc_pages_test",
         &|_| {},
     )
     .unwrap();

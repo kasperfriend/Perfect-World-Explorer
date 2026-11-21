@@ -5326,3 +5326,60 @@ fn c2_cold_ray_deadline_uses_first_frame_timeout_and_resets_on_progress() {
         "must report stall after 120s of complete silence"
     );
 }
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[test]
+fn c3_slow_compile_emits_heartbeats_and_does_not_trip_deadline() {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    let events: Mutex<Vec<(Instant, String)>> = Mutex::new(Vec::new());
+    let progress = |msg: &str| {
+        events
+            .lock()
+            .unwrap()
+            .push((Instant::now(), msg.to_owned()));
+    };
+
+    let value = super::vulkan::run_with_compile_heartbeat(
+        "Hardware RT trace pipeline (variant: overlay)",
+        Duration::from_millis(40),
+        &progress,
+        || {
+            std::thread::sleep(Duration::from_millis(220));
+            42u32
+        },
+    );
+    assert_eq!(value, 42);
+
+    let recorded = events.into_inner().unwrap();
+    assert!(
+        recorded.len() >= 4,
+        "expected start + >=2 heartbeats + done, got {} events: {recorded:?}",
+        recorded.len()
+    );
+    assert!(
+        recorded[0]
+            .1
+            .contains("Compiling Hardware RT trace pipeline (variant: overlay)"),
+        "first event should name the pipeline: {}",
+        recorded[0].1
+    );
+    assert!(
+        recorded.last().unwrap().1.contains("done in"),
+        "final event should report elapsed duration: {}",
+        recorded.last().unwrap().1
+    );
+
+    let mut deadline = super::ColdRayDeadline {
+        expires_at: recorded[0].0 + Duration::from_millis(120),
+        timeout: Duration::from_millis(120),
+    };
+    for (ts, msg) in &recorded {
+        assert!(
+            !deadline.is_stalled(*ts),
+            "heartbeat should prevent deadline trip before event {msg:?}"
+        );
+        deadline.on_progress(*ts);
+    }
+}
