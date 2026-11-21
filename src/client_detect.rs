@@ -610,7 +610,11 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
             continue;
         }
         let matched = fs::read_dir(&current).ok()?.flatten().find(|entry| {
-            if !entry.file_name().to_string_lossy().eq_ignore_ascii_case(part) {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(part)
+            {
                 return false;
             }
             let path = entry.path();
