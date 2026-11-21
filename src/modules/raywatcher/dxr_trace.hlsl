@@ -66,14 +66,24 @@ float3 cosine_hemisphere(inout uint state, float3 n) {
     float u1 = rand01(state);
     float u2 = rand01(state);
     float r = sqrt(u1);
-    float phi = 2.0 * PI * u2;
-    float x = r * cos(phi);
-    float y = r * sin(phi);
+    float s_phi, c_phi;
+    sincos(2.0 * PI * u2, s_phi, c_phi);
     float z = sqrt(max(0.0, 1.0 - u1));
     float3 up = abs(n.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
     float3 t = normalize(cross(up, n));
     float3 b = cross(n, t);
-    return normalize(t * x + b * y + n * z);
+    return t * (r * c_phi) + b * (r * s_phi) + n * z;
+}
+
+float3 cone_direction(inout uint state, float3 axis, float radius) {
+    float r = sqrt(rand01(state));
+    float s_phi, c_phi;
+    sincos(2.0 * PI * rand01(state), s_phi, c_phi);
+    float spread = r * tan(radius);
+    float3 up = abs(axis.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 t = normalize(cross(up, axis));
+    float3 b = cross(axis, t);
+    return normalize(axis + (t * c_phi + b * s_phi) * spread);
 }
 
 float3 environment() {
@@ -198,14 +208,14 @@ Surface shade(float3 origin, float3 dir, inout uint state) {
         float3 t_axis = normalize(cross(up, hit.normal));
         float3 b_axis = cross(hit.normal, t_axis);
         uint hits = 0u;
-        const uint ao_samples = 8u;
+        uint spp = max(uint(params.frame.y), 1u);
+        uint ao_samples = max(2u, 4u / spp);
         for (uint i = 0u; i < ao_samples; i = i + 1u) {
             float u1 = rand01(state);
             float u2 = rand01(state);
             float r = sqrt(u1);
-            float phi = 2.0 * PI * u2;
             float s_phi, c_phi;
-            sincos(phi, s_phi, c_phi);
+            sincos(2.0 * PI * u2, s_phi, c_phi);
             float z = sqrt(max(0.0, 1.0 - u1));
             float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + hit.normal * z;
             if (occluded(ray_origin, d, bias, params.fog.z)) {
@@ -216,30 +226,35 @@ Surface shade(float3 origin, float3 dir, inout uint state) {
     }
     surface.visibility = open;
 
+    // `params.sun_colour.xyz` already includes `sun.intensity`.
     float n_dot_l = max(dot(hit.normal, params.sun_dir.xyz), 0.0);
     float3 direct = float3(0.0, 0.0, 0.0);
     if (bits_lighting && n_dot_l > 0.0) {
         float shadow = 1.0;
         if (bits_shadows) {
-            if (occluded(ray_origin, params.sun_dir.xyz, bias, params.lens.y)) {
+            float3 shadow_dir = params.lens.z > 1e-4
+                ? cone_direction(state, params.sun_dir.xyz, params.lens.z)
+                : params.sun_dir.xyz;
+            if (occluded(ray_origin, shadow_dir, bias, params.lens.y)) {
                 shadow = 0.0;
             }
         }
-        direct = params.sun_colour.xyz * (n_dot_l * params.lens.w * shadow);
+        direct = params.sun_colour.xyz * (n_dot_l * shadow);
     }
     float3 ambient = params.ambient.xyz * (open * params.tuning.z);
-    float3 diffuse = bits_lighting ? (direct + ambient * albedo) : (ambient * albedo);
+    float3 diffuse = albedo * (bits_lighting ? (direct + ambient) : ambient);
 
     if (bits_reflections && roughness <= params.effects.x) {
-        float3 reflect_dir = normalize(dir - hit.normal * (2.0 * dot(dir, hit.normal)));
-        Hit rhit = closest_hit(hit_point + hit.normal * bias, reflect_dir, bias, params.lens.y);
+        float3 reflect_dir = reflect(dir, hit.normal);
+        Hit rhit = closest_hit(ray_origin, reflect_dir, bias, params.lens.y);
         if (rhit.index != 0xffffffffu) {
             Material rmat = material_of(rhit.index);
             float3 lit = rmat.albedo.rgb * (params.ambient.xyz * params.tuning.z +
-                params.sun_colour.xyz * (max(dot(rhit.normal, params.sun_dir.xyz), 0.0) * params.lens.w));
+                params.sun_colour.xyz * max(dot(rhit.normal, params.sun_dir.xyz), 0.0));
             float f0 = 0.04 + 0.06 * (1.0 - roughness);
-            float cos_theta = clamp(dot(-dir, hit.normal), 0.0, 1.0);
-            float fresnel = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
+            float m = 1.0 - saturate(dot(-dir, hit.normal));
+            float m2 = m * m;
+            float fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
             surface.reflection = lit * fresnel;
             surface.reflection_distance = rhit.t;
         } else {
@@ -261,9 +276,12 @@ Surface shade(float3 origin, float3 dir, inout uint state) {
                 float3 bpoint = source + d * bhit.t;
                 Material bmat = material_of(bhit.index);
                 float3 incoming = bmat.albedo.rgb * (params.ambient.xyz * params.tuning.z +
-                    params.sun_colour.xyz * (max(dot(bhit.normal, params.sun_dir.xyz), 0.0) * params.lens.w));
+                    params.sun_colour.xyz * max(dot(bhit.normal, params.sun_dir.xyz), 0.0));
                 bounce = bounce + throughput * incoming;
                 throughput = throughput * bmat.albedo.rgb;
+                if (max(throughput.x, max(throughput.y, throughput.z)) < 1e-3) {
+                    break;
+                }
                 source = bpoint;
                 normal = bhit.normal;
             } else {
@@ -272,6 +290,14 @@ Surface shade(float3 origin, float3 dir, inout uint state) {
             }
         }
         diffuse = diffuse + bounce * params.tuning.w;
+    }
+
+    float fog_start = params.fog.x;
+    float fog_end = params.fog.y;
+    if (fog_end > fog_start && fog_start >= 0.0) {
+        float fog_t = saturate((hit.t - fog_start) / (fog_end - fog_start));
+        diffuse = lerp(diffuse, params.fog_colour.xyz, fog_t);
+        surface.reflection *= (1.0 - fog_t);
     }
 
     surface.colour = diffuse;

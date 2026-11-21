@@ -250,8 +250,10 @@ fn fs(i: VOut) -> FOut {
 
     var out: FOut;
     out.color = vec4<f32>(c + r.rgb, 1.0);
+    let n_len = length(n.xyz);
+    let unit_n = select(vec3<f32>(0.0, 1.0, 0.0), n.xyz / n_len, n_len > 1e-4);
     out.depth = d;
-    out.normals = n;
+    out.normals = vec4<f32>(unit_n, clamp(n.w, 0.02, 1.0));
     out.diffuse_albedo = vec4<f32>(a.rgb, 1.0);
     out.specular_albedo = vec4<f32>(a.a, a.a, a.a, 1.0);
     out.hit_distance = r.a;
@@ -493,6 +495,7 @@ fn fs(i: VOut) -> FOut {
         extent: (u32, u32),
         natives: RrNatives,
         prep: PrepPipeline,
+        prep_bg: Option<wgpu::BindGroup>,
         frame_index: u64,
         param_slot: usize,
         last_instant: Instant,
@@ -572,6 +575,7 @@ fn fs(i: VOut) -> FOut {
                 extent,
                 natives,
                 prep,
+                prep_bg: None,
                 frame_index: 0,
                 param_slot: 0,
                 last_instant: Instant::now(),
@@ -582,10 +586,17 @@ fn fs(i: VOut) -> FOut {
             self.extent
         }
 
+        /// Drop the cached prep bind group so it is rebuilt on the next frame
+        /// (e.g. after `grid_extent` changes while `render_extent` stays fixed).
+        pub fn invalidate_prep(&mut self) {
+            self.prep_bg = None;
+        }
+
         pub fn evaluate(
             &mut self,
             device: &wgpu::Device,
             queue: &wgpu::Queue,
+            post_encoder: &mut wgpu::CommandEncoder,
             inputs: &DlssRrInputs<'_>,
             dst_output: &wgpu::Texture,
         ) -> Result<(), String> {
@@ -594,35 +605,37 @@ fn fs(i: VOut) -> FOut {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("raywatcher dlss-rr prep"),
             });
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("raywatcher dlss-rr prep"),
-                layout: &self.prep.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(inputs.grid_colour),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(inputs.grid_reflection),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(inputs.grid_normals),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(inputs.grid_albedo),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::TextureView(inputs.depth),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: wgpu::BindingResource::Sampler(&self.prep.sampler),
-                    },
-                ],
+            let bg = self.prep_bg.get_or_insert_with(|| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("raywatcher dlss-rr prep"),
+                    layout: &self.prep.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(inputs.grid_colour),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(inputs.grid_reflection),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(inputs.grid_normals),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(inputs.grid_albedo),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(inputs.depth),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::Sampler(&self.prep.sampler),
+                        },
+                    ],
+                })
             });
             fn attach(view: &wgpu::TextureView) -> Option<wgpu::RenderPassColorAttachment<'_>> {
                 Some(wgpu::RenderPassColorAttachment {
@@ -650,7 +663,7 @@ fn fs(i: VOut) -> FOut {
                     occlusion_query_set: None,
                 });
                 rp.set_pipeline(&self.prep.pipeline);
-                rp.set_bind_group(0, &bg, &[]);
+                rp.set_bind_group(0, bg, &[]);
                 rp.draw(0..3, 0..1);
             }
             encoder.copy_texture_to_texture(
@@ -743,43 +756,47 @@ fn fs(i: VOut) -> FOut {
                     0 => &mut self.params,
                     _ => replacement.as_mut().expect("replacement map"),
                 };
-                params.set_resource_set_slot(slot);
+                // Populate static dimensions, subrects, constants, and native
+                // resource pointers once on frame 0 (or on a retry map).
+                if self.frame_index == 0 || attempt > 0 {
+                    params.set_resource_set_slot(slot);
+                    params.set_f32(P_MV_SCALE_X, 1.0);
+                    params.set_f32(P_MV_SCALE_Y, 1.0);
+                    params.set_f32(P_PRE_EXPOSURE, 1.0);
+                    params.set_f32(P_EXPOSURE_SCALE, 1.0);
+                    params.set_u32(P_TONEMAPPER_TYPE, 0);
+                    params.set_i32(P_INDICATOR_INVERT_X, 0);
+                    params.set_i32(P_INDICATOR_INVERT_Y, 0);
+                    for name in P_ZERO_SUBRECTS {
+                        params.set_u32(name, 0);
+                    }
+                    params.set_u32(P_RENDER_WIDTH, w);
+                    params.set_u32(P_RENDER_HEIGHT, h);
+                    for (name, val) in [
+                        (P_WIDTH, w),
+                        (P_HEIGHT, h),
+                        (P_OUT_WIDTH, w),
+                        (P_OUT_HEIGHT, h),
+                        (P_RESOURCE_WIDTH, w),
+                        (P_RESOURCE_HEIGHT, h),
+                        (P_RESOURCE_OUT_WIDTH, w),
+                        (P_RESOURCE_OUT_HEIGHT, h),
+                    ] {
+                        params.set_u32(name, val);
+                    }
+                    params.set_d3d12_resource(P_COLOR, rt_inputs[0] as *mut c_void);
+                    params.set_d3d12_resource(P_DEPTH, rt_inputs[1] as *mut c_void);
+                    params.set_d3d12_resource(P_MOTION_VECTORS, mv_res as *mut c_void);
+                    params.set_d3d12_resource(P_OUTPUT, out_res as *mut c_void);
+                    params.set_d3d12_resource(P_GBUFFER_NORMALS, rt_inputs[2] as *mut c_void);
+                    params.set_d3d12_resource(P_DIFFUSE_ALBEDO, rt_inputs[3] as *mut c_void);
+                    params.set_d3d12_resource(P_SPECULAR_ALBEDO, rt_inputs[4] as *mut c_void);
+                    params.set_d3d12_resource(P_HIT_DISTANCE, rt_inputs[5] as *mut c_void);
+                }
                 params.set_f32(P_JITTER_X, inputs.jitter.0);
                 params.set_f32(P_JITTER_Y, inputs.jitter.1);
                 params.set_i32(P_RESET, i32::from(inputs.reset || self.frame_index == 0));
-                params.set_f32(P_MV_SCALE_X, 1.0);
-                params.set_f32(P_MV_SCALE_Y, 1.0);
                 params.set_f32(P_FRAME_TIME_MS, frame_time_ms);
-                params.set_f32(P_PRE_EXPOSURE, 1.0);
-                params.set_f32(P_EXPOSURE_SCALE, 1.0);
-                params.set_u32(P_TONEMAPPER_TYPE, 0);
-                params.set_i32(P_INDICATOR_INVERT_X, 0);
-                params.set_i32(P_INDICATOR_INVERT_Y, 0);
-                for name in P_ZERO_SUBRECTS {
-                    params.set_u32(name, 0);
-                }
-                params.set_u32(P_RENDER_WIDTH, w);
-                params.set_u32(P_RENDER_HEIGHT, h);
-                for (name, val) in [
-                    (P_WIDTH, w),
-                    (P_HEIGHT, h),
-                    (P_OUT_WIDTH, w),
-                    (P_OUT_HEIGHT, h),
-                    (P_RESOURCE_WIDTH, w),
-                    (P_RESOURCE_HEIGHT, h),
-                    (P_RESOURCE_OUT_WIDTH, w),
-                    (P_RESOURCE_OUT_HEIGHT, h),
-                ] {
-                    params.set_u32(name, val);
-                }
-                params.set_d3d12_resource(P_COLOR, rt_inputs[0] as *mut c_void);
-                params.set_d3d12_resource(P_DEPTH, rt_inputs[1] as *mut c_void);
-                params.set_d3d12_resource(P_MOTION_VECTORS, mv_res as *mut c_void);
-                params.set_d3d12_resource(P_OUTPUT, out_res as *mut c_void);
-                params.set_d3d12_resource(P_GBUFFER_NORMALS, rt_inputs[2] as *mut c_void);
-                params.set_d3d12_resource(P_DIFFUSE_ALBEDO, rt_inputs[3] as *mut c_void);
-                params.set_d3d12_resource(P_SPECULAR_ALBEDO, rt_inputs[4] as *mut c_void);
-                params.set_d3d12_resource(P_HIT_DISTANCE, rt_inputs[5] as *mut c_void);
                 params.set_void_pointer(P_WORLD_TO_VIEW, w2v.as_mut_ptr() as *mut c_void);
                 params.set_void_pointer(P_VIEW_TO_CLIP, v2c.as_mut_ptr() as *mut c_void);
 
@@ -839,11 +856,9 @@ fn fs(i: VOut) -> FOut {
             self.param_slot = winning_slot;
             self.frame_index = self.frame_index.saturating_add(1);
 
-            // 3. Copy the DLSS-RR output into Raywatcher's output texture.
-            let mut copy_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("raywatcher dlss-rr copy"),
-            });
-            copy_enc.copy_texture_to_texture(
+            // 3. Record the output copy into the caller's post-RR encoder so it
+            // batches with the final blit in a single queue submission.
+            post_encoder.copy_texture_to_texture(
                 wgpu::ImageCopyTexture {
                     texture: &self.natives.output.texture,
                     mip_level: 0,
@@ -862,7 +877,6 @@ fn fs(i: VOut) -> FOut {
                     depth_or_array_layers: 1,
                 },
             );
-            queue.submit(Some(copy_enc.finish()));
             Ok(())
         }
     }
@@ -888,10 +902,13 @@ impl DlssRayReconstructor {
         (0, 0)
     }
 
+    pub fn invalidate_prep(&mut self) {}
+
     pub fn evaluate(
         &mut self,
         _device: &wgpu::Device,
         _queue: &wgpu::Queue,
+        _post_encoder: &mut wgpu::CommandEncoder,
         _inputs: &DlssRrInputs<'_>,
         _dst_output: &wgpu::Texture,
     ) -> Result<(), String> {

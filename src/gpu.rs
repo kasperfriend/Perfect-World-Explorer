@@ -3916,6 +3916,7 @@ impl Renderer {
                 let ran = gpu.reconstruct_dlss_rr(
                     &self.device,
                     &self.queue,
+                    encoder,
                     &sdk_dir,
                     &params,
                     &self.object_mv,

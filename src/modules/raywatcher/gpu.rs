@@ -276,12 +276,13 @@ fn orthonormal_basis(n: vec3<f32>) -> mat3x3<f32> {
 }
 
 fn cosine_hemisphere(state: ptr<function, u32>, n: vec3<f32>) -> vec3<f32> {
-    let r = sqrt(next_f32(state));
+    let u1 = next_f32(state);
+    let r = sqrt(u1);
     let phi = next_f32(state) * 2.0 * PI;
     let x = r * cos(phi);
     let y = r * sin(phi);
-    let z = sqrt(max(1.0 - x * x - y * y, 0.0));
-    return normalize(orthonormal_basis(n) * vec3<f32>(x, y, z));
+    let z = sqrt(max(1.0 - u1, 0.0));
+    return orthonormal_basis(n) * vec3<f32>(x, y, z);
 }
 
 fn cone_direction(state: ptr<function, u32>, axis: vec3<f32>, radius: f32) -> vec3<f32> {
@@ -452,7 +453,9 @@ fn environment() -> vec3<f32> {
 }
 
 fn material_of(index: u32) -> Material {
-    return materials[u32(tris[index].b.w)];
+    let mat_count = max(u32(params.counts.z), 1u);
+    let mat_idx = min(u32(round(tris[index].b.w)), mat_count - 1u);
+    return materials[mat_idx];
 }
 
 struct Surface {
@@ -511,13 +514,15 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
     if (bits_ao) {
         let onb = orthonormal_basis(hit.normal);
         var hits = 0u;
-        let ao_samples = 8u;
+        let spp = max(u32(params.frame.y), 1u);
+        let ao_samples = max(2u, 4u / spp);
         for (var i = 0u; i < ao_samples; i = i + 1u) {
-            let r = sqrt(next_f32(state));
+            let u1 = next_f32(state);
+            let r = sqrt(u1);
             let phi = next_f32(state) * 2.0 * PI;
             let x = r * cos(phi);
             let y = r * sin(phi);
-            let z = sqrt(max(1.0 - x * x - y * y, 0.0));
+            let z = sqrt(max(1.0 - u1, 0.0));
             let d = onb * vec3<f32>(x, y, z);
             if (occluded(ray_origin, d, bias, params.fog.z)) {
                 hits = hits + 1u;
@@ -527,31 +532,37 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
     }
     surface.visibility = open;
 
-    // Sun, skipping the shadow ray completely when the surface faces away.
+    // Sun (`params.sun_colour.xyz` already includes `sun.intensity`), skipping
+    // the shadow ray when facing away and jittering within the sun angular disc.
     let n_dot_l = max(dot(hit.normal, params.sun_dir.xyz), 0.0);
     var direct = vec3<f32>(0.0);
     if (bits_lighting && n_dot_l > 0.0) {
         var shadow = 1.0;
-        if (bits_shadows && occluded(ray_origin, params.sun_dir.xyz, bias, params.lens.y)) {
-            shadow = 0.0;
+        if (bits_shadows) {
+            let shadow_dir = select(
+                params.sun_dir.xyz,
+                cone_direction(state, params.sun_dir.xyz, params.lens.z),
+                params.lens.z > 1e-4,
+            );
+            if (occluded(ray_origin, shadow_dir, bias, params.lens.y)) {
+                shadow = 0.0;
+            }
         }
-        direct = params.sun_colour.xyz * (n_dot_l * params.lens.w * shadow);
+        direct = params.sun_colour.xyz * (n_dot_l * shadow);
     }
     let ambient = params.ambient.xyz * (open * params.tuning.z);
-    var diffuse = direct + ambient * albedo;
-    if (!bits_lighting) {
-        diffuse = ambient * albedo;
-    }
+    var diffuse = albedo * select(ambient, direct + ambient, bits_lighting);
 
     if (bits_reflections && roughness <= params.effects.x) {
-        let reflect_dir = normalize(dir - hit.normal * (2.0 * dot(dir, hit.normal)));
-        let rhit = closest_hit(point + hit.normal * bias, reflect_dir, bias, params.lens.y);
+        let reflect_dir = reflect(dir, hit.normal);
+        let rhit = closest_hit(ray_origin, reflect_dir, bias, params.lens.y);
         if (rhit.index != 0xffffffffu) {
             let rmaterial = material_of(rhit.index);
-            let lit = rmaterial.albedo.rgb * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * (max(dot(rhit.normal, params.sun_dir.xyz), 0.0) * params.lens.w));
+            let lit = rmaterial.albedo.rgb * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * max(dot(rhit.normal, params.sun_dir.xyz), 0.0));
             let f0 = 0.04 + 0.06 * (1.0 - roughness);
-            let cos_theta = clamp(dot(-dir, hit.normal), 0.0, 1.0);
-            let fresnel = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
+            let m = 1.0 - clamp(dot(-dir, hit.normal), 0.0, 1.0);
+            let m2 = m * m;
+            let fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
             surface.reflection = lit * fresnel;
             surface.reflection_distance = rhit.t;
         } else {
@@ -572,9 +583,12 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
             if (bhit.index != 0xffffffffu) {
                 let bpoint = source + d * bhit.t;
                 let bmaterial = material_of(bhit.index);
-                let incoming = bmaterial.albedo.rgb * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * (max(dot(bhit.normal, params.sun_dir.xyz), 0.0) * params.lens.w));
+                let incoming = bmaterial.albedo.rgb * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * max(dot(bhit.normal, params.sun_dir.xyz), 0.0));
                 bounce = bounce + throughput * incoming;
                 throughput = throughput * bmaterial.albedo.rgb;
+                if (max(throughput.x, max(throughput.y, throughput.z)) < 1e-3) {
+                    break;
+                }
                 source = bpoint;
                 normal = bhit.normal;
             } else {
@@ -583,6 +597,13 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
             }
         }
         diffuse = diffuse + bounce * params.tuning.w;
+    }
+    let fog_start = params.fog.x;
+    let fog_end = params.fog.y;
+    if (fog_end > fog_start && fog_start >= 0.0) {
+        let fog_t = clamp((hit.t - fog_start) / (fog_end - fog_start), 0.0, 1.0);
+        diffuse = mix(diffuse, params.fog_colour.xyz, fog_t);
+        surface.reflection = surface.reflection * (1.0 - fog_t);
     }
     surface.colour = diffuse;
     return surface;
@@ -730,18 +751,20 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let gp = grid_coord(pixel, size, gdim);
     let current = textureLoad(src_colour, gp, 0).rgb + textureLoad(src_reflection, gp, 0).rgb;
     // Local 3x3 mean and standard deviation in ray-grid space for variance clamping.
-    var sum = vec3<f32>(0.0);
-    var sum_sq = vec3<f32>(0.0);
-    var count = 0.0;
+    var sum = current;
+    var sum_sq = current * current;
     for (var dy = -1; dy <= 1; dy = dy + 1) {
         for (var dx = -1; dx <= 1; dx = dx + 1) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
             let p = clamp(gp + vec2<i32>(dx, dy), vec2<i32>(0), gmax);
             let c = textureLoad(src_colour, p, 0).rgb + textureLoad(src_reflection, p, 0).rgb;
             sum = sum + c;
             sum_sq = sum_sq + c * c;
-            count = count + 1.0;
         }
     }
+    let count = 9.0;
     let mean = sum / count;
     let stddev = sqrt(max(sum_sq / count - mean * mean, vec3<f32>(0.0))) * params.weights.w;
 
@@ -760,16 +783,15 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(out_moments, pixel, vec4<f32>(m1, m2, depth, length));
 }
 
-fn variance_at(pixel: vec2<i32>) -> f32 {
-    let moments = textureLoad(history_moments, pixel, 0);
+fn variance_of(moments: vec4<f32>) -> f32 {
     let length = moments.w;
     let variance = max(moments.y - moments.x * moments.x, 0.0);
     let bias = select(1.0, 1.0 / max(sqrt(length), 0.25), length > 0.0);
     return max(variance * bias, params.misc.y);
 }
 
-fn normal_at(pixel: vec2<i32>, size: vec2<i32>, ndim: vec2<u32>) -> vec3<f32> {
-    let gp = grid_coord(pixel, size, ndim);
+fn normal_at_scaled(pixel: vec2<i32>, grid_scale: vec2<f32>, gmax: vec2<f32>) -> vec3<f32> {
+    let gp = vec2<i32>(clamp((vec2<f32>(pixel) + vec2<f32>(0.5)) * grid_scale, vec2<f32>(0.0), gmax));
     let n = textureLoad(src_normals, gp, 0).xyz;
     let len = length(n);
     return select(vec3<f32>(0.0, 1.0, 0.0), n / len, len > 1e-4);
@@ -789,15 +811,17 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= u32(size.x) || id.y >= u32(size.y)) {
         return;
     }
-    let ndim = textureDimensions(src_normals);
+    let ndim = vec2<f32>(textureDimensions(src_normals));
+    let grid_scale = ndim / vec2<f32>(size);
+    let gmax = ndim - vec2<f32>(1.0);
     let centre_depth = textureLoad(src_depth, pixel, 0);
-    let centre_normal = normal_at(pixel, size, ndim);
-    let centre_variance = variance_at(pixel);
-    let sigma = max(params.weights.x * sqrt(centre_variance), 1e-6);
-    let depth_denom = max(params.weights.z * max(abs(centre_depth), 1e-3), 1e-6);
+    let centre_normal = normal_at_scaled(pixel, grid_scale, gmax);
+    let centre_moments = textureLoad(history_moments, pixel, 0);
+    let centre_variance = variance_of(centre_moments);
+    let inv_sigma = 1.0 / max(params.weights.x * sqrt(centre_variance), 1e-6);
+    let inv_depth_denom = 1.0 / max(params.weights.z * max(abs(centre_depth), 1e-3), 1e-6);
     let centre = textureLoad(history_colour, pixel, 0).rgb;
     let centre_lum = luminance(centre);
-    let centre_moments = textureLoad(history_moments, pixel, 0);
 
     // Seed accumulation with the centre tap (skipping redundant exp(0)/pow(1)).
     let w0 = 0.375 * 0.375;
@@ -817,11 +841,17 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 continue;
             }
             let d1 = textureLoad(src_depth, p, 0);
-            let wd = exp(-abs(centre_depth - d1) / depth_denom);
-            let n1 = normal_at(p, size, ndim);
+            let wd = exp(-abs(centre_depth - d1) * inv_depth_denom);
+            if (wd < 1e-4) {
+                continue;
+            }
+            let n1 = normal_at_scaled(p, grid_scale, gmax);
             let wn = pow(max(dot(centre_normal, n1), 0.0), params.weights.y);
+            if (wn < 1e-4) {
+                continue;
+            }
             let sample = textureLoad(history_colour, p, 0).rgb;
-            let w_colour = exp(-abs(centre_lum - luminance(sample)) / sigma);
+            let w_colour = exp(-abs(centre_lum - luminance(sample)) * inv_sigma);
             let w = wy * kernel_weight(dx) * wn * wd * w_colour;
             if (w <= 1e-6) {
                 continue;
@@ -1916,9 +1946,12 @@ impl RaywatcherGpu {
                 self.dxr_failed = true;
             }
         }
-        if let Some(rr) = self.dlss_rr.as_ref() {
+        if let Some(rr) = self.dlss_rr.as_mut() {
             if rr.extent() != (w, h) {
                 self.dlss_rr = None;
+            } else {
+                // Grid or depth views were recreated; rebuild cached prep bindings.
+                rr.invalidate_prep();
             }
         }
         self.filter_colour = filter_colour;
@@ -2180,6 +2213,7 @@ impl RaywatcherGpu {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        post_encoder: &mut wgpu::CommandEncoder,
         sdk_dir: &std::path::Path,
         params: &FrameParams,
         motion: &wgpu::Texture,
@@ -2216,7 +2250,7 @@ impl RaywatcherGpu {
             world_to_view,
             view_to_clip,
         };
-        match rr.evaluate(device, queue, &inputs, &self.output) {
+        match rr.evaluate(device, queue, post_encoder, &inputs, &self.output) {
             Ok(()) => true,
             Err(err) => {
                 eprintln!("[Raywatcher] DLSS Ray Reconstruction evaluate failed ({err}); falling back to in-house denoiser");
