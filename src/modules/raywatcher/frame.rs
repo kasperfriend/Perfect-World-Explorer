@@ -908,6 +908,26 @@ mod tests {
     }
 
     #[test]
+    fn sky_miss_path_uses_real_sky_env_target_not_analytic_gradient() {
+        let wgsl = super::super::gpu::RAY_SHADER;
+        let hlsl = include_str!("dxr_trace.hlsl");
+        for (name, src) in [("WGSL", wgsl), ("HLSL", hlsl)] {
+            let fn_pos = src
+                .find("sample_sky_reflection(")
+                .expect("sample_sky_reflection must exist");
+            let body = &src[fn_pos..src.len().min(fn_pos + 320)];
+            assert!(
+                body.contains("sample_sky_env("),
+                "{name} sample_sky_reflection must sample the real sky_env target"
+            );
+            assert!(
+                !body.contains("fog_colour"),
+                "{name} sample_sky_reflection must not fall back to an analytic fog gradient"
+            );
+        }
+    }
+
+    #[test]
     fn sky_reflection_on_miss_returns_non_zero_sky_gradient() {
         let sun_dir = Vec3::new(0.0, 0.7, 0.7).normalize();
         let sun_col = Vec3::new(1.0, 0.95, 0.85);

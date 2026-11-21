@@ -469,6 +469,7 @@ struct Material {
 @group(0) @binding(10) var src_gbuf_pos: texture_2d<f32>;
 @group(0) @binding(11) var src_gbuf_norm: texture_2d<f32>;
 @group(0) @binding(12) var src_gbuf_raster: texture_2d<f32>;
+@group(0) @binding(13) var src_sky_env: texture_2d<f32>;
 
 const PI: f32 = 3.14159265;
 
@@ -732,28 +733,51 @@ fn sample_screen_radiance(world_pos: vec3<f32>, ray_t: f32) -> vec4<f32> {
     return vec4<f32>(0.0);
 }
 
-// Phase 4: Sample the raster sky for a missed reflection ray (on-screen sky
-// pixels read the exact raster skybox/clouds; off-screen directions use the
-// matched horizon-to-zenith gradient + sun lobe).
-fn sample_sky_reflection(dir: vec3<f32>) -> vec3<f32> {
-    let far_pos = params.eye.xyz + dir * (params.lens.y * 0.9);
-    let clip = params.vp * vec4<f32>(far_pos, 1.0);
-    if (clip.w > 1e-4) {
-        let ndc = clip.xyz / clip.w;
-        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-        if (uv.x >= 0.01 && uv.x <= 0.99 && uv.y >= 0.01 && uv.y <= 0.99) {
-            let gdim = vec2<i32>(i32(params.extents.x), i32(params.extents.y));
-            let sp = clamp(vec2<i32>(uv * params.extents.xy), vec2<i32>(0), gdim - vec2<i32>(1));
-            if (textureLoad(src_gbuf_pos, sp, 0).w <= 0.0) {
-                return textureLoad(src_gbuf_raster, sp, 0).rgb;
-            }
-        }
+// Phase 3: Sample the real rendered SkyGpu + CloudGpu 3x2 cubemap atlas.
+fn sample_sky_env(dir: vec3<f32>) -> vec3<f32> {
+    let d = normalize(dir);
+    let ad = abs(d);
+    var face = 0u;
+    var uc = 0.0;
+    var vc = 0.0;
+    var ma = 1.0;
+    if (ad.x >= ad.y && ad.x >= ad.z) {
+        ma = ad.x;
+        if (d.x >= 0.0) { face = 0u; uc = -d.z; vc = -d.y; }
+        else            { face = 1u; uc =  d.z; vc = -d.y; }
+    } else if (ad.y >= ad.x && ad.y >= ad.z) {
+        ma = ad.y;
+        if (d.y >= 0.0) { face = 2u; uc =  d.x; vc =  d.z; }
+        else            { face = 3u; uc =  d.x; vc = -d.z; }
+    } else {
+        ma = ad.z;
+        if (d.z >= 0.0) { face = 4u; uc =  d.x; vc = -d.y; }
+        else            { face = 5u; uc = -d.x; vc = -d.y; }
     }
-    let up_t = pow(clamp(dir.y, 0.0, 1.0), 0.55);
-    let zenith = max(params.ambient.xyz * 1.15, params.fog_colour.xyz * vec3<f32>(0.70, 0.85, 1.15));
-    let base = mix(params.fog_colour.xyz, zenith, up_t);
-    let sun_dot = clamp(dot(dir, params.sun_dir.xyz), 0.0, 1.0);
-    return max(base + params.sun_colour.xyz * (pow(sun_dot, 96.0) * 1.5), vec3<f32>(0.0));
+    let fuv = clamp(0.5 * (vec2<f32>(uc, vc) / max(ma, 1e-5) + vec2<f32>(1.0)), vec2<f32>(0.002), vec2<f32>(0.998));
+    let dim = vec2<f32>(textureDimensions(src_sky_env));
+    let fw = dim.x / 3.0;
+    let fh = dim.y / 2.0;
+    let col = face % 3u;
+    let row = face / 3u;
+    let fx = f32(col) * fw + fuv.x * (fw - 1.0);
+    let fy = f32(row) * fh + fuv.y * (fh - 1.0);
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let x1 = min(x0 + 1, i32((col + 1u) * u32(fw)) - 1);
+    let y1 = min(y0 + 1, i32((row + 1u) * u32(fh)) - 1);
+    let frac_xy = vec2<f32>(fx - f32(x0), fy - f32(y0));
+    let c00 = textureLoad(src_sky_env, vec2<i32>(x0, y0), 0).rgb;
+    let c10 = textureLoad(src_sky_env, vec2<i32>(x1, y0), 0).rgb;
+    let c01 = textureLoad(src_sky_env, vec2<i32>(x0, y1), 0).rgb;
+    let c11 = textureLoad(src_sky_env, vec2<i32>(x1, y1), 0).rgb;
+    return max(mix(mix(c00, c10, frac_xy.x), mix(c01, c11, frac_xy.x), frac_xy.y), vec3<f32>(0.0));
+}
+
+// Phase 3: Reflection miss ALWAYS samples the real rendered SkyGpu + CloudGpu
+// environment target (analytic gradient removed from the miss path).
+fn sample_sky_reflection(dir: vec3<f32>) -> vec3<f32> {
+    return sample_sky_env(dir);
 }
 
 fn ggx_sample(normal: vec3<f32>, roughness: f32, u1: f32, u2: f32) -> vec3<f32> {
@@ -1554,6 +1578,10 @@ pub const COLOUR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// `Rg16Float` would be smaller, but storage textures cannot be 16-bit
 /// single/dual channel on every backend, so the guide is RGBA like the rest.
 pub const GUIDE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Edge resolution of each face in the 3x2 sky+cloud reflection cubemap atlas.
+pub const SKY_ENV_FACE: u32 = 128;
+pub const SKY_ENV_WIDTH: u32 = SKY_ENV_FACE * 3;
+pub const SKY_ENV_HEIGHT: u32 = SKY_ENV_FACE * 2;
 
 fn storage_texture(
     device: &wgpu::Device,
@@ -1714,6 +1742,7 @@ impl Pipelines {
                 texture_entry(10, wgpu::TextureSampleType::Float { filterable: false }),
                 texture_entry(11, wgpu::TextureSampleType::Float { filterable: true }),
                 texture_entry(12, wgpu::TextureSampleType::Float { filterable: true }),
+                texture_entry(13, wgpu::TextureSampleType::Float { filterable: true }),
             ],
         });
         let denoise_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2160,6 +2189,21 @@ pub struct RaywatcherGpu {
     _depth_tex: wgpu::Texture,
     pre_water_depth: wgpu::TextureView,
     _pre_water_depth_tex: wgpu::Texture,
+    /// 3x2 cubemap atlas (`SKY_ENV_WIDTH x SKY_ENV_HEIGHT`, `COLOUR_FORMAT`)
+    /// holding the real `SkyGpu` + `CloudGpu` skybox for reflections & sky GI.
+    sky_env_tex: wgpu::Texture,
+    sky_env_view: wgpu::TextureView,
+    sky_env_face_cursor: u32,
+    sky_env_initialized: bool,
+    sky_env_scratch: Option<(
+        wgpu::TextureFormat,
+        wgpu::Texture,
+        wgpu::TextureView,
+        wgpu::Texture,
+        wgpu::TextureView,
+        wgpu::BindGroup,
+        wgpu::RenderPipeline,
+    )>,
     /// Interpolated result, at the render extent, for the upscaler to consume.
     pub output: wgpu::Texture,
     pub output_view: wgpu::TextureView,
@@ -2211,6 +2255,23 @@ impl RaywatcherGpu {
         let scene_geom = scene.clone();
         let scene_buffers = SceneBuffers::upload(device, scene);
         let grid = GridTargets::new(device, grid_extent.0, grid_extent.1);
+        let sky_env_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("raywatcher sky env atlas"),
+            size: wgpu::Extent3d {
+                width: SKY_ENV_WIDTH,
+                height: SKY_ENV_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COLOUR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let sky_env_view = sky_env_tex.create_view(&Default::default());
         let (w, h) = (render_extent.0.max(1), render_extent.1.max(1));
         let (filter_colour_tex, filter_colour) = {
             let (a, av) = plane(device, "raywatcher filter colour a", w, h, COLOUR_FORMAT);
@@ -2240,8 +2301,14 @@ impl RaywatcherGpu {
             mapped_at_creation: false,
         });
 
-        let trace_bind_group =
-            Self::trace_bindings(device, &pipelines, &uniforms, &scene_buffers, &grid);
+        let trace_bind_group = Self::trace_bindings(
+            device,
+            &pipelines,
+            &uniforms,
+            &scene_buffers,
+            &grid,
+            &sky_env_view,
+        );
         let temporal_bind_groups = [
             Self::temporal_binding(
                 device,
@@ -2344,6 +2411,11 @@ impl RaywatcherGpu {
             _depth_tex: depth_tex,
             pre_water_depth,
             _pre_water_depth_tex: pre_water_depth_tex,
+            sky_env_tex,
+            sky_env_view,
+            sky_env_face_cursor: 0,
+            sky_env_initialized: false,
+            sky_env_scratch: None,
             output,
             output_view,
             guide,
@@ -2360,6 +2432,7 @@ impl RaywatcherGpu {
         uniforms: &wgpu::Buffer,
         scene: &SceneBuffers,
         grid: &GridTargets,
+        sky_env_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("raywatcher scene"),
@@ -2416,6 +2489,10 @@ impl RaywatcherGpu {
                 wgpu::BindGroupEntry {
                     binding: 12,
                     resource: wgpu::BindingResource::TextureView(&grid.gbuf_raster_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(sky_env_view),
                 },
             ],
         })
@@ -2664,8 +2741,14 @@ impl RaywatcherGpu {
         }
         if !render_changed {
             let pipelines = &self.pipelines;
-            self.trace_bind_group =
-                Self::trace_bindings(device, pipelines, &self.uniforms, &self.scene, &self.grid);
+            self.trace_bind_group = Self::trace_bindings(
+                device,
+                pipelines,
+                &self.uniforms,
+                &self.scene,
+                &self.grid,
+                &self.sky_env_view,
+            );
             self.temporal_bind_groups = [
                 Self::temporal_binding(
                     device,
@@ -2756,8 +2839,14 @@ impl RaywatcherGpu {
         let (pre_water_depth_tex, pre_water_depth) = depth_plane(device, w, h);
         let (output, output_view) = plane(device, "raywatcher output", w, h, COLOUR_FORMAT);
         let (guide, guide_view) = plane(device, "raywatcher output guide", w, h, GUIDE_FORMAT);
-        self.trace_bind_group =
-            Self::trace_bindings(device, pipelines, &self.uniforms, &self.scene, &self.grid);
+        self.trace_bind_group = Self::trace_bindings(
+            device,
+            pipelines,
+            &self.uniforms,
+            &self.scene,
+            &self.grid,
+            &self.sky_env_view,
+        );
         self.temporal_bind_groups = [
             Self::temporal_binding(
                 device,
@@ -2872,6 +2961,7 @@ impl RaywatcherGpu {
             &self.uniforms,
             &self.scene,
             &self.grid,
+            &self.sky_env_view,
         );
     }
 
@@ -3056,6 +3146,7 @@ impl RaywatcherGpu {
                     &self.grid.gbuf_pos,
                     &self.grid.gbuf_norm,
                     &self.grid.gbuf_raster,
+                    &self.sky_env_tex,
                 );
                 let pending = std::mem::replace(
                     encoder,
@@ -3281,6 +3372,241 @@ impl RaywatcherGpu {
     /// Snapshot the untouched full raster world target into an internal copy so
     /// Raywatcher can composite shadows, reflections, AO and GI on top of it
     /// (and feed it into DLSS Ray Reconstruction) without overwriting it.
+    /// Phase 3: Render the real game sky (`SkyGpu`) and cloud billboards
+    /// (`CloudGpu`) into the 3x2 cubemap environment atlas (`self.sky_env_tex`).
+    /// On the first frame all 6 faces are populated; subsequent frames refresh
+    /// one face per frame so clouds and time-of-day stay live at minimal cost.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_sky_env(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        sky: &crate::sky_gpu::SkyGpu,
+        cloud: Option<&crate::cloud_gpu::CloudGpu>,
+        sky_format: wgpu::TextureFormat,
+        sky_frame: crate::sky_gpu::SkyFrame,
+        sky_sets: (i32, i32, f32),
+        camera_pos: glam::Vec3,
+        cloud_detail: bool,
+        daylight: f32,
+        fog: crate::fog_matrix::Fog,
+    ) {
+        let needs_alloc = self
+            .sky_env_scratch
+            .as_ref()
+            .is_none_or(|(fmt, ..)| *fmt != sky_format);
+        if needs_alloc {
+            let scratch_tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("raywatcher sky env scratch"),
+                size: wgpu::Extent3d {
+                    width: SKY_ENV_FACE,
+                    height: SKY_ENV_FACE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: sky_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let scratch_view = scratch_tex.create_view(&Default::default());
+            let (scratch_depth, scratch_depth_view) =
+                depth_plane(device, SKY_ENV_FACE, SKY_ENV_FACE);
+            let blit_bg = Self::blit_binding(device, &self.pipelines, &scratch_view);
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("raywatcher sky env blit"),
+                bind_group_layouts: &[&self.pipelines.blit_layout],
+                push_constant_ranges: &[],
+            });
+            let blit_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("raywatcher sky env blit"),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &self.pipelines.blit_module,
+                    entry_point: "vs",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.pipelines.blit_module,
+                    entry_point: "fs",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: COLOUR_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+            self.sky_env_scratch = Some((
+                sky_format,
+                scratch_tex,
+                scratch_view,
+                scratch_depth,
+                scratch_depth_view,
+                blit_bg,
+                blit_pipe,
+            ));
+        }
+
+        // 6 cubemap face directions matching `sample_sky_env` (faces 0..5 = +X, -X, +Y, -Y, +Z, -Z).
+        const FACES: [(glam::Vec3, glam::Vec3, f32, f32); 6] = [
+            (
+                glam::Vec3::X,
+                glam::Vec3::Y,
+                std::f32::consts::FRAC_PI_2,
+                0.0,
+            ),
+            (
+                glam::Vec3::NEG_X,
+                glam::Vec3::Y,
+                -std::f32::consts::FRAC_PI_2,
+                0.0,
+            ),
+            (
+                glam::Vec3::Y,
+                glam::Vec3::NEG_Z,
+                0.0,
+                std::f32::consts::FRAC_PI_2 * 0.99,
+            ),
+            (
+                glam::Vec3::NEG_Y,
+                glam::Vec3::Z,
+                0.0,
+                -std::f32::consts::FRAC_PI_2 * 0.99,
+            ),
+            (glam::Vec3::Z, glam::Vec3::Y, std::f32::consts::PI, 0.0),
+            (glam::Vec3::NEG_Z, glam::Vec3::Y, 0.0, 0.0),
+        ];
+
+        let faces_to_render: Vec<u32> = if !self.sky_env_initialized {
+            self.sky_env_initialized = true;
+            (0..6).collect()
+        } else {
+            let f = self.sky_env_face_cursor % 6;
+            self.sky_env_face_cursor = self.sky_env_face_cursor.wrapping_add(1);
+            vec![f]
+        };
+
+        let multi_face = faces_to_render.len() > 1;
+        let sky_proj = glam::Mat4::from_scale(glam::Vec3::new(-1.0, 1.0, 1.0))
+            * glam::Mat4::perspective_rh(90.0f32.to_radians(), 1.0, 1.0, 16000.0);
+        let cloud_proj =
+            glam::Mat4::perspective_infinite_reverse_rh(90.0f32.to_radians(), 1.0, 0.5);
+
+        for face in faces_to_render {
+            let (dir, up, yaw, pitch) = FACES[face as usize];
+            let view = glam::Mat4::look_to_rh(glam::Vec3::ZERO, dir, up);
+            sky.update_custom(queue, view, sky_proj, SKY_ENV_FACE, sky_frame, sky_sets);
+
+            let mut local_enc = if multi_face {
+                Some(
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("raywatcher sky env face"),
+                    }),
+                )
+            } else {
+                None
+            };
+            let enc: &mut wgpu::CommandEncoder = match local_enc.as_mut() {
+                Some(e) => e,
+                None => encoder,
+            };
+
+            let Some((
+                _,
+                _,
+                ref scratch_view,
+                _,
+                ref scratch_depth_view,
+                ref blit_bg,
+                ref blit_pipe,
+            )) = self.sky_env_scratch
+            else {
+                return;
+            };
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("raywatcher sky env draw"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: scratch_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: scratch_depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                sky.draw(&mut pass, false);
+            }
+            if let Some(cloud) = cloud {
+                let cloud_view = glam::Mat4::look_to_rh(camera_pos, dir, up);
+                let cloud_mat = cloud_proj * cloud_view;
+                cloud.draw(
+                    queue,
+                    enc,
+                    scratch_view,
+                    scratch_depth_view,
+                    cloud_mat,
+                    yaw,
+                    pitch,
+                    cloud_detail,
+                    daylight,
+                    fog,
+                    [0.0; 4],
+                    false,
+                );
+            }
+            let col = face % 3;
+            let row = face / 3;
+            let mut blit_pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("raywatcher sky env atlas blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.sky_env_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            blit_pass.set_viewport(
+                (col * SKY_ENV_FACE) as f32,
+                (row * SKY_ENV_FACE) as f32,
+                SKY_ENV_FACE as f32,
+                SKY_ENV_FACE as f32,
+                0.0,
+                1.0,
+            );
+            blit_pass.set_pipeline(blit_pipe);
+            blit_pass.set_bind_group(0, blit_bg, &[]);
+            blit_pass.draw(0..3, 0..1);
+            drop(blit_pass);
+
+            if let Some(e) = local_enc {
+                queue.submit(Some(e.finish()));
+            }
+        }
+    }
+
     pub fn capture_raster(
         &mut self,
         device: &wgpu::Device,

@@ -52,6 +52,8 @@ StructuredBuffer<Material> materials : register(t2);
 Texture2D<float4> src_gbuf_pos : register(t3);
 Texture2D<float4> src_gbuf_norm : register(t4);
 Texture2D<float4> src_gbuf_raster : register(t5);
+// Phase 3: Real sky (SkyGpu) + cloud billboards (CloudGpu) in a 3x2 cubemap atlas.
+Texture2D<float4> src_sky_env : register(t6);
 
 RWTexture2D<float4> out_colour : register(u0);
 RWTexture2D<float4> out_guide : register(u1);
@@ -202,27 +204,52 @@ float4 sample_screen_radiance(float3 world_pos, float ray_t) {
     return float4(0.0, 0.0, 0.0, 0.0);
 }
 
-// Phase 4: Sample the raster sky on reflection miss (exact raster skybox when
-// on-screen, matched horizon-to-zenith gradient + sun lobe when off-screen).
-float3 sample_sky_reflection(float3 dir) {
-    float3 far_pos = params.eye.xyz + dir * (params.lens.y * 0.9);
-    float4 clip = mul(params.vp, float4(far_pos, 1.0));
-    if (clip.w > 1e-4) {
-        float3 ndc = clip.xyz / clip.w;
-        float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-        if (uv.x >= 0.01 && uv.x <= 0.99 && uv.y >= 0.01 && uv.y <= 0.99) {
-            int2 gdim = int2(int(params.extents.x), int(params.extents.y));
-            int2 sp = clamp(int2(uv * params.extents.xy), int2(0, 0), gdim - int2(1, 1));
-            if (src_gbuf_pos.Load(int3(sp, 0)).w <= 0.0) {
-                return src_gbuf_raster.Load(int3(sp, 0)).rgb;
-            }
-        }
+// Phase 3: Sample the real rendered SkyGpu + CloudGpu 3x2 cubemap atlas.
+float3 sample_sky_env(float3 dir) {
+    float3 d = normalize(dir);
+    float3 ad = abs(d);
+    uint face = 0u;
+    float uc = 0.0;
+    float vc = 0.0;
+    float ma = 1.0;
+    if (ad.x >= ad.y && ad.x >= ad.z) {
+        ma = ad.x;
+        if (d.x >= 0.0) { face = 0u; uc = -d.z; vc = -d.y; }
+        else            { face = 1u; uc =  d.z; vc = -d.y; }
+    } else if (ad.y >= ad.x && ad.y >= ad.z) {
+        ma = ad.y;
+        if (d.y >= 0.0) { face = 2u; uc =  d.x; vc =  d.z; }
+        else            { face = 3u; uc =  d.x; vc = -d.z; }
+    } else {
+        ma = ad.z;
+        if (d.z >= 0.0) { face = 4u; uc =  d.x; vc = -d.y; }
+        else            { face = 5u; uc = -d.x; vc = -d.y; }
     }
-    float up_t = pow(saturate(dir.y), 0.55);
-    float3 zenith = max(params.ambient.xyz * 1.15, params.fog_colour.xyz * float3(0.70, 0.85, 1.15));
-    float3 base = lerp(params.fog_colour.xyz, zenith, up_t);
-    float sun_dot = saturate(dot(dir, params.sun_dir.xyz));
-    return max(base + params.sun_colour.xyz * (pow(sun_dot, 96.0) * 1.5), float3(0.0, 0.0, 0.0));
+    float2 fuv = clamp(0.5 * (float2(uc, vc) / max(ma, 1e-5) + 1.0), 0.002, 0.998);
+    uint w, h;
+    src_sky_env.GetDimensions(w, h);
+    float fw = float(w) / 3.0;
+    float fh = float(h) / 2.0;
+    uint col = face % 3u;
+    uint row = face / 3u;
+    float fx = float(col) * fw + fuv.x * (fw - 1.0);
+    float fy = float(row) * fh + fuv.y * (fh - 1.0);
+    int x0 = int(floor(fx));
+    int y0 = int(floor(fy));
+    int x1 = min(x0 + 1, int((col + 1u) * uint(fw)) - 1);
+    int y1 = min(y0 + 1, int((row + 1u) * uint(fh)) - 1);
+    float2 frac_xy = float2(fx - float(x0), fy - float(y0));
+    float3 c00 = src_sky_env.Load(int3(x0, y0, 0)).rgb;
+    float3 c10 = src_sky_env.Load(int3(x1, y0, 0)).rgb;
+    float3 c01 = src_sky_env.Load(int3(x0, y1, 0)).rgb;
+    float3 c11 = src_sky_env.Load(int3(x1, y1, 0)).rgb;
+    return max(lerp(lerp(c00, c10, frac_xy.x), lerp(c01, c11, frac_xy.x), frac_xy.y), float3(0.0, 0.0, 0.0));
+}
+
+// Phase 3: Reflection miss ALWAYS samples the real rendered SkyGpu + CloudGpu
+// environment target (analytic gradient removed from the miss path).
+float3 sample_sky_reflection(float3 dir) {
+    return sample_sky_env(dir);
 }
 
 float3 ggx_sample(float3 normal, float roughness, float u1, float u2) {

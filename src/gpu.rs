@@ -1759,6 +1759,9 @@ struct Renderer {
     raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester,
     /// Worst Raywatcher CPU frame time observed (ms), logged under `PWE_RT_DEBUG=1`.
     raywatcher_worst_frame_ms: f64,
+    /// Last frame's sky parameters and blend sets, reused by Raywatcher to
+    /// render the real `SkyGpu` + `CloudGpu` reflection environment atlas.
+    last_sky_frame: Option<(crate::sky_gpu::SkyFrame, (i32, i32, f32))>,
     /// This frame's ray plan, decided before the world pass and consumed after
     /// it. `Plan::OFF` on a frame the module is not tracing.
     raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan,
@@ -2536,6 +2539,7 @@ impl Renderer {
             raywatcher_scene: None,
             raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester::new(),
             raywatcher_worst_frame_ms: 0.0,
+            last_sky_frame: None,
             raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan::OFF,
             raywatcher_hw_probe: None,
             raywatcher_overrides: crate::modules::raywatcher::frame::RasterOverrides::NONE,
@@ -2933,6 +2937,7 @@ impl Renderer {
             },
             drift: self.sky_drift,
         };
+        self.last_sky_frame = Some((frame, main_sets));
         self.sky
             .update(&self.queue, direction, w, h, frame, main_sets, false);
         if camera.water_reflections {
@@ -4070,6 +4075,22 @@ impl Renderer {
         // Always snapshot the untouched 1:1 raster world target so both layered
         // mode and opt-in `replace_raster` anchor to real textures/geometry
         // (never coarse proxy boxes).
+        if let Some((sky_frame, sky_sets)) = self.last_sky_frame {
+            gpu.update_sky_env(
+                &self.device,
+                &self.queue,
+                encoder,
+                &self.sky,
+                self.cloud.as_ref(),
+                destination.format(),
+                sky_frame,
+                sky_sets,
+                camera.pos,
+                camera.cloud_detail,
+                crate::environment::daylight(camera.time_of_day),
+                camera.active_fog(),
+            );
+        }
         gpu.capture_raster(&self.device, encoder, destination);
         let mut active_water: Vec<crate::modules::raywatcher::harvest::WaterSurface> = self
             .water_batches
