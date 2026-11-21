@@ -69,6 +69,15 @@ impl DxrTracer {
         Err("DXR 1.1 hardware ray tracing requires Windows + DX12".into())
     }
 
+    pub fn copy_gbuf_inputs(
+        &mut self,
+        _encoder: &mut wgpu::CommandEncoder,
+        _src_pos: &wgpu::Texture,
+        _src_norm: &wgpu::Texture,
+        _src_raster: &wgpu::Texture,
+    ) {
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn trace(
         &mut self,
@@ -93,7 +102,8 @@ mod imp {
     use std::sync::Arc;
 
     use winapi::shared::dxgiformat::{
-        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_UNKNOWN,
+        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+        DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_UNKNOWN,
     };
     use winapi::shared::dxgitype::DXGI_SAMPLE_DESC;
     use winapi::shared::guiddef::GUID;
@@ -490,16 +500,21 @@ mod imp {
     }
 
     struct DxrTargets {
+        in_pos: NativeTexture2D,
+        in_norm: NativeTexture2D,
+        in_raster: NativeTexture2D,
         colour: NativeTexture2D,
         guide: NativeTexture2D,
         reflection: NativeTexture2D,
         normals: NativeTexture2D,
         albedo: NativeTexture2D,
         extent: (u32, u32),
-        /// True once `wgpu` has copied from the corresponding target, leaving
-        /// wgpu's DX12 state tracker expecting `D3D12_RESOURCE_STATE_COPY_SOURCE`
-        /// instead of the initial `D3D12_RESOURCE_STATE_COMMON`.
+        /// True once `wgpu` has copied from the corresponding output target,
+        /// leaving wgpu's DX12 state tracker expecting `COPY_SOURCE`.
         wgpu_tracked_copy_src: [bool; 5],
+        /// True once `wgpu` has copied into the G-buffer input targets,
+        /// leaving wgpu's DX12 state tracker expecting `COPY_DEST`.
+        wgpu_tracked_copy_dst: bool,
     }
 
     impl DxrTargets {
@@ -509,11 +524,54 @@ mod imp {
             extent: (u32, u32),
         ) -> Result<Self, String> {
             let (w, h) = (extent.0.max(1), extent.1.max(1));
+            let state = d12::D3D12_RESOURCE_STATE_COMMON;
+            let in_usage = wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING;
+            let in_pos = unsafe {
+                NativeTexture2D::create(
+                    device,
+                    raw_device,
+                    "raywatcher dxr in_pos",
+                    wgpu::TextureFormat::Rgba32Float,
+                    DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    (w, h),
+                    d12::D3D12_RESOURCE_FLAG_NONE,
+                    in_usage,
+                    state,
+                    false,
+                )?
+            };
+            let in_norm = unsafe {
+                NativeTexture2D::create(
+                    device,
+                    raw_device,
+                    "raywatcher dxr in_norm",
+                    GUIDE_FORMAT,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    (w, h),
+                    d12::D3D12_RESOURCE_FLAG_NONE,
+                    in_usage,
+                    state,
+                    false,
+                )?
+            };
+            let in_raster = unsafe {
+                NativeTexture2D::create(
+                    device,
+                    raw_device,
+                    "raywatcher dxr in_raster",
+                    COLOUR_FORMAT,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    (w, h),
+                    d12::D3D12_RESOURCE_FLAG_NONE,
+                    in_usage,
+                    state,
+                    false,
+                )?
+            };
             let flags = d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             let usage = wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::STORAGE_BINDING;
-            let state = d12::D3D12_RESOURCE_STATE_COMMON;
             let mk = |label: &str, fmt: wgpu::TextureFormat| unsafe {
                 NativeTexture2D::create(
                     device,
@@ -534,6 +592,9 @@ mod imp {
             let normals = mk("raywatcher dxr normals", GUIDE_FORMAT)?;
             let albedo = mk("raywatcher dxr albedo", COLOUR_FORMAT)?;
             Ok(Self {
+                in_pos,
+                in_norm,
+                in_raster,
                 colour,
                 guide,
                 reflection,
@@ -541,6 +602,7 @@ mod imp {
                 albedo,
                 extent: (w, h),
                 wgpu_tracked_copy_src: [false; 5],
+                wgpu_tracked_copy_dst: false,
             })
         }
     }
@@ -564,12 +626,15 @@ mod imp {
     // 0: t0 TLAS SRV
     // 1: t1 tris StructuredBuffer SRV
     // 2: t2 materials StructuredBuffer SRV
-    // 3: u0 out_colour UAV
-    // 4: u1 out_guide UAV
-    // 5: u2 out_reflection UAV
-    // 6: u3 out_normals UAV
-    // 7: u4 out_albedo UAV
-    const HEAP_SLOTS: u32 = 8;
+    // 3: t3 in_pos Texture2D SRV
+    // 4: t4 in_norm Texture2D SRV
+    // 5: t5 in_raster Texture2D SRV
+    // 6: u0 out_colour UAV
+    // 7: u1 out_guide UAV
+    // 8: u2 out_reflection UAV
+    // 9: u3 out_normals UAV
+    // 10: u4 out_albedo UAV
+    const HEAP_SLOTS: u32 = 11;
 
     impl Drop for DxrTracer {
         fn drop(&mut self) {
@@ -650,11 +715,11 @@ mod imp {
             String,
         > {
             // Root parameter 0: CBV at b0
-            // Root parameter 1: Descriptor table with 3 SRVs (t0..t2)
+            // Root parameter 1: Descriptor table with 6 SRVs (t0..t5)
             // Root parameter 2: Descriptor table with 5 UAVs (u0..u4)
             let srv_range = d12::D3D12_DESCRIPTOR_RANGE {
                 RangeType: d12::D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                NumDescriptors: 3,
+                NumDescriptors: 6,
                 BaseShaderRegister: 0,
                 RegisterSpace: 0,
                 OffsetInDescriptorsFromTableStart: 0,
@@ -1105,6 +1170,36 @@ mod imp {
         fn write_target_descriptors(&self) {
             unsafe {
                 let dev = self.raw_device.as_mut_ptr();
+                // Slots 3..5: t3..t5 G-buffer input Texture2D SRVs.
+                let in_specs = [
+                    (
+                        self.targets.in_pos.resource.as_mut_ptr(),
+                        DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    ),
+                    (
+                        self.targets.in_norm.resource.as_mut_ptr(),
+                        DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    ),
+                    (
+                        self.targets.in_raster.resource.as_mut_ptr(),
+                        DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    ),
+                ];
+                for (i, (res, fmt)) in in_specs.into_iter().enumerate() {
+                    let mut srv: d12::D3D12_SHADER_RESOURCE_VIEW_DESC = zeroed();
+                    srv.Format = fmt;
+                    srv.ViewDimension = d12::D3D12_SRV_DIMENSION_TEXTURE2D;
+                    srv.Shader4ComponentMapping = 0x0000_1688;
+                    *srv.u.Texture2D_mut() = d12::D3D12_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                        PlaneSlice: 0,
+                        ResourceMinLODClamp: 0.0,
+                    };
+                    (*dev).CreateShaderResourceView(res, &srv, self.cpu_handle(3 + i as u32));
+                }
+
+                // Slots 6..10: u0..u4 output Texture2D UAVs.
                 let mut uav: d12::D3D12_UNORDERED_ACCESS_VIEW_DESC = zeroed();
                 uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
                 uav.ViewDimension = d12::D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -1120,10 +1215,51 @@ mod imp {
                         res,
                         null_mut(),
                         &uav,
-                        self.cpu_handle(3 + i as u32),
+                        self.cpu_handle(6 + i as u32),
                     );
                 }
             }
+        }
+
+        /// Copy the wgpu-generated 1:1 depth-derived G-buffer planes into the
+        /// shared DX12 input textures. Call on `encoder` and submit `encoder`
+        /// to `queue` before calling [`Self::trace`].
+        pub fn copy_gbuf_inputs(
+            &mut self,
+            encoder: &mut wgpu::CommandEncoder,
+            src_pos: &wgpu::Texture,
+            src_norm: &wgpu::Texture,
+            src_raster: &wgpu::Texture,
+        ) {
+            let (tw, th) = self.targets.extent;
+            let pairs = [
+                (src_pos, &self.targets.in_pos.texture),
+                (src_norm, &self.targets.in_norm.texture),
+                (src_raster, &self.targets.in_raster.texture),
+            ];
+            for (src, dst) in pairs {
+                let copy_extent = wgpu::Extent3d {
+                    width: tw.min(src.width()).min(dst.width()),
+                    height: th.min(src.height()).min(dst.height()),
+                    depth_or_array_layers: 1,
+                };
+                encoder.copy_texture_to_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: src,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyTexture {
+                        texture: dst,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    copy_extent,
+                );
+            }
+            self.targets.wgpu_tracked_copy_dst = true;
         }
 
         pub fn set_scene(&mut self, scene: &Arc<SceneGeometry>) -> Result<(), String> {
@@ -1172,6 +1308,16 @@ mod imp {
                 self.cbvs[slot_idx].write_upload(bytemuck::bytes_of(params))?;
                 let list = self.ring.slot_mut(slot_idx).list.as_mut_ptr();
 
+                let in_resources = [
+                    self.targets.in_pos.resource.as_mut_ptr(),
+                    self.targets.in_norm.resource.as_mut_ptr(),
+                    self.targets.in_raster.resource.as_mut_ptr(),
+                ];
+                let in_wgpu_state = if self.targets.wgpu_tracked_copy_dst {
+                    d12::D3D12_RESOURCE_STATE_COPY_DEST
+                } else {
+                    d12::D3D12_RESOURCE_STATE_COMMON
+                };
                 let resources = [
                     self.targets.colour.resource.as_mut_ptr(),
                     self.targets.guide.resource.as_mut_ptr(),
@@ -1179,8 +1325,20 @@ mod imp {
                     self.targets.normals.resource.as_mut_ptr(),
                     self.targets.albedo.resource.as_mut_ptr(),
                 ];
-                let mut to_uav: [d12::D3D12_RESOURCE_BARRIER; 5] = zeroed();
-                for ((b, res), tracked) in to_uav
+                let mut pre_barriers: [d12::D3D12_RESOURCE_BARRIER; 8] = zeroed();
+                for (b, res) in pre_barriers[0..3]
+                    .iter_mut()
+                    .zip(in_resources.iter().copied())
+                {
+                    b.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    *b.u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: res,
+                        Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: in_wgpu_state,
+                        StateAfter: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    };
+                }
+                for ((b, res), tracked) in pre_barriers[3..8]
                     .iter_mut()
                     .zip(resources.iter().copied())
                     .zip(self.targets.wgpu_tracked_copy_src.iter().copied())
@@ -1197,7 +1355,7 @@ mod imp {
                         StateAfter: d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     };
                 }
-                (*list).ResourceBarrier(to_uav.len() as UINT, to_uav.as_ptr());
+                (*list).ResourceBarrier(pre_barriers.len() as UINT, pre_barriers.as_ptr());
 
                 let mut heaps = [self.desc_heap];
                 (*list).SetDescriptorHeaps(1, heaps.as_mut_ptr());
@@ -1205,11 +1363,23 @@ mod imp {
                 (*list).SetPipelineState(self.pso);
                 (*list).SetComputeRootConstantBufferView(0, self.cbvs[slot_idx].gpu_va);
                 (*list).SetComputeRootDescriptorTable(1, self.gpu_handle(0));
-                (*list).SetComputeRootDescriptorTable(2, self.gpu_handle(3));
+                (*list).SetComputeRootDescriptorTable(2, self.gpu_handle(6));
                 (*list).Dispatch(w.div_ceil(8), h.div_ceil(8), 1);
 
-                let mut to_wgpu: [d12::D3D12_RESOURCE_BARRIER; 5] = zeroed();
-                for ((b, res), tracked) in to_wgpu
+                let mut post_barriers: [d12::D3D12_RESOURCE_BARRIER; 8] = zeroed();
+                for (b, res) in post_barriers[0..3]
+                    .iter_mut()
+                    .zip(in_resources.iter().copied())
+                {
+                    b.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    *b.u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: res,
+                        Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        StateAfter: in_wgpu_state,
+                    };
+                }
+                for ((b, res), tracked) in post_barriers[3..8]
                     .iter_mut()
                     .zip(resources.iter().copied())
                     .zip(self.targets.wgpu_tracked_copy_src.iter().copied())
@@ -1229,7 +1399,7 @@ mod imp {
                         },
                     };
                 }
-                (*list).ResourceBarrier(to_wgpu.len() as UINT, to_wgpu.as_ptr());
+                (*list).ResourceBarrier(post_barriers.len() as UINT, post_barriers.as_ptr());
 
                 self.ring.retire(slot_idx, &self.raw_queue, "DXR-Trace")?;
             }

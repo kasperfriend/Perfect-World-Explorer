@@ -848,7 +848,7 @@ pub struct RtMeshTriangle {
 /// Hard per-page cap on retained CPU triangles so whole-world preloads across
 /// hundreds of pages stay within a few megabytes of RAM while near-camera
 /// buildings and props retain real mesh silhouettes for shadows & reflections.
-const MAX_RT_TRIS_PER_PAGE: usize = 512;
+const MAX_RT_TRIS_PER_PAGE: usize = 8192;
 
 fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32]) -> Vec<RtMeshTriangle> {
     let tri_count = indices.len() / 3;

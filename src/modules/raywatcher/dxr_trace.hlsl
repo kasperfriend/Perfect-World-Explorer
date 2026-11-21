@@ -1,8 +1,10 @@
 // DXR Tier 1.1 inline ray-tracing compute shader (`cs_6_5`).
 //
 // Runs directly on hardware RT cores (NVIDIA RTX, AMD RDNA2+, Intel Arc) via
-// `RayQuery`, matching `RAY_SHADER` in `gpu.rs` stage-for-stage so hardware and
-// software paths agree on lighting, shadows, reflections, AO, and GI.
+// `RayQuery`, anchored 1:1 to the raster world's depth-reconstructed world
+// position, depth-derived surface normal, and untouched raster colour so the
+// visible world is always the exact original game geometry (buildings, trees,
+// terrain, water, sky, effects) — never coarse proxy boxes.
 
 struct Params {
     column_major float4x4 inv_vp;
@@ -40,6 +42,13 @@ cbuffer ParamsBuffer : register(b0) {
 RaytracingAccelerationStructure scene_tlas : register(t0);
 StructuredBuffer<Tri> tris : register(t1);
 StructuredBuffer<Material> materials : register(t2);
+// 1:1 screen-space G-buffer derived from the raster world pass:
+// src_gbuf_pos:    .xyz world position P, .w linear distance from eye (0 = sky)
+// src_gbuf_norm:   .xyz world normal N,   .w surface roughness (0.06 water, 0.85 matte)
+// src_gbuf_raster: .rgb untouched raster colour at this pixel
+Texture2D<float4> src_gbuf_pos : register(t3);
+Texture2D<float4> src_gbuf_norm : register(t4);
+Texture2D<float4> src_gbuf_raster : register(t5);
 
 RWTexture2D<float4> out_colour : register(u0);
 RWTexture2D<float4> out_guide : register(u1);
@@ -84,10 +93,6 @@ float3 cone_direction(inout uint state, float3 axis, float radius) {
     float3 t = normalize(cross(up, axis));
     float3 b = cross(axis, t);
     return normalize(axis + (t * c_phi + b * s_phi) * spread);
-}
-
-float3 environment() {
-    return max(params.fog_colour.xyz, params.ambient.xyz * 0.85);
 }
 
 struct Hit {
@@ -149,238 +154,176 @@ Material material_of(uint tri_index) {
     return materials[mat_idx];
 }
 
-struct Surface {
-    float3 colour;
-    float light_factor;
-    float3 reflection;
-    float visibility;
-    float depth;
-    float reflection_distance;
-    float3 normal;
-    float roughness;
-    float3 albedo;
-};
-
-Surface shade(float3 origin, float3 dir, inout uint state) {
-    bool layered = params.effects.w > 0.5;
-    Surface surface;
-    surface.colour = float3(0.0, 0.0, 0.0);
-    surface.light_factor = 1.0;
-    surface.reflection = float3(0.0, 0.0, 0.0);
-    surface.visibility = 1.0;
-    surface.reflection_distance = params.lens.y;
-    surface.depth = params.lens.y;
-    surface.normal = float3(0.0, 1.0, 0.0);
-    surface.roughness = 1.0;
-    surface.albedo = float3(0.0, 0.0, 0.0);
-
-    Hit hit = closest_hit(origin, dir, params.effects.z, params.lens.y);
-    if (hit.index == 0xffffffffu) {
-        if (!layered) {
-            float fog_start = params.fog.x;
-            float fog_end = params.fog.y;
-            if (fog_end > fog_start && fog_start >= 0.0) {
-                surface.colour = params.fog_colour.xyz;
-            } else {
-                surface.colour = environment();
-            }
-        }
-        surface.depth = params.lens.y;
-        return surface;
-    }
-
-    float3 hit_point = origin + dir * hit.t;
-    Material mat = material_of(hit.index);
-    float3 albedo = mat.albedo.rgb;
-    float roughness = mat.surface.x;
-    surface.depth = hit.t;
-    surface.normal = hit.normal;
-    surface.roughness = roughness;
-    surface.albedo = albedo;
-
-    uint effects = uint(round(params.effects.y));
-    bool bits_shadows = (effects & 1u) != 0u;
-    bool bits_lighting = (effects & 2u) != 0u;
-    bool bits_reflections = (effects & 4u) != 0u;
-    bool bits_ao = (effects & 8u) != 0u;
-    bool bits_gi = (effects & 16u) != 0u;
-    float bias = params.effects.z;
-
-    float3 ray_origin = hit_point + hit.normal * bias;
-    float open = 1.0;
-    if (bits_ao) {
-        float3 up = abs(hit.normal.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
-        float3 t_axis = normalize(cross(up, hit.normal));
-        float3 b_axis = cross(hit.normal, t_axis);
-        uint hits = 0u;
-        uint spp = max(uint(params.frame.y), 1u);
-        uint ao_samples = max(2u, 4u / spp);
-        for (uint i = 0u; i < ao_samples; i = i + 1u) {
-            float u1 = rand01(state);
-            float u2 = rand01(state);
-            float r = sqrt(u1);
-            float s_phi, c_phi;
-            sincos(2.0 * PI * u2, s_phi, c_phi);
-            float z = sqrt(max(0.0, 1.0 - u1));
-            float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + hit.normal * z;
-            if (occluded(ray_origin, d, bias, params.fog.z)) {
-                hits = hits + 1u;
-            }
-        }
-        open = 1.0 - float(hits) / float(ao_samples);
-    }
-    surface.visibility = open;
-
-    // `params.sun_colour.xyz` already includes `sun.intensity`.
-    float n_dot_l = max(dot(hit.normal, params.sun_dir.xyz), 0.0);
-    float shadow = 1.0;
-    float3 direct = float3(0.0, 0.0, 0.0);
-    if ((bits_lighting || (layered && bits_shadows)) && n_dot_l > 0.0) {
-        if (bits_shadows) {
-            float3 shadow_dir = params.lens.z > 1e-4
-                ? cone_direction(state, params.sun_dir.xyz, params.lens.z)
-                : params.sun_dir.xyz;
-            if (occluded(ray_origin, shadow_dir, bias, params.lens.y)) {
-                shadow = 0.0;
-            }
-        }
-        if (bits_lighting) {
-            direct = params.sun_colour.xyz * (n_dot_l * shadow);
-        }
-    }
-    float3 ambient = params.ambient.xyz * (open * params.tuning.z);
-    float3 diffuse = albedo * (bits_lighting ? (direct + ambient) : ambient);
-    float3 gi_bounce = float3(0.0, 0.0, 0.0);
-
-    if (bits_reflections && roughness <= params.effects.x) {
-        float3 reflect_dir = reflect(dir, hit.normal);
-        Hit rhit = closest_hit(ray_origin, reflect_dir, bias, params.lens.y);
-        if (rhit.index != 0xffffffffu) {
-            Material rmat = material_of(rhit.index);
-            float3 lit = rmat.albedo.rgb * (params.ambient.xyz * params.tuning.z +
-                params.sun_colour.xyz * max(dot(rhit.normal, params.sun_dir.xyz), 0.0));
-            float f0 = 0.04 + 0.06 * (1.0 - roughness);
-            float m = 1.0 - saturate(dot(-dir, hit.normal));
-            float m2 = m * m;
-            float fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
-            surface.reflection = lit * fresnel;
-            surface.reflection_distance = rhit.t;
-        } else {
-            surface.reflection = environment() * 0.08;
-            surface.reflection_distance = params.lens.y;
-        }
-    }
-
-    if (bits_gi && params.frame.z >= 1.0 && params.tuning.w > 0.0) {
-        float3 bounce = float3(0.0, 0.0, 0.0);
-        float3 throughput = albedo;
-        float3 source = hit_point;
-        float3 normal = hit.normal;
-        uint bounces = uint(params.frame.z);
-        for (uint b = 0u; b < bounces; b = b + 1u) {
-            float3 d = cosine_hemisphere(state, normal);
-            Hit bhit = closest_hit(source + normal * bias, d, bias, params.lens.y);
-            if (bhit.index != 0xffffffffu) {
-                float3 bpoint = source + d * bhit.t;
-                Material bmat = material_of(bhit.index);
-                float3 incoming = bmat.albedo.rgb * (params.ambient.xyz * params.tuning.z +
-                    params.sun_colour.xyz * max(dot(bhit.normal, params.sun_dir.xyz), 0.0));
-                bounce = bounce + throughput * incoming;
-                throughput = throughput * bmat.albedo.rgb;
-                if (max(throughput.x, max(throughput.y, throughput.z)) < 1e-3) {
-                    break;
-                }
-                source = bpoint;
-                normal = bhit.normal;
-            } else {
-                bounce = bounce + throughput * environment();
-                break;
-            }
-        }
-        gi_bounce = bounce * params.tuning.w;
-        diffuse = diffuse + gi_bounce;
-    }
-
-    float fog_t = 0.0;
-    float fog_start = params.fog.x;
-    float fog_end = params.fog.y;
-    if (fog_end > fog_start && fog_start >= 0.0) {
-        fog_t = saturate((hit.t - fog_start) / (fog_end - fog_start));
-        diffuse = lerp(diffuse, params.fog_colour.xyz, fog_t);
-        surface.reflection *= (1.0 - fog_t);
-    }
-
-    if (layered) {
-        // Layered mode: modulate the full textured raster world by RT shadow
-        // and AO visibility (attenuated by fog so distant silhouettes stay
-        // consistent with raster fog), and output GI bounce as additive light.
-        float shadow_mod = 1.0;
-        if (bits_shadows && n_dot_l > 0.05) {
-            shadow_mod = lerp(0.45, 1.0, shadow);
-        }
-        float ao_mod = bits_ao ? lerp(0.65, 1.0, open) : 1.0;
-        surface.light_factor = lerp(shadow_mod * ao_mod, 1.0, fog_t);
-        surface.colour = gi_bounce * (0.25 * (1.0 - fog_t));
-    } else {
-        surface.colour = diffuse;
-        surface.light_factor = 1.0;
-    }
-    return surface;
-}
-
 [numthreads(8, 8, 1)]
 void trace_pass(uint3 id : SV_DispatchThreadID) {
     uint2 extent = uint2(uint(params.extents.x), uint(params.extents.y));
     if (id.x >= extent.x || id.y >= extent.y) {
         return;
     }
-    float2 grid = params.extents.xy;
+
+    float4 pos_d = src_gbuf_pos.Load(int3(id.xy, 0));
+    float dist = pos_d.w;
+    // Sky / background pixels (`dist <= 0`): skip all ray tracing so sky,
+    // clouds, and horizon fog pass through 100% untouched at zero RT cost.
+    if (dist <= 0.0) {
+        float3 sky_rgb = src_gbuf_raster.Load(int3(id.xy, 0)).rgb;
+        bool layered_sky = params.effects.w > 0.5;
+        out_colour[id.xy] = float4(layered_sky ? float3(0.0, 0.0, 0.0) : sky_rgb, 1.0);
+        out_guide[id.xy] = float4(1.0, 1.0, 0.0, 0.0);
+        out_reflection[id.xy] = float4(0.0, 0.0, 0.0, 1.0);
+        out_normals[id.xy] = float4(0.0, 1.0, 0.0, 1.0);
+        out_albedo[id.xy] = float4(0.0, 0.0, 0.0, 0.04);
+        return;
+    }
+
+    float3 point = pos_d.xyz;
+    float4 norm_r = src_gbuf_norm.Load(int3(id.xy, 0));
+    float3 normal = norm_r.xyz;
+    float nlen = length(normal);
+    normal = nlen > 1e-4 ? (normal / nlen) : float3(0.0, 1.0, 0.0);
+    float roughness = clamp(norm_r.w, 0.04, 1.0);
+    float3 raster_rgb = src_gbuf_raster.Load(int3(id.xy, 0)).rgb;
+    float3 view_dir = normalize(point - params.eye.xyz);
+
+    bool layered = params.effects.w > 0.5;
+    uint effects = uint(round(params.effects.y));
+    bool bits_shadows = (effects & 1u) != 0u;
+    bool bits_lighting = (effects & 2u) != 0u;
+    bool bits_reflections = (effects & 4u) != 0u;
+    bool bits_ao = (effects & 8u) != 0u;
+    bool bits_gi = (effects & 16u) != 0u;
+
+    // Distance-scaled bias prevents self-intersection between the exact 1:1
+    // raster depth surface and the BVH/BLAS geometry at all view distances.
+    float bias = max(params.effects.z, max(0.15, dist * 0.003));
+    float3 ray_origin = point + normal * bias - view_dir * (bias * 0.35);
+    float n_dot_l = max(dot(normal, params.sun_dir.xyz), 0.0);
+
+    float fog_t = 0.0;
+    float fog_start = params.fog.x;
+    float fog_end = params.fog.y;
+    if (fog_end > fog_start && fog_start >= 0.0) {
+        fog_t = saturate((dist - fog_start) / (fog_end - fog_start));
+    }
+
     uint samples = max(uint(params.frame.y), 1u);
-    float3 accum = float3(0.0, 0.0, 0.0);
-    float accum_light_factor = 0.0;
-    float3 accum_reflection = float3(0.0, 0.0, 0.0);
-    float accum_visibility = 0.0;
-    float accum_depth = 0.0;
-    float accum_reflection_distance = 0.0;
-    float3 accum_normal = float3(0.0, 0.0, 0.0);
-    float accum_roughness = 0.0;
-    float3 accum_albedo = float3(0.0, 0.0, 0.0);
     uint state = id.x * 0x9e3779b9u ^ id.y * 0x85ebca6bu ^ uint(params.frame.x) * 0xc2b2ae35u;
 
+    float accum_shadow = 0.0;
+    float accum_open = 0.0;
+    float3 accum_reflection = float3(0.0, 0.0, 0.0);
+    float accum_refl_dist = 0.0;
+    float3 accum_gi = float3(0.0, 0.0, 0.0);
+
+    // Short-range contact AO radius (4..6 world units) for crisp crevice
+    // darkening without tracing expensive 100+ unit occlusion rays.
+    float ao_radius = clamp(params.fog.z, 2.0, 6.0);
+    uint ao_samples = samples > 1u ? 1u : 2u;
+
+    float3 up = abs(normal.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 t_axis = normalize(cross(up, normal));
+    float3 b_axis = cross(normal, t_axis);
+
     for (uint s = 0u; s < samples; s = s + 1u) {
-        float2 offset = float2(0.0, 0.0);
-        if (samples > 1u) {
-            float n = float(samples);
-            offset = float2((float(s) + 0.5) / n - 0.5, (float(s % 2u) + 0.5) / 2.0 - 0.5) * 0.4;
+        // 1. Real RT sun shadows (soft penumbra within sun angular disc).
+        float shadow = 1.0;
+        if (bits_shadows && n_dot_l > 0.02) {
+            float3 shadow_dir = params.lens.z > 1e-4
+                ? cone_direction(state, params.sun_dir.xyz, params.lens.z)
+                : params.sun_dir.xyz;
+            if (occluded(ray_origin, shadow_dir, bias * 0.5, params.lens.y)) {
+                shadow = 0.0;
+            }
         }
-        float2 pixel = float2(float(id.x) + 0.5, float(id.y) + 0.5) + offset + params.tuning.xy;
-        float2 ndc = float2(pixel.x / grid.x * 2.0 - 1.0, 1.0 - pixel.y / grid.y * 2.0);
-        float4 far_p = mul(params.inv_vp, float4(ndc, 0.0, 1.0));
-        float4 near_p = far_p + float4(params.inv_vp[0].z, params.inv_vp[1].z, params.inv_vp[2].z, params.inv_vp[3].z);
-        float3 dir = normalize(far_p.xyz / far_p.w - near_p.xyz / near_p.w);
-        Surface surface = shade(params.eye.xyz, dir, state);
-        accum += surface.colour;
-        accum_light_factor += surface.light_factor;
-        accum_reflection += surface.reflection;
-        accum_visibility += surface.visibility;
-        accum_depth += surface.depth;
-        accum_reflection_distance += surface.reflection_distance;
-        accum_normal += surface.normal;
-        accum_roughness += surface.roughness;
-        accum_albedo += surface.albedo;
+        accum_shadow += shadow;
+
+        // 2. Short-range contact ambient occlusion.
+        float open = 1.0;
+        if (bits_ao) {
+            uint hits = 0u;
+            for (uint i = 0u; i < ao_samples; i = i + 1u) {
+                float u1 = rand01(state);
+                float u2 = rand01(state);
+                float r = sqrt(u1);
+                float s_phi, c_phi;
+                sincos(2.0 * PI * u2, s_phi, c_phi);
+                float z = sqrt(max(0.0, 1.0 - u1));
+                float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + normal * z;
+                if (occluded(ray_origin, d, bias * 0.5, ao_radius)) {
+                    hits = hits + 1u;
+                }
+            }
+            open = 1.0 - float(hits) / float(ao_samples);
+        }
+        accum_open += open;
+
+        // 3. Crisp RT reflections on water / glossy surfaces (geometry hits
+        //    only — sky misses emit 0 so raster sky reflections stay clean).
+        float refl_dist = params.lens.y;
+        if (bits_reflections && roughness <= params.effects.x) {
+            float3 reflect_dir = reflect(view_dir, normal);
+            Hit rhit = closest_hit(ray_origin, reflect_dir, bias, params.lens.y);
+            if (rhit.index != 0xffffffffu) {
+                Material rmat = material_of(rhit.index);
+                float r_ndl = max(dot(rhit.normal, params.sun_dir.xyz), 0.0);
+                float3 lit = rmat.albedo.rgb * (params.ambient.xyz * params.tuning.z +
+                    params.sun_colour.xyz * r_ndl);
+                float f0 = 0.04 + 0.16 * (1.0 - roughness);
+                float m = 1.0 - saturate(dot(-view_dir, normal));
+                float m2 = m * m;
+                float fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
+                accum_reflection += lit * fresnel * (1.0 - fog_t);
+                refl_dist = rhit.t;
+            }
+        }
+        accum_refl_dist += refl_dist;
+
+        // 4. Local colored indirect GI bounce (geometry hits ONLY — sky escape
+        //    emits 0 so it never adds a white/sky veil over the raster world).
+        if (bits_gi && params.frame.z >= 1.0 && params.tuning.w > 0.0) {
+            float3 d = cosine_hemisphere(state, normal);
+            Hit bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 48.0));
+            if (bhit.index != 0xffffffffu) {
+                Material bmat = material_of(bhit.index);
+                float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
+                if (b_ndl > 0.01) {
+                    float3 incoming = bmat.albedo.rgb * params.sun_colour.xyz * b_ndl;
+                    accum_gi += raster_rgb * incoming * (params.tuning.w * 0.30 * (1.0 - fog_t));
+                }
+            }
+        }
     }
 
     float inv = 1.0 / float(samples);
-    float3 avg_n = accum_normal * inv;
-    float n_len = length(avg_n);
-    avg_n = n_len > 1e-4 ? (avg_n / n_len) : float3(0.0, 1.0, 0.0);
-    float avg_rough = clamp(accum_roughness * inv, 0.02, 1.0);
-    float3 avg_albedo = accum_albedo * inv;
-    float spec_f0 = 0.04 + 0.06 * (1.0 - avg_rough);
+    float avg_shadow = accum_shadow * inv;
+    float avg_open = accum_open * inv;
+    float3 avg_refl = accum_reflection * inv;
+    float avg_refl_dist = accum_refl_dist * inv;
+    float3 avg_gi = accum_gi * inv;
 
-    out_colour[id.xy] = float4(accum * inv, accum_light_factor * inv);
-    out_guide[id.xy] = float4(accum_visibility * inv, (accum_depth * inv) / params.lens.y, 0.0, 0.0);
-    out_reflection[id.xy] = float4(accum_reflection * inv, (accum_reflection_distance * inv) / params.lens.y);
-    out_normals[id.xy] = float4(avg_n, avg_rough);
-    out_albedo[id.xy] = float4(avg_albedo, spec_f0);
+    float3 out_rgb;
+    float out_lf;
+    if (layered) {
+        // Modulate the 1:1 raster world by RT sun shadow and contact AO
+        // (attenuated smoothly into raster fog), plus colored GI bounce.
+        float shadow_mod = (bits_shadows && n_dot_l > 0.02) ? lerp(0.30, 1.0, avg_shadow) : 1.0;
+        float ao_mod = bits_ao ? lerp(0.58, 1.0, avg_open) : 1.0;
+        out_lf = lerp(shadow_mod * ao_mod, 1.0, fog_t);
+        out_rgb = avg_gi;
+    } else {
+        // Opt-in replace_raster mode: keep 1:1 raster world textures/albedo
+        // instead of low-poly proxy boxes, relit purely by RT sun + RT ambient.
+        float3 direct = bits_lighting ? (params.sun_colour.xyz * (n_dot_l * avg_shadow)) : float3(0.0, 0.0, 0.0);
+        float3 ambient = params.ambient.xyz * (avg_open * params.tuning.z);
+        float3 relit = raster_rgb * (direct + ambient) + avg_gi;
+        out_rgb = lerp(relit, params.fog_colour.xyz, fog_t);
+        out_lf = 1.0;
+    }
+
+    float spec_f0 = 0.04 + 0.16 * (1.0 - roughness);
+    out_colour[id.xy] = float4(out_rgb, out_lf);
+    out_guide[id.xy] = float4(avg_open, dist / params.lens.y, 0.0, 0.0);
+    out_reflection[id.xy] = float4(avg_refl, avg_refl_dist / params.lens.y);
+    out_normals[id.xy] = float4(normal, roughness);
+    out_albedo[id.xy] = float4(raster_rgb, spec_f0);
 }

@@ -3790,13 +3790,13 @@ impl Renderer {
             use crate::modules::raywatcher::harvest::{
                 Frustum, InstanceProxy, MeshTriangle, WaterSurface,
             };
-            let frustum = Frustum::from_view_projection(matrix);
-            let detail_radius = config.radius.max(128.0) * 1.5;
+            let _ = Frustum::from_view_projection(matrix);
+            let detail_radius = config.radius.max(128.0) * 2.0;
             let detail_radius_sq = detail_radius * detail_radius;
 
-            // Real mesh triangles from resident scenery pages near the camera
-            // so near buildings, bridges and props cast exact mesh shadows and
-            // match baked surface colours in reflections.
+            // Real mesh triangles from ALL resident scenery pages within 360
+            // degrees around the camera so buildings behind or beside the view
+            // still cast accurate mesh shadows onto the 1:1 raster world.
             let mut real_meshes = Vec::new();
             let pages_iter = if self.world_done {
                 self.world_pages.iter()
@@ -3811,9 +3811,6 @@ impl Renderer {
                 let half = (bmax - bmin) * 0.5;
                 let dist_sq = (camera.pos - center).abs().max(half).distance_squared(half);
                 if dist_sq > detail_radius_sq {
-                    continue;
-                }
-                if !frustum.intersects_aabb(bmin, bmax) {
                     continue;
                 }
                 for t in page.rt_triangles() {
@@ -3988,11 +3985,25 @@ impl Renderer {
         let hardware_mode = self.modules.raywatcher().effective_mode()
             == crate::modules::raywatcher::plan::RayTracingMode::Hardware;
         let layered = !plan.replace_raster;
-        if layered {
-            // Snapshot the untouched full raster world target before tracing or
-            // DLSS RR so the RT lighting layer composites cleanly on top of it.
-            gpu.capture_raster(&self.device, encoder, destination);
-        }
+        // Always snapshot the untouched 1:1 raster world target so both layered
+        // mode and opt-in `replace_raster` anchor to real textures/geometry
+        // (never coarse proxy boxes).
+        gpu.capture_raster(&self.device, encoder, destination);
+        let mut active_water: Vec<crate::modules::raywatcher::harvest::WaterSurface> = self
+            .water_batches
+            .iter()
+            .map(|w| crate::modules::raywatcher::harvest::WaterSurface {
+                bounds: w.bounds,
+                height: w.height,
+            })
+            .collect();
+        active_water.sort_by(|a, b| {
+            let da = ((a.bounds[0] + a.bounds[1]) * 0.5 - camera.pos.x).powi(2)
+                + ((a.bounds[2] + a.bounds[3]) * 0.5 - camera.pos.z).powi(2);
+            let db = ((b.bounds[0] + b.bounds[1]) * 0.5 - camera.pos.x).powi(2)
+                + ((b.bounds[2] + b.bounds[3]) * 0.5 - camera.pos.z).powi(2);
+            da.total_cmp(&db)
+        });
         gpu.record(
             &self.device,
             &self.queue,
@@ -4004,6 +4015,7 @@ impl Renderer {
             &denoise,
             &self.object_mv,
             &self.depth,
+            &active_water,
         );
         let mut dlss_rr_ran = false;
         if plan.reconstruction

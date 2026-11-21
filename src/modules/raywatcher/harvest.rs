@@ -705,19 +705,19 @@ pub fn proxy_from_box(centre: Vec3, half: Vec3, matrix: &Mat4, albedo: [f32; 3])
 fn frustum_signature(
     config: HarvestConfig,
     eye: Vec3,
-    view_forward: Vec3,
+    _view_forward: Vec3,
     view_distance: f32,
     terrain_generation: u64,
     content_hash: u64,
 ) -> Signature {
-    let snap = (config.chunk_size.max(32.0) / 8.0).max(8.0);
+    // Snap to 64-unit steps and omit camera yaw/pitch: the harvested BVH/BLAS
+    // covers 360 degrees around the camera out to `view_distance`, so rotating
+    // the camera never triggers a CPU BVH or DXR BLAS rebuild stall, and
+    // buildings behind the camera still cast shadows into the view.
+    let snap = (config.chunk_size.max(64.0) / 4.0).max(32.0);
     let anchor = ((eye.x / snap).round() as i32, (eye.z / snap).round() as i32);
-    // Quantise yaw/pitch to ~15-degree buckets so small camera turns reuse the
-    // cached BVH/BLAS without rebuilding every frame.
-    let fwd = view_forward.normalize_or_zero();
-    let yaw_bucket = ((fwd.z.atan2(fwd.x) / (std::f32::consts::PI / 12.0)).round() as i32) as u64;
-    let far_bucket = ((view_distance / 64.0).round() as u32) as u64;
-    let frustum_key = (yaw_bucket & 0xffff) | ((far_bucket & 0xffff) << 16) | (1u64 << 63);
+    let far_bucket = ((view_distance / 128.0).round() as u32) as u64;
+    let frustum_key = (far_bucket & 0xffff) | (1u64 << 63);
     Signature {
         config,
         anchor,
@@ -790,9 +790,7 @@ fn push_water(
         if dx * dx + dz * dz > far_sq {
             continue;
         }
-        if !frustum.intersects_aabb(min, max) {
-            continue;
-        }
+        let _ = (frustum, min, max);
         let mat_id = *water_mat.get_or_insert_with(|| {
             let id = materials.len() as u32;
             materials.push(RayMaterial {
@@ -850,13 +848,7 @@ fn push_instances_chunked(
         if dist_sq > far_sq {
             continue;
         }
-        // Keep everything inside the near shadow ring so objects just behind
-        // the camera still cast shadows into the view; frustum-cull beyond it.
-        if dist_sq > near_ring_sq
-            && !frustum.intersects_aabb(inst.centre - inst.half, inst.centre + inst.half)
-        {
-            continue;
-        }
+        let _ = (near_ring_sq, frustum);
         let cx = (inst.centre.x / chunk).floor() as i32;
         let cz = (inst.centre.z / chunk).floor() as i32;
         chunks
@@ -960,27 +952,20 @@ fn push_terrain_frustum(
             if dist > far {
                 continue;
             }
-            // Keep chunks inside the near shadow ring regardless of camera
-            // direction; frustum-cull chunks beyond it (generous Y bounds so
-            // hills and valleys never clip prematurely).
-            if dist > near_r {
-                let cmin = Vec3::new(x0, eye.y - 512.0, z0);
-                let cmax = Vec3::new(x1, eye.y + 512.0, z1);
-                if !frustum.intersects_aabb(cmin, cmax) {
-                    continue;
-                }
-            }
-            // Pick LOD grid divisions per chunk based on distance from eye.
+            let _ = frustum;
+            // Pick compact 360-degree LOD divisions per chunk based on distance
+            // from eye so the full view distance is covered in every direction
+            // without camera-rotation rebuild stalls.
             let target_step = if dist <= near_r {
-                fine_step
-            } else if dist <= mid_r {
                 fine_step * 2.0
-            } else if dist <= far_r {
+            } else if dist <= mid_r {
                 fine_step * 4.0
-            } else {
+            } else if dist <= far_r {
                 fine_step * 8.0
+            } else {
+                fine_step * 16.0
             };
-            let divs = ((chunk_size / target_step).round() as u32).clamp(2, 32);
+            let divs = ((chunk_size / target_step).round() as u32).clamp(2, 20);
             let step = chunk_size / divs as f32;
             let side = (divs + 1) as usize;
             let mut heights = Vec::with_capacity(side * side);
@@ -1264,6 +1249,36 @@ mod tests {
         assert!(scene
             .closest_hit(Vec3::new(0.0, 20.0, 590.0), Vec3::NEG_Y, 0.01, 30.0)
             .is_none());
+    }
+
+    #[test]
+    fn rotating_camera_reuses_cached_bvh_without_rebuilding() {
+        let mut harvester = Harvester::new();
+        let config = HarvestConfig::default();
+        let eye = Vec3::new(10.0, 20.0, 10.0);
+        let vp_north = Mat4::perspective_rh(60f32.to_radians(), 16.0 / 9.0, 1000.0, 0.5)
+            * Mat4::look_to_rh(eye, Vec3::NEG_Z, Vec3::Y);
+        let ground = |_: f32, _: f32| 0.0f32;
+        let first = harvester.scene_frustum(
+            config,
+            eye,
+            Vec3::NEG_Z,
+            vp_north,
+            1000.0,
+            2.0,
+            1,
+            42,
+            Some(&ground),
+            &[],
+            &[],
+            &[],
+        );
+        // Rotating 180 degrees at the same position must be a cache hit so
+        // looking around never triggers a CPU BVH or DXR BLAS rebuild stall.
+        let cached = harvester
+            .cached_if_unchanged_frustum(config, eye, Vec3::Z, 1000.0, 1, 42)
+            .expect("rotating the camera must hit the 360-degree BVH cache");
+        assert!(std::sync::Arc::ptr_eq(&first, &cached));
     }
 
     #[test]

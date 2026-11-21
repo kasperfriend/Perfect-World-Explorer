@@ -131,7 +131,7 @@ impl RayParams {
                 config.bias,
                 if plan.replace_raster { 0. } else { 1. },
             ],
-            fog: [fog.0, fog.1, (params.far * 0.05).clamp(2., 120.), 0.],
+            fog: [fog.0, fog.1, 5.0, 0.],
             counts: [counts[0] as f32, counts[1] as f32, counts[2] as f32, 0.],
         }
     }
@@ -192,6 +192,160 @@ pub struct SceneCounts {
     pub _pad: u32,
 }
 
+/// Uniform parameters for [`GBUF_PREP_SHADER`]: reconstructs 1:1 world
+/// position, depth-derived surface normal, water roughness, and raster colour
+/// at ray-grid resolution before tracing.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GbufPrepParams {
+    pub inv_view_projection: [[f32; 4]; 4],
+    pub eye: [f32; 4],
+    /// `x` grid_w, `y` grid_h, `z` render_w, `w` render_h.
+    pub extents: [f32; 4],
+    /// `x` water_count (0..=16).
+    pub water_count: [f32; 4],
+    /// Up to 16 active water planes: `[min_x, max_x, min_z, max_z]`.
+    pub water_planes: [[f32; 4]; 16],
+    /// Packed water heights for the 16 planes (4 per vec4).
+    pub water_heights: [[f32; 4]; 4],
+}
+
+impl GbufPrepParams {
+    pub fn pack(
+        params: &FrameParams,
+        grid: (u32, u32),
+        render: (u32, u32),
+        water: &[super::harvest::WaterSurface],
+    ) -> Self {
+        let mut planes = [[0.0f32; 4]; 16];
+        let mut heights = [[0.0f32; 4]; 4];
+        let count = water.len().min(16);
+        for (i, w) in water.iter().take(count).enumerate() {
+            planes[i] = w.bounds;
+            heights[i / 4][i % 4] = w.height;
+        }
+        Self {
+            inv_view_projection: params.inv_view_projection.to_cols_array_2d(),
+            eye: params.eye.extend(1.0).to_array(),
+            extents: [
+                grid.0.max(1) as f32,
+                grid.1.max(1) as f32,
+                render.0.max(1) as f32,
+                render.1.max(1) as f32,
+            ],
+            water_count: [count as f32, 0.0, 0.0, 0.0],
+            water_planes: planes,
+            water_heights: heights,
+        }
+    }
+}
+
+/// 1:1 raster G-buffer prep shader: reads the full-resolution reversed-Z depth
+/// buffer and untouched raster colour buffer, reconstructs exact world-space
+/// position and edge-preserving surface normals, and tags water pixels for
+/// crisp ray-traced reflections.
+pub const GBUF_PREP_SHADER: &str = r#"
+struct PrepParams {
+    inv_vp: mat4x4<f32>,
+    eye: vec4<f32>,
+    extents: vec4<f32>,
+    water_count: vec4<f32>,
+    water_planes: array<vec4<f32>, 16>,
+    water_heights: array<vec4<f32>, 4>,
+};
+
+@group(0) @binding(0) var<uniform> prep: PrepParams;
+@group(0) @binding(1) var src_depth: texture_depth_2d;
+@group(0) @binding(2) var src_raster: texture_2d<f32>;
+@group(0) @binding(3) var out_pos: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(4) var out_norm: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(5) var out_raster: texture_storage_2d<rgba16float, write>;
+
+fn reconstruct_pos(px: vec2<i32>, z: f32, render: vec2<f32>) -> vec3<f32> {
+    let uv = (vec2<f32>(px) + vec2<f32>(0.5)) / render;
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let clip = prep.inv_vp * vec4<f32>(ndc, z, 1.0);
+    return clip.xyz / clip.w;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
+    let gw = u32(prep.extents.x);
+    let gh = u32(prep.extents.y);
+    if (id.x >= gw || id.y >= gh) {
+        return;
+    }
+    let grid = prep.extents.xy;
+    let render = prep.extents.zw;
+    let rmax = vec2<i32>(i32(render.x) - 1, i32(render.y) - 1);
+    let px = vec2<i32>(clamp((vec2<f32>(id.xy) + vec2<f32>(0.5)) / grid * render, vec2<f32>(0.0), render - vec2<f32>(1.0)));
+
+    let z = textureLoad(src_depth, px, 0);
+    let raster_rgb = textureLoad(src_raster, px, 0).rgb;
+
+    if (z <= 1e-6) {
+        textureStore(out_pos, vec2<i32>(id.xy), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+        textureStore(out_norm, vec2<i32>(id.xy), vec4<f32>(0.0, 1.0, 0.0, 1.0));
+        textureStore(out_raster, vec2<i32>(id.xy), vec4<f32>(raster_rgb, 1.0));
+        return;
+    }
+
+    let p = reconstruct_pos(px, z, render);
+    let dist = length(p - prep.eye.xyz);
+    let view_dir = normalize(p - prep.eye.xyz);
+
+    let px_l = clamp(px + vec2<i32>(-1, 0), vec2<i32>(0), rmax);
+    let px_r = clamp(px + vec2<i32>(1, 0), vec2<i32>(0), rmax);
+    let px_u = clamp(px + vec2<i32>(0, -1), vec2<i32>(0), rmax);
+    let px_d = clamp(px + vec2<i32>(0, 1), vec2<i32>(0), rmax);
+
+    let z_l = textureLoad(src_depth, px_l, 0);
+    let z_r = textureLoad(src_depth, px_r, 0);
+    let z_u = textureLoad(src_depth, px_u, 0);
+    let z_d = textureLoad(src_depth, px_d, 0);
+
+    var dpdx = vec3<f32>(1.0, 0.0, 0.0);
+    if (abs(z_r - z) < abs(z_l - z) && z_r > 1e-6) {
+        dpdx = reconstruct_pos(px_r, z_r, render) - p;
+    } else if (z_l > 1e-6) {
+        dpdx = p - reconstruct_pos(px_l, z_l, render);
+    }
+
+    var dpdy = vec3<f32>(0.0, 0.0, 1.0);
+    if (abs(z_d - z) < abs(z_u - z) && z_d > 1e-6) {
+        dpdy = reconstruct_pos(px_d, z_d, render) - p;
+    } else if (z_u > 1e-6) {
+        dpdy = p - reconstruct_pos(px_u, z_u, render);
+    }
+
+    let raw_n = cross(dpdy, dpdx);
+    var n = select(vec3<f32>(0.0, 1.0, 0.0), normalize(raw_n), length(raw_n) > 1e-6);
+    if (dot(n, view_dir) > 0.0) {
+        n = -n;
+    }
+
+    var roughness = 0.85;
+    let wc = min(u32(prep.water_count.x), 16u);
+    if (n.y > 0.85) {
+        for (var wi = 0u; wi < wc; wi = wi + 1u) {
+            let wb = prep.water_planes[wi];
+            let wh = prep.water_heights[wi / 4u][wi % 4u];
+            if (p.x >= wb.x - 1.0 && p.x <= wb.y + 1.0 &&
+                p.z >= wb.z - 1.0 && p.z <= wb.w + 1.0 &&
+                abs(p.y - wh) < 0.65) {
+                roughness = 0.06;
+                n = vec3<f32>(0.0, 1.0, 0.0);
+                break;
+            }
+        }
+    }
+
+    textureStore(out_pos, vec2<i32>(id.xy), vec4<f32>(p, dist));
+    textureStore(out_norm, vec2<i32>(id.xy), vec4<f32>(n, roughness));
+    textureStore(out_raster, vec2<i32>(id.xy), vec4<f32>(raster_rgb, 1.0));
+}
+"#;
+
 /// The trace shader.
 ///
 /// The traversal is an explicit-stack closest-hit walk; the shading follows
@@ -248,6 +402,10 @@ struct Material {
 @group(0) @binding(8) var out_normals: texture_storage_2d<rgba16float, write>;
 // rgb diffuse albedo, a specular F0.
 @group(0) @binding(9) var out_albedo: texture_storage_2d<rgba16float, write>;
+// 1:1 raster-derived G-buffer (world position+dist, world normal+roughness, raster rgb).
+@group(0) @binding(10) var src_gbuf_pos: texture_2d<f32>;
+@group(0) @binding(11) var src_gbuf_norm: texture_2d<f32>;
+@group(0) @binding(12) var src_gbuf_raster: texture_2d<f32>;
 
 const PI: f32 = 3.14159265;
 
@@ -458,52 +616,33 @@ fn material_of(index: u32) -> Material {
     return materials[mat_idx];
 }
 
-struct Surface {
-    colour: vec3<f32>,
-    light_factor: f32,
-    reflection: vec3<f32>,
-    visibility: f32,
-    depth: f32,
-    reflection_distance: f32,
-    normal: vec3<f32>,
-    roughness: f32,
-    albedo: vec3<f32>,
-};
-
-fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surface {
-    let layered = params.effects.w > 0.5;
-    var surface: Surface;
-    surface.colour = vec3<f32>(0.0);
-    surface.light_factor = 1.0;
-    surface.reflection = vec3<f32>(0.0);
-    surface.visibility = 1.0;
-    surface.reflection_distance = params.lens.y;
-    surface.depth = params.lens.y;
-    surface.normal = vec3<f32>(0.0, 1.0, 0.0);
-    surface.roughness = 1.0;
-    surface.albedo = vec3<f32>(0.0);
-    let hit = closest_hit(origin, dir, params.effects.z, params.lens.y);
-    if (hit.index == 0xffffffffu) {
-        if (!layered) {
-            let fog_start = params.fog.x;
-            let fog_end = params.fog.y;
-            if (fog_end > fog_start && fog_start >= 0.0) {
-                surface.colour = params.fog_colour.xyz;
-            } else {
-                surface.colour = environment();
-            }
-        }
-        surface.depth = params.lens.y;
-        return surface;
+@compute @workgroup_size(8, 8, 1)
+fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
+    let extent = vec2<u32>(u32(params.extents.x), u32(params.extents.y));
+    if (id.x >= extent.x || id.y >= extent.y) {
+        return;
     }
-    let point = origin + dir * hit.t;
-    let material = material_of(hit.index);
-    let albedo = material.albedo.rgb;
-    let roughness = material.surface.x;
-    surface.depth = hit.t;
-    surface.normal = hit.normal;
-    surface.roughness = roughness;
-    surface.albedo = albedo;
+    let ip = vec2<i32>(id.xy);
+    let pos_d = textureLoad(src_gbuf_pos, ip, 0);
+    let dist = pos_d.w;
+    let layered = params.effects.w > 0.5;
+    if (dist <= 0.0) {
+        let sky_rgb = textureLoad(src_gbuf_raster, ip, 0).rgb;
+        textureStore(out_colour, ip, vec4<f32>(select(sky_rgb, vec3<f32>(0.0), layered), 1.0));
+        textureStore(out_guide, ip, vec4<f32>(1.0, 1.0, 0.0, 0.0));
+        textureStore(out_reflection, ip, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        textureStore(out_normals, ip, vec4<f32>(0.0, 1.0, 0.0, 1.0));
+        textureStore(out_albedo, ip, vec4<f32>(0.0, 0.0, 0.0, 0.04));
+        return;
+    }
+
+    let point = pos_d.xyz;
+    let norm_r = textureLoad(src_gbuf_norm, ip, 0);
+    let raw_n = norm_r.xyz;
+    let normal = select(vec3<f32>(0.0, 1.0, 0.0), normalize(raw_n), length(raw_n) > 1e-4);
+    let roughness = clamp(norm_r.w, 0.04, 1.0);
+    let raster_rgb = textureLoad(src_gbuf_raster, ip, 0).rgb;
+    let view_dir = normalize(point - params.eye.xyz);
 
     let effects = u32(round(params.effects.y));
     let bits_shadows = (effects & 1u) != 0u;
@@ -511,179 +650,120 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
     let bits_reflections = (effects & 4u) != 0u;
     let bits_ao = (effects & 8u) != 0u;
     let bits_gi = (effects & 16u) != 0u;
-    let bias = params.effects.z;
 
-    // Occlusion: a hemisphere fan with hoisted orthonormal basis.
-    let ray_origin = point + hit.normal * bias;
-    var open = 1.0;
-    if (bits_ao) {
-        let onb = orthonormal_basis(hit.normal);
-        var hits = 0u;
-        let spp = max(u32(params.frame.y), 1u);
-        let ao_samples = max(2u, 4u / spp);
-        for (var i = 0u; i < ao_samples; i = i + 1u) {
-            let u1 = next_f32(state);
-            let r = sqrt(u1);
-            let phi = next_f32(state) * 2.0 * PI;
-            let x = r * cos(phi);
-            let y = r * sin(phi);
-            let z = sqrt(max(1.0 - u1, 0.0));
-            let d = onb * vec3<f32>(x, y, z);
-            if (occluded(ray_origin, d, bias, params.fog.z)) {
-                hits = hits + 1u;
-            }
-        }
-        open = 1.0 - f32(hits) / f32(ao_samples);
-    }
-    surface.visibility = open;
+    let bias = max(params.effects.z, max(0.15, dist * 0.003));
+    let ray_origin = point + normal * bias - view_dir * (bias * 0.35);
+    let n_dot_l = max(dot(normal, params.sun_dir.xyz), 0.0);
 
-    // Sun (`params.sun_colour.xyz` already includes `sun.intensity`), skipping
-    // the shadow ray when facing away and jittering within the sun angular disc.
-    let n_dot_l = max(dot(hit.normal, params.sun_dir.xyz), 0.0);
-    var shadow = 1.0;
-    var direct = vec3<f32>(0.0);
-    if ((bits_lighting || (layered && bits_shadows)) && n_dot_l > 0.0) {
-        if (bits_shadows) {
-            let shadow_dir = select(
-                params.sun_dir.xyz,
-                cone_direction(state, params.sun_dir.xyz, params.lens.z),
-                params.lens.z > 1e-4,
-            );
-            if (occluded(ray_origin, shadow_dir, bias, params.lens.y)) {
-                shadow = 0.0;
-            }
-        }
-        if (bits_lighting) {
-            direct = params.sun_colour.xyz * (n_dot_l * shadow);
-        }
-    }
-    let ambient = params.ambient.xyz * (open * params.tuning.z);
-    var diffuse = albedo * select(ambient, direct + ambient, bits_lighting);
-    var gi_bounce = vec3<f32>(0.0);
-
-    if (bits_reflections && roughness <= params.effects.x) {
-        let reflect_dir = reflect(dir, hit.normal);
-        let rhit = closest_hit(ray_origin, reflect_dir, bias, params.lens.y);
-        if (rhit.index != 0xffffffffu) {
-            let rmaterial = material_of(rhit.index);
-            let lit = rmaterial.albedo.rgb * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * max(dot(rhit.normal, params.sun_dir.xyz), 0.0));
-            let f0 = 0.04 + 0.06 * (1.0 - roughness);
-            let m = 1.0 - clamp(dot(-dir, hit.normal), 0.0, 1.0);
-            let m2 = m * m;
-            let fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
-            surface.reflection = lit * fresnel;
-            surface.reflection_distance = rhit.t;
-        } else {
-            surface.reflection = environment() * 0.08;
-            surface.reflection_distance = params.lens.y;
-        }
-    }
-
-    if (bits_gi && params.frame.z >= 1.0 && params.tuning.w > 0.0) {
-        var bounce = vec3<f32>(0.0);
-        var throughput = albedo;
-        var source = point;
-        var normal = hit.normal;
-        let bounces = u32(params.frame.z);
-        for (var b = 0u; b < bounces; b = b + 1u) {
-            let d = cosine_hemisphere(state, normal);
-            let bhit = closest_hit(source + normal * bias, d, bias, params.lens.y);
-            if (bhit.index != 0xffffffffu) {
-                let bpoint = source + d * bhit.t;
-                let bmaterial = material_of(bhit.index);
-                let incoming = bmaterial.albedo.rgb * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * max(dot(bhit.normal, params.sun_dir.xyz), 0.0));
-                bounce = bounce + throughput * incoming;
-                throughput = throughput * bmaterial.albedo.rgb;
-                if (max(throughput.x, max(throughput.y, throughput.z)) < 1e-3) {
-                    break;
-                }
-                source = bpoint;
-                normal = bhit.normal;
-            } else {
-                bounce = bounce + throughput * environment();
-                break;
-            }
-        }
-        gi_bounce = bounce * params.tuning.w;
-        diffuse = diffuse + gi_bounce;
-    }
     var fog_t = 0.0;
     let fog_start = params.fog.x;
     let fog_end = params.fog.y;
     if (fog_end > fog_start && fog_start >= 0.0) {
-        fog_t = clamp((hit.t - fog_start) / (fog_end - fog_start), 0.0, 1.0);
-        diffuse = mix(diffuse, params.fog_colour.xyz, fog_t);
-        surface.reflection = surface.reflection * (1.0 - fog_t);
+        fog_t = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
     }
-    if (layered) {
-        var shadow_mod = 1.0;
-        if (bits_shadows && n_dot_l > 0.05) {
-            shadow_mod = mix(0.45, 1.0, shadow);
-        }
-        let ao_mod = select(1.0, mix(0.65, 1.0, open), bits_ao);
-        surface.light_factor = mix(shadow_mod * ao_mod, 1.0, fog_t);
-        surface.colour = gi_bounce * (0.25 * (1.0 - fog_t));
-    } else {
-        surface.colour = diffuse;
-        surface.light_factor = 1.0;
-    }
-    return surface;
-}
 
-@compute @workgroup_size(8, 8, 1)
-fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
-    let extent = vec2<u32>(u32(params.extents.x), u32(params.extents.y));
-    if (id.x >= extent.x || id.y >= extent.y) {
-        return;
-    }
-    let grid = vec2<f32>(params.extents.xy);
     let samples = max(u32(params.frame.y), 1u);
-    var accum = vec3<f32>(0.0);
-    var accum_light_factor = 0.0;
-    var accum_reflection = vec3<f32>(0.0);
-    var accum_visibility = 0.0;
-    var accum_depth = 0.0;
-    var accum_reflection_distance = 0.0;
-    var accum_normal = vec3<f32>(0.0);
-    var accum_roughness = 0.0;
-    var accum_albedo = vec3<f32>(0.0);
     var state = id.x * 0x9e3779b9u ^ id.y * 0x85ebca6bu ^ u32(params.frame.x) * 0xc2b2ae35u;
+    var accum_shadow = 0.0;
+    var accum_open = 0.0;
+    var accum_reflection = vec3<f32>(0.0);
+    var accum_refl_dist = 0.0;
+    var accum_gi = vec3<f32>(0.0);
+
+    let ao_radius = clamp(params.fog.z, 2.0, 6.0);
+    let ao_samples = select(2u, 1u, samples > 1u);
+    let onb = orthonormal_basis(normal);
+
     for (var s = 0u; s < samples; s = s + 1u) {
-        // Jitter rotates across frames; each sample sits at a stratified offset
-        // inside the pixel, so a 4-sample frame is a 2x2 grid.
-        var offset = vec2<f32>(0.0, 0.0);
-        if (samples > 1u) {
-            let n = f32(samples);
-            offset = vec2<f32>((f32(s) + 0.5) / n - 0.5, (f32(s % 2u) + 0.5) / 2.0 - 0.5);
-            offset = offset * 0.4;
+        var shadow = 1.0;
+        if (bits_shadows && n_dot_l > 0.02) {
+            let shadow_dir = select(
+                params.sun_dir.xyz,
+                cone_direction(&state, params.sun_dir.xyz, params.lens.z),
+                params.lens.z > 1e-4,
+            );
+            if (occluded(ray_origin, shadow_dir, bias * 0.5, params.lens.y)) {
+                shadow = 0.0;
+            }
         }
-        let pixel = vec2<f32>(f32(id.x) + 0.5, f32(id.y) + 0.5) + offset + params.tuning.xy;
-        let ndc = vec2<f32>(pixel.x / grid.x * 2.0 - 1.0, 1.0 - pixel.y / grid.y * 2.0);
-        let far = params.inv_vp * vec4<f32>(ndc, 0.0, 1.0);
-        let near = far + params.inv_vp[2];
-        let dir = normalize(far.xyz / far.w - near.xyz / near.w);
-        let surface = shade(params.eye.xyz, dir, &state);
-        accum = accum + surface.colour;
-        accum_light_factor = accum_light_factor + surface.light_factor;
-        accum_reflection = accum_reflection + surface.reflection;
-        accum_visibility = accum_visibility + surface.visibility;
-        accum_depth = accum_depth + surface.depth;
-        accum_reflection_distance = accum_reflection_distance + surface.reflection_distance;
-        accum_normal = accum_normal + surface.normal;
-        accum_roughness = accum_roughness + surface.roughness;
-        accum_albedo = accum_albedo + surface.albedo;
+        accum_shadow = accum_shadow + shadow;
+
+        var open = 1.0;
+        if (bits_ao) {
+            var hits = 0u;
+            for (var i = 0u; i < ao_samples; i = i + 1u) {
+                let u1 = next_f32(&state);
+                let r = sqrt(u1);
+                let phi = next_f32(&state) * 2.0 * PI;
+                let d = onb * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
+                if (occluded(ray_origin, d, bias * 0.5, ao_radius)) {
+                    hits = hits + 1u;
+                }
+            }
+            open = 1.0 - f32(hits) / f32(ao_samples);
+        }
+        accum_open = accum_open + open;
+
+        var refl_dist = params.lens.y;
+        if (bits_reflections && roughness <= params.effects.x) {
+            let reflect_dir = reflect(view_dir, normal);
+            let rhit = closest_hit(ray_origin, reflect_dir, bias, params.lens.y);
+            if (rhit.index != 0xffffffffu) {
+                let rmaterial = material_of(rhit.index);
+                let r_ndl = max(dot(rhit.normal, params.sun_dir.xyz), 0.0);
+                let lit = rmaterial.albedo.rgb * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * r_ndl);
+                let f0 = 0.04 + 0.16 * (1.0 - roughness);
+                let m = 1.0 - clamp(dot(-view_dir, normal), 0.0, 1.0);
+                let m2 = m * m;
+                let fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
+                accum_reflection = accum_reflection + lit * fresnel * (1.0 - fog_t);
+                refl_dist = rhit.t;
+            }
+        }
+        accum_refl_dist = accum_refl_dist + refl_dist;
+
+        if (bits_gi && params.frame.z >= 1.0 && params.tuning.w > 0.0) {
+            let d = cosine_hemisphere(&state, normal);
+            let bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 48.0));
+            if (bhit.index != 0xffffffffu) {
+                let bmaterial = material_of(bhit.index);
+                let b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
+                if (b_ndl > 0.01) {
+                    let incoming = bmaterial.albedo.rgb * params.sun_colour.xyz * b_ndl;
+                    accum_gi = accum_gi + raster_rgb * incoming * (params.tuning.w * 0.30 * (1.0 - fog_t));
+                }
+            }
+        }
     }
+
     let inv = 1.0 / f32(samples);
-    let raw_n = accum_normal * inv;
-    let avg_n = select(vec3<f32>(0.0, 1.0, 0.0), normalize(raw_n), length(raw_n) > 1e-4);
-    let avg_rough = clamp(accum_roughness * inv, 0.02, 1.0);
-    let avg_albedo = accum_albedo * inv;
-    let spec_f0 = 0.04 + 0.06 * (1.0 - avg_rough);
-    textureStore(out_colour, vec2<i32>(id.xy), vec4<f32>(accum * inv, accum_light_factor * inv));
-    textureStore(out_guide, vec2<i32>(id.xy), vec4<f32>(accum_visibility * inv, (accum_depth * inv) / params.lens.y, 0.0, 0.0));
-    textureStore(out_reflection, vec2<i32>(id.xy), vec4<f32>(accum_reflection * inv, (accum_reflection_distance * inv) / params.lens.y));
-    textureStore(out_normals, vec2<i32>(id.xy), vec4<f32>(avg_n, avg_rough));
-    textureStore(out_albedo, vec2<i32>(id.xy), vec4<f32>(avg_albedo, spec_f0));
+    let avg_shadow = accum_shadow * inv;
+    let avg_open = accum_open * inv;
+    let avg_refl = accum_reflection * inv;
+    let avg_refl_dist = accum_refl_dist * inv;
+    let avg_gi = accum_gi * inv;
+
+    var out_rgb = vec3<f32>(0.0);
+    var out_lf = 1.0;
+    if (layered) {
+        let shadow_mod = select(1.0, mix(0.30, 1.0, avg_shadow), bits_shadows && n_dot_l > 0.02);
+        let ao_mod = select(1.0, mix(0.58, 1.0, avg_open), bits_ao);
+        out_lf = mix(shadow_mod * ao_mod, 1.0, fog_t);
+        out_rgb = avg_gi;
+    } else {
+        let direct = select(vec3<f32>(0.0), params.sun_colour.xyz * (n_dot_l * avg_shadow), bits_lighting);
+        let ambient = params.ambient.xyz * (avg_open * params.tuning.z);
+        let relit = raster_rgb * (direct + ambient) + avg_gi;
+        out_rgb = mix(relit, params.fog_colour.xyz, fog_t);
+        out_lf = 1.0;
+    }
+
+    let spec_f0 = 0.04 + 0.16 * (1.0 - roughness);
+    textureStore(out_colour, ip, vec4<f32>(out_rgb, out_lf));
+    textureStore(out_guide, ip, vec4<f32>(avg_open, dist / params.lens.y, 0.0, 0.0));
+    textureStore(out_reflection, ip, vec4<f32>(avg_refl, avg_refl_dist / params.lens.y));
+    textureStore(out_normals, ip, vec4<f32>(normal, roughness));
+    textureStore(out_albedo, ip, vec4<f32>(raster_rgb, spec_f0));
 }
 "#;
 
@@ -792,24 +872,32 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         // Local 3x3 mean and standard deviation in ray-grid space for variance clamping.
         var sum = current;
         var sum_sq = current * current;
+        var sum_lf = current_lf;
+        var sum_lf_sq = current_lf * current_lf;
         for (var dy = -1; dy <= 1; dy = dy + 1) {
             for (var dx = -1; dx <= 1; dx = dx + 1) {
                 if (dx == 0 && dy == 0) {
                     continue;
                 }
                 let p = clamp(gp + vec2<i32>(dx, dy), vec2<i32>(0), gmax);
-                let c = textureLoad(src_colour, p, 0).rgb + textureLoad(src_reflection, p, 0).rgb;
+                let raw = textureLoad(src_colour, p, 0);
+                let c = raw.rgb + textureLoad(src_reflection, p, 0).rgb;
                 sum = sum + c;
                 sum_sq = sum_sq + c * c;
+                sum_lf = sum_lf + raw.a;
+                sum_lf_sq = sum_lf_sq + raw.a * raw.a;
             }
         }
         let inv9 = 1.0 / 9.0;
         let mean = sum * inv9;
         let stddev = sqrt(max(sum_sq * inv9 - mean * mean, vec3<f32>(0.0))) * params.weights.w;
         let history = clamp(prev.colour, mean - stddev, mean + stddev);
+        let mean_lf = sum_lf * inv9;
+        let std_lf = sqrt(max(sum_lf_sq * inv9 - mean_lf * mean_lf, 0.0)) * params.weights.w;
+        let history_lf = clamp(prev.light_factor, mean_lf - std_lf, mean_lf + std_lf);
         let alpha = max(1.0 / (n + 1.0), params.extent.w);
         blended = mix(history, current, alpha);
-        blended_lf = clamp(mix(prev.light_factor, current_lf, alpha), 0.0, 1.0);
+        blended_lf = clamp(mix(history_lf, current_lf, alpha), 0.0, 1.0);
         length = min(n + 1.0, params.misc.z);
         let lum = luminance(blended);
         m1 = mix(prev.moments.x, lum, alpha);
@@ -895,7 +983,8 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             let sample_raw = textureLoad(history_colour, p, 0);
             let sample = sample_raw.rgb;
             let w_colour = exp(-abs(centre_lum - luminance(sample)) * inv_sigma);
-            let w = wy * kernel_weight(dx) * wn * wd * w_colour;
+            let w_lf = exp(-abs(centre_raw.a - sample_raw.a) * 5.0);
+            let w = wy * kernel_weight(dx) * wn * wd * w_colour * w_lf;
             if (w <= 1e-6) {
                 continue;
             }
@@ -1040,6 +1129,8 @@ fn storage_texture(
 
 /// Shader modules and pipeline layouts, created once.
 struct Pipelines {
+    gbuf_prep: wgpu::ComputePipeline,
+    gbuf_prep_layout: wgpu::BindGroupLayout,
     trace: wgpu::ComputePipeline,
     temporal: wgpu::ComputePipeline,
     atrous: wgpu::ComputePipeline,
@@ -1056,6 +1147,45 @@ struct Pipelines {
 
 impl Pipelines {
     fn new(device: &wgpu::Device) -> Self {
+        let gbuf_prep_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("raywatcher gbuf prep"),
+            source: wgpu::ShaderSource::Wgsl(GBUF_PREP_SHADER.into()),
+        });
+        let gbuf_prep_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raywatcher gbuf prep"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                texture_entry(1, wgpu::TextureSampleType::Depth),
+                texture_entry(2, wgpu::TextureSampleType::Float { filterable: true }),
+                storage_texture_entry(
+                    3,
+                    wgpu::StorageTextureAccess::WriteOnly,
+                    wgpu::TextureFormat::Rgba32Float,
+                ),
+                storage_texture_entry(4, wgpu::StorageTextureAccess::WriteOnly, GUIDE_FORMAT),
+                storage_texture_entry(5, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
+            ],
+        });
+        let gbuf_prep_pipeline = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("raywatcher gbuf prep"),
+            bind_group_layouts: &[&gbuf_prep_layout],
+            push_constant_ranges: &[],
+        });
+        let gbuf_prep = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("raywatcher gbuf prep"),
+            layout: Some(&gbuf_prep_pipeline),
+            module: &gbuf_prep_module,
+            entry_point: "gbuf_prep",
+        });
         let trace_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raywatcher trace"),
             source: wgpu::ShaderSource::Wgsl(RAY_SHADER.into()),
@@ -1126,6 +1256,9 @@ impl Pipelines {
                 storage_texture_entry(7, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
                 storage_texture_entry(8, wgpu::StorageTextureAccess::WriteOnly, GUIDE_FORMAT),
                 storage_texture_entry(9, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
+                texture_entry(10, wgpu::TextureSampleType::Float { filterable: false }),
+                texture_entry(11, wgpu::TextureSampleType::Float { filterable: true }),
+                texture_entry(12, wgpu::TextureSampleType::Float { filterable: true }),
             ],
         });
         let denoise_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1215,6 +1348,8 @@ impl Pipelines {
             entry_point: "atrous_pass",
         });
         Self {
+            gbuf_prep,
+            gbuf_prep_layout,
             trace,
             temporal,
             atrous,
@@ -1399,6 +1534,12 @@ impl SceneBuffers {
 
 /// The ray pass's own render targets, at the ray grid's extent.
 struct GridTargets {
+    gbuf_pos: wgpu::Texture,
+    gbuf_norm: wgpu::Texture,
+    gbuf_raster: wgpu::Texture,
+    gbuf_pos_view: wgpu::TextureView,
+    gbuf_norm_view: wgpu::TextureView,
+    gbuf_raster_view: wgpu::TextureView,
     colour: wgpu::Texture,
     guide: wgpu::Texture,
     reflection: wgpu::Texture,
@@ -1413,6 +1554,18 @@ struct GridTargets {
 
 impl GridTargets {
     fn new(device: &wgpu::Device, w: u32, h: u32) -> Self {
+        let gbuf_pos = storage_texture(
+            device,
+            "raywatcher gbuf pos",
+            w,
+            h,
+            wgpu::TextureFormat::Rgba32Float,
+        );
+        let gbuf_norm = storage_texture(device, "raywatcher gbuf norm", w, h, GUIDE_FORMAT);
+        let gbuf_raster = storage_texture(device, "raywatcher gbuf raster", w, h, COLOUR_FORMAT);
+        let gbuf_pos_view = gbuf_pos.create_view(&Default::default());
+        let gbuf_norm_view = gbuf_norm.create_view(&Default::default());
+        let gbuf_raster_view = gbuf_raster.create_view(&Default::default());
         let colour = storage_texture(device, "raywatcher rays", w, h, COLOUR_FORMAT);
         let guide = storage_texture(device, "raywatcher guide", w, h, GUIDE_FORMAT);
         let reflection = storage_texture(device, "raywatcher reflection", w, h, COLOUR_FORMAT);
@@ -1424,6 +1577,12 @@ impl GridTargets {
         let normals_view = normals.create_view(&Default::default());
         let albedo_view = albedo.create_view(&Default::default());
         Self {
+            gbuf_pos,
+            gbuf_norm,
+            gbuf_raster,
+            gbuf_pos_view,
+            gbuf_norm_view,
+            gbuf_raster_view,
             colour,
             guide,
             reflection,
@@ -1480,6 +1639,8 @@ fn depth_plane(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::T
 /// Everything Raywatcher owns on the GPU.
 pub struct RaywatcherGpu {
     pipelines: Pipelines,
+    gbuf_prep_uniforms: wgpu::Buffer,
+    gbuf_prep_bind_group: Option<wgpu::BindGroup>,
     uniforms: wgpu::Buffer,
     temporal_uniforms: wgpu::Buffer,
     atrous_uniforms: Vec<wgpu::Buffer>,
@@ -1543,6 +1704,12 @@ impl RaywatcherGpu {
         grid_extent: (u32, u32),
     ) -> Self {
         let pipelines = Pipelines::new(device);
+        let gbuf_prep_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raywatcher gbuf prep params"),
+            size: std::mem::size_of::<GbufPrepParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("raywatcher params"),
             size: std::mem::size_of::<RayParams>() as u64,
@@ -1655,6 +1822,8 @@ impl RaywatcherGpu {
         let blit_bind_group = Self::blit_binding(device, &pipelines, &output_view);
         Self {
             pipelines,
+            gbuf_prep_uniforms,
+            gbuf_prep_bind_group: None,
             uniforms,
             temporal_uniforms,
             atrous_uniforms,
@@ -1748,6 +1917,18 @@ impl RaywatcherGpu {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: wgpu::BindingResource::TextureView(&grid.albedo_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(&grid.gbuf_pos_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(&grid.gbuf_norm_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&grid.gbuf_raster_view),
                 },
             ],
         })
@@ -2061,6 +2242,7 @@ impl RaywatcherGpu {
             if let Some(rr) = self.dlss_rr.as_mut() {
                 rr.invalidate_prep();
             }
+            self.gbuf_prep_bind_group = None;
             self.frames = 0;
             return true;
         }
@@ -2169,6 +2351,7 @@ impl RaywatcherGpu {
         self._depth_tex = depth_tex;
         self.blit_bind_group = Self::blit_binding(device, &self.pipelines, &output_view);
         self.raster_copy = None;
+        self.gbuf_prep_bind_group = None;
         self.output = output;
         self.output_view = output_view;
         self.guide = guide;
@@ -2217,11 +2400,94 @@ impl RaywatcherGpu {
         config: &DenoiseConfig,
         motion: &wgpu::Texture,
         depth: &wgpu::Texture,
+        water: &[super::harvest::WaterSurface],
     ) {
         if !plan.trace {
             self.traced_last_frame = false;
             return;
         }
+        // Copy hardware depth FIRST so both the 1:1 G-buffer prep pass and the
+        // denoiser/DLSS RR consume the exact raster depth from the world pass.
+        let (rw, rh) = self.render_extent;
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: depth,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::DepthOnly,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &self._depth_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::DepthOnly,
+            },
+            wgpu::Extent3d {
+                width: rw.min(depth.width()),
+                height: rh.min(depth.height()),
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // Build the 1:1 depth-anchored G-buffer (world pos, normal, water
+        // roughness, and untouched raster colour) at ray-grid resolution.
+        if self.gbuf_prep_bind_group.is_none() {
+            let raster_view = self
+                .raster_copy
+                .as_ref()
+                .map(|(_, _, _, v, _)| v)
+                .unwrap_or(&self.output_view);
+            self.gbuf_prep_bind_group =
+                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("raywatcher gbuf prep"),
+                    layout: &self.pipelines.gbuf_prep_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.gbuf_prep_uniforms.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&self.depth),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(raster_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&self.grid.gbuf_pos_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&self.grid.gbuf_norm_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.grid.gbuf_raster_view,
+                            ),
+                        },
+                    ],
+                }));
+        }
+        let prep_packed = GbufPrepParams::pack(params, plan.grid, self.render_extent, water);
+        queue.write_buffer(
+            &self.gbuf_prep_uniforms,
+            0,
+            bytemuck::bytes_of(&prep_packed),
+        );
+        if let Some(ref bg) = self.gbuf_prep_bind_group {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("raywatcher gbuf prep"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipelines.gbuf_prep);
+            pass.set_bind_group(0, bg, &[]);
+            let (gw, gh) = plan.grid;
+            pass.dispatch_workgroups(gw.div_ceil(8), gh.div_ceil(8), 1);
+        }
+
         let packed = RayParams::pack(
             params,
             plan,
@@ -2251,9 +2517,22 @@ impl RaywatcherGpu {
                 }
             }
             if let Some(dxr) = self.dxr.as_mut() {
-                // Skip copying `albedo` when in-house denoiser runs, and skip
-                // copying `guide` once DLSS Ray Reconstruction is initialized
-                // (keep `guide` on the first probe frame for seamless fallback).
+                // Copy the freshly built G-buffer planes into the shared DX12
+                // inputs and submit the wgpu encoder so the world pass +
+                // G-buffer prep complete on the GPU before DXR dispatches.
+                dxr.copy_gbuf_inputs(
+                    encoder,
+                    &self.grid.gbuf_pos,
+                    &self.grid.gbuf_norm,
+                    &self.grid.gbuf_raster,
+                );
+                let pending = std::mem::replace(
+                    encoder,
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("raywatcher post-dxr"),
+                    }),
+                );
+                queue.submit(Some(pending.finish()));
                 let dst_guide =
                     (!skip_inhouse || self.dlss_rr.is_none()).then_some(&self.grid.guide);
                 let dst_albedo = skip_inhouse.then_some(&self.grid.albedo);
@@ -2290,30 +2569,6 @@ impl RaywatcherGpu {
             let (w, h) = plan.grid;
             pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
         }
-
-        // Depth is consumed by both the in-house denoiser and DLSS RR; motion is
-        // copied inside `record_denoise` only when the in-house denoiser runs
-        // (DLSS RR reads the caller's motion texture directly).
-        let (rw, rh) = self.render_extent;
-        encoder.copy_texture_to_texture(
-            wgpu::ImageCopyTexture {
-                texture: depth,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::DepthOnly,
-            },
-            wgpu::ImageCopyTexture {
-                texture: &self._depth_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::DepthOnly,
-            },
-            wgpu::Extent3d {
-                width: rw.min(depth.width()),
-                height: rh.min(depth.height()),
-                depth_or_array_layers: 1,
-            },
-        );
 
         if !skip_inhouse {
             self.record_denoise(queue, encoder, params, config, motion);
@@ -2518,6 +2773,7 @@ impl RaywatcherGpu {
                 ],
             });
             self.raster_copy = Some((fmt, ext, tex, view, bg));
+            self.gbuf_prep_bind_group = None;
             if let Some(rr) = self.dlss_rr.as_mut() {
                 rr.invalidate_prep();
             }
