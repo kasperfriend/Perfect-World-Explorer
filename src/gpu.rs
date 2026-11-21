@@ -3821,6 +3821,7 @@ impl Renderer {
                         normal: Vec3::from_array(t.normal),
                         albedo: t.albedo,
                         roughness: 0.72,
+                        opacity: t.opacity,
                     });
                 }
             }

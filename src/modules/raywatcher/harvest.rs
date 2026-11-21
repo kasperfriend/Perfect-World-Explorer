@@ -116,6 +116,7 @@ pub struct MeshTriangle {
     pub normal: Vec3,
     pub albedo: [f32; 3],
     pub roughness: f32,
+    pub opacity: f32,
 }
 
 /// Axis-aligned water surface plane harvested from the renderer's water
@@ -528,7 +529,18 @@ fn push_instances(
             ],
             // Buildings read as rough dielectric; the slight sheen keeps a
             // grazing reflection from being a flat wash.
-            surface: [0.75, 0.05, 0., 1.],
+            surface: [
+                0.75,
+                0.05,
+                0.,
+                if instance.albedo[1] > instance.albedo[0] * 1.15
+                    && instance.albedo[1] > instance.albedo[2] * 1.15
+                {
+                    0.58
+                } else {
+                    1.0
+                },
+            ],
         });
         push_box(triangles, instance, material);
         pushed += 1;
@@ -738,21 +750,23 @@ fn push_real_meshes(
     if meshes.is_empty() {
         return;
     }
-    let mut palette: std::collections::HashMap<(u8, u8, u8, u8), u32> =
+    let mut palette: std::collections::HashMap<(u8, u8, u8, u8, u8), u32> =
         std::collections::HashMap::new();
     triangles.reserve(meshes.len());
     for m in meshes {
+        let opacity = m.opacity.clamp(0.0, 1.0);
         let key = (
             (m.albedo[0].clamp(0.0, 1.0) * 31.0).round() as u8,
             (m.albedo[1].clamp(0.0, 1.0) * 31.0).round() as u8,
             (m.albedo[2].clamp(0.0, 1.0) * 31.0).round() as u8,
             (m.roughness.clamp(0.0, 1.0) * 15.0).round() as u8,
+            (opacity * 15.0).round() as u8,
         );
         let mat_id = *palette.entry(key).or_insert_with(|| {
             let id = materials.len() as u32;
             materials.push(RayMaterial {
                 albedo: [m.albedo[0], m.albedo[1], m.albedo[2], 1.0],
-                surface: [m.roughness.clamp(0.04, 1.0), 0.05, 0.0, 1.0],
+                surface: [m.roughness.clamp(0.04, 1.0), 0.05, 0.0, opacity],
             });
             id
         });
@@ -1300,6 +1314,7 @@ mod tests {
             normal: Vec3::NEG_Z,
             albedo: [0.8, 0.2, 0.1],
             roughness: 0.72,
+            opacity: 1.0,
         };
         let water = WaterSurface {
             bounds: [-50.0, 50.0, 40.0, 400.0],

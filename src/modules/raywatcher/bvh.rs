@@ -462,16 +462,18 @@ impl SceneGeometry {
                 let first = node.max[3] as u32;
                 for i in 0..count {
                     let tri_index = self.order[(first + i) as usize];
-                    if intersect_triangle(
-                        &self.triangles[tri_index as usize],
-                        origin,
-                        dir,
-                        t_min,
-                        t_max,
-                    )
-                    .is_some()
-                    {
-                        return true;
+                    let tri = &self.triangles[tri_index as usize];
+                    if intersect_triangle(tri, origin, dir, t_min, t_max).is_some() {
+                        let mat_idx =
+                            (tri.material() as usize).min(self.materials.len().saturating_sub(1));
+                        let opacity = self
+                            .materials
+                            .get(mat_idx)
+                            .map(|m| m.surface[3])
+                            .unwrap_or(1.0);
+                        if opacity > 0.001 {
+                            return true;
+                        }
                     }
                 }
             } else {
@@ -805,6 +807,37 @@ mod tests {
                 assert!((i + 1) < scene.nodes.len());
             }
         }
+    }
+
+    #[test]
+    fn material_opacity_zero_does_not_occlude_and_one_does() {
+        let tri_transparent = RayTriangle::new(
+            Vec3::new(-1.0, -1.0, 2.0),
+            Vec3::new(1.0, -1.0, 2.0),
+            Vec3::new(0.0, 1.0, 2.0),
+            Vec3::NEG_Z,
+            0,
+        );
+        let tri_opaque = RayTriangle::new(
+            Vec3::new(-1.0, -1.0, 4.0),
+            Vec3::new(1.0, -1.0, 4.0),
+            Vec3::new(0.0, 1.0, 4.0),
+            Vec3::NEG_Z,
+            1,
+        );
+        let mats = vec![
+            RayMaterial {
+                albedo: [0.2, 0.6, 0.2, 1.0],
+                surface: [0.8, 0.0, 0.0, 0.0],
+            },
+            RayMaterial {
+                albedo: [0.5, 0.5, 0.5, 1.0],
+                surface: [0.8, 0.0, 0.0, 1.0],
+            },
+        ];
+        let scene = SceneGeometry::build(vec![tri_transparent, tri_opaque], mats);
+        assert!(!scene.occluded(Vec3::ZERO, Vec3::Z, 0.01, 3.0));
+        assert!(scene.occluded(Vec3::ZERO, Vec3::Z, 0.01, 5.0));
     }
 
     #[test]

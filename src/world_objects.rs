@@ -843,6 +843,10 @@ pub struct RtMeshTriangle {
     pub c: [f32; 3],
     pub normal: [f32; 3],
     pub albedo: [f32; 3],
+    /// Material opacity in `[0, 1]` derived from the game's vertex alpha byte
+    /// and blend/cutout draw band (solid = 1.0, alpha-blended leaf/banner cards
+    /// and cutout foliage < 1.0).
+    pub opacity: f32,
 }
 
 /// Hard per-page cap on retained CPU triangles so whole-world preloads across
@@ -891,12 +895,26 @@ fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32]) -> Vec<RtMeshTrian
                     ((c0[1] + c1[1] + c2[1]) / 3.0).clamp(0.08, 0.92),
                     ((c0[2] + c1[2] + c2[2]) / 3.0).clamp(0.08, 0.92),
                 ];
+                let a0 = ((v0.diffuse >> 24) & 0xff) as f32 / 255.0;
+                let a1 = ((v1.diffuse >> 24) & 0xff) as f32 / 255.0;
+                let a2 = ((v2.diffuse >> 24) & 0xff) as f32 / 255.0;
+                let v_alpha = ((a0 + a1 + a2) / 3.0).clamp(0.0, 1.0);
+                let kind = v0.kind;
+                let is_sdr_blend = (kind > 2.01 && kind < 2.03) || (kind > 2.11 && kind < 2.13);
+                let band_opacity = if is_sdr_blend {
+                    0.55
+                } else if kind > 3.5 {
+                    0.62
+                } else {
+                    1.0
+                };
                 out.push(RtMeshTriangle {
                     a,
                     b,
                     c,
                     normal: [nx * inv, ny * inv, nz * inv],
                     albedo,
+                    opacity: (v_alpha * band_opacity).clamp(0.0, 1.0),
                 });
             }
         }
