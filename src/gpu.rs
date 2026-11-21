@@ -3897,28 +3897,30 @@ impl Renderer {
                     }
                 }
             }
-            // Procedural trees have no static `rt_triangles()`; use canopy
-            // proxies only as fallback for soft tree shadows.
-            let mut tree_proxies = 0usize;
-            for block in &self.model_scene.blocks {
-                for tree in &block.trees {
-                    let pos = Vec3::from_array(tree.position);
-                    proxies.push(InstanceProxy {
-                        centre: pos + Vec3::new(0.0, 5.5, 0.0),
-                        half: Vec3::new(2.8, 5.5, 2.8),
-                        albedo: [0.18, 0.30, 0.14],
-                        yaw: 0.0,
-                    });
-                    tree_proxies += 1;
-                }
-            }
+            // Phase 4: Harvest the same runtime SpeedTree LOD geometry the
+            // raster draws (branches, fronds, alpha-tested leaves) matching
+            // view distance, falling back to an alpha-tested crossed canopy
+            // (never a box) only when the triangle budget is exhausted.
+            let tree_lod_scale =
+                self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees);
+            let tree_tri_budget = 140_000usize;
+            let (real_tree_instances, real_tree_tris, tree_canopy_fallbacks) =
+                self.far_trees.harvest_rt_triangles(
+                    camera.pos,
+                    detail_radius,
+                    tree_lod_scale,
+                    tree_tri_budget,
+                    &mut real_meshes,
+                );
             if std::env::var_os("PWE_RT_DEBUG").is_some() {
                 eprintln!(
-                    "[Raywatcher] harvest: {} real-mesh pages ({} tris), {} proxy fallbacks, {} tree proxies (detail_radius={:.0})",
+                    "[Raywatcher] harvest: {} real-mesh pages ({} total tris), {} proxy fallbacks, trees(real_inst={}, real_tris={}, canopy_fallbacks={}) (detail_radius={:.0})",
                     real_mesh_pages,
                     real_meshes.len(),
                     proxy_fallback_models,
-                    tree_proxies,
+                    real_tree_instances,
+                    real_tree_tris,
+                    tree_canopy_fallbacks,
                     detail_radius,
                 );
             }
