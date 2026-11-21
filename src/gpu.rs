@@ -3984,7 +3984,28 @@ impl Renderer {
         };
         let hardware_mode = self.modules.raywatcher().effective_mode()
             == crate::modules::raywatcher::plan::RayTracingMode::Hardware;
-        let layered = !plan.replace_raster;
+        if plan.debug_view == crate::modules::raywatcher::plan::DebugView::RasterOnly {
+            // Phase 0 baseline check: leave the raster world target completely
+            // untouched so the user can compare against RT off.
+            self.modules.raywatcher_mut().next_frame();
+            return;
+        }
+        if params.frame == 0 {
+            let probe_world = camera.pos + camera.direction() * 25.0;
+            let err = crate::modules::raywatcher::frame::depth_unprojection_error(
+                matrix,
+                params.inv_view_projection,
+                probe_world,
+            );
+            if std::env::var_os("PWE_RT_DEBUG").is_some() || err > 0.05 {
+                eprintln!(
+                    "[Raywatcher] Phase 0 depth-unprojection reference error at 25u: {:.6} u",
+                    err
+                );
+            }
+        }
+        let layered = !plan.replace_raster
+            && plan.debug_view == crate::modules::raywatcher::plan::DebugView::None;
         // Always snapshot the untouched 1:1 raster world target so both layered
         // mode and opt-in `replace_raster` anchor to real textures/geometry
         // (never coarse proxy boxes).

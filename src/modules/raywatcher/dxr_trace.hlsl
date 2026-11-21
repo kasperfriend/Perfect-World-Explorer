@@ -320,10 +320,38 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         out_lf = 1.0;
     }
 
+    uint debug_mode = uint(round(params.counts.w));
+    float3 store_refl = avg_refl;
+    if (debug_mode == 1u) {
+        out_rgb = raster_rgb;
+        out_lf = 1.0;
+        store_refl = float3(0.0, 0.0, 0.0);
+    } else if (debug_mode == 2u) {
+        out_rgb = float3(avg_shadow, avg_shadow, avg_shadow);
+        out_lf = 1.0;
+        store_refl = float3(0.0, 0.0, 0.0);
+    } else if (debug_mode == 3u) {
+        out_rgb = float3(avg_open, avg_open, avg_open);
+        out_lf = 1.0;
+        store_refl = float3(0.0, 0.0, 0.0);
+    } else if (debug_mode == 4u) {
+        out_rgb = avg_gi;
+        out_lf = 1.0;
+        store_refl = float3(0.0, 0.0, 0.0);
+    } else if (debug_mode == 5u) {
+        out_rgb = avg_refl;
+        out_lf = 1.0;
+        store_refl = float3(0.0, 0.0, 0.0);
+    } else if (debug_mode == 6u) {
+        out_rgb = float3(0.0, 0.0, 0.0);
+        out_lf = 1.0;
+        store_refl = float3(0.0, 0.0, 0.0);
+    }
+
     float spec_f0 = 0.04 + 0.16 * (1.0 - roughness);
     out_colour[id.xy] = float4(out_rgb, out_lf);
-    out_guide[id.xy] = float4(avg_open, dist / params.lens.y, 0.0, 0.0);
-    out_reflection[id.xy] = float4(avg_refl, avg_refl_dist / params.lens.y);
+    out_guide[id.xy] = float4(avg_open, dist / params.lens.y, avg_shadow, roughness);
+    out_reflection[id.xy] = float4(store_refl, avg_refl_dist / params.lens.y);
     out_normals[id.xy] = float4(normal, roughness);
     out_albedo[id.xy] = float4(raster_rgb, spec_f0);
 }

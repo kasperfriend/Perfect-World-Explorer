@@ -132,7 +132,12 @@ impl RayParams {
                 if plan.replace_raster { 0. } else { 1. },
             ],
             fog: [fog.0, fog.1, 5.0, 0.],
-            counts: [counts[0] as f32, counts[1] as f32, counts[2] as f32, 0.],
+            counts: [
+                counts[0] as f32,
+                counts[1] as f32,
+                counts[2] as f32,
+                plan.debug_view.as_u32() as f32,
+            ],
         }
     }
 }
@@ -758,10 +763,38 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         out_lf = 1.0;
     }
 
+    let debug_mode = u32(round(params.counts.w));
+    var store_refl = avg_refl;
+    if (debug_mode == 1u) {
+        out_rgb = raster_rgb;
+        out_lf = 1.0;
+        store_refl = vec3<f32>(0.0);
+    } else if (debug_mode == 2u) {
+        out_rgb = vec3<f32>(avg_shadow);
+        out_lf = 1.0;
+        store_refl = vec3<f32>(0.0);
+    } else if (debug_mode == 3u) {
+        out_rgb = vec3<f32>(avg_open);
+        out_lf = 1.0;
+        store_refl = vec3<f32>(0.0);
+    } else if (debug_mode == 4u) {
+        out_rgb = avg_gi;
+        out_lf = 1.0;
+        store_refl = vec3<f32>(0.0);
+    } else if (debug_mode == 5u) {
+        out_rgb = avg_refl;
+        out_lf = 1.0;
+        store_refl = vec3<f32>(0.0);
+    } else if (debug_mode == 6u) {
+        out_rgb = vec3<f32>(0.0);
+        out_lf = 1.0;
+        store_refl = vec3<f32>(0.0);
+    }
+
     let spec_f0 = 0.04 + 0.16 * (1.0 - roughness);
     textureStore(out_colour, ip, vec4<f32>(out_rgb, out_lf));
-    textureStore(out_guide, ip, vec4<f32>(avg_open, dist / params.lens.y, 0.0, 0.0));
-    textureStore(out_reflection, ip, vec4<f32>(avg_refl, avg_refl_dist / params.lens.y));
+    textureStore(out_guide, ip, vec4<f32>(avg_open, dist / params.lens.y, avg_shadow, roughness));
+    textureStore(out_reflection, ip, vec4<f32>(store_refl, avg_refl_dist / params.lens.y));
     textureStore(out_normals, ip, vec4<f32>(normal, roughness));
     textureStore(out_albedo, ip, vec4<f32>(raster_rgb, spec_f0));
 }

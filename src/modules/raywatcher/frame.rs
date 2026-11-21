@@ -141,6 +141,69 @@ pub fn ray_through_ndc(inv_view_projection: Mat4, ndc: [f32; 2]) -> Vec3 {
     (far - near).normalize_or_zero()
 }
 
+/// Unproject a screen NDC coordinate and reversed-Z hardware depth (`1` near,
+/// `0` far) back into world space.
+pub fn unproject_depth(inv_view_projection: Mat4, ndc: [f32; 2], depth: f32) -> Vec3 {
+    let clip = inv_view_projection * Vec4::new(ndc[0], ndc[1], depth, 1.0);
+    clip.truncate() / clip.w
+}
+
+/// Phase 0 reference check: project `world_pos` through `view_projection` to
+/// NDC + reversed-Z depth, unproject back via `inv_view_projection`, and
+/// return the Euclidean reconstruction error in world units.
+pub fn depth_unprojection_error(
+    view_projection: Mat4,
+    inv_view_projection: Mat4,
+    world_pos: Vec3,
+) -> f32 {
+    let clip = view_projection * world_pos.extend(1.0);
+    if clip.w.abs() < 1e-6 {
+        return f32::INFINITY;
+    }
+    let ndc = clip.truncate() / clip.w;
+    let reconstructed = unproject_depth(inv_view_projection, [ndc.x, ndc.y], ndc.z);
+    (reconstructed - world_pos).length()
+}
+
+/// Phase 1 distance-scaled ray origin bias: prevents self-shadowing acne on
+/// distant terrain and meshes while keeping contact shadows tight near the eye.
+pub fn distance_scaled_bias(base_bias: f32, distance: f32) -> f32 {
+    base_bias.max((distance * 0.0025).max(0.08))
+}
+
+/// Phase 2 layered composite reference formula: modulates the untouched raster
+/// colour by sun shadow visibility and ambient occlusion (faded into fog), and
+/// adds indirect GI, local point lights, and specular reflections. When all RT
+/// signals are neutral (`sun_vis = 1`, `ao = 1`, `gi = 0`, `point = 0`,
+/// `refl = 0`), the output equals `raster` identically.
+#[allow(clippy::too_many_arguments)]
+pub fn composite_layered(
+    raster: Vec3,
+    sun_vis: f32,
+    ao: f32,
+    gi: Vec3,
+    point_lights: Vec3,
+    reflection: Vec3,
+    fog_t: f32,
+    shadows_on: bool,
+    ao_on: bool,
+    n_dot_l: f32,
+) -> Vec3 {
+    let shadow_mod = if shadows_on && n_dot_l > 0.02 {
+        0.30 + 0.70 * sun_vis.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let ao_mod = if ao_on {
+        0.58 + 0.42 * ao.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let fog = fog_t.clamp(0.0, 1.0);
+    let light_factor = (shadow_mod * ao_mod) * (1.0 - fog) + fog;
+    (raster * light_factor + gi + point_lights + reflection).max(Vec3::ZERO)
+}
+
 /// The sun, as the ray pass needs it: a *position* far away (for the shadow
 /// ray's angular size) and a radiance.
 #[derive(Clone, Copy, PartialEq, Debug)]

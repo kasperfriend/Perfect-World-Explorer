@@ -138,6 +138,88 @@ impl RayReconstruction {
     }
 }
 
+/// Single-term debug view (Phase 0) that isolates one RT signal at a time or
+/// bypasses compositing to prove the raster baseline is unchanged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DebugView {
+    /// Normal composited output (raster + layered RT).
+    #[default]
+    None,
+    /// Render the untouched raster frame alone with RT compositing bypassed.
+    RasterOnly,
+    /// Greyscale sun shadow visibility (0 = occluded, 1 = lit).
+    SunVisibility,
+    /// Greyscale ray-traced ambient occlusion (0 = occluded, 1 = open).
+    AmbientOcclusion,
+    /// Indirect diffuse global illumination irradiance.
+    GlobalIllumination,
+    /// Ray-traced specular reflection radiance.
+    Reflections,
+    /// Local / point-light direct shadowed contribution.
+    PointLights,
+}
+
+impl DebugView {
+    pub const ALL: [DebugView; 7] = [
+        Self::None,
+        Self::RasterOnly,
+        Self::SunVisibility,
+        Self::AmbientOcclusion,
+        Self::GlobalIllumination,
+        Self::Reflections,
+        Self::PointLights,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "Off (normal)",
+            Self::RasterOnly => "Raster only (baseline)",
+            Self::SunVisibility => "Sun visibility",
+            Self::AmbientOcclusion => "Ambient occlusion",
+            Self::GlobalIllumination => "Global illumination",
+            Self::Reflections => "Reflections",
+            Self::PointLights => "Point lights",
+        }
+    }
+
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::RasterOnly => "raster",
+            Self::SunVisibility => "sun",
+            Self::AmbientOcclusion => "ao",
+            Self::GlobalIllumination => "gi",
+            Self::Reflections => "reflections",
+            Self::PointLights => "points",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" => Some(Self::None),
+            "raster" | "baseline" => Some(Self::RasterOnly),
+            "sun" | "shadow" | "shadows" => Some(Self::SunVisibility),
+            "ao" | "occlusion" => Some(Self::AmbientOcclusion),
+            "gi" | "bounce" => Some(Self::GlobalIllumination),
+            "reflections" | "refl" => Some(Self::Reflections),
+            "points" | "point_lights" | "lights" => Some(Self::PointLights),
+            _ => None,
+        }
+    }
+
+    pub fn as_u32(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::RasterOnly => 1,
+            Self::SunVisibility => 2,
+            Self::AmbientOcclusion => 3,
+            Self::GlobalIllumination => 4,
+            Self::Reflections => 5,
+            Self::PointLights => 6,
+        }
+    }
+}
+
 /// The effects Raywatcher can replace. Each one is an independent switch, and
 /// the module's whole point is that turning one on *removes* the corresponding
 /// raster effect: the world is rebound to the ray-traced lighting model, so a
@@ -230,6 +312,8 @@ pub struct Settings {
     /// `false` so textured terrain, buildings, trees, water, effects, sky and
     /// fog stay intact.
     pub replace_raster: bool,
+    /// Single-term debug view (Phase 0); `DebugView::None` in normal play.
+    pub debug_view: DebugView,
     /// Folder the reconstruction SDKs are loaded from. Empty means
     /// `PW_UPSCALER_SDK_DIR`, then `<exe>/sdk`, the same rule the upscalers use.
     pub sdk_dir: String,
@@ -251,6 +335,7 @@ impl Default for Settings {
             reflection_roughness_cutoff: 0.4,
             show_denoiser_input: false,
             replace_raster: false,
+            debug_view: DebugView::None,
             sdk_dir: String::new(),
         }
     }
@@ -324,6 +409,8 @@ pub struct Plan {
     /// Explicit opt-in to replace raster lighting terms. `false` (default)
     /// keeps the full raster world render untouched and composites RT on top.
     pub replace_raster: bool,
+    /// Single-term debug view (Phase 0); `DebugView::None` in normal play.
+    pub debug_view: DebugView,
 }
 
 impl Plan {
@@ -346,6 +433,7 @@ impl Plan {
         grid: (0, 0),
         render: (0, 0),
         replace_raster: false,
+        debug_view: DebugView::None,
     };
 
     /// Largest ray grid edge a software trace can be asked for at 1 sample. A
@@ -400,6 +488,7 @@ impl Plan {
             grid: ((render.0 / ray_scale).max(1), (render.1 / ray_scale).max(1)),
             render,
             replace_raster: settings.replace_raster,
+            debug_view: settings.debug_view,
         }
     }
 }

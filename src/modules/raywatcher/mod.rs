@@ -46,8 +46,8 @@ pub mod gpu;
 pub mod reconstruct;
 
 pub use plan::{
-    Availability, Effects, Plan, RayReconstruction, RayTracingMode, Settings, BOUNCES_RANGE,
-    DENOISE_RANGE, SAMPLES_RANGE,
+    Availability, DebugView, Effects, Plan, RayReconstruction, RayTracingMode, Settings,
+    BOUNCES_RANGE, DENOISE_RANGE, SAMPLES_RANGE,
 };
 
 use std::path::{Path, PathBuf};
@@ -136,6 +136,7 @@ impl Raywatcher {
             || settings.reconstruction != self.settings.reconstruction
             || settings.samples != self.settings.samples
             || settings.replace_raster != self.settings.replace_raster
+            || settings.debug_view != self.settings.debug_view
         {
             self.pending_reset = true;
         }
@@ -323,10 +324,10 @@ impl Raywatcher {
             .weak(),
         );
         ui.separator();
-        ui.heading("Replaced effects");
+        ui.heading("Layered RT effects");
         ui.label(
             egui::RichText::new(
-                "Every effect ticked here has its raster version switched off and its ray-traced version drawn instead — there is no state where both run.",
+                "By default, Raywatcher keeps the full original raster world and layers the ticked ray-traced signals on top.",
             )
             .small()
             .weak(),
@@ -384,10 +385,17 @@ impl Raywatcher {
             .on_hover_text(
                 "Draws the raw one-sample-per-pixel ray image instead of the filtered one. A debug switch: it makes the denoiser's work visible.",
             );
-        ui.checkbox(&mut settings.replace_raster, "Replace raster lighting (opt-in)")
+        ui.checkbox(&mut settings.replace_raster, "Replace raster lighting (debug opt-in)")
             .on_hover_text(
-                "Off by default: Raywatcher layers ray-traced shadows, reflections, AO and GI over the full textured raster world. Enable only to zero raster lighting and draw raw RT geometry.",
+                "Off by default: Raywatcher layers ray-traced shadows, reflections, AO, point lights and GI over the full textured raster world.",
             );
+        egui::ComboBox::from_label("Debug view")
+            .selected_text(settings.debug_view.label())
+            .show_ui(ui, |ui| {
+                for view in DebugView::ALL {
+                    ui.selectable_value(&mut settings.debug_view, view, view.label());
+                }
+            });
         ui.separator();
         ui.heading("Ray reconstruction");
         ui.horizontal(|ui| {
@@ -492,6 +500,7 @@ impl Raywatcher {
             "replace_raster={}",
             u8::from(self.settings.replace_raster)
         );
+        let _ = writeln!(out, "debug_view={}", self.settings.debug_view.token());
         let effects = self.settings.effects;
         for (name, on) in [
             ("shadows", effects.shadows),
@@ -548,6 +557,9 @@ impl Raywatcher {
         if let Some(v) = get("replace_raster").and_then(parse_flag) {
             s.replace_raster = v;
         }
+        if let Some(v) = get("debug_view").and_then(|v| DebugView::parse(&v)) {
+            s.debug_view = v;
+        }
         let mut effects = s.effects;
         for (name, slot) in [
             ("shadows", &mut effects.shadows),
@@ -569,7 +581,8 @@ impl Raywatcher {
         let reset = s.mode != self.settings.mode
             || s.reconstruction != self.settings.reconstruction
             || s.samples != self.settings.samples
-            || s.replace_raster != self.settings.replace_raster;
+            || s.replace_raster != self.settings.replace_raster
+            || s.debug_view != self.settings.debug_view;
         self.settings = s;
         if reset {
             self.pending_reset = true;
