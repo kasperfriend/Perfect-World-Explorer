@@ -76,10 +76,10 @@ impl DxrTracer {
         _params: &RayParams,
         _grid_extent: (u32, u32),
         _dst_colour: &wgpu::Texture,
-        _dst_guide: &wgpu::Texture,
+        _dst_guide: Option<&wgpu::Texture>,
         _dst_reflection: &wgpu::Texture,
         _dst_normals: &wgpu::Texture,
-        _dst_albedo: &wgpu::Texture,
+        _dst_albedo: Option<&wgpu::Texture>,
     ) -> Result<(), String> {
         Err("DXR 1.1 hardware ray tracing requires Windows + DX12".into())
     }
@@ -488,12 +488,17 @@ mod imp {
                     false,
                 )
             };
+            let colour = mk("raywatcher dxr colour", COLOUR_FORMAT)?;
+            let guide = mk("raywatcher dxr guide", GUIDE_FORMAT)?;
+            let reflection = mk("raywatcher dxr reflection", COLOUR_FORMAT)?;
+            let normals = mk("raywatcher dxr normals", GUIDE_FORMAT)?;
+            let albedo = mk("raywatcher dxr albedo", COLOUR_FORMAT)?;
             Ok(Self {
-                colour: mk("raywatcher dxr colour", COLOUR_FORMAT)?,
-                guide: mk("raywatcher dxr guide", GUIDE_FORMAT)?,
-                reflection: mk("raywatcher dxr reflection", COLOUR_FORMAT)?,
-                normals: mk("raywatcher dxr normals", GUIDE_FORMAT)?,
-                albedo: mk("raywatcher dxr albedo", COLOUR_FORMAT)?,
+                colour,
+                guide,
+                reflection,
+                normals,
+                albedo,
                 extent: (w, h),
             })
         }
@@ -509,7 +514,7 @@ mod imp {
         pso: *mut d12::ID3D12PipelineState,
         desc_heap: *mut d12::ID3D12DescriptorHeap,
         desc_stride: u32,
-        cbv: RawBuffer,
+        cbvs: [RawBuffer; 3],
         scene: DxrScene,
         targets: DxrTargets,
     }
@@ -560,15 +565,17 @@ mod imp {
                     e
                 })?
             };
-            let cbv = unsafe {
+            let cbv_size = (size_of::<RayParams>() as u64 + 255) & !255;
+            let mk_cbv = || unsafe {
                 RawBuffer::create(
                     dev_ptr,
-                    (size_of::<RayParams>() as u64 + 255) & !255,
+                    cbv_size,
                     d12::D3D12_HEAP_TYPE_UPLOAD,
                     d12::D3D12_RESOURCE_FLAG_NONE,
                     d12::D3D12_RESOURCE_STATE_GENERIC_READ,
-                )?
+                )
             };
+            let cbvs = [mk_cbv()?, mk_cbv()?, mk_cbv()?];
             let dxr_scene = Self::build_scene(dev_ptr, device5, &mut ring, &raw_queue, scene)?;
             let targets = DxrTargets::new(device, &raw_device, grid_extent)?;
 
@@ -581,7 +588,7 @@ mod imp {
                 pso,
                 desc_heap,
                 desc_stride,
-                cbv,
+                cbvs,
                 scene: dxr_scene,
                 targets,
             };
@@ -733,7 +740,7 @@ mod imp {
             // succeeds even on an empty scene.
             let mut tris_data: Vec<RayTriangle> = if scene.triangles.is_empty() {
                 vec![RayTriangle {
-                    a: [0.0, 0.0, 0.0],
+                    a: [0.0, 0.0, 0.0, 0.0],
                     b: [0.0, 0.0, 0.0, 0.0],
                     c: [0.0, 0.0, 0.0, 0.0],
                     normal: [0.0, 1.0, 0.0, 0.0],
@@ -756,7 +763,7 @@ mod imp {
             // the DXR BLAS triangle geometry descriptor.
             let mut verts: Vec<[f32; 3]> = Vec::with_capacity(tris_data.len() * 3);
             for t in &mut tris_data {
-                verts.push(t.a);
+                verts.push([t.a[0], t.a[1], t.a[2]]);
                 verts.push([t.b[0], t.b[1], t.b[2]]);
                 verts.push([t.c[0], t.c[1], t.c[2]]);
             }
@@ -1097,15 +1104,15 @@ mod imp {
             params: &RayParams,
             grid_extent: (u32, u32),
             dst_colour: &wgpu::Texture,
-            dst_guide: &wgpu::Texture,
+            dst_guide: Option<&wgpu::Texture>,
             dst_reflection: &wgpu::Texture,
             dst_normals: &wgpu::Texture,
-            dst_albedo: &wgpu::Texture,
+            dst_albedo: Option<&wgpu::Texture>,
         ) -> Result<(), String> {
             let (w, h) = (grid_extent.0.max(1), grid_extent.1.max(1));
             unsafe {
-                self.cbv.write_upload(bytemuck::bytes_of(params))?;
                 let slot_idx = self.ring.acquire("DXR-Trace")?;
+                self.cbvs[slot_idx].write_upload(bytemuck::bytes_of(params))?;
                 let list = self.ring.slot_mut(slot_idx).list.as_mut_ptr();
 
                 let resources = [
@@ -1131,7 +1138,7 @@ mod imp {
                 (*list).SetDescriptorHeaps(1, heaps.as_mut_ptr());
                 (*list).SetComputeRootSignature(self.root_sig);
                 (*list).SetPipelineState(self.pso);
-                (*list).SetComputeRootConstantBufferView(0, self.cbv.gpu_va);
+                (*list).SetComputeRootConstantBufferView(0, self.cbvs[slot_idx].gpu_va);
                 (*list).SetComputeRootDescriptorTable(1, self.gpu_handle(0));
                 (*list).SetComputeRootDescriptorTable(2, self.gpu_handle(3));
                 (*list).Dispatch(w.div_ceil(8), h.div_ceil(8), 1);
@@ -1156,14 +1163,17 @@ mod imp {
                 height: h.min(self.targets.extent.1).min(dst_colour.height()),
                 depth_or_array_layers: 1,
             };
+            // Copy only the planes the active denoiser/reconstructor consumes,
+            // keeping all DXR targets strictly in COPY_SOURCE for wgpu DX12 state safety.
             let pairs = [
-                (&self.targets.colour.texture, dst_colour),
+                (&self.targets.colour.texture, Some(dst_colour)),
                 (&self.targets.guide.texture, dst_guide),
-                (&self.targets.reflection.texture, dst_reflection),
-                (&self.targets.normals.texture, dst_normals),
+                (&self.targets.reflection.texture, Some(dst_reflection)),
+                (&self.targets.normals.texture, Some(dst_normals)),
                 (&self.targets.albedo.texture, dst_albedo),
             ];
-            for (src, dst) in pairs {
+            for (src, dst_opt) in pairs {
+                let Some(dst) = dst_opt else { continue };
                 encoder.copy_texture_to_texture(
                     wgpu::ImageCopyTexture {
                         texture: src,

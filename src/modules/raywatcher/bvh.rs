@@ -27,7 +27,7 @@ use glam::Vec3;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RayTriangle {
-    pub a: [f32; 3],
+    pub a: [f32; 4],
     /// `w` carries the triangle's material index as a float; the shader reads it
     /// back with `as u32`, so a 24-bit float mantissa is far more materials than
     /// the world has.
@@ -39,7 +39,7 @@ pub struct RayTriangle {
 impl RayTriangle {
     pub fn new(a: Vec3, b: Vec3, c: Vec3, normal: Vec3, material: u32) -> Self {
         Self {
-            a: a.to_array(),
+            a: [a.x, a.y, a.z, 0.],
             b: [b.x, b.y, b.z, material as f32],
             c: [c.x, c.y, c.z, 0.],
             normal: [normal.x, normal.y, normal.z, 0.],
@@ -803,6 +803,13 @@ mod tests {
                 assert!((i + 1) < scene.nodes.len());
             }
         }
+    }
+
+    #[test]
+    fn gpu_struct_layouts_match_wgsl_and_hlsl_stride() {
+        assert_eq!(std::mem::size_of::<RayTriangle>(), 64);
+        assert_eq!(std::mem::size_of::<BvhNode>(), 32);
+        assert_eq!(std::mem::size_of::<RayMaterial>(), 32);
     }
 
     #[test]

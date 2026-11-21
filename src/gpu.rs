@@ -3750,6 +3750,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         render_extent: (u32, u32),
         matrix: Mat4,
+        jitter: (f32, f32),
         reset_history: bool,
         map_space: Option<&crate::navigation::MapSpace>,
         destination: &wgpu::Texture,
@@ -3868,7 +3869,7 @@ impl Renderer {
             } else {
                 camera.far
             },
-            jitter: (0., 0.),
+            jitter,
             frame: self.modules.raywatcher().frame_index(),
             history_valid: u32::from(!reset_history),
             sun,
@@ -3923,7 +3924,7 @@ impl Renderer {
                     proj.to_cols_array_2d(),
                 );
                 if !ran {
-                    gpu.record_denoise(&self.queue, encoder, &params, &denoise);
+                    gpu.record_denoise(&self.queue, encoder, &params, &denoise, &self.object_mv);
                 }
             }
         }
@@ -6998,6 +6999,7 @@ pub fn run(
                                     &mut ray_encoder,
                                     world_extent,
                                     world_matrix,
+                                    frame_jitter,
                                     camera_jumped,
                                     Some(&map_space),
                                     render_scale.texture(),

@@ -304,8 +304,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
         float2 pixel = float2(float(id.x) + 0.5, float(id.y) + 0.5) + offset + params.tuning.xy;
         float2 ndc = float2(pixel.x / grid.x * 2.0 - 1.0, 1.0 - pixel.y / grid.y * 2.0);
-        float4 near_p = mul(params.inv_vp, float4(ndc, 1.0, 1.0));
         float4 far_p = mul(params.inv_vp, float4(ndc, 0.0, 1.0));
+        float4 near_p = far_p + float4(params.inv_vp[0].z, params.inv_vp[1].z, params.inv_vp[2].z, params.inv_vp[3].z);
         float3 dir = normalize(far_p.xyz / far_p.w - near_p.xyz / near_p.w);
         Surface surface = shade(params.eye.xyz, dir, state);
         accum += surface.colour;

@@ -616,8 +616,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         let pixel = vec2<f32>(f32(id.x) + 0.5, f32(id.y) + 0.5) + offset + params.tuning.xy;
         let ndc = vec2<f32>(pixel.x / grid.x * 2.0 - 1.0, 1.0 - pixel.y / grid.y * 2.0);
-        let near = params.inv_vp * vec4<f32>(ndc, 1.0, 1.0);
         let far = params.inv_vp * vec4<f32>(ndc, 0.0, 1.0);
+        let near = far + params.inv_vp[2];
         let dir = normalize(far.xyz / far.w - near.xyz / near.w);
         let surface = shade(params.eye.xyz, dir, &state);
         accum = accum + surface.colour;
@@ -1187,24 +1187,50 @@ pub struct SceneBuffers {
 
 impl SceneBuffers {
     fn upload(device: &wgpu::Device, scene: Arc<super::bvh::SceneGeometry>) -> Self {
+        // wgpu 0.19 rejects 0-byte storage buffers; substitute a 1-element dummy
+        // buffer when a slice is empty while keeping `counts` at the real length.
+        let dummy_tri = [<RayTriangle as bytemuck::Zeroable>::zeroed()];
+        let dummy_node = [<BvhNode as bytemuck::Zeroable>::zeroed()];
+        let dummy_ord = [0u32];
+        let dummy_mat = [<RayMaterial as bytemuck::Zeroable>::zeroed()];
+        let tri_slice = if scene.triangles.is_empty() {
+            &dummy_tri[..]
+        } else {
+            &scene.triangles[..]
+        };
+        let node_slice = if scene.nodes.is_empty() {
+            &dummy_node[..]
+        } else {
+            &scene.nodes[..]
+        };
+        let ord_slice = if scene.order.is_empty() {
+            &dummy_ord[..]
+        } else {
+            &scene.order[..]
+        };
+        let mat_slice = if scene.materials.is_empty() {
+            &dummy_mat[..]
+        } else {
+            &scene.materials[..]
+        };
         let triangles = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("raywatcher triangles"),
-            contents: bytemuck::cast_slice(&scene.triangles),
+            contents: bytemuck::cast_slice(tri_slice),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let nodes = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("raywatcher bvh"),
-            contents: bytemuck::cast_slice(&scene.nodes),
+            contents: bytemuck::cast_slice(node_slice),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let order = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("raywatcher order"),
-            contents: bytemuck::cast_slice(&scene.order),
+            contents: bytemuck::cast_slice(ord_slice),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("raywatcher materials"),
-            contents: bytemuck::cast_slice(&scene.materials),
+            contents: bytemuck::cast_slice(mat_slice),
             usage: wgpu::BufferUsages::STORAGE,
         });
         Self {
@@ -1316,6 +1342,7 @@ pub struct RaywatcherGpu {
     dlss_rr: Option<super::reconstruct::DlssRayReconstructor>,
     dlss_rr_failed: bool,
     blit_pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+    blit_bind_group: wgpu::BindGroup,
     grid: GridTargets,
     grid_extent: (u32, u32),
     render_extent: (u32, u32),
@@ -1469,6 +1496,7 @@ impl RaywatcherGpu {
                 &guide_view,
             ),
         ];
+        let blit_bind_group = Self::blit_binding(device, &pipelines, &output_view);
         Self {
             pipelines,
             uniforms,
@@ -1481,6 +1509,7 @@ impl RaywatcherGpu {
             dlss_rr: None,
             dlss_rr_failed: false,
             blit_pipeline: None,
+            blit_bind_group,
             grid,
             grid_extent,
             render_extent: (w, h),
@@ -1759,6 +1788,27 @@ impl RaywatcherGpu {
         })
     }
 
+    fn blit_binding(
+        device: &wgpu::Device,
+        pipelines: &Pipelines,
+        output_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raywatcher blit"),
+            layout: &pipelines.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&pipelines.blit_sampler),
+                },
+            ],
+        })
+    }
+
     /// Resize the render-extent targets. Returns `false` when the device refused
     /// the size, in which case the caller keeps the module disabled rather than
     /// binding stale targets.
@@ -1883,6 +1933,7 @@ impl RaywatcherGpu {
         self._motion_tex = motion_tex;
         self.depth = depth;
         self._depth_tex = depth_tex;
+        self.blit_bind_group = Self::blit_binding(device, &self.pipelines, &output_view);
         self.output = output;
         self.output_view = output_view;
         self.guide = guide;
@@ -1947,6 +1998,10 @@ impl RaywatcherGpu {
             ],
         );
 
+        let skip_inhouse = plan.reconstruction
+            == super::plan::RayReconstruction::DlssRayReconstruction
+            && !self.dlss_rr_failed;
+
         let mut traced_hw = false;
         if hardware_mode && !self.dxr_failed {
             if self.dxr.is_none() {
@@ -1961,15 +2016,19 @@ impl RaywatcherGpu {
                 }
             }
             if let Some(dxr) = self.dxr.as_mut() {
+                // Skip copying `albedo` when in-house denoiser runs, and skip
+                // copying `guide` when DLSS Ray Reconstruction runs.
+                let dst_guide = (!skip_inhouse).then_some(&self.grid.guide);
+                let dst_albedo = skip_inhouse.then_some(&self.grid.albedo);
                 match dxr.trace(
                     encoder,
                     &packed,
                     plan.grid,
                     &self.grid.colour,
-                    &self.grid.guide,
+                    dst_guide,
                     &self.grid.reflection,
                     &self.grid.normals,
-                    &self.grid.albedo,
+                    dst_albedo,
                 ) {
                     Ok(()) => traced_hw = true,
                     Err(err) => {
@@ -1995,29 +2054,10 @@ impl RaywatcherGpu {
             pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
         }
 
-        // The denoiser's guide inputs are the scene's own motion and depth.
-        // They are copied rather than aliased because the filter samples them at
-        // arbitrary reprojected positions.
+        // Depth is consumed by both the in-house denoiser and DLSS RR; motion is
+        // copied inside `record_denoise` only when the in-house denoiser runs
+        // (DLSS RR reads the caller's motion texture directly).
         let (rw, rh) = self.render_extent;
-        encoder.copy_texture_to_texture(
-            wgpu::ImageCopyTexture {
-                texture: motion,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::ImageCopyTexture {
-                texture: &self._motion_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: rw.min(motion.width()),
-                height: rh.min(motion.height()),
-                depth_or_array_layers: 1,
-            },
-        );
         encoder.copy_texture_to_texture(
             wgpu::ImageCopyTexture {
                 texture: depth,
@@ -2038,11 +2078,8 @@ impl RaywatcherGpu {
             },
         );
 
-        let skip_inhouse = plan.reconstruction
-            == super::plan::RayReconstruction::DlssRayReconstruction
-            && !self.dlss_rr_failed;
         if !skip_inhouse {
-            self.record_denoise(queue, encoder, params, config);
+            self.record_denoise(queue, encoder, params, config, motion);
         }
         self.frames = self.frames.saturating_add(1);
         self.traced_last_frame = true;
@@ -2055,8 +2092,28 @@ impl RaywatcherGpu {
         encoder: &mut wgpu::CommandEncoder,
         params: &FrameParams,
         config: &DenoiseConfig,
+        motion: &wgpu::Texture,
     ) {
         let (rw, rh) = self.render_extent;
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: motion,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &self._motion_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: rw.min(motion.width()),
+                height: rh.min(motion.height()),
+                depth_or_array_layers: 1,
+            },
+        );
         queue.write_buffer(
             &self.temporal_uniforms,
             0,
@@ -2246,20 +2303,6 @@ impl RaywatcherGpu {
         let Some((_, ref pipe)) = self.blit_pipeline else {
             return;
         };
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("raywatcher blit"),
-            layout: &self.pipelines.blit_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.output_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.pipelines.blit_sampler),
-                },
-            ],
-        });
         let dst_view = destination.create_view(&Default::default());
         let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("raywatcher blit"),
@@ -2276,7 +2319,7 @@ impl RaywatcherGpu {
             occlusion_query_set: None,
         });
         rp.set_pipeline(pipe);
-        rp.set_bind_group(0, &bg, &[]);
+        rp.set_bind_group(0, &self.blit_bind_group, &[]);
         rp.draw(0..3, 0..1);
     }
 
