@@ -258,7 +258,7 @@ jobs:
           exit "$status"
       - name: Run viewer unit tests
         run: |
-          CARGO_TERM_COLOR=never cargo test --locked --bin perfect-world-explorer 2>&1 | tee /tmp/cargo-test.log
+          CARGO_TERM_COLOR=never cargo test --locked --bin perfect-world-explorer -- --show-output 2>&1 | tee /tmp/cargo-test.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
             # Preserve compiler spans/help next to a test-only type error; the
