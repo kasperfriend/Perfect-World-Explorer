@@ -5298,3 +5298,31 @@ fn c1_overlay_startup_failure_keeps_raster_world_and_records_status() {
         super::ReloadOutcome::Fatal("reference pipeline failed".into())
     );
 }
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[test]
+fn c2_cold_ray_deadline_uses_first_frame_timeout_and_resets_on_progress() {
+    use std::time::{Duration, Instant};
+
+    let t0 = Instant::now();
+    let mut deadline = super::ColdRayDeadline::start(t0);
+    assert_eq!(deadline.timeout, crate::world_handoff::FIRST_FRAME_TIMEOUT);
+    assert_eq!(deadline.timeout, Duration::from_secs(120));
+
+    for step in 1..=5 {
+        let now = t0 + Duration::from_secs(step * 45);
+        assert!(
+            !deadline.is_stalled(now),
+            "must not stall while progress arrives every 45s (step {step})"
+        );
+        deadline.on_progress(now);
+    }
+
+    let last_progress = t0 + Duration::from_secs(5 * 45);
+    assert!(!deadline.is_stalled(last_progress + Duration::from_secs(119)));
+    assert!(!deadline.is_stalled(last_progress + Duration::from_secs(120)));
+    assert!(
+        deadline.is_stalled(last_progress + Duration::from_secs(121)),
+        "must report stall after 120s of complete silence"
+    );
+}

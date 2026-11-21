@@ -1128,6 +1128,36 @@ enum ColdRayBuild {
     Done(Result<(vulkan::Renderer, bool), String>),
 }
 
+/// Stall-based deadline for background Vulkan RT pipeline startup.
+/// Shares `FIRST_FRAME_TIMEOUT` (120 s) with world handoff, resets on every
+/// real progress event or in-flight compile heartbeat, and expires only after
+/// 120 seconds of complete silence.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ColdRayDeadline {
+    expires_at: Instant,
+    timeout: Duration,
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+impl ColdRayDeadline {
+    pub(crate) fn start(now: Instant) -> Self {
+        let timeout = crate::world_handoff::FIRST_FRAME_TIMEOUT;
+        Self {
+            expires_at: now + timeout,
+            timeout,
+        }
+    }
+
+    pub(crate) fn on_progress(&mut self, now: Instant) {
+        self.expires_at = now + self.timeout;
+    }
+
+    pub(crate) fn is_stalled(&self, now: Instant) -> bool {
+        now > self.expires_at
+    }
+}
+
 /// Outcome of checking a Reload World request against live Lighter state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReloadOutcome {
@@ -1157,7 +1187,7 @@ pub struct Lighter {
     /// Deadline for cold-ray startup; reset on every stage advance so a
     /// stalled pipeline worker fails closed instead of hanging forever.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    cold_ray_deadline: Option<Instant>,
+    cold_ray_deadline: Option<ColdRayDeadline>,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     paced_startup: bool,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -2132,7 +2162,7 @@ impl Lighter {
                     .filter(|_| self.bc_pages)
                     .map(|w| w.textures.bc_pages.clone());
                 let stage: u64 = 0;
-                self.cold_ray_deadline = Some(Instant::now() + Duration::from_secs(30));
+                self.cold_ray_deadline = Some(ColdRayDeadline::start(Instant::now()));
                 std::thread::Builder::new().name("lighter-pipeline-startup".into()).spawn(move || {
                     let progress = |step| { let _ = tx.send(ColdRayBuild::Progress(stage, step)); };
                     let build = |temporal| vulkan::Renderer::new(&device, compact, reuse, pages.as_ref(), temporal, game, &progress);
@@ -2162,23 +2192,25 @@ impl Lighter {
             if let Some(rx) = &self.cold_ray {
                 let made = loop {
                     if let Some(deadline) = self.cold_ray_deadline {
-                        if Instant::now() > deadline {
+                        if deadline.is_stalled(Instant::now()) {
                             return Err(
-                                "Lighter cold-ray startup exceeded the first-frame timeout".into(),
+                                "Lighter cold-ray startup stalled (no progress for 120s)".into()
                             );
                         }
                     }
                     match rx.try_recv() {
                         Ok(ColdRayBuild::Progress(_, stage_msg)) => {
                             crate::gpu::first_frame_progress(stage_msg);
-                            self.cold_ray_deadline = Some(Instant::now() + Duration::from_secs(30));
+                            if let Some(deadline) = self.cold_ray_deadline.as_mut() {
+                                deadline.on_progress(Instant::now());
+                            }
                         }
                         Ok(ColdRayBuild::Done(made)) => break made,
                         Err(TryRecvError::Empty) => {
                             if let Some(deadline) = self.cold_ray_deadline {
-                                if Instant::now() > deadline {
+                                if deadline.is_stalled(Instant::now()) {
                                     return Err(
-                                        "Lighter cold-ray startup exceeded the first-frame timeout"
+                                        "Lighter cold-ray startup stalled (no progress for 120s)"
                                             .into(),
                                     );
                                 }
