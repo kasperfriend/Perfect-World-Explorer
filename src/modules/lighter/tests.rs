@@ -5241,3 +5241,15 @@ fn r6_overlay_and_reference_reload_paths_end_to_end() {
         "Reference reload must succeed when world is replaced"
     );
 }
+
+#[test]
+fn r7_native_mode_leaves_lighter_completely_inactive() {
+    let mut lighter = Lighter::default();
+    lighter.settings.mode = Mode::Off;
+    lighter.settings.ray_lighting = true;
+    lighter.settings.reference = false;
+    assert!(!lighter.replaces_world());
+    assert!(!lighter.overlays_world());
+    assert!(!lighter.overlay_ready());
+    assert_eq!(lighter.check_reload_state(Mode::Off, false), Ok(true));
+}
