@@ -3976,4 +3976,53 @@ mod phase_r1_tests {
             "open-sea water pixel on water plane must be glossy (0.06), got {sea_r}"
         );
     }
+
+    #[test]
+    fn phase_r4_water_excluded_from_occluder_bvh_while_water_pixels_trace_reflections() {
+        use super::super::harvest::{HarvestConfig, Harvester, WaterSurface, KIND_WATER};
+        let water = [WaterSurface {
+            bounds: [-50.0, 50.0, -50.0, 50.0],
+            height: 10.0,
+        }];
+        let mut harvester = Harvester::new();
+        let flat_ground = |_x: f32, _z: f32| -> f32 { 5.0 };
+        let scene = harvester.scene_frustum(
+            HarvestConfig {
+                radius: 64.0,
+                chunk_size: 64.0,
+                max_distance: 64.0,
+                ..HarvestConfig::default()
+            },
+            glam::Vec3::new(0.0, 20.0, 0.0),
+            glam::Vec3::NEG_Z,
+            glam::Mat4::IDENTITY,
+            64.0,
+            2.0,
+            1,
+            1,
+            Some(&flat_ground),
+            &[],
+            &[],
+            &water,
+        );
+        assert!(
+            scene.triangles.iter().all(|t| t.kind() != KIND_WATER),
+            "occluder BVH must contain zero KIND_WATER triangles"
+        );
+        // Real water pixel still qualifies for reflections (roughness 0.06 <= cutoff 0.35).
+        let cutoff = 0.35_f32;
+        let water_r =
+            classify_surface_roughness(0.32, 0.20, glam::Vec3::new(0.0, 10.0, 0.0), &water);
+        assert!(
+            water_r <= cutoff,
+            "water pixel roughness {water_r} must qualify for reflections (<= {cutoff})"
+        );
+        // Dry land pixel stays matte (0.92 > cutoff) and never traces reflections.
+        let land_r =
+            classify_surface_roughness(0.20, 0.20, glam::Vec3::new(0.0, 10.0, 0.0), &water);
+        assert!(
+            land_r > cutoff,
+            "land pixel roughness {land_r} must not qualify for reflections (> {cutoff})"
+        );
+    }
 }
