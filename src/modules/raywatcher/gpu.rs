@@ -297,6 +297,7 @@ struct PrepParams {
 @group(0) @binding(3) var out_pos: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(4) var out_norm: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var out_raster: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(6) var src_pre_water_depth: texture_depth_2d;
 
 fn reconstruct_pos(px: vec2<i32>, z: f32, render: vec2<f32>) -> vec3<f32> {
     let uv = (vec2<f32>(px) + vec2<f32>(0.5)) / render;
@@ -387,24 +388,16 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Default terrain/ground roughness is matte (0.92), strictly above
-    // `reflection_roughness_cutoff` (default 0.4) so rough ground never traces
-    // mirror reflections. Only flat horizontal water pixels strictly inside a
-    // water plane's footprint and height band receive low water roughness.
+    // Phase 1: Use the real raster water mask instead of rectangular AABB
+    // bounds. The raster water pass writes closer reversed-Z depth than the
+    // pre-water opaque depth (`z > z_pre + 1e-6`) ONLY on actual water pixels;
+    // dry ground inside a water body's rectangular AABB has `z == z_pre` and
+    // stays matte (`0.92`), so it never traces mirror reflections.
     var roughness = 0.92;
-    let wc = min(u32(prep.water_count.x), 16u);
-    if (n.y > 0.985) {
-        for (var wi = 0u; wi < wc; wi = wi + 1u) {
-            let wb = prep.water_planes[wi];
-            let wh = prep.water_heights[wi / 4u][wi % 4u];
-            if (p.x >= wb.x && p.x <= wb.y &&
-                p.z >= wb.z && p.z <= wb.w &&
-                abs(p.y - wh) < 0.15) {
-                roughness = 0.06;
-                n = vec3<f32>(0.0, 1.0, 0.0);
-                break;
-            }
-        }
+    let z_pre = textureLoad(src_pre_water_depth, px, 0);
+    if (z > z_pre + 1e-6) {
+        roughness = 0.06;
+        n = vec3<f32>(0.0, 1.0, 0.0);
     }
 
     textureStore(out_pos, vec2<i32>(id.xy), vec4<f32>(p, dist));
@@ -1634,6 +1627,7 @@ impl Pipelines {
                 ),
                 storage_texture_entry(4, wgpu::StorageTextureAccess::WriteOnly, GUIDE_FORMAT),
                 storage_texture_entry(5, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
+                texture_entry(6, wgpu::TextureSampleType::Depth),
             ],
         });
         let gbuf_prep_pipeline = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2164,6 +2158,8 @@ pub struct RaywatcherGpu {
     _motion_tex: wgpu::Texture,
     depth: wgpu::TextureView,
     _depth_tex: wgpu::Texture,
+    pre_water_depth: wgpu::TextureView,
+    _pre_water_depth_tex: wgpu::Texture,
     /// Interpolated result, at the render extent, for the upscaler to consume.
     pub output: wgpu::Texture,
     pub output_view: wgpu::TextureView,
@@ -2232,6 +2228,7 @@ impl RaywatcherGpu {
             plane(device, "raywatcher temporal moments", w, h, GUIDE_FORMAT);
         let (motion_tex, motion) = plane(device, "raywatcher motion", w, h, COLOUR_FORMAT);
         let (depth_tex, depth) = depth_plane(device, w, h);
+        let (pre_water_depth_tex, pre_water_depth) = depth_plane(device, w, h);
         let (output, output_view) = plane(device, "raywatcher output", w, h, COLOUR_FORMAT);
         let (guide, guide_view) = plane(device, "raywatcher output guide", w, h, GUIDE_FORMAT);
         let compose_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2345,6 +2342,8 @@ impl RaywatcherGpu {
             _motion_tex: motion_tex,
             depth,
             _depth_tex: depth_tex,
+            pre_water_depth,
+            _pre_water_depth_tex: pre_water_depth_tex,
             output,
             output_view,
             guide,
@@ -2754,6 +2753,7 @@ impl RaywatcherGpu {
             plane(device, "raywatcher temporal moments", w, h, GUIDE_FORMAT);
         let (motion_tex, motion) = plane(device, "raywatcher motion", w, h, COLOUR_FORMAT);
         let (depth_tex, depth) = depth_plane(device, w, h);
+        let (pre_water_depth_tex, pre_water_depth) = depth_plane(device, w, h);
         let (output, output_view) = plane(device, "raywatcher output", w, h, COLOUR_FORMAT);
         let (guide, guide_view) = plane(device, "raywatcher output guide", w, h, GUIDE_FORMAT);
         self.trace_bind_group =
@@ -2839,6 +2839,8 @@ impl RaywatcherGpu {
         self._motion_tex = motion_tex;
         self.depth = depth;
         self._depth_tex = depth_tex;
+        self.pre_water_depth = pre_water_depth;
+        self._pre_water_depth_tex = pre_water_depth_tex;
         self.blit_bind_group = Self::blit_binding(device, &self.pipelines, &output_view);
         self.raster_copy = None;
         self.gbuf_prep_bind_group = None;
@@ -2891,6 +2893,7 @@ impl RaywatcherGpu {
         config: &DenoiseConfig,
         motion: &wgpu::Texture,
         depth: &wgpu::Texture,
+        pre_water_depth: &wgpu::Texture,
         water: &[super::harvest::WaterSurface],
         point_lights: &[super::frame::PointLight],
     ) {
@@ -2917,6 +2920,30 @@ impl RaywatcherGpu {
             },
             wgpu::ImageCopyTexture {
                 texture: &self._depth_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::DepthOnly,
+            },
+            wgpu::Extent3d {
+                width: rw,
+                height: rh,
+                depth_or_array_layers: 1,
+            },
+        );
+        let pre_src = if (pre_water_depth.width(), pre_water_depth.height()) == (rw, rh) {
+            pre_water_depth
+        } else {
+            depth
+        };
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: pre_src,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::DepthOnly,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &self._pre_water_depth_tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::DepthOnly,
@@ -2966,6 +2993,10 @@ impl RaywatcherGpu {
                             resource: wgpu::BindingResource::TextureView(
                                 &self.grid.gbuf_raster_view,
                             ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(&self.pre_water_depth),
                         },
                     ],
                 }));

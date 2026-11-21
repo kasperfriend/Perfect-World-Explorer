@@ -4135,6 +4135,7 @@ impl Renderer {
             &denoise,
             &self.object_mv,
             &self.depth,
+            self.water.sample_depth_texture(),
             &active_water,
             &active_point_lights,
         );
@@ -4464,7 +4465,7 @@ impl Renderer {
         {
             self.water.copy_scene_to_refraction(&mut e);
         }
-        if use_post {
+        if use_post || self.raywatcher_frame_plan.trace {
             self.water.copy_depth(&mut e, &self.depth);
         }
         self.water.blit(&mut e, scene_target);

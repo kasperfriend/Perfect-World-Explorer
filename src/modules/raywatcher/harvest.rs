@@ -479,17 +479,11 @@ impl Harvester {
         let t_start = std::time::Instant::now();
         let mut triangles = Vec::new();
         let mut materials = Vec::new();
-        let before_water = triangles.len();
-        push_water(
-            &mut triangles,
-            &mut materials,
-            &water,
-            eye,
-            &frustum,
-            far,
-            ground,
-        );
-        let water_quads = (triangles.len() - before_water) / 2;
+        // Phase 1: Water does not cast shadows or AO in the game; do not add
+        // water sheets to the occluder BVH. Reflections trace from the raster
+        // water mask against the scene BVH + sky environment.
+        let _ = &water;
+        let water_quads = 0usize;
         let mut terrain_lod_tris = [0usize; 4];
         if let Some(ground_fn) = ground {
             terrain_lod_tris = push_terrain_frustum(
@@ -647,18 +641,10 @@ impl Harvester {
         );
         let proxy_tris = triangles.len() - before_proxy;
 
-        // 3. Reflective water surfaces across the visible frustum.
-        let before_water = triangles.len();
-        push_water(
-            &mut triangles,
-            &mut materials,
-            water,
-            eye,
-            &frustum,
-            far,
-            ground,
-        );
-        let water_quads = (triangles.len() - before_water) / 2;
+        // 3. Phase 1: Water sheets are excluded from the occluder BVH so they
+        //    never cast phantom shadows/AO or wedges on dry ground.
+        let _ = water;
+        let water_quads = 0usize;
 
         // 4. Chunked multi-LOD terrain across the entire visible frustum out to
         //    `far`.
@@ -1067,6 +1053,7 @@ fn push_real_meshes(
 /// subdivided into world cells and any cell whose terrain rises above
 /// `w.height` is dropped. This prevents rectangular water AABBs from placing
 /// phantom water occluders over dry sandbanks, islands, or adjacent ground.
+#[cfg_attr(not(test), allow(dead_code))]
 fn push_water(
     triangles: &mut Vec<RayTriangle>,
     materials: &mut Vec<RayMaterial>,
@@ -1799,10 +1786,14 @@ mod tests {
             &[],
             &[water],
         );
-        assert_eq!(scene.triangle_count(), 3);
+        // Phase 1: water sheets must NOT enter the occluder BVH; only the 1 real mesh tri is present.
+        assert_eq!(scene.triangle_count(), 1);
         assert!(
-            scene.materials.iter().any(|m| m.surface[0] <= 0.1),
-            "water must emit a low-roughness reflective material"
+            !scene
+                .triangles()
+                .iter()
+                .any(|t| (t.kind() - KIND_WATER).abs() < 0.25),
+            "water sheets must not enter the occluder BVH"
         );
         assert!(
             scene
@@ -1810,6 +1801,40 @@ mod tests {
                 .iter()
                 .any(|m| (m.albedo[0] - 0.8).abs() < 0.05),
             "real mesh albedo must survive into the RT material table"
+        );
+    }
+
+    #[test]
+    fn water_sheets_are_excluded_from_occluder_bvh() {
+        let mut harvester = Harvester::new();
+        let eye = Vec3::new(0.0, 20.0, -40.0);
+        let forward = Vec3::Z;
+        let vp = Mat4::perspective_infinite_reverse_rh(60.0f32.to_radians(), 16.0 / 9.0, 0.5)
+            * Mat4::look_to_rh(eye, forward, Vec3::Y);
+        let water = [WaterSurface {
+            bounds: [-32.0, 32.0, -32.0, 32.0],
+            height: 5.0,
+        }];
+        let scene = harvester.scene_frustum(
+            HarvestConfig::default(),
+            eye,
+            forward,
+            vp,
+            200.0,
+            4.0,
+            1,
+            1,
+            Some(&|_, _| 0.0),
+            &[],
+            &[],
+            &water,
+        );
+        assert!(
+            !scene
+                .triangles()
+                .iter()
+                .any(|t| (t.kind() - KIND_WATER).abs() < 0.25),
+            "water sheets must never appear in the occluder BVH"
         );
     }
 

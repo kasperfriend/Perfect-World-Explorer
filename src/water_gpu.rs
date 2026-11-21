@@ -806,6 +806,11 @@ impl WaterGpu {
     pub fn depth(&self) -> wgpu::TextureView {
         self.targets.reflect_depth.create_view(&Default::default())
     }
+    /// Pre-water opaque scene depth copied by [`Self::copy_depth`], used by
+    /// Raywatcher to derive an exact pixel water mask (`post_depth > pre_depth`).
+    pub fn sample_depth_texture(&self) -> &wgpu::Texture {
+        &self.targets.sample_depth
+    }
     pub fn update(&self, queue: &wgpu::Queue, u: &WaterUniform) {
         let mut value = *u;
         value.animation[2] = if self.format.is_srgb() { 1. } else { 0. };
