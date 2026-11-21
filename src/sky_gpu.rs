@@ -1480,7 +1480,7 @@ pub(crate) fn sky_selection_from_configs(element: &Path) -> Option<SkySelection>
 
 /// Best-effort read of `configs/element_client.cfg`; any failure falls back to
 /// the shipped defaults rather than failing the load.
-fn read_sky_images(element: &Path) -> Vec<String> {
+pub(crate) fn read_sky_images(element: &Path) -> Vec<String> {
     let defaults = || SKY_DEFAULTS.map(str::to_string).to_vec();
     let Ok(mut cfg_file) = File::open(element.join("configs.pck")) else {
         return defaults();

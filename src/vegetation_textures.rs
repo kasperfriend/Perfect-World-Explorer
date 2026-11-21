@@ -17,7 +17,9 @@ pub fn authored_lower_mips(bytes: &[u8]) -> Result<Vec<image::RgbaImage>, String
         // `crate::dxt::decode_level` is the only decoder it has. An
         // uncompressed source has no authored chain to carry into an atlas, so
         // there is nothing for the experiment to preserve.
-        crate::model_dds::Format::Uncompressed(_) => return Ok(Vec::new()),
+        crate::model_dds::Format::Bc5
+        | crate::model_dds::Format::Bc7
+        | crate::model_dds::Format::Uncompressed(_) => return Ok(Vec::new()),
     };
     let mut out = Vec::with_capacity(dds.mips.len().saturating_sub(1));
     for mip in dds.mips.iter().skip(1) {

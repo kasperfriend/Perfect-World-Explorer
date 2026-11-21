@@ -7,12 +7,12 @@ use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct Vertex {
-    p: [f32; 3],
-    uv: [f32; 2],
-    day: u32,
-    night: u32,
-    alpha: f32,
+pub(crate) struct Vertex {
+    pub p: [f32; 3],
+    pub uv: [f32; 2],
+    pub day: u32,
+    pub night: u32,
+    pub alpha: f32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -74,7 +74,7 @@ fn sample_noise(table: &[f32], oct: &[(usize, usize, f32)], x: f32) -> f32 {
         })
         .sum()
 }
-fn mesh(waves: &[crate::water::WaterArea]) -> (Vec<Vertex>, Vec<u32>) {
+pub(crate) fn mesh(waves: &[crate::water::WaterArea]) -> (Vec<Vertex>, Vec<u32>) {
     let (noise_table, oct) = noise();
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -205,6 +205,26 @@ fn wave_offset(seconds: f32, phase: f32, half: bool) -> f32 {
     };
     -0.5 * bezier(a, b, c, d, t)
 }
+pub(crate) fn wave_images(element: &Path) -> Result<Vec<image::RgbaImage>, String> {
+    let mut file = std::fs::File::open(element.join("textures.pck")).map_err(|e| e.to_string())?;
+    let entries = crate::pck::directory(&mut file)?;
+    let e = entries
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case("textures/water/wave1.dds"))
+        .ok_or("missing textures/water/wave1.dds")?;
+    let raw = crate::pck::read_entry(&mut file, e)?;
+    crate::water::decode_texture_mips(&raw)
+}
+
+pub(crate) fn wave_offsets(seconds: f32) -> [f32; 4] {
+    [
+        wave_offset(seconds, 0., false),
+        wave_offset(seconds, 2.5, false),
+        wave_offset(seconds, 0.4, true),
+        0.,
+    ]
+}
+
 const SHADER: &str = r#"
 struct Uniform { matrix:mat4x4<f32>, eye_night:vec4<f32>, offsets:vec4<f32>, flags:vec4<f32>, bounds:vec4<f32>, fog_range:vec4<f32>, fog_color:vec4<f32> };
 @group(0) @binding(0) var<uniform> u:Uniform;
@@ -256,15 +276,7 @@ impl ShoreGpu {
         if idx.is_empty() {
             return Ok(None);
         }
-        let mut file =
-            std::fs::File::open(element.join("textures.pck")).map_err(|e| e.to_string())?;
-        let entries = crate::pck::directory(&mut file)?;
-        let e = entries
-            .iter()
-            .find(|e| e.name.eq_ignore_ascii_case("textures/water/wave1.dds"))
-            .ok_or("missing textures/water/wave1.dds")?;
-        let raw = crate::pck::read_entry(&mut file, e)?;
-        let images = crate::water::decode_texture_mips(&raw)?;
+        let images = wave_images(element)?;
         Ok(Some(Self::from_images(
             device, queue, format, images, verts, idx,
         )))
@@ -470,12 +482,7 @@ impl ShoreGpu {
         let u = Uniform {
             matrix: matrix.to_cols_array_2d(),
             eye_night: [eye.x, eye.y, eye.z, night],
-            offsets: [
-                wave_offset(seconds, 0., false),
-                wave_offset(seconds, 2.5, false),
-                wave_offset(seconds, 0.4, true),
-                0.,
-            ],
+            offsets: wave_offsets(seconds),
             // flags.y is the wave sight range: wavevs takes it as c0.w =
             // 1/(range*range) rather than hard-coding the radius in the shader.
             flags: [

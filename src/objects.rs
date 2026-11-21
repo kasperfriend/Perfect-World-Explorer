@@ -36,6 +36,8 @@ pub struct Texture {
     pub width: usize,
     pub height: usize,
     pub rgba: Vec<u8>,
+    /// Retained only for the ray-enabled streamed world, not native preload.
+    pub ray_dds: Option<Vec<u8>>,
 }
 impl Texture {
     pub fn sample(&self, u: f32, v: f32) -> [f32; 3] {
@@ -57,10 +59,12 @@ impl Texture {
 }
 fn content_hash(tex: &Texture) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325 ^ ((tex.width as u64) << 32) ^ (tex.height as u64);
-    for chunk in tex.rgba.chunks(8) {
-        let mut v = [0u8; 8];
-        v[..chunk.len()].copy_from_slice(chunk);
-        h = (h ^ u64::from_le_bytes(v)).wrapping_mul(0x100000001b3);
+    for data in std::iter::once(&tex.rgba).chain(tex.ray_dds.iter()) {
+        for chunk in data.chunks(8) {
+            let mut v = [0u8; 8];
+            v[..chunk.len()].copy_from_slice(chunk);
+            h = (h ^ u64::from_le_bytes(v)).wrapping_mul(0x100000001b3);
+        }
     }
     h
 }
@@ -142,8 +146,11 @@ impl TextureCache {
         self.by_name.get(name).copied()
     }
     pub fn get(&self, name: &str) -> Option<&Texture> {
-        let hash = self.by_name.get(name)?;
-        Some(&self.by_hash.get(hash)?.tex)
+        self.get_with_key(name).map(|(_, tex)| tex)
+    }
+    fn get_with_key(&self, name: &str) -> Option<(u64, &Texture)> {
+        let hash = self.key(name)?;
+        Some((hash, &self.by_hash.get(&hash)?.tex))
     }
     /// Marks a reference as used by the current batch (pins its content).
     pub fn touch(&mut self, name: &str) {
@@ -158,7 +165,9 @@ impl TextureCache {
     /// recorded (deduplication). Evicts unpinned LRU entries afterwards
     /// until the byte budget holds again.
     pub fn store(&mut self, name: String, tex: Texture) {
-        let bytes = tex.rgba.len() + tex.width * tex.height / 1024;
+        let bytes = tex.rgba.len()
+            + tex.ray_dds.as_ref().map_or(0, Vec::len)
+            + tex.width * tex.height / 1024;
         let hash = content_hash(&tex);
         if self.by_hash.contains_key(&hash) {
             self.aliases.entry(hash).or_default().push(name.clone());
@@ -240,11 +249,15 @@ pub struct Objects {
     model_names: Vec<String>,
     models: HashMap<String, bmd::Model>,
     cache: TextureCache,
+    keep_ray_dds: bool,
+    ray_normals: HashMap<String, String>,
     resolver: TextureResolver,
     /// Scenery archives are optional: an instance map can still show terrain,
     /// water, trees and the models it does have when one package is absent.
     litfile: Option<File>,
     texfile: Option<File>,
+    shaders: Option<File>,
+    shader_entries: HashMap<String, pck::Entry>,
     lit_archive_error: Option<String>,
     lit_archive_entries: usize,
     litmodel_map_id: String,
@@ -332,6 +345,8 @@ fn tex_budget_bytes() -> usize {
         .unwrap_or(DEFAULT_TEX_BUDGET_MIB)
         << 20
 }
+const ARCHIVE_NAMES: [&str; 3] = ["litmodels.pck", "building.pck", "shaders.pck"];
+
 enum PendingTexture {
     Archive {
         mount: usize,
@@ -343,27 +358,66 @@ enum PendingTexture {
     },
 }
 
-fn decode_texture_bytes(key: &str, data: &[u8]) -> Result<Texture, String> {
-    let decoded = if key.ends_with(".tga") {
-        image::load_from_memory_with_format(data, image::ImageFormat::Tga)
+fn decode_texture_bytes(key: &str, data: Vec<u8>, keep_ray_dds: bool) -> Result<Texture, String> {
+    let is_dds = data.starts_with(b"DDS ");
+    let img = if is_dds && data.get(84..88) == Some(b"DX10") {
+        // The generic decoder does not enforce the single 2D surface contract.
+        crate::model_dds::decode_base(&data)?
     } else {
-        image::load_from_memory(data)
-    };
-    match decoded {
-        Ok(img) => {
-            let img = img.into_rgba8();
-            let (w, h) = img.dimensions();
-            Ok(Texture {
-                width: w as usize,
-                height: h as usize,
-                rgba: img.into_raw(),
-            })
+        let decoded = if key.ends_with(".tga") {
+            image::load_from_memory_with_format(&data, image::ImageFormat::Tga)
+        } else {
+            image::load_from_memory(&data)
+        };
+        match decoded {
+            Ok(img) => img.into_rgba8(),
+            Err(_) if is_dds => crate::model_dds::decode_base(&data)?,
+            Err(err) => return Err(err.to_string()),
         }
-        Err(err) => Err(err.to_string()),
-    }
+    };
+    let (w, h) = img.dimensions();
+    Ok(Texture {
+        width: w as usize,
+        height: h as usize,
+        rgba: img.into_raw(),
+        ray_dds: (keep_ray_dds && is_dds).then_some(data),
+    })
 }
 
 impl Objects {
+    /// Set before the first streaming batch so decoded aliases can retain
+    /// distinct authored mip chains even when level zero is identical.
+    #[allow(dead_code)] // standalone native survey binaries never set this
+    pub fn retain_ray_dds(&mut self) {
+        if self.keep_ray_dds {
+            return;
+        }
+        self.keep_ray_dds = true;
+        let path = self.resolver.disk_root().join("shaders.pck");
+        if path.is_file() {
+            let (file, entries, _) = open_optional_archive(&path);
+            if file.is_some() {
+                self.resolver.mount(MountedArchive {
+                    tag: "shaders".into(),
+                    index: entries.keys().cloned().collect(),
+                });
+                self.shaders = file;
+                self.shader_entries = entries;
+            }
+        }
+    }
+
+    fn archives(&self) -> [Option<&File>; 3] {
+        [
+            self.litfile.as_ref(),
+            self.texfile.as_ref(),
+            self.shaders.as_ref(),
+        ]
+    }
+    fn entries(&self) -> [&HashMap<String, pck::Entry>; 3] {
+        [&self.litentries, &self.texentries, &self.shader_entries]
+    }
+
     pub fn open<O: Into<Arc<[Ornament]>>>(element: &Path, ornaments: O) -> Result<Self, String> {
         let ornaments = ornaments.into();
         let litmodel_map_id = ornaments
@@ -410,9 +464,13 @@ impl Objects {
             model_names,
             models: HashMap::new(),
             cache: TextureCache::new(tex_budget_bytes()),
+            keep_ray_dds: false,
+            ray_normals: HashMap::new(),
             resolver,
             litfile,
             texfile,
+            shaders: None,
+            shader_entries: HashMap::new(),
             lit_archive_error,
             lit_archive_entries,
             litmodel_map_id,
@@ -441,6 +499,27 @@ impl Objects {
         self.load_ids(&ids)?;
         Ok(ids)
     }
+    /// Visit a small ray-only batch without replacing the native region's
+    /// parsed models. Resolution, failures and the bounded decoded texture
+    /// cache are still shared. The visitor must consume the batch's textures
+    /// before the next load (only the current load's textures are pinned).
+    #[allow(dead_code)] // This file is also compiled into scenery audit binaries.
+    pub(crate) fn with_supplemental_ids<T>(
+        &mut self,
+        ids: &[usize],
+        visit: impl FnOnce(&Self) -> T,
+    ) -> Result<T, String> {
+        let main = std::mem::take(&mut self.models);
+        let result = self.load_ids(ids).map(|()| visit(self));
+        self.models = main;
+        result
+    }
+
+    #[allow(dead_code)] // Used by the viewer's ray coverage report.
+    pub(crate) fn lit_archive_available(&self) -> bool {
+        self.litfile.is_some() && self.lit_archive_error.is_none()
+    }
+
     /// Loads a small explicit batch for the independent world preload worker.
     pub fn load_ids(&mut self, ids: &[usize]) -> Result<(), String> {
         let mut active = HashSet::with_capacity(ids.len());
@@ -600,22 +679,27 @@ impl Objects {
                     pending.push(job);
                 }
             }
-            // Derived normal-map reference (A3DLitMesh::LoadTexture step
-            // 4). The client tolerates every failure here (a missing file
-            // inside A3DTexture::Load returns TRUE), and this renderer
-            // has no normal-map consumer, so the derivation is resolved
-            // and counted but never decoded.
+            // The native survey still counts the tolerant NRF lookup. A ray
+            // scene may also need the actual normal pixels when relighting.
             if let Some((nrf, used_default)) = self.resolver.resolve_nrf(&raw) {
-                if matches!(nrf, Resolution::Missing { .. }) {
-                    self.register(
+                match nrf {
+                    Resolution::Missing { .. } => self.register(
                         &raw,
-                        if used_default {
-                            "nrf-default-missing"
-                        } else {
-                            "nrf-derived-missing"
-                        },
+                        if used_default { "nrf-default-missing" } else { "nrf-derived-missing" },
                         "derived normal-map reference resolves nowhere; client tolerates (A3DTexture::Load returns TRUE on open failure, 0x78a440)",
-                    );
+                    ),
+                    Resolution::Archive { mount, key } if self.keep_ray_dds => {
+                        self.ray_normals.insert(normalize(&raw), key.clone());
+                        if self.cache.contains(&key) { self.cache.touch(&key); }
+                        else if queued_keys.insert(key.clone()) { pending.push(PendingTexture::Archive { mount, key }); }
+                    }
+                    Resolution::Disk { path } if self.keep_ray_dds => {
+                        let key = normalize(&format!("@nrf/{}", path.display()));
+                        self.ray_normals.insert(normalize(&raw), key.clone());
+                        if self.cache.contains(&key) { self.cache.touch(&key); }
+                        else if queued_keys.insert(key.clone()) { pending.push(PendingTexture::Disk { key, path }); }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -637,11 +721,11 @@ impl Objects {
             for job in pending {
                 match job {
                     PendingTexture::Archive { mount, key } => {
-                        let entry = if mount == 0 {
-                            self.litentries.get(&key).cloned()
-                        } else {
-                            self.texentries.get(&key).cloned()
-                        };
+                        let entry = self
+                            .entries()
+                            .get(mount)
+                            .and_then(|map| map.get(&key))
+                            .cloned();
                         let entry =
                             entry.ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
                         jobs.push(ResolvedJob::Archive { key, mount, entry });
@@ -664,8 +748,8 @@ impl Objects {
             let workers = workers.min(jobs.len());
             let chunk_size = (jobs.len() + workers - 1) / workers;
             let decoded: Vec<Vec<(String, Result<Texture, String>)>> = {
-                let litfile = self.litfile.as_ref();
-                let texfile = self.texfile.as_ref();
+                let archives = self.archives();
+                let keep_ray_dds = self.keep_ray_dds;
                 std::thread::scope(|s| {
                     let handles: Vec<_> = jobs
                         .chunks(chunk_size)
@@ -673,32 +757,26 @@ impl Objects {
                             s.spawn(move || {
                                 let mut out = Vec::with_capacity(chunk.len());
                                 for jobs_batch in chunk.chunks(16) {
-                                    let mut lit_jobs: Vec<(String, pck::Entry)> = Vec::new();
-                                    let mut tex_jobs: Vec<(String, pck::Entry)> = Vec::new();
+                                    let mut archive_jobs: [Vec<(String, pck::Entry)>; 3] =
+                                        std::array::from_fn(|_| Vec::new());
                                     for job in jobs_batch {
                                         if let ResolvedJob::Archive { key, mount, entry } = job {
-                                            let file = if *mount == 0 { litfile } else { texfile };
-                                            if file.is_none() {
-                                                let archive = if *mount == 0 {
-                                                    "litmodels.pck"
-                                                } else {
-                                                    "building.pck"
-                                                };
+                                            if archives[*mount].is_some() {
+                                                archive_jobs[*mount]
+                                                    .push((key.clone(), entry.clone()));
+                                            } else {
                                                 out.push((
                                                     key.clone(),
                                                     Err(format!(
-                                                        "scenery archive {archive} unavailable"
+                                                        "scenery archive {} unavailable",
+                                                        ARCHIVE_NAMES[*mount]
                                                     )),
                                                 ));
-                                            } else if *mount == 0 {
-                                                lit_jobs.push((key.clone(), entry.clone()));
-                                            } else {
-                                                tex_jobs.push((key.clone(), entry.clone()));
                                             }
                                         }
                                     }
                                     for (file, archive_jobs) in
-                                        [(litfile, lit_jobs), (texfile, tex_jobs)]
+                                        archives.into_iter().zip(archive_jobs)
                                     {
                                         let Some(file) = file else { continue };
                                         if archive_jobs.is_empty() {
@@ -718,7 +796,11 @@ impl Objects {
                                                 {
                                                     out.push((
                                                         key.clone(),
-                                                        decode_texture_bytes(&key, &data),
+                                                        decode_texture_bytes(
+                                                            &key,
+                                                            data,
+                                                            keep_ray_dds,
+                                                        ),
                                                     ));
                                                 }
                                             }
@@ -744,7 +826,9 @@ impl Objects {
                                                         path.display()
                                                     )
                                                 })
-                                                .and_then(|data| decode_texture_bytes(key, &data));
+                                                .and_then(|data| {
+                                                    decode_texture_bytes(key, data, keep_ray_dds)
+                                                });
                                             out.push((key.clone(), result));
                                         }
                                     }
@@ -796,7 +880,7 @@ impl Objects {
             Some(PendingTexture::Disk { key, path }) => {
                 let data = std::fs::read(&path)
                     .map_err(|e| format!("disk texture {}: {e}", path.display()))?;
-                self.decode_and_store(&key, &data)
+                self.decode_and_store(&key, data)
             }
         }
     }
@@ -875,17 +959,8 @@ impl Objects {
                 None
             }
             Resolution::Archive { mount, key } => {
-                let archive = if mount == 0 {
-                    "litmodels.pck"
-                } else {
-                    "building.pck"
-                };
-                let available = if mount == 0 {
-                    self.litfile.is_some()
-                } else {
-                    self.texfile.is_some()
-                };
-                if !available {
+                let archive = ARCHIVE_NAMES[mount];
+                if self.archives()[mount].is_none() {
                     self.register(
                         raw,
                         "texture-load-failed",
@@ -909,33 +984,18 @@ impl Objects {
         }
     }
     fn load_from_archive(&mut self, mount: usize, key: &str) -> Result<(), String> {
-        let data = if mount == 0 {
-            let entry = self
-                .litentries
-                .get(key)
-                .cloned()
-                .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
-            let file = self
-                .litfile
-                .as_mut()
-                .ok_or_else(|| "litmodels.pck unavailable".to_string())?;
-            pck::read_entry(file, &entry)?
-        } else {
-            let entry = self
-                .texentries
-                .get(key)
-                .cloned()
-                .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
-            let file = self
-                .texfile
-                .as_mut()
-                .ok_or_else(|| "building.pck unavailable".to_string())?;
-            pck::read_entry(file, &entry)?
-        };
-        self.decode_and_store(key, &data)
+        let entry = self.entries()[mount]
+            .get(key)
+            .cloned()
+            .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
+        let file = [&mut self.litfile, &mut self.texfile, &mut self.shaders][mount]
+            .as_mut()
+            .ok_or_else(|| format!("{} unavailable", ARCHIVE_NAMES[mount]))?;
+        let data = pck::read_entry(file, &entry)?;
+        self.decode_and_store(key, data)
     }
-    fn decode_and_store(&mut self, key: &str, data: &[u8]) -> Result<(), String> {
-        match decode_texture_bytes(key, data) {
+    fn decode_and_store(&mut self, key: &str, data: Vec<u8>) -> Result<(), String> {
+        match decode_texture_bytes(key, data, self.keep_ray_dds) {
             Ok(tex) => {
                 self.cache.store(key.to_string(), tex);
                 Ok(())
@@ -963,8 +1023,11 @@ impl Objects {
         });
     }
     pub fn get(&self, idx: usize) -> Option<&bmd::Model> {
-        self.models
-            .get(&litmodel_key(&self.ornaments.get(idx)?.path))
+        self.models.get(self.model_names.get(idx)?)
+    }
+    #[allow(dead_code)] // Native preview census.
+    pub(crate) fn has_lit_archive(&self) -> bool {
+        self.litfile.is_some()
     }
     /// Distinct BMDs that could not be resolved or parsed for this map.
     pub fn unavailable_model_count(&self) -> usize {
@@ -982,6 +1045,19 @@ impl Objects {
     }
     pub fn texture(&self, path: &str) -> Option<&Texture> {
         self.cache.get(&normalize(path))
+    }
+    pub fn texture_with_key(&self, path: &str) -> Option<(u64, &Texture)> {
+        self.cache.get_with_key(&normalize(path))
+    }
+    #[allow(dead_code)] // standalone archive surveys do not shade materials
+    pub(crate) fn ray_dds_by_hash(&self, hash: u64) -> Option<&[u8]> {
+        self.cache.by_hash.get(&hash)?.tex.ray_dds.as_deref()
+    }
+
+    #[allow(dead_code)] // standalone archive surveys do not shade materials
+    pub(crate) fn ray_normal_with_key(&self, base: &str) -> Option<(u64, &Texture)> {
+        self.cache
+            .get_with_key(self.ray_normals.get(&normalize(base))?)
     }
     /// Content key of a resolved texture, for cross-name deduplication in
     /// downstream packers. `None` when the reference did not resolve to
@@ -1139,8 +1215,23 @@ mod tests {
             width: side,
             height: side,
             rgba: vec![fill; side * side * 4],
+            ray_dds: None,
         }
     }
+    #[test]
+    fn ray_cache_does_not_alias_identical_tops_with_distinct_authored_chains() {
+        let mut a = tex(7, 4);
+        let mut b = tex(7, 4);
+        a.ray_dds = Some(vec![0; 8]);
+        b.ray_dds = Some(vec![1; 8]);
+        let mut cache = TextureCache::new(1 << 20);
+        cache.begin_batch();
+        cache.store("a.dds".into(), a);
+        cache.store("b.dds".into(), b);
+        assert_ne!(cache.key("a.dds"), cache.key("b.dds"));
+        assert_eq!(cache.stats.resident_bytes, 2 * (4 * 4 * 4 + 8));
+    }
+
     #[test]
     fn dedup_stores_identical_content_once_under_alias_names() {
         let mut cache = TextureCache::new(64 << 20);

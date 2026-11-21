@@ -362,8 +362,8 @@ pub fn prepare_trees_for_scene(
     Ok(final_dir)
 }
 
-// Show a small native loading window while terrain and the first-run tree cache
-// are prepared. Its message pump lives on a separate thread from disk loading.
+// Keep native loading UI available through first presentation. Its message
+// pump never runs on the thread doing disk I/O or calling the graphics driver.
 #[repr(C)]
 struct WinMessage {
     hwnd: Hwnd,
@@ -439,6 +439,21 @@ fn directstorage_state(stats: crate::pck::direct_storage::ReadStats) -> String {
     "DirectStorage ready; waiting for eligible archive reads (64 KiB+)".into()
 }
 
+const CANCEL_STARTUP: usize = 201;
+unsafe extern "system" fn loading_proc(
+    hwnd: Hwnd,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    if msg == 0x0010 || (msg == 0x0111 && (wparam & 0xffff) == CANCEL_STARTUP) {
+        // A driver call need not return to the viewer loop. This is a user's
+        // explicit quit, not an attempt to unwind or reuse a stuck device.
+        std::process::exit(0);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
 pub struct LoadingWindow {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -456,20 +471,33 @@ impl LoadingWindow {
             *guard = Some(status_tx);
         }
         let thread = std::thread::spawn(move || unsafe {
-            let class = wide("STATIC");
+            let instance = GetModuleHandleW(std::ptr::null());
+            let class = wide("PerfectWorldExplorerLoading");
+            RegisterClassW(&WindowClass {
+                style: 0,
+                proc: Some(loading_proc),
+                class_extra: 0,
+                window_extra: 0,
+                instance,
+                icon: std::ptr::null_mut(),
+                cursor: LoadCursorW(std::ptr::null_mut(), 32512usize as *const u16),
+                background: GetSysColorBrush(15),
+                menu_name: std::ptr::null(),
+                class_name: class.as_ptr(),
+            });
             let text = wide("Perfect World Explorer — Loading");
             let hwnd = CreateWindowExW(
                 0,
                 class.as_ptr(),
                 text.as_ptr(),
-                0x00c00000 | 0x10000000,
+                0x00c80000 | 0x10000000, // caption + system menu + visible
                 0x80000000u32 as i32,
                 0x80000000u32 as i32,
                 620,
-                230,
+                265,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                instance,
                 std::ptr::null_mut(),
             );
             let (status_label, ds_state_label, ds_graph_label, ds_totals_label) = if hwnd.is_null()
@@ -481,7 +509,6 @@ impl LoadingWindow {
                     std::ptr::null_mut(),
                 )
             } else {
-                let instance = GetModuleHandleW(std::ptr::null());
                 let status = control(
                     hwnd,
                     instance,
@@ -498,7 +525,7 @@ impl LoadingWindow {
                     hwnd,
                     instance,
                     "STATIC",
-                    "First launch may take several minutes while trees are prepared.",
+                    "First launch may take longer while trees and shaders are prepared.",
                     0x50000000,
                     24,
                     51,
@@ -542,6 +569,18 @@ impl LoadingWindow {
                     38,
                     0,
                 );
+                control(
+                    hwnd,
+                    instance,
+                    "BUTTON",
+                    "Cancel startup",
+                    0x50010000,
+                    440,
+                    190,
+                    144,
+                    29,
+                    CANCEL_STARTUP,
+                );
                 ShowWindow(hwnd, 5);
                 UpdateWindow(hwnd);
                 (status, ds_state, ds_graph, ds_totals)
@@ -557,7 +596,7 @@ impl LoadingWindow {
 
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                 let mut msg: WinMessage = std::mem::zeroed();
-                while PeekMessageW(&mut msg, hwnd, 0, 0, 1) != 0 {
+                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, 1) != 0 {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }

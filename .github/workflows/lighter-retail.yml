@@ -1,0 +1,141 @@
+name: Lighter retail capture matrix
+
+# Optional evidence, not a required PR check. Use the same public client tree
+# for maps and packages; never cache or upload client asset bytes.
+on:
+  workflow_dispatch:
+  # Run on branch updates to the evidence pipeline itself. Documentation-only
+  # pushes and the eventual merge to main need not download the packs again.
+  push:
+    branches-ignore: [main]
+    paths:
+      - '.github/workflows/lighter-retail.yml'
+      - 'tools/lighter_capture_matrix.py'
+      - 'tools/fixtures/lighter-retail-*'
+
+concurrency:
+  group: lighter-retail-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    name: Compare matched Native and Software cameras on CPU Vulkan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch matching map files and packages
+        run: |
+          set -euo pipefail
+          while read -r id sha file; do
+            [[ -n "$id" && "$id" != \#* ]] || continue
+            path="${RUNNER_TEMP}/lighter-client/element/$file"
+            mkdir -p "$(dirname "$path")"
+            curl -fsSL --retry 2 --max-time 240 -o "$path" \
+              "https://drive.usercontent.google.com/download?id=$id&export=download&confirm=t" || {
+                echo "::error::Could not fetch $file from the public client tree"; exit 1;
+              }
+            if ! printf '%s  %s\n' "$sha" "$path" | sha256sum -c -; then
+              echo "::error::Unexpected bytes for $file; refusing mismatched client inputs"
+              exit 1
+            fi
+          done < tools/fixtures/lighter-retail-inputs.txt
+      - name: Select the CPU Vulkan driver
+        run: |
+          set -euo pipefail
+          # Native and Lighter read back on the same adapter. The headless
+          # path has no X11 dependency; prefer the runner's Mesa if present.
+          icd="$(find /usr/share/vulkan/icd.d -iname '*lvp*.json' -print -quit 2>/dev/null || true)"
+          if [[ -z "$icd" ]]; then
+            dir="$RUNNER_TEMP/pinned-lavapipe"
+            mkdir -p "$dir"
+            file="$dir/driver.tgz"
+            curl -fsS --retry 2 --max-time 90 -o "$file" \
+              'https://registry.npmjs.org/@drawcall/webgpu-linux-x64/-/webgpu-linux-x64-0.2.1.tgz'
+            expected='SoiVjq+d8+uIUlxWgKEIqOfrvSy1k3KedcOqrvP3s67J8oF1Nd2ur32hFg/8IvhhpEm+NGF7GIjk3GTlxNSb0g=='
+            test "$(openssl dgst -sha512 -binary "$file" | openssl base64 -A)" = "$expected"
+            tar -xzf "$file" --strip-components=1 -C "$dir" package/libvulkan_lvp.so package/libvulkan.so.1
+            icd="$dir/lvp_icd.json"
+            printf '{"file_format_version":"1.0.0","ICD":{"library_path":"%s/libvulkan_lvp.so","api_version":"1.3.0"}}\n' "$dir" > "$icd"
+            echo "LD_LIBRARY_PATH=$dir" >> "$GITHUB_ENV"
+          fi
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          echo "GALLIVM_PERF=nopt" >> "$GITHUB_ENV"
+      - name: Build viewer
+        run: cargo build --locked --bin perfect-world-explorer --bin lighter-terrain-plan
+      - name: Compare matched day, night and rain cameras
+        env:
+          XDG_RUNTIME_DIR: ${{ runner.temp }}
+          PW_CACHE_DIR: ${{ runner.temp }}/lighter-cache
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/lighter-python"
+          py="$RUNNER_TEMP/lighter-python/bin/python"
+          "$py" -m pip install --disable-pip-version-check Pillow==11.3.0
+          "$py" -m unittest discover -s tools -p test_lighter_capture_matrix.py
+          "$py" -m unittest discover -s tools -p test_lighter_terrain_audit.py
+          mkdir -p target/lighter-terrain-input-audit
+          maps="$RUNNER_TEMP/lighter-client/element/maps"
+          "$py" tools/lighter-terrain-audit.py "$maps/a01/a01.trn2" "$maps/a02/a02.trn2" "$maps/a07/a07.trn2" \
+            --viewer-planner target/debug/lighter-terrain-plan --json target/lighter-terrain-input-audit/pw142.json
+          "$py" tools/lighter_capture_matrix.py \
+            --profile cpu --manifest tools/fixtures/lighter-retail-scenes.json \
+            --input-manifest tools/fixtures/lighter-retail-inputs.txt \
+            --viewer target/debug/perfect-world-explorer --client "$RUNNER_TEMP/lighter-client" \
+            --output target/lighter-retail --ray-resolution 25 --timed-frames 3
+      - name: Report capture manifest hashes
+        if: always()
+        run: |
+          for file in target/lighter-retail/SHA256SUMS.txt target/lighter-terrain-input-audit/pw142.json; do
+            if [[ -f "$file" ]]; then
+              echo "::notice title=Lighter receipt SHA-256::$(sha256sum "$file")"
+            fi
+          done
+      - name: Report all matched results, including late a07 views
+        if: always()
+        run: |
+          # Keep the complete captures as the artifact. The small JSON index
+          # is also readable if the signed artifact transfer is unavailable.
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path('target/lighter-retail/capture-summary.json')
+          if path.is_file():
+              report = json.loads(path.read_text(encoding='utf-8'))
+              maps = report.pop('maps')
+              def encode(data):
+                  return json.dumps(data, separators=(',', ':')).replace('%', '%25')
+
+              def notice(label, data):
+                  print(f"::notice title={label}::{encode(data)}")
+
+              notice('Lighter capture index', report)
+              # Check-run annotation text truncates at 4,096 characters.
+              # Keep whole case records in each batch, with some headroom.
+              for name, rows in maps.items():
+                  part, batch = 1, []
+                  for row in rows:
+                      if batch and len(encode([*batch, row])) > 3800:
+                          notice(f'Lighter {name}/{part}', batch)
+                          part, batch = part + 1, []
+                      if len(encode([row])) > 3800:
+                          notice(f'Lighter {name}/{part}', {'artifact_only': row['id']})
+                          part += 1
+                      else:
+                          batch.append(row)
+                  if batch:
+                      notice(f'Lighter {name}/{part}', batch)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lighter-retail-matrix
+          path: |
+            target/lighter-retail/
+            target/lighter-terrain-input-audit/
+          if-no-files-found: warn

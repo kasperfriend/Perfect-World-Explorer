@@ -110,6 +110,30 @@ pub struct AlphaStatus {
     pub slots: usize,
 }
 
+/// Skip reasons use the same gates as the ray pose iterator, not the raster
+/// queue (which additionally rejects off-screen actors).
+#[allow(dead_code)] // The standalone model tools do not consume the ray feed.
+pub(crate) enum RayActor<'a> {
+    Pose(
+        u64,
+        &'a crate::model_asset::ModelAsset,
+        &'a crate::skeleton_pose::Pose,
+        &'a [crate::model_asset::PosedMesh],
+    ),
+    Cutoff,
+    Range,
+    Invalid,
+}
+
+#[allow(dead_code)]
+pub(crate) enum NativeModelDraw {
+    Submitted,
+    Cutoff,
+    Culled,
+    Invalid,
+    Empty,
+}
+
 pub struct World {
     assets: Assets,
     keep_unbounded: bool,
@@ -121,6 +145,7 @@ pub struct World {
     format: wgpu::TextureFormat,
     grid: StaticGrid,
     publications: LightPublications,
+    ray_lights: Vec<DynamicLight>,
     owners: gfx_owner::Manager,
     /// The map's height grid, when the renderer installed one. It is the only
     /// terrain the effect pass can see, and it is what lets a `MatchGrnd` decal
@@ -145,6 +170,8 @@ pub struct World {
     catalog: crate::gfx_catalog::Catalog,
     /// Identities handed out to on-demand catalogue spawns.
     catalog_spawns: u64,
+    model_event_roots: usize,
+    rejected_model_events: usize,
     /// Explorer position and effect activation radius in world units.
     view: Option<(f32, f32, f32)>,
     /// Retail `SCNRES_EFFECT` distance in world units; 0 disables the fade and
@@ -241,6 +268,7 @@ impl World {
             format: format.remove_srgb_suffix(),
             grid: StaticGrid::default(),
             publications: LightPublications::default(),
+            ray_lights: Vec::new(),
             owners: gfx_owner::Manager::new(),
             terrain: None,
             producers: Vec::new(),
@@ -249,6 +277,8 @@ impl World {
             effect_quads: Vec::new(),
             catalog: crate::gfx_catalog::Catalog::default(),
             catalog_spawns: 0,
+            model_event_roots: 0,
+            rejected_model_events: 0,
             view: None,
             effect_distance: 0.,
             census: [0; 3],
@@ -476,8 +506,16 @@ impl World {
     /// hook record is an explicit failure, never the model origin.
     pub fn install_model_events(&mut self) -> usize {
         let mut installed = 0;
+        let mut authored = 0;
         for (index, instance) in self.assets.instances.iter().enumerate() {
             let asset = &self.assets.assets[instance.asset];
+            let events = asset
+                .descriptor
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| event.kind == 100);
+            authored += events.clone().count();
             let transform = match self.slots[index].transform.as_ref() {
                 Ok(transform) => *transform,
                 Err(error) => {
@@ -486,14 +524,16 @@ impl World {
                     continue;
                 }
             };
-            for (event_index, event) in asset.descriptor.events.iter().enumerate() {
-                let Some(path) = event.gfx_path() else {
-                    continue;
-                };
+            for (event_index, event) in events {
                 let described = format!(
                     "{} export {} event {event_index}",
                     instance.placement.path, instance.placement.export_id
                 );
+                let Some(path) = event.gfx_path() else {
+                    self.reported
+                        .push(format!("{described}: GFX event is missing FxFilePath"));
+                    continue;
+                };
                 let record = match model_attachment::from_fields(&event.fields) {
                     Ok(record) => record,
                     Err(error) => {
@@ -564,7 +604,16 @@ impl World {
                 installed += 1;
             }
         }
+        self.model_event_roots += authored;
+        self.rejected_model_events += authored - installed;
         installed
+    }
+
+    /// Event census covers descriptors that decoded, not the event lists of
+    /// absent or unsupported models. Detached hook owners stay in the total.
+    #[allow(dead_code)]
+    pub(crate) fn model_event_census(&self) -> (usize, usize) {
+        (self.model_event_roots, self.rejected_model_events)
     }
     /// Release receiving-model geometry and poses outside the installed terrain
     /// window, rather than merely disabling their effect-light producers.
@@ -626,6 +675,11 @@ impl World {
     pub fn light_priority_limit(&self) -> i32 {
         self.owners.priority_limit()
     }
+    #[allow(dead_code)]
+    pub(crate) fn ray_effect_status(&self) -> gfx_owner::GeometryStatus {
+        self.owners.geometry_status()
+    }
+
     pub fn gfx_status(&self) -> gfx_owner::Status {
         self.owners.status()
     }
@@ -776,23 +830,99 @@ impl World {
         advance: bool,
     ) {
         if advance {
-            // 1. Playback advances once per frame and each model is posed once.
-            self.advance_poses(delta_ms);
-            // 2. Hook-attached producers resolve their parent from those poses
-            //    (0x7b2520), then publish before the grid consumes, so a light
-            //    created or moved on this tick already lights this frame.
-            self.resolve_attachments();
-            self.apply_activation(night, delta_ms, center);
-            self.owners.update(delta_ms, &mut self.publications);
-            self.update_effects(device, queue, frame, delta_ms);
-            self.grid.update(lights, center);
-            self.publications.consume_into(&mut self.grid);
+            self.advance_frame(device, queue, frame, center, lights, night, delta_ms, true);
         }
         self.draw_models(device, queue, frame, night);
         if advance {
             self.rebuild_alpha_order(center);
         }
     }
+
+    /// Same playback/light publication, without raster buffer or pipeline work.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn update_for_rays(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Frame,
+        center: [f32; 3],
+        lights: &SceneLights,
+        night: f32,
+        delta_ms: u32,
+    ) {
+        self.advance_frame(device, queue, frame, center, lights, night, delta_ms, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn advance_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Frame,
+        center: [f32; 3],
+        lights: &SceneLights,
+        night: f32,
+        delta_ms: u32,
+        upload: bool,
+    ) {
+        self.advance_poses(delta_ms);
+        self.resolve_attachments();
+        self.apply_activation(night, delta_ms, center);
+        self.owners.update(delta_ms, &mut self.publications);
+        self.update_effects(device, queue, frame, delta_ms, upload);
+        if upload {
+            self.grid.update(lights, center);
+            self.publications.consume_into(&mut self.grid);
+        } else {
+            // Lighter has its own influence-volume BVH, rather than the
+            // camera-centred native receiving-model cell grid.
+            self.publications.consume(&mut self.ray_lights);
+        }
+    }
+
+    // Source data, not the current raster queue. In particular don't discard
+    // poses outside the camera frustum: a reflected or shadow ray can see them.
+    #[allow(dead_code, clippy::type_complexity)]
+    pub(crate) fn ray_sources(
+        &mut self,
+    ) -> (
+        impl Iterator<Item = RayActor<'_>> + '_,
+        &[crate::gfx_player::EffectQuad],
+        &[DynamicLight],
+        &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+    ) {
+        let bounds = self.resident_bounds;
+        let view = self.view;
+        let assets = &self.assets.assets;
+        let poses = self
+            .assets
+            .instances
+            .iter()
+            .zip(&self.slots)
+            .enumerate()
+            .map(move |(owner, (i, slot))| {
+                let p = i.placement.position;
+                if !p.iter().all(|x| x.is_finite()) {
+                    return RayActor::Invalid;
+                }
+                if !cutoff_residency::contains(bounds, p) {
+                    return RayActor::Cutoff;
+                }
+                if view.is_some_and(|(x, z, r)| {
+                    (p[0] - x).powi(2) + (p[2] - z).powi(2) > (r + 128.).powi(2)
+                }) {
+                    return RayActor::Range;
+                }
+                match &slot.posed {
+                    Some(Ok(pose)) if !slot.failed => {
+                        RayActor::Pose(owner as u64, &assets[i.asset], &pose.pose, &pose.meshes)
+                    }
+                    _ => RayActor::Invalid,
+                }
+            });
+        (poses, &self.effect_quads, &self.ray_lights, &mut *self.read)
+    }
+
     /// Install the surface query the effect pass needs to drape a
     /// ground-matched decal over the terrain.
     ///
@@ -844,6 +974,7 @@ impl World {
         queue: &wgpu::Queue,
         frame: Frame,
         delta_ms: u32,
+        upload: bool,
     ) {
         if !self.owners.effects_enabled() {
             self.effect_quads.clear();
@@ -914,6 +1045,9 @@ impl World {
             ..
         } = self;
         *effect_quads = quads;
+        if !upload {
+            return;
+        }
         if effects.is_none() {
             // The same reverse-Z depth buffer the world's models use, so an
             // effect in front of a wall is occluded by nothing and one behind it
@@ -1000,6 +1134,49 @@ impl World {
     /// the map's `fSpeed` overrode the file's `PlaySpeed`.
     pub fn effect_clocks(&self) -> Vec<(String, f32, f32, f32)> {
         self.owners.player_clocks()
+    }
+
+    /// Main-view slots after pose/material preparation and the alpha queue.
+    #[allow(dead_code)]
+    pub(crate) fn native_model_draws(&self) -> impl Iterator<Item = NativeModelDraw> + '_ {
+        use NativeModelDraw::*;
+        let alpha_slots: std::collections::HashSet<_> =
+            self.alpha.iter().map(|entry| entry.slot).collect();
+        self.assets
+            .instances
+            .iter()
+            .zip(&self.slots)
+            .enumerate()
+            .map(move |(i, (instance, slot))| {
+                if !cutoff_residency::contains(self.resident_bounds, instance.placement.position) {
+                    Cutoff
+                } else if slot.failed {
+                    Invalid
+                } else if !slot.visible {
+                    Culled
+                } else if let Some(draw) = &slot.draw {
+                    if draw.mesh_count() > draw.alpha_meshes().len() || alpha_slots.contains(&i) {
+                        Submitted
+                    } else if draw.mesh_count() > 0 {
+                        Invalid
+                    } else {
+                        Empty
+                    }
+                } else {
+                    Empty
+                }
+            })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn native_effect_draws(&self) -> gfx_effect_gpu::Admission {
+        self.effects.as_ref().map_or_else(
+            || gfx_effect_gpu::Admission {
+                unavailable: self.effect_quads.len(),
+                ..Default::default()
+            },
+            |draw| draw.admission(&self.effect_quads),
+        )
     }
 
     /// Quads the world's animated effects produced this frame.
@@ -1207,6 +1384,7 @@ impl World {
         }
         // A producer whose owner is gone or whose hook cannot be resolved is
         // dropped instead of retrying against a stale parent every frame.
+        self.rejected_model_events += detached.len();
         self.producers.retain(|p| !detached.contains(&p.identity));
     }
     /// Upload this frame's already-evaluated poses. Runs for every pass without

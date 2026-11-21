@@ -506,8 +506,7 @@ fn main() {
             action: None,
             playback: Ok(playback),
         }],
-        failures: vec![],
-        unloaded: vec![],
+        ..Default::default()
     };
     let mut opaque = frame;
     opaque.blend_enabled = false;

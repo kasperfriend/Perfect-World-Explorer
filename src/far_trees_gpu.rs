@@ -206,6 +206,20 @@ pub fn lod_admits(bounds: Option<[f32; 4]>, p: [f32; 3]) -> bool {
     cutoff_residency::contains(bounds, p)
 }
 
+// Host-side placement classification is separate from the GPU's indirect
+// instance counts (one placement may submit two LODs during a crossfade).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PlacementCensus {
+    pub loaded: usize,
+    pub cutoff: usize,
+    pub invalid: usize,
+    pub empty: usize,
+    pub unavailable: usize,
+    pub budget: usize,
+    pub disabled: usize,
+}
+
 pub struct FarTrees {
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
@@ -215,6 +229,8 @@ pub struct FarTrees {
     instances: wgpu::Buffer,
     batches: Vec<Batch>,
     groups: Vec<Group>,
+    #[allow(dead_code)]
+    unpacked: PlacementCensus,
     /// Slots in the instance buffer: three level slices per placement.
     capacity: usize,
     last_resident_update: Option<([f32; 3], f32, Option<[f32; 4]>)>,
@@ -304,6 +320,10 @@ impl FarTrees {
         let mut batches = Vec::new();
         let mut groups = Vec::new();
         let mut packed_count = 0usize;
+        let mut unpacked = PlacementCensus {
+            unavailable: trees.placements.len(),
+            ..PlacementCensus::default()
+        };
         let mut mip_slots: Vec<(
             usize,
             usize,
@@ -352,6 +372,11 @@ impl FarTrees {
                 .map(|p| p.position)
                 .collect();
             if positions.is_empty() {
+                continue;
+            }
+            unpacked.unavailable -= positions.len();
+            if tree.lods.is_empty() {
+                unpacked.empty += positions.len();
                 continue;
             }
             let height = tree.lods[0]
@@ -430,6 +455,7 @@ impl FarTrees {
                 packed_count += 1;
             }
             if slots.len() != 2 {
+                unpacked.budget += positions.len();
                 continue;
             }
             let first_batch = batches.len();
@@ -1043,6 +1069,7 @@ impl FarTrees {
             instances,
             batches,
             groups,
+            unpacked,
             capacity,
             last_resident_update: None,
             lod_pipeline,
@@ -1162,6 +1189,61 @@ impl FarTrees {
         }
         queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&staging));
         queue.write_buffer(&self.lod_args, 0, &args);
+    }
+    /// Audit only. Use the same placement table and view/LOD inputs that were
+    /// sent to the compute pass. Report the actual GPU draw instances separately.
+    #[allow(dead_code)]
+    pub(crate) fn placement_census(&self, enabled: bool) -> PlacementCensus {
+        let mut counts = self.unpacked;
+        for (i, group) in self.groups.iter().enumerate() {
+            if !enabled {
+                counts.disabled += group.positions.len();
+                continue;
+            }
+            let Some((eye, scale, bounds)) = self.last_resident_update else {
+                counts.empty += group.positions.len();
+                continue;
+            };
+            let end = self
+                .groups
+                .get(i + 1)
+                .map_or(self.batches.len(), |g| g.first_batch);
+            let levels = &self.batches[group.first_batch..end];
+            for &position in &group.positions {
+                let Some(distance) = crate::tree_lod::client_distance(position, eye) else {
+                    counts.invalid += 1;
+                    continue;
+                };
+                if !lod_admits(bounds, position) {
+                    counts.cutoff += 1;
+                    continue;
+                }
+                let lod = crate::tree_lod::select(distance, group.height, scale);
+                if levels.len() >= 3
+                    && std::iter::once(lod.primary)
+                        .chain(lod.secondary)
+                        .any(|level| !levels[level].indices.is_empty())
+                {
+                    counts.loaded += 1;
+                } else {
+                    counts.empty += 1;
+                }
+            }
+        }
+        counts
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn submitted_instances(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> usize {
+        if self.placements == 0 {
+            return 0;
+        }
+        self.lod_instance_counts(device, queue)
+            .into_iter()
+            .zip(&self.batches)
+            .filter(|(_, batch)| !batch.indices.is_empty())
+            .map(|(count, _)| count as usize)
+            .sum()
     }
     pub fn residency_stats(&self) -> (usize, u64) {
         (self.capacity, self.instances.size())

@@ -104,31 +104,38 @@ pub(crate) fn resolve_case_insensitive(
     }
     Ok(result)
 }
+/// Map coordinates to the authored row/column, with the native strict bounds.
+pub(crate) fn cell_at(
+    x: f32,
+    z: f32,
+    center: [f32; 3],
+    grid_size: f32,
+    columns: usize,
+    rows: usize,
+) -> Option<usize> {
+    // 0x7807c6–0x780813 rejects the bounding box boundary before
+    // 0x781c50 maps to and clamps the mask cell.
+    let half_x = columns as f32 * grid_size * 0.5;
+    let half_z = rows as f32 * grid_size * 0.5;
+    if !x.is_finite()
+        || !z.is_finite()
+        || (x - center[0]).abs() >= half_x
+        || (z - center[2]).abs() >= half_z
+    {
+        return None;
+    }
+    let col = ((x - (center[0] - columns as f32 * grid_size * 0.5)) / grid_size).floor() as isize;
+    let row = (((center[2] + rows as f32 * grid_size * 0.5) - z) / grid_size).floor() as isize;
+    if col < 0 || row < 0 || col >= columns as isize || row >= rows as isize {
+        return None;
+    }
+    Some(row as usize * columns + col as usize)
+}
 impl WaterArea {
     pub fn contains_xz(&self, x: f32, z: f32) -> bool {
-        // 0x7807c6–0x780813 rejects the bounding box boundary before
-        // 0x781c50 maps to and clamps the mask cell.
-        let half_x = self.columns as f32 * self.grid_size * 0.5;
-        let half_z = self.rows as f32 * self.grid_size * 0.5;
-        if !x.is_finite()
-            || !z.is_finite()
-            || (x - self.center[0]).abs() >= half_x
-            || (z - self.center[2]).abs() >= half_z
-        {
-            return false;
-        }
-        let col = ((x - (self.center[0] - self.columns as f32 * self.grid_size * 0.5))
-            / self.grid_size)
-            .floor() as isize;
-        let row = (((self.center[2] + self.rows as f32 * self.grid_size * 0.5) - z)
-            / self.grid_size)
-            .floor() as isize;
-        if col < 0 || row < 0 || col >= self.columns as isize || row >= self.rows as isize {
-            return false;
-        }
-        self.mask
-            .get(row as usize * self.columns + col as usize)
-            .is_some_and(|m| *m != 0)
+        cell_at(x, z, self.center, self.grid_size, self.columns, self.rows)
+            .and_then(|i| self.mask.get(i))
+            .is_some_and(|&m| m != 0)
     }
     pub fn parse(b: &[u8], p: usize, export_id: u32) -> Result<Self, String> {
         let version = u(b, p)?;

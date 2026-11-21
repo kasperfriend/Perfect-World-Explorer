@@ -17,6 +17,7 @@ pub struct Part {
     pub vertices: Vec<Vert>,
     pub indices: Vec<u32>,
 }
+#[derive(Clone)]
 pub struct Leaf {
     pub center: [f32; 3],
     // PWTREE09 records the per-leaf runtime normal used by the client.

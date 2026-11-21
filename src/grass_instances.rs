@@ -4,7 +4,7 @@
 mod refraction_fog;
 use crate::gpu::Vertex;
 use crate::indirect_args::{record, DrawIndexedArgs};
-use std::{collections::BTreeMap, ops::Range};
+use std::{borrow::Cow, collections::BTreeMap, ops::Range};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -16,18 +16,18 @@ pub struct GrassVertex {
     pub scale_y: f32,
 }
 #[derive(Default)]
-struct Group {
+struct Group<'a> {
     vertices: Vec<GrassVertex>,
-    indices: Vec<u32>,
+    indices: Cow<'a, [u32]>,
     instances: Vec<[f32; 12]>,
 }
 #[derive(Default)]
-pub struct Builder {
-    groups: BTreeMap<(usize, usize), Group>,
+pub struct Builder<'a> {
+    groups: BTreeMap<(usize, usize), Group<'a>>,
 }
 pub struct Batch {
-    indices: Range<u32>,
-    instances: Range<u32>,
+    pub(crate) indices: Range<u32>,
+    pub(crate) instances: Range<u32>,
 }
 #[derive(Default)]
 pub struct Data {
@@ -36,9 +36,15 @@ pub struct Data {
     instances: Vec<[f32; 12]>,
     batches: Vec<Batch>,
 }
-impl Builder {
+impl<'a> Builder<'a> {
     pub fn contains(&self, key: (usize, usize)) -> bool {
         self.groups.contains_key(&key)
+    }
+    #[allow(dead_code)] // Viewer coverage; standalone checks use the builder directly.
+    pub(crate) fn instance_count(&self, key: (usize, usize)) -> usize {
+        self.groups
+            .get(&key)
+            .map_or(0, |group| group.instances.len())
     }
     pub fn mesh(&mut self, key: (usize, usize), vertices: Vec<Vertex>, indices: Vec<u32>) {
         let scale_y = vertices.first().map_or(0., |v| v.color[2]);
@@ -48,7 +54,7 @@ impl Builder {
         &mut self,
         key: (usize, usize),
         vertices: Vec<Vertex>,
-        indices: Vec<u32>,
+        indices: impl Into<Cow<'a, [u32]>>,
         scale_y: f32,
     ) {
         let vertices = vertices
@@ -57,7 +63,7 @@ impl Builder {
             .collect();
         self.groups.entry(key).or_insert(Group {
             vertices,
-            indices,
+            indices: indices.into(),
             instances: Vec::new(),
         });
     }
@@ -116,7 +122,7 @@ impl Builder {
             let i = data.indices.len() as u32;
             let n = data.instances.len() as u32;
             data.vertices.extend(g.vertices);
-            data.indices.extend(g.indices.into_iter().map(|v| v + base));
+            data.indices.extend(g.indices.iter().map(|v| v + base));
             data.instances.extend(g.instances);
             data.batches.push(Batch {
                 indices: i..data.indices.len() as u32,
@@ -127,6 +133,16 @@ impl Builder {
     }
 }
 impl Data {
+    #[allow(dead_code)] // consumed by the viewer's alternate world renderer
+    pub(crate) fn geometry(&self) -> (&[GrassVertex], &[u32], &[[f32; 12]], &[Batch]) {
+        (
+            &self.vertices,
+            &self.indices,
+            &self.instances,
+            &self.batches,
+        )
+    }
+
     pub fn counts(&self) -> (usize, usize, usize) {
         (
             self.vertices.len(),

@@ -297,6 +297,7 @@ struct Library {
     /// Bind-pose head height per rig, for the overhead name. Computed once per
     /// template rather than once per actor.
     heads: HashMap<String, f32>,
+    skin_omissions: crate::skin::UnsupportedSkins,
 }
 
 /// `R_` NPC textures store a specular mask in alpha, not surface opacity.
@@ -354,6 +355,7 @@ impl Library {
             gait_source_failures: HashMap::new(),
             retargeted_gaits: HashMap::new(),
             heads: HashMap::new(),
+            skin_omissions: Default::default(),
         })
     }
 
@@ -494,10 +496,14 @@ impl Library {
             tracks,
             assets,
             failures,
-            heads: _,
+            skin_omissions,
             ..
         } = self;
-        let mut read = |path: &str| read_archive(models, textures.as_mut(), path);
+        let mut read = |path: &str| {
+            let bytes = read_archive(models, textures.as_mut(), path)?;
+            skin_omissions.observe(path, &bytes);
+            Ok(bytes)
+        };
         let loaded = ModelAsset::load_cached(&key, &mut read, tracks);
         match loaded {
             Ok(mut asset) => {
@@ -873,7 +879,16 @@ impl Live {
     /// evaluate neither falls back to its authored bind pose rather than
     /// disappearing.
     fn pose(&mut self) -> Result<Vec<PosedMesh>, String> {
+        self.evaluate_pose().map(|(_, meshes)| meshes)
+    }
+
+    fn evaluate_pose(&mut self) -> Result<(crate::skeleton_pose::Pose, Vec<PosedMesh>), String> {
         let world = self.world();
+        let prepare = |pose: Result<crate::skeleton_pose::Pose, String>| {
+            let pose = pose?;
+            let meshes = self.asset.meshes_from_pose(&pose)?;
+            Ok((pose, meshes))
+        };
         // Generated residents keep their original city rig as the visible
         // model. The normal player's walk/run animation is used only when its
         // skeleton can be safely retargeted onto that rig; otherwise the
@@ -889,11 +904,12 @@ impl Live {
                     }
                 });
                 if let Some(clip) = clip {
-                    match self.asset.pose_tracks_at_time(
+                    match prepare(crate::skeleton_pose::evaluate(
+                        &self.asset.skeleton,
                         &clip.tracks,
                         clip.clip.seconds(self.gait_clock),
                         world,
-                    ) {
+                    )) {
                         Ok(meshes) => return Ok(meshes),
                         Err(error) => {
                             if self.pose_error.is_none() {
@@ -903,7 +919,7 @@ impl Live {
                     }
                 }
             }
-            return self.asset.pose_bind(world);
+            return prepare(self.asset.bind_pose(world));
         }
         let idle_sample = self.playback.as_ref().and_then(Playback::sample);
         let fallback = self.action.map(|action| {
@@ -915,7 +931,7 @@ impl Live {
         });
         let samples = [idle_sample, fallback, None];
         for (action, seconds) in samples.into_iter().flatten() {
-            match self.asset.pose_action_at_time(action, seconds, world) {
+            match prepare(self.asset.action_pose(action, seconds, world)) {
                 Ok(meshes) => return Ok(meshes),
                 // A rig whose walk/idle tracks cannot be evaluated is drawn in
                 // its next supported pose, then its bind pose, rather than
@@ -927,7 +943,7 @@ impl Live {
                 }
             }
         }
-        self.asset.pose_bind(world)
+        prepare(self.asset.bind_pose(world))
     }
 }
 
@@ -2963,6 +2979,82 @@ impl Populator {
         }
     }
 
+    pub(super) fn ray_skin_omissions(&self) -> crate::skin::SkinOmissions {
+        self.library
+            .as_ref()
+            .map_or_else(Default::default, |library| library.skin_omissions.totals())
+    }
+
+    pub(super) fn ray_inputs(
+        &mut self,
+        matrix: Mat4,
+        out: &mut super::lighter::model_feed::Moving<'_>,
+    ) -> Result<(), String> {
+        if !self.active {
+            return Ok(());
+        }
+        let Some(library) = self.library.as_mut() else {
+            return Ok(());
+        };
+        let mut decode = |path: &str| {
+            let mut error = String::new();
+            for bytes in library.texture_candidates(path)? {
+                match crate::model_texture_gpu::decode_for_rays(&bytes) {
+                    Ok(tex) => return Ok(tex),
+                    Err(e) => error = e,
+                }
+            }
+            Err(error)
+        };
+        Self::ray_actors(&mut self.live, matrix, out, &mut decode)
+    }
+
+    fn ray_actors(
+        actors: &mut [Live],
+        matrix: Mat4,
+        out: &mut super::lighter::model_feed::Moving<'_>,
+        decode: &mut super::lighter::model_feed::Decode<'_>,
+    ) -> Result<(), String> {
+        for live in actors {
+            live.visible = live.failure.is_none()
+                && !live.wedged
+                && on_screen(matrix, live.position, live.head);
+            use super::lighter::coverage::Class::Populator as Class;
+            if live.failure.is_some() {
+                out.coverage[Class].invalid += 1;
+                continue;
+            }
+            if live.wedged {
+                out.coverage[Class].disabled += 1;
+                continue;
+            }
+            // Off-camera actors still exist in the ray scene (shadows,
+            // reflected views). Their animation clock has already advanced.
+            match live.evaluate_pose() {
+                Ok((pose, meshes)) => {
+                    live.motion.observe(pose_signature(&meshes));
+                    out.model(
+                        "populator",
+                        live.spawn as u64,
+                        super::lighter::model_feed::Posed {
+                            asset: live.asset.as_ref(),
+                            pose: &pose,
+                            meshes: &meshes,
+                            attached: false,
+                        },
+                        |_| true,
+                        decode,
+                    )?;
+                }
+                Err(error) => {
+                    out.coverage[Class].invalid += 1;
+                    live.failure = Some(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Adds the population to the host's model pass. The pass is only opened
     /// when at least one actor has a valid draw.
     #[allow(clippy::too_many_arguments)]
@@ -3509,6 +3601,9 @@ impl Populator {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::off_camera_npc_packets;
 
 #[cfg(test)]
 mod tests {
@@ -4107,6 +4202,107 @@ mod tests {
             walk_pose_signature(&bind),
             "a generated resident follows routes without evaluating a walk pose"
         );
+    }
+
+    pub(crate) fn off_camera_npc_packets(
+        matrix: Mat4,
+    ) -> [crate::modules::lighter::scene::Packet; 2] {
+        use crate::modules::lighter::{model_feed::Moving, scene::AccelCache, textures::Textures};
+        let mut asset = rig_without_combined_actions();
+        asset.skeleton.bones.push(crate::skeleton::Bone {
+            name: "root".into(),
+            flags: 0,
+            parent: -1,
+            first_joint: 0,
+            relative: Mat4::IDENTITY.to_cols_array(),
+            initial: Mat4::IDENTITY.to_cols_array(),
+            children: vec![],
+        });
+        asset.skeleton.joints.push(crate::skeleton::Joint {
+            class: 15,
+            name: "root joint".into(),
+            parent: -1,
+            child: 0,
+            sibling: -1,
+        });
+        asset.skins[0].data.bones.push("root".into());
+        asset.model.actions.push(idle_action("fixture", 0., 30.));
+        asset.tracks = vec![Some(synthetic_walk_track([
+            [0.; 3],
+            [-3., 0., 0.],
+            [0.; 3],
+        ]))];
+        let skin = &mut asset.skins[0].data;
+        skin.materials[0].diffuse = [1.; 4];
+        skin.meshes[0].vertices = [
+            [-0.45, 0.45, 0.],
+            [0.45, 0.45, 0.],
+            [-0.45, -0.45, 0.],
+            [0.45, -0.45, 0.],
+        ]
+        .into_iter()
+        .map(|position| crate::skin::Vertex {
+            position,
+            normal: [0., 0., -1.],
+            uv: [0.; 2],
+            weights: [1., 0., 0., 0.],
+            joints: [0; 4],
+        })
+        .collect();
+        skin.meshes[0].indices = vec![0, 2, 1, 1, 2, 3];
+        let mut npc = Live {
+            spawn: 56,
+            position: Vec3::new(4., 35. / 24., -5.),
+            yaw: 0.,
+            asset: Rc::new(asset),
+            action: Some(0),
+            playback: None,
+            clip: None,
+            clock: 0.,
+            gait: None,
+            gait_clock: 0.,
+            live_world_moving: false,
+            live_world_running: false,
+            head: 0.45,
+            on_floor: false,
+            pose_error: None,
+            motion: Default::default(),
+            name_visible: true,
+            floor_stamp: 0,
+            nudged: false,
+            wedged: false,
+            visible: true,
+            pose_index: None,
+            pose_stamp: None,
+            uploaded_stamp: None,
+            follow: None,
+            live_world: false,
+            live_world_zone: None,
+            route_attempt: 0,
+            route_retry_seconds: 0.,
+            draw: None,
+            failure: None,
+        };
+        let mut cache = AccelCache::default();
+        let mut textures = Textures::default();
+        let packets = [0., 0.5].map(|seconds| {
+            npc.clock = seconds;
+            let mut out = Moving::new(&mut textures);
+            Populator::ray_actors(
+                std::slice::from_mut(&mut npc),
+                matrix,
+                &mut out,
+                &mut |_| Err("fixture white fallback".into()),
+            )
+            .unwrap();
+            assert!(!npc.visible && npc.failure.is_none() && npc.pose_error.is_none());
+            let packet = out.finish_cached(&mut cache).unwrap();
+            assert_eq!(packet.triangles(), 2);
+            packet
+        });
+        assert_eq!(cache.builds, [1, 1]);
+        assert_eq!(cache.refits, [1, 1]);
+        packets
     }
 
     #[test]

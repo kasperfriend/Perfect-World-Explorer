@@ -39,6 +39,14 @@ struct O {@builtin(position) p:vec4<f32>,@location(0) uv:vec2<f32>};
  return vec4<f32>(rgb,a);
 }
 "#;
+pub(crate) fn frame_index(seconds: f64) -> usize {
+    let phase = if seconds.is_finite() {
+        seconds.max(0.)
+    } else {
+        0.
+    };
+    ((phase / 0.033).floor() as u64 % 30) as usize
+}
 pub struct SimpleWaterGpu {
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
@@ -235,12 +243,7 @@ impl SimpleWaterGpu {
         fog: [f32; 4],
         fog_color: [f32; 4],
     ) {
-        let phase = if seconds.is_finite() {
-            seconds.max(0.)
-        } else {
-            0.
-        };
-        let frame = ((phase / 0.033).floor() as u64 % 30) as f32;
+        let frame = frame_index(seconds) as f32;
         let angle = crate::water_gpu::normal_offset_angle(seconds);
         queue.write_buffer(
             &self.uniform,

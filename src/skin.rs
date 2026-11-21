@@ -130,40 +130,143 @@ impl<'a> Reader<'a> {
         Ok(n as usize)
     }
 }
+/// Counts declared by a validated SKI header. This is an inventory of
+/// unsupported data, not an attempt to decode or partially recover that skin.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SkinOmissions {
+    pub files: usize,
+    pub morph_skin: usize,
+    pub morph_rigid: usize,
+    pub supple: usize,
+    pub muscle: usize,
+}
+
+impl std::fmt::Display for SkinOmissions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} SKI files: morph {}/{} (skin/rigid), supple {}, muscle {}",
+            self.files, self.morph_skin, self.morph_rigid, self.supple, self.muscle
+        )
+    }
+}
+
+#[derive(Default)]
+pub struct UnsupportedSkins {
+    seen: std::collections::HashSet<String>,
+    totals: SkinOmissions,
+}
+
+impl UnsupportedSkins {
+    pub fn observe(&mut self, path: &str, bytes: &[u8]) -> bool {
+        if !(bytes.starts_with(b"IKSA")
+            || bytes.starts_with(b"MOXBIKSA")
+            || bytes.starts_with(b"MOXTIKSA"))
+        {
+            return false;
+        }
+        if let Ok((_, header)) = skin_header(bytes) {
+            let c = header.unsupported;
+            if c.files == 1 && self.seen.insert(path.replace('\\', "/").to_lowercase()) {
+                self.totals.files += 1;
+                self.totals.morph_skin += c.morph_skin;
+                self.totals.morph_rigid += c.morph_rigid;
+                self.totals.supple += c.supple;
+                self.totals.muscle += c.muscle;
+            }
+            return c.files != 0;
+        }
+        false
+    }
+
+    pub fn totals(&self) -> SkinOmissions {
+        self.totals
+    }
+}
+
+struct Header {
+    binary: bool,
+    version: u32,
+    skin: usize,
+    rigid: usize,
+    tex_count: usize,
+    material_count: usize,
+    bone_count: usize,
+    unsupported: SkinOmissions,
+}
+
+fn skin_header(bytes: &[u8]) -> Result<(Reader<'_>, Header), String> {
+    let (bytes, binary) = if bytes.starts_with(b"MOXB") {
+        (&bytes[4..], true)
+    } else if bytes.starts_with(b"MOXT") {
+        (&bytes[4..], false)
+    } else {
+        (bytes, false)
+    };
+    let mut r = Reader {
+        data: bytes,
+        pos: 0,
+    };
+    if r.bytes(4)? != b"IKSA" {
+        return Err("invalid skin signature".into());
+    }
+    let version = r.u32()?;
+    if version == 0 || (version > 9 && version != 100 && version != 101) {
+        return Err(format!("unsupported skin version {version}"));
+    }
+    let skin = r.count(10000)?;
+    let rigid = r.count(10000)?;
+    let morph_skin = r.count(10000)?;
+    let morph_rigid = r.count(10000)?;
+    let tex_count = r.count(10000)?;
+    let material_count = r.count(10000)?;
+    let bone_count = r.count(10000)?;
+    let _min_weight = r.f32()?;
+    let _skeleton_bones = r.i32()?;
+    let supple = r.count(10000)?;
+    let muscle = r.count(10000)?;
+    r.bytes(52)?;
+    let unsupported = SkinOmissions {
+        files: usize::from(morph_skin + morph_rigid + supple + muscle != 0),
+        morph_skin,
+        morph_rigid,
+        supple,
+        muscle,
+    };
+    Ok((
+        r,
+        Header {
+            binary,
+            version,
+            skin,
+            rigid,
+            tex_count,
+            material_count,
+            bone_count,
+            unsupported,
+        },
+    ))
+}
+
 impl Skin {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let (bytes, binary) = if bytes.starts_with(b"MOXB") {
-            (&bytes[4..], true)
-        } else if bytes.starts_with(b"MOXT") {
-            (&bytes[4..], false)
-        } else {
-            (bytes, false)
-        };
-        let mut r = Reader {
-            data: bytes,
-            pos: 0,
-        };
-        if r.bytes(4)? != b"IKSA" {
-            return Err("invalid skin signature".into());
-        }
-        let version = r.u32()?;
-        if version == 0 || (version > 9 && version != 100 && version != 101) {
-            return Err(format!("unsupported skin version {version}"));
-        }
-        let skin = r.count(10000)?;
-        let rigid = r.count(10000)?;
-        let morph_skin = r.count(10000)?;
-        let morph_rigid = r.count(10000)?;
-        let tex_count = r.count(10000)?;
-        let material_count = r.count(10000)?;
-        let bone_count = r.count(10000)?;
-        let _min_weight = r.f32()?;
-        let _skeleton_bones = r.i32()?;
-        let supple = r.count(10000)?;
-        let muscle = r.count(10000)?;
-        r.bytes(52)?;
-        if morph_skin + morph_rigid + supple + muscle != 0 {
-            return Err("morph, supple and muscle skin meshes are not supported yet".into());
+        let (
+            mut r,
+            Header {
+                binary,
+                version,
+                skin,
+                rigid,
+                tex_count,
+                material_count,
+                bone_count,
+                unsupported,
+            },
+        ) = skin_header(bytes)?;
+        if unsupported.files != 0 {
+            return Err(format!(
+                "morph, supple and muscle skin meshes are not supported yet ({unsupported})"
+            ));
         }
         let mut bones = Vec::new();
         if version >= 9 {
@@ -408,4 +511,29 @@ mod tests {
         assert_eq!(c.directional_diffuse, [0.3, 0.35, 0.4, 0.75]);
         assert_eq!(c.point_diffuse[3], 0.);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn inventory_distinguishes_unsupported_skin_families_and_deduplicates_paths() {
+    let mut bytes = b"MOXBIKSA".to_vec();
+    for word in [9u32, 0, 0, 2, 3, 0, 0, 0, 0, 0, 5, 7] {
+        bytes.extend(word.to_le_bytes());
+    }
+    bytes.extend([0; 52]);
+    let mut census = UnsupportedSkins::default();
+    census.observe("models/asset.ski", &bytes);
+    census.observe("Models\\Asset.ski", &bytes);
+    census.observe("models/short.ski", &bytes[..bytes.len() - 1]);
+    assert_eq!(
+        census.totals(),
+        SkinOmissions {
+            files: 1,
+            morph_skin: 2,
+            morph_rigid: 3,
+            supple: 5,
+            muscle: 7
+        }
+    );
+    assert!(Skin::parse(&bytes).unwrap_err().contains("morph 2/3"));
 }

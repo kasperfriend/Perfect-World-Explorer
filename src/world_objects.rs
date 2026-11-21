@@ -647,6 +647,7 @@ fn run(
         width: 1,
         height: 1,
         rgba: vec![160, 160, 160, 255],
+        ray_dds: None,
     };
     let batch_size = if crate::objects::unbounded_textures() {
         64
@@ -1377,6 +1378,7 @@ mod page_tests {
             width: side,
             height: side,
             rgba: vec![fill; side * side * 4],
+            ray_dds: None,
         }
     }
     #[test]
@@ -1420,6 +1422,7 @@ mod page_tests {
             width: 3,
             height: 2,
             rgba: (0u8..24).collect(),
+            ray_dds: None,
         };
         let mut page = Builder::new();
         let (slot, _) = allocate_slot(&mut page, TextureKey::Content(7), &texture).unwrap();

@@ -13,6 +13,7 @@ image = { version = "0.25", default-features = false, features = ["dds", "bmp", 
 wgpu = "0.19"
 winit = "0.29"
 pollster = "0.3"
+bcdec_rs = "0.2.1"
 bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
 glam = "0.27"
 goblin = "0.8"
@@ -20,6 +21,15 @@ sha2 = "0.10"
 egui = "0.27"
 egui-winit = { version = "0.27", default-features = false, features = ["x11", "clipboard"] }
 egui-wgpu = { version = "0.27", default-features = false }
+
+# Lighter imports a buffer through wgpu 0.19's Vulkan HAL, so ash must match.
+# Use a separate Naga for guarded ray-query getters and to keep candidate
+# and committed intersections distinct in SPIR-V (gfx-rs/wgpu#6752, #7497).
+# The viewer keeps wgpu 0.19.
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+ash = "0.37.3"
+libloading = "0.8.9"
+naga-rt = { package = "naga", version = "26.0.0", features = ["wgsl-in", "spv-out", "termcolor"] }
 
 [target.'cfg(windows)'.dependencies]
 rodio = { version = "0.17", default-features = false, features = ["mp3", "vorbis", "wav"] }
