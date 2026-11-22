@@ -214,7 +214,8 @@ impl DenoiseParams {
             ],
             frame: [params.jitter.0, params.jitter.1, params.frame as f32, 0.],
             inv_view_projection: params.inv_view_projection.to_cols_array_2d(),
-            prev_view_projection: prev_vp.to_cols_array_2d(),
+            // Pre-multiplied `prev_vp * inv_vp` saves one full mat4x4*vec4 + div per pixel in temporal_pass.
+            prev_view_projection: (prev_vp * params.inv_view_projection).to_cols_array_2d(),
         }
     }
 }
@@ -923,13 +924,18 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let rot_angle = ign(id.xy, u32(params.frame.x)) * (2.0 * PI);
     let onb = orthonormal_basis(normal);
     let sun_onb = orthonormal_basis(params.sun_dir.xyz);
+    let spread_tan = select(0.0, tan(params.lens.z), params.lens.z > 1e-4);
+    let sun_luma = luminance(params.sun_colour.xyz);
+    let sun_strength = smoothstep(0.16, 0.36, sun_luma);
+    let gi_fade = 1.0 - clamp((dist - 150.0) / 70.0, 0.0, 1.0);
+    let est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
+    let receiver_albedo = clamp(raster_rgb / max(est_direct, vec3<f32>(0.18)), vec3<f32>(0.08), vec3<f32>(0.92));
 
     for (var s = 0u; s < samples; s = s + 1u) {
         var shadow = 1.0;
         if (bits_shadows && n_dot_l > 0.02 && fog_t < 0.96) {
-            let sun_taps = select(1u, 2u, params.lens.z > 1e-4 && dist < 160.0);
+            let sun_taps = select(1u, 2u, spread_tan > 0.0 && dist < 140.0);
             var sun_hits = 0u;
-            let spread_tan = tan(params.lens.z);
             for (var k = 0u; k < sun_taps; k = k + 1u) {
                 var shadow_dir = params.sun_dir.xyz;
                 if (sun_taps > 1u) {
@@ -1003,14 +1009,9 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         // Real multi-bounce (1..=6) path-traced coloured diffuse GI with unbiased
         // Russian Roulette (bounces 2..=6 stay active), zero sky-wash white tint
         // in layered mode, and zero daytime GI energy at night.
-        let gi_fade = 1.0 - clamp((dist - 180.0) / 80.0, 0.0, 1.0);
-        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
-            let sun_luma = luminance(params.sun_colour.xyz);
-            let sun_strength = smoothstep(0.16, 0.36, sun_luma);
-            if (sun_strength > 0.005) {
+        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01 && sun_strength > 0.005) {
+            {
                 let gi_taps = select(1u, 2u, max_bounces <= 1u && dist < 80.0);
-                let est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
-                let receiver_albedo = clamp(raster_rgb / max(est_direct, vec3<f32>(0.18)), vec3<f32>(0.08), vec3<f32>(0.92));
                 var gi_sum = vec3<f32>(0.0);
                 let bounce_max_t = min(params.lens.y, 96.0);
                 for (var g = 0u; g < gi_taps; g = g + 1u) {
@@ -1110,11 +1111,11 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 if (pl_ndl > 0.001) {
                     let atten = point_light_falloff(pl_dist, pl_pr.w);
                     if (atten > 1e-5) {
+                        let w = pl_ci.w * atten * pl_ndl;
                         var pl_vis = 1.0;
-                        if (bits_shadows && occluded(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias), state ^ (li * 131u + 17u))) {
+                        if (bits_shadows && pl_dist > 1.5 && w > 0.015 && occluded(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias), state ^ (li * 131u + 17u))) {
                             pl_vis = 0.0;
                         }
-                        let w = pl_ci.w * atten * pl_ndl;
                         pl_w_total = pl_w_total + w;
                         pl_w_lit = pl_w_lit + w * pl_vis;
                         pl_debug_lit = pl_debug_lit + pl_ci.rgb * (w * pl_vis);
@@ -1304,13 +1305,9 @@ fn reproject(pixel: vec2<i32>, size: vec2<i32>) -> ReprojectResult {
     } else {
         let uv = (vec2<f32>(pixel) + vec2<f32>(0.5)) / vec2<f32>(size);
         let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-        let world_h = params.inv_vp * vec4<f32>(ndc, current_depth, 1.0);
-        if (abs(world_h.w) <= 1e-5) {
-            return empty;
-        }
-        let world_pos = world_h.xyz / world_h.w;
-        let prev_clip = params.prev_vp * vec4<f32>(world_pos, 1.0);
-        if (prev_clip.w <= 1e-4) {
+        // `params.prev_vp` holds pre-multiplied `prev_vp * inv_vp` (1 mat4 mul instead of 2).
+        let prev_clip = params.prev_vp * vec4<f32>(ndc, current_depth, 1.0);
+        if (abs(prev_clip.w) <= 1e-5) {
             return empty;
         }
         let prev_ndc = prev_clip.xyz / prev_clip.w;
@@ -3141,30 +3138,34 @@ impl RaywatcherGpu {
                 depth_or_array_layers: 1,
             },
         );
-        let pre_src = if (pre_water_depth.width(), pre_water_depth.height()) == (rw, rh) {
-            pre_water_depth
-        } else {
-            depth
-        };
-        encoder.copy_texture_to_texture(
-            wgpu::ImageCopyTexture {
-                texture: pre_src,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::DepthOnly,
-            },
-            wgpu::ImageCopyTexture {
-                texture: &self._pre_water_depth_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::DepthOnly,
-            },
-            wgpu::Extent3d {
-                width: rw,
-                height: rh,
-                depth_or_array_layers: 1,
-            },
-        );
+        // Boost #5: Only copy full-resolution pre-water depth when active water
+        // planes exist (or on frame 0 to initialize), saving a full-screen Depth32F copy.
+        if !water.is_empty() || self.frames == 0 {
+            let pre_src = if (pre_water_depth.width(), pre_water_depth.height()) == (rw, rh) {
+                pre_water_depth
+            } else {
+                depth
+            };
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: pre_src,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &self._pre_water_depth_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                },
+                wgpu::Extent3d {
+                    width: rw,
+                    height: rh,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
 
         // Build the 1:1 depth-anchored G-buffer (world pos, normal, water
         // roughness, and untouched raster colour) at ray-grid resolution.
@@ -3624,18 +3625,19 @@ impl RaywatcherGpu {
             (glam::Vec3::NEG_Z, glam::Vec3::Y, 0.0, 0.0),
         ];
 
-        let faces_to_render: Vec<u32> = if !self.sky_env_initialized {
+        let (face_buf, face_count): ([u32; 6], usize) = if !self.sky_env_initialized {
             self.sky_env_initialized = true;
             self.sky_env_dirty = true;
-            (0..6).collect()
-        } else if self.frames % 4 == 0 {
+            ([0, 1, 2, 3, 4, 5], 6)
+        } else if self.frames % 12 == 0 {
             let f = self.sky_env_face_cursor % 6;
             self.sky_env_face_cursor = self.sky_env_face_cursor.wrapping_add(1);
             self.sky_env_dirty = true;
-            vec![f]
+            ([f, 0, 0, 0, 0, 0], 1)
         } else {
             return;
         };
+        let faces_to_render = &face_buf[..face_count];
 
         let multi_face = faces_to_render.len() > 1;
         let sky_proj = glam::Mat4::from_scale(glam::Vec3::new(-1.0, 1.0, 1.0))
@@ -3643,7 +3645,7 @@ impl RaywatcherGpu {
         let cloud_proj =
             glam::Mat4::perspective_infinite_reverse_rh(90.0f32.to_radians(), 1.0, 0.5);
 
-        for face in faces_to_render {
+        for &face in faces_to_render {
             let (dir, up, yaw, pitch) = FACES[face as usize];
             let view = glam::Mat4::look_to_rh(glam::Vec3::ZERO, dir, up);
             sky.update_custom(queue, view, sky_proj, SKY_ENV_FACE, sky_frame, sky_sets);

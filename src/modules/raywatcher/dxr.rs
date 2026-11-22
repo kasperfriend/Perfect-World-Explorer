@@ -641,6 +641,9 @@ mod imp {
         desc_stride: u32,
         cbvs: [RawBuffer; 3],
         scene: DxrScene,
+        /// Deferred retirement lists freed once `ring.completed_fence() >= fence`.
+        retired_scenes: Vec<(u64, DxrScene)>,
+        retired_buffers: Vec<(u64, Vec<RawBuffer>)>,
         targets: DxrTargets,
     }
 
@@ -703,7 +706,7 @@ mod imp {
                 )
             };
             let cbvs = [mk_cbv()?, mk_cbv()?, mk_cbv()?];
-            let dxr_scene =
+            let (dxr_scene, staging, build_fence) =
                 Self::build_scene(dev_ptr, device5_guard.0, &mut ring, &raw_queue, scene)?;
             let targets = DxrTargets::new(device, &raw_device, grid_extent)?;
 
@@ -718,6 +721,8 @@ mod imp {
                 desc_stride,
                 cbvs,
                 scene: dxr_scene,
+                retired_scenes: Vec::new(),
+                retired_buffers: vec![(build_fence, staging)],
                 targets,
             };
             tracer.write_scene_descriptors();
@@ -863,7 +868,7 @@ mod imp {
             ring: &mut NativeCommandRing,
             raw_queue: &d3d12::CommandQueue,
             scene: &Arc<SceneGeometry>,
-        ) -> Result<DxrScene, String> {
+        ) -> Result<(DxrScene, Vec<RawBuffer>, u64), String> {
             // Ensure at least 1 degenerate triangle so BLAS/TLAS build always
             // succeeds even on an empty scene.
             let dummy_tri = [RayTriangle {
@@ -886,48 +891,31 @@ mod imp {
             } else {
                 &scene.materials
             };
-            // Partition triangles into opaque (opacity >= 0.99, hardware RT Core
-            // fast path with zero shader ejection) followed by alpha-tested
-            // foliage so 90%+ of intersections never leave fixed-function RT Cores.
-            let mut opaque_tris: Vec<RayTriangle> = Vec::with_capacity(raw_tris.len());
-            let mut alpha_tris: Vec<RayTriangle> = Vec::new();
+            // Count opaque vs alpha-tested triangles in one pass, then write
+            // partitioned RayTriangles and flat [f32; 3] BLAS vertices directly
+            // into mapped DX12 upload heaps (zero intermediate Vec allocations).
             let mat_max = mats_data.len().saturating_sub(1);
-            for &t in raw_tris {
+            let mut opaque_tri_count = 0u32;
+            for t in raw_tris {
                 let mat_idx = (t.b[3].round().max(0.0) as usize).min(mat_max);
                 if mats_data[mat_idx].surface[3] >= 0.99 {
-                    opaque_tris.push(t);
-                } else {
-                    alpha_tris.push(t);
+                    opaque_tri_count += 1;
                 }
             }
-            let opaque_tri_count = opaque_tris.len() as u32;
-            let alpha_tri_count = alpha_tris.len() as u32;
-            opaque_tris.extend_from_slice(&alpha_tris);
-            drop(alpha_tris);
-            let tris_data: &[RayTriangle] = &opaque_tris;
-            let tri_count = tris_data.len() as u32;
+            let tri_count = raw_tris.len() as u32;
+            let alpha_tri_count = tri_count - opaque_tri_count;
             let mat_count = mats_data.len() as u32;
 
-            // Pack flat [f32; 3] vertex positions (3 vertices per triangle) for
-            // the DXR BLAS triangle geometry descriptors.
-            let mut verts: Vec<[f32; 3]> = Vec::with_capacity(tris_data.len() * 3);
-            for t in tris_data {
-                verts.push([t.a[0], t.a[1], t.a[2]]);
-                verts.push([t.b[0], t.b[1], t.b[2]]);
-                verts.push([t.c[0], t.c[1], t.c[2]]);
-            }
-
             unsafe {
+                let verts_bytes = (raw_tris.len() * 3 * size_of::<[f32; 3]>()) as u64;
                 let vertices = RawBuffer::create(
                     dev_ptr,
-                    (verts.len() * size_of::<[f32; 3]>()) as u64,
+                    verts_bytes,
                     d12::D3D12_HEAP_TYPE_UPLOAD,
                     d12::D3D12_RESOURCE_FLAG_NONE,
                     d12::D3D12_RESOURCE_STATE_GENERIC_READ,
                 )?;
-                vertices.write_upload(bytemuck::cast_slice(&verts))?;
-
-                let tris_bytes = (tris_data.len() * size_of::<RayTriangle>()) as u64;
+                let tris_bytes = (raw_tris.len() * size_of::<RayTriangle>()) as u64;
                 let tris_upload = RawBuffer::create(
                     dev_ptr,
                     tris_bytes,
@@ -935,7 +923,43 @@ mod imp {
                     d12::D3D12_RESOURCE_FLAG_NONE,
                     d12::D3D12_RESOURCE_STATE_GENERIC_READ,
                 )?;
-                tris_upload.write_upload(bytemuck::cast_slice(&tris_data))?;
+                {
+                    let read_range = d12::D3D12_RANGE { Begin: 0, End: 0 };
+                    let mut v_mapped: *mut c_void = null_mut();
+                    let hr_v = (*vertices.resource).Map(0, &read_range, &mut v_mapped);
+                    if hr_v < 0 || v_mapped.is_null() {
+                        return Err(format!("DXR vertex upload Map failed (0x{hr_v:08x})"));
+                    }
+                    let mut t_mapped: *mut c_void = null_mut();
+                    let hr_t = (*tris_upload.resource).Map(0, &read_range, &mut t_mapped);
+                    if hr_t < 0 || t_mapped.is_null() {
+                        (*vertices.resource).Unmap(0, null());
+                        return Err(format!("DXR tri upload Map failed (0x{hr_t:08x})"));
+                    }
+                    let v_out = v_mapped as *mut [f32; 3];
+                    let t_out = t_mapped as *mut RayTriangle;
+                    let mut o_idx = 0usize;
+                    let mut a_idx = opaque_tri_count as usize;
+                    for &t in raw_tris {
+                        let mat_idx = (t.b[3].round().max(0.0) as usize).min(mat_max);
+                        let dst = if mats_data[mat_idx].surface[3] >= 0.99 {
+                            let i = o_idx;
+                            o_idx += 1;
+                            i
+                        } else {
+                            let i = a_idx;
+                            a_idx += 1;
+                            i
+                        };
+                        t_out.add(dst).write(t);
+                        let vbase = dst * 3;
+                        v_out.add(vbase).write([t.a[0], t.a[1], t.a[2]]);
+                        v_out.add(vbase + 1).write([t.b[0], t.b[1], t.b[2]]);
+                        v_out.add(vbase + 2).write([t.c[0], t.c[1], t.c[2]]);
+                    }
+                    (*tris_upload.resource).Unmap(0, null());
+                    (*vertices.resource).Unmap(0, null());
+                }
                 let tris = RawBuffer::create(
                     dev_ptr,
                     tris_bytes,
@@ -1145,24 +1169,25 @@ mod imp {
 
                 com_release(list4);
                 ring.retire(slot_idx, raw_queue, "DXR-AS")?;
-                ring.wait_idle();
+                let build_fence = ring.current_fence();
 
-                // Staging/upload/scratch buffers drop here now that the GPU is idle.
-                drop(vertices);
-                drop(tris_upload);
-                drop(mats_upload);
-                drop(instance_desc);
-                drop(scratch);
+                // Keep staging/upload/scratch alive until the GPU passes `build_fence`
+                // instead of stalling the frame thread with `ring.wait_idle()`.
+                let staging = vec![vertices, tris_upload, mats_upload, instance_desc, scratch];
 
-                Ok(DxrScene {
-                    tris,
-                    materials,
-                    _blas: blas,
-                    tlas,
-                    tri_count,
-                    opaque_tri_count,
-                    mat_count,
-                })
+                Ok((
+                    DxrScene {
+                        tris,
+                        materials,
+                        _blas: blas,
+                        tlas,
+                        tri_count,
+                        opaque_tri_count,
+                        mat_count,
+                    },
+                    staging,
+                    build_fence,
+                ))
             }
         }
 
@@ -1344,15 +1369,25 @@ mod imp {
             self.targets.wgpu_tracked_copy_dst = true;
         }
 
+        fn gc_retired(&mut self) {
+            let done = self.ring.completed_fence();
+            self.retired_buffers.retain(|(f, _)| *f > done);
+            self.retired_scenes.retain(|(f, _)| *f > done);
+        }
+
         pub fn set_scene(&mut self, scene: &Arc<SceneGeometry>) -> Result<(), String> {
-            self.ring.wait_idle();
-            self.scene = Self::build_scene(
+            self.gc_retired();
+            let prev_fence = self.ring.current_fence();
+            let (new_scene, staging, build_fence) = Self::build_scene(
                 self.raw_device.as_mut_ptr(),
                 self.device5,
                 &mut self.ring,
                 &self.raw_queue,
                 scene,
             )?;
+            let old_scene = std::mem::replace(&mut self.scene, new_scene);
+            self.retired_scenes.push((prev_fence, old_scene));
+            self.retired_buffers.push((build_fence, staging));
             self.write_scene_descriptors();
             Ok(())
         }
@@ -1386,6 +1421,7 @@ mod imp {
         ) -> Result<(), String> {
             let (w, h) = (grid_extent.0.max(1), grid_extent.1.max(1));
             unsafe {
+                self.gc_retired();
                 let slot_idx = self.ring.acquire("DXR-Trace")?;
                 let mut dxr_params = *params;
                 dxr_params.fog[3] = self.scene.opaque_tri_count as f32;
@@ -1449,7 +1485,7 @@ mod imp {
                 (*list).SetComputeRootConstantBufferView(0, self.cbvs[slot_idx].gpu_va);
                 (*list).SetComputeRootDescriptorTable(1, self.gpu_handle(0));
                 (*list).SetComputeRootDescriptorTable(2, self.gpu_handle(7));
-                (*list).Dispatch(w.div_ceil(8), h.div_ceil(8), 1);
+                (*list).Dispatch(w.div_ceil(8), h.div_ceil(4), 1);
 
                 let mut post_barriers: [d12::D3D12_RESOURCE_BARRIER; 9] = zeroed();
                 for (b, res) in post_barriers[0..4]

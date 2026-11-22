@@ -350,7 +350,7 @@ float3 kind_colour(float kind) {
     return float3(0.95, 0.15, 0.85);                 // magenta: instance proxy
 }
 
-[numthreads(8, 8, 1)]
+[numthreads(8, 4, 1)]
 void trace_pass(uint3 id : SV_DispatchThreadID) {
     uint2 extent = uint2(uint(params.extents.x), uint(params.extents.y));
     if (id.x >= extent.x || id.y >= extent.y) {
@@ -438,14 +438,22 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float3 sun_up = abs(params.sun_dir.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
     float3 sun_t = normalize(cross(sun_up, params.sun_dir.xyz));
     float3 sun_b = cross(params.sun_dir.xyz, sun_t);
+    float spread_tan = (params.lens.z > 1e-4) ? tan(params.lens.z) : 0.0;
+    float sun_luma = dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722));
+    float sun_strength = smoothstep(0.16, 0.36, sun_luma);
+    float gi_fade = 1.0 - saturate((dist - 150.0) / 70.0);
+    float3 est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
+    float3 receiver_albedo = clamp(
+        raster_rgb / max(est_direct, float3(0.18, 0.18, 0.18)),
+        float3(0.08, 0.08, 0.08),
+        float3(0.92, 0.92, 0.92));
 
     for (uint s = 0u; s < samples; s = s + 1u) {
         // 2-tap IGN-rotated Vogel-disk soft sun shadow penumbra.
         float shadow = 1.0;
         if (bits_shadows && n_dot_l > 0.02 && fog_t < 0.96) {
-            uint sun_taps = (params.lens.z > 1e-4 && dist < 160.0) ? 2u : 1u;
+            uint sun_taps = (spread_tan > 0.0 && dist < 140.0) ? 2u : 1u;
             uint sun_hits = 0u;
-            float spread_tan = tan(params.lens.z);
             for (uint k = 0u; k < sun_taps; k = k + 1u) {
                 float3 shadow_dir = params.sun_dir.xyz;
                 if (sun_taps > 1u) {
@@ -455,7 +463,14 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     sincos(theta, s_th, c_th);
                     shadow_dir = normalize(params.sun_dir.xyz + (sun_t * c_th + sun_b * s_th) * r);
                 }
-                if (occluded(ray_origin, shadow_dir, bias * 0.5, params.lens.y, state ^ k)) {
+                bool hit_s = false;
+                if (dist > 96.0) {
+                    // Distant shadows (>96u): pure fixed-function RT-core opaque hit (zero shader ejection).
+                    hit_s = occluded_fast(ray_origin, shadow_dir, bias * 0.5, params.lens.y);
+                } else {
+                    hit_s = occluded(ray_origin, shadow_dir, bias * 0.5, params.lens.y, state ^ k);
+                }
+                if (hit_s) {
                     sun_hits = sun_hits + 1u;
                 }
             }
@@ -527,17 +542,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // Real multi-bounce (1..=6) path-traced coloured diffuse GI with unbiased
         // Russian Roulette (bounces 2..=6 stay active), zero sky-wash white tint
         // in layered mode, and zero daytime GI energy at night.
-        float gi_fade = 1.0 - saturate((dist - 180.0) / 80.0);
-        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
-            float sun_luma = dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722));
-            float sun_strength = smoothstep(0.16, 0.36, sun_luma);
-            if (sun_strength > 0.005) {
+        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01 && sun_strength > 0.005) {
+            {
                 uint gi_taps = (max_bounces <= 1u && dist < 80.0) ? 2u : 1u;
-                float3 est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
-                float3 receiver_albedo = clamp(
-                    raster_rgb / max(est_direct, float3(0.18, 0.18, 0.18)),
-                    float3(0.08, 0.08, 0.08),
-                    float3(0.92, 0.92, 0.92));
                 float3 gi_sum = float3(0.0, 0.0, 0.0);
                 float bounce_max_t = min(params.lens.y, 96.0);
                 for (uint g = 0u; g < gi_taps; g = g + 1u) {
@@ -649,11 +656,11 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 if (pl_ndl > 0.001) {
                     float atten = point_light_falloff(pl_dist, pl_pr.w);
                     if (atten > 1e-5) {
+                        float w = pl_ci.w * atten * pl_ndl;
                         float pl_vis = 1.0;
-                        if (bits_shadows && occluded_fast(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias))) {
+                        if (bits_shadows && pl_dist > 1.5 && w > 0.015 && occluded_fast(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias))) {
                             pl_vis = 0.0;
                         }
-                        float w = pl_ci.w * atten * pl_ndl;
                         pl_w_total += w;
                         pl_w_lit += w * pl_vis;
                         pl_debug_lit += pl_ci.rgb * (w * pl_vis);

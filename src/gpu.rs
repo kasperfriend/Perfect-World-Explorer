@@ -3869,6 +3869,7 @@ impl Renderer {
             const REAL_MESH_TRI_BUDGET: usize = 320_000;
 
             let mut real_meshes = Vec::new();
+            let mut page_tris = Vec::new();
             let mut real_mesh_pages = 0usize;
             let proxy_fallback_models = 0usize;
             let proxies = Vec::new();
@@ -3895,27 +3896,14 @@ impl Renderer {
                 })
                 .collect();
             candidate_pages.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            let mut queued_tris = 0usize;
             for (_, idx) in candidate_pages {
                 let page = &pages_slice[idx];
                 let tris = page.rt_triangles();
-                if !tris.is_empty() && real_meshes.len() < REAL_MESH_TRI_BUDGET {
+                if !tris.is_empty() && queued_tris < REAL_MESH_TRI_BUDGET {
                     real_mesh_pages += 1;
-                    let remaining = REAL_MESH_TRI_BUDGET - real_meshes.len();
-                    let step = (tris.len() / remaining.max(1)).max(1);
-                    let mut ti = 0usize;
-                    while ti < tris.len() && real_meshes.len() < REAL_MESH_TRI_BUDGET {
-                        let t = &tris[ti];
-                        real_meshes.push(MeshTriangle {
-                            a: Vec3::from_array(t.a),
-                            b: Vec3::from_array(t.b),
-                            c: Vec3::from_array(t.c),
-                            normal: Vec3::from_array(t.normal),
-                            albedo: t.albedo,
-                            roughness: 0.72,
-                            opacity: t.opacity,
-                        });
-                        ti += step;
-                    }
+                    queued_tris += tris.len();
+                    page_tris.push(page.rt_triangles_arc());
                 }
             }
             // Do not emit coarse axis-aligned bounding boxes (`InstanceProxy`):
@@ -3989,6 +3977,8 @@ impl Renderer {
                 0,
                 content_hash,
                 ground_box,
+                page_tris,
+                REAL_MESH_TRI_BUDGET,
                 real_meshes,
                 proxies,
                 water,
@@ -4256,13 +4246,23 @@ impl Renderer {
                 // Also harvest luminous additive world effects (torches, magic glows,
                 // lanterns, spells) clustered within 6 u so effects cast real shadowed light.
                 if let Some(models) = &self.models {
-                    let mut effect_clusters: Vec<(glam::Vec3, glam::Vec3, f32, f32)> = Vec::new();
+                    let mut effect_clusters: Vec<(glam::Vec3, glam::Vec3, f32, f32)> =
+                        Vec::with_capacity(32);
+                    let max_eff_d_sq = (params.far + 48.0) * (params.far + 48.0);
                     for q in models.effect_quads() {
                         // D3DBLEND_ONE (2) = additive emissive glow.
                         if q.destination_blend != 2 || q.mesh.is_some() {
                             continue;
                         }
                         let a = q.color[3].clamp(0.0, 1.0);
+                        if a < 0.08 {
+                            continue;
+                        }
+                        // Cheap vertex-0 distance pre-rejection before luminance/extent math.
+                        let p0 = glam::Vec3::from_array(q.positions[0]);
+                        if p0.distance_squared(camera.pos) > max_eff_d_sq {
+                            continue;
+                        }
                         let col = glam::Vec3::new(
                             q.color[0].max(0.0),
                             q.color[1].max(0.0),
@@ -4272,7 +4272,6 @@ impl Renderer {
                         if lum < 0.08 {
                             continue;
                         }
-                        let p0 = glam::Vec3::from_array(q.positions[0]);
                         let p1 = glam::Vec3::from_array(q.positions[1]);
                         let p2 = glam::Vec3::from_array(q.positions[2]);
                         let p3 = glam::Vec3::from_array(q.positions[3]);

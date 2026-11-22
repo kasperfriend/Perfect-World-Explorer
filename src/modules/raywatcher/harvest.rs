@@ -462,7 +462,9 @@ impl Harvester {
         terrain_generation: u64,
         content_hash: u64,
         ground: Option<Box<dyn Fn(f32, f32) -> f32 + Send>>,
-        real_meshes: Vec<MeshTriangle>,
+        page_tris: Vec<std::sync::Arc<[crate::world_objects::RtMeshTriangle]>>,
+        page_tri_budget: usize,
+        mut real_meshes: Vec<MeshTriangle>,
         instances: Vec<InstanceProxy>,
         water: Vec<WaterSurface>,
         skip_cpu_bvh: bool,
@@ -512,6 +514,30 @@ impl Harvester {
                         config,
                         ground_fn.as_ref(),
                     );
+                }
+                // Unpack O(1)-cloned page Arc slices entirely off the main thread.
+                let mut page_added = 0usize;
+                for tris in &page_tris {
+                    if tris.is_empty() || page_added >= page_tri_budget {
+                        break;
+                    }
+                    let remaining = page_tri_budget - page_added;
+                    let step = (tris.len() / remaining.max(1)).max(1);
+                    let mut ti = 0usize;
+                    while ti < tris.len() && page_added < page_tri_budget {
+                        let t = &tris[ti];
+                        real_meshes.push(MeshTriangle {
+                            a: Vec3::from_array(t.a),
+                            b: Vec3::from_array(t.b),
+                            c: Vec3::from_array(t.c),
+                            normal: Vec3::from_array(t.normal),
+                            albedo: t.albedo,
+                            roughness: 0.72,
+                            opacity: t.opacity,
+                        });
+                        page_added += 1;
+                        ti += step;
+                    }
                 }
                 let before_mesh = triangles.len();
                 push_real_meshes(&mut triangles, &mut materials, &real_meshes);
@@ -1272,8 +1298,8 @@ fn push_instances_chunked(
     let chunk = config.chunk_size.max(32.0);
     let far_sq = far * far;
     let near_ring_sq = config.radius.max(32.0).powi(2);
-    let mut chunks: std::collections::BTreeMap<(i32, i32), Vec<(f32, usize)>> =
-        std::collections::BTreeMap::new();
+    let mut chunks: std::collections::HashMap<(i32, i32), Vec<(f32, usize)>> =
+        std::collections::HashMap::new();
     for (index, inst) in instances.iter().enumerate() {
         if inst.half.min_element() < config.min_instance_size * 0.5
             || inst.half.max_element() <= 0.0
@@ -1299,8 +1325,8 @@ fn push_instances_chunked(
         if list.len() > config.max_instances {
             list.select_nth_unstable_by(config.max_instances, |a, b| a.0.total_cmp(&b.0));
             list.truncate(config.max_instances);
+            list.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         }
-        list.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         triangles.reserve(list.len() * 12);
         for (_, index) in list {
             let instance = instances[index];
@@ -1434,14 +1460,40 @@ fn push_terrain_frustum(
                     Vec3::Y
                 }
             };
+            // Boost #10: On 1:1 raster cells (`step <= base_cell + 0.01`), `ground()`
+            // is piecewise-linear inside each cell so midpoints match linear edges
+            // exactly; skip all 5 redundant midpoint queries per cell (5x faster!).
+            // On coarser LOD chunks, pre-sample shared horizontal/vertical edge
+            // midpoints once instead of redundantly querying each shared edge twice.
+            let is_unit_cell = step <= base_cell + 0.01;
+            let (h_edges, v_edges) = if is_unit_cell {
+                (Vec::new(), Vec::new())
+            } else {
+                let mut he = Vec::with_capacity(side * divs as usize);
+                for iz in 0..side {
+                    let wz = z0 + iz as f32 * step;
+                    for ix in 0..divs as usize {
+                        he.push(ground(x0 + (ix as f32 + 0.5) * step, wz));
+                    }
+                }
+                let mut ve = Vec::with_capacity(divs as usize * side);
+                for iz in 0..divs as usize {
+                    let wzc = z0 + (iz as f32 + 0.5) * step;
+                    for ix in 0..side {
+                        ve.push(ground(x0 + ix as f32 * step, wzc));
+                    }
+                }
+                (he, ve)
+            };
             triangles.reserve((divs * divs * 2) as usize);
-            for iz in 0..divs as usize {
+            let divs_u = divs as usize;
+            for iz in 0..divs_u {
                 let wz0 = z0 + iz as f32 * step;
                 let wz1 = wz0 + step;
                 let wzc = (wz0 + wz1) * 0.5;
                 let row0 = iz * side;
                 let row1 = (iz + 1) * side;
-                for ix in 0..divs as usize {
+                for ix in 0..divs_u {
                     let wx0 = x0 + ix as f32 * step;
                     let wx1 = wx0 + step;
                     let wxc = (wx0 + wx1) * 0.5;
@@ -1449,17 +1501,22 @@ fn push_terrain_frustum(
                     let h1 = heights[row0 + ix + 1];
                     let h2 = heights[row1 + ix + 1];
                     let h3 = heights[row1 + ix];
-                    let hc = ground(wxc, wzc);
-                    let hm_n = ground(wxc, wz0);
-                    let hm_s = ground(wxc, wz1);
-                    let hm_w = ground(wx0, wzc);
-                    let hm_e = ground(wx1, wzc);
-                    let err_c = ((h0 + h2) * 0.5 - hc).abs();
-                    let edge_err = ((h0 + h1) * 0.5 - hm_n)
-                        .abs()
-                        .max(((h3 + h2) * 0.5 - hm_s).abs())
-                        .max(((h0 + h3) * 0.5 - hm_w).abs())
-                        .max(((h1 + h2) * 0.5 - hm_e).abs());
+                    let (hc, hm_n, hm_s, hm_w, hm_e, err_c, edge_err) = if is_unit_cell {
+                        ((h0 + h2) * 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    } else {
+                        let hc = ground(wxc, wzc);
+                        let hm_n = h_edges[iz * divs_u + ix];
+                        let hm_s = h_edges[(iz + 1) * divs_u + ix];
+                        let hm_w = v_edges[iz * side + ix];
+                        let hm_e = v_edges[iz * side + ix + 1];
+                        let err_c = ((h0 + h2) * 0.5 - hc).abs();
+                        let edge_err = ((h0 + h1) * 0.5 - hm_n)
+                            .abs()
+                            .max(((h3 + h2) * 0.5 - hm_s).abs())
+                            .max(((h0 + h3) * 0.5 - hm_w).abs())
+                            .max(((h1 + h2) * 0.5 - hm_e).abs());
+                        (hc, hm_n, hm_s, hm_w, hm_e, err_c, edge_err)
+                    };
 
                     if edge_err > 0.08 {
                         // Watertight 8-triangle star pinning both the cell

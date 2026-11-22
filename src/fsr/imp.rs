@@ -1197,6 +1197,14 @@ impl NativeCommandRing {
         &mut self.slots[index]
     }
 
+    pub(crate) fn completed_fence(&self) -> u64 {
+        self.fence.get_value()
+    }
+
+    pub(crate) fn current_fence(&self) -> u64 {
+        self.fence_value
+    }
+
     /// Close the slot's list, submit it on `queue`, and stamp it with the new
     /// fence value so the next `acquire` of this slot waits only if needed.
     pub(crate) fn retire(

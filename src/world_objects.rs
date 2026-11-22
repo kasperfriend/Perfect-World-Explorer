@@ -854,18 +854,35 @@ pub struct RtMeshTriangle {
 /// buildings and props retain real mesh silhouettes for shadows & reflections.
 const MAX_RT_TRIS_PER_PAGE: usize = 32768;
 
+#[inline]
+fn srgb_to_linear_u8(v: u8) -> f32 {
+    let s = v as f32 / 255.0;
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 fn sample_atlas_rgba(
     atlas: &[u8],
+    atlas_w: usize,
     atlas_h: usize,
     v_color: [f32; 4],
     kind: f32,
     uv: [f32; 2],
 ) -> Option<([f32; 3], f32)> {
-    if atlas.is_empty() || atlas_h == 0 || kind <= 1.5 {
+    if atlas.is_empty() || atlas_w == 0 || atlas_h == 0 || kind <= 1.5 {
         return None;
     }
     let scale_u = v_color[2];
-    let scale_v = if kind < 2.5 { v_color[3] } else { v_color[2] };
+    // `Page::finish` scales `v.color[3]` by `SIDE / used_height` for all trimmed pages;
+    // always prefer `v_color[3]` when populated so `kind >= 2.5` never samples the wrong V row.
+    let scale_v = if v_color[3] > 1e-5 {
+        v_color[3]
+    } else {
+        v_color[2]
+    };
     if scale_u <= 1e-5 || scale_v <= 1e-5 {
         return None;
     }
@@ -873,25 +890,30 @@ fn sample_atlas_rgba(
     let lv = ((uv[1] - v_color[1]) / scale_v).rem_euclid(1.0) * scale_v;
     let au = (v_color[0] + lu).clamp(0.0, 0.9999);
     let av = (v_color[1] + lv).clamp(0.0, 0.9999);
-    let x = ((au * SIDE as f32) as usize).min(SIDE - 1);
+    let x = ((au * atlas_w as f32) as usize).min(atlas_w - 1);
     let y = ((av * atlas_h as f32) as usize).min(atlas_h - 1);
-    let idx = (y * SIDE + x) * 4;
+    let idx = (y * atlas_w + x) * 4;
     if idx + 3 >= atlas.len() {
         return None;
     }
-    let r = atlas[idx] as f32 / 255.0;
-    let g = atlas[idx + 1] as f32 / 255.0;
-    let b = atlas[idx + 2] as f32 / 255.0;
+    let r = srgb_to_linear_u8(atlas[idx]);
+    let g = srgb_to_linear_u8(atlas[idx + 1]);
+    let b = srgb_to_linear_u8(atlas[idx + 2]);
     let a = atlas[idx + 3] as f32 / 255.0;
-    Some(([r * r, g * g, b * b], a))
+    Some(([r, g, b], a))
 }
 
-fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32], atlas: &[u8]) -> Vec<RtMeshTriangle> {
+fn extract_rt_triangles(
+    vertices: &[Vertex],
+    indices: &[u32],
+    atlas: &[u8],
+    atlas_w: usize,
+    atlas_h: usize,
+) -> Vec<RtMeshTriangle> {
     let tri_count = indices.len() / 3;
     if tri_count == 0 {
         return Vec::new();
     }
-    let atlas_h = atlas.len() / (SIDE * 4);
     let step = (tri_count / MAX_RT_TRIS_PER_PAGE).max(1);
     let mut out = Vec::with_capacity(tri_count.min(MAX_RT_TRIS_PER_PAGE));
     let mut t = 0usize;
@@ -913,12 +935,32 @@ fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32], atlas: &[u8]) -> V
             let len2 = nx * nx + ny * ny + nz * nz;
             if len2 > 1e-8 {
                 let inv = len2.sqrt().recip();
+                let geo_n = [nx * inv, ny * inv, nz * inv];
+                // Preserve smooth artist-authored BMD vertex normals instead of
+                // flat geometric triangle normals so curved roofs, pillars, and
+                // trunks reflect smoothly without triangle faceting.
+                let sx = v0.normal[0] + v1.normal[0] + v2.normal[0];
+                let sy = v0.normal[1] + v1.normal[1] + v2.normal[1];
+                let sz = v0.normal[2] + v1.normal[2] + v2.normal[2];
+                let slen2 = sx * sx + sy * sy + sz * sz;
+                let smooth_n = if slen2 > 1e-4 && sx.is_finite() && sy.is_finite() && sz.is_finite()
+                {
+                    let sinv = slen2.sqrt().recip();
+                    let mut n = [sx * sinv, sy * sinv, sz * sinv];
+                    if n[0] * geo_n[0] + n[1] * geo_n[1] + n[2] * geo_n[2] < 0.0 {
+                        n = [-n[0], -n[1], -n[2]];
+                    }
+                    n
+                } else {
+                    geo_n
+                };
                 // Average baked vertex diffuse RGB (0xAARRGGBB) into linear albedo.
                 let decode = |d: u32| -> [f32; 3] {
-                    let r = ((d >> 16) & 0xff) as f32 / 255.0;
-                    let g = ((d >> 8) & 0xff) as f32 / 255.0;
-                    let bl = (d & 0xff) as f32 / 255.0;
-                    [r * r, g * g, bl * bl]
+                    [
+                        srgb_to_linear_u8(((d >> 16) & 0xff) as u8),
+                        srgb_to_linear_u8(((d >> 8) & 0xff) as u8),
+                        srgb_to_linear_u8((d & 0xff) as u8),
+                    ]
                 };
                 let kind = v0.kind;
                 let is_sdr_blend = (kind > 2.01 && kind < 2.03) || (kind > 2.11 && kind < 2.13);
@@ -939,7 +981,9 @@ fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32], atlas: &[u8]) -> V
                     [(uv_c[0] + v1.uv[0]) * 0.5, (uv_c[1] + v1.uv[1]) * 0.5],
                     [(uv_c[0] + v2.uv[0]) * 0.5, (uv_c[1] + v2.uv[1]) * 0.5],
                 ] {
-                    if let Some((rgb, a)) = sample_atlas_rgba(atlas, atlas_h, v0.color, kind, uv) {
+                    if let Some((rgb, a)) =
+                        sample_atlas_rgba(atlas, atlas_w, atlas_h, v0.color, kind, uv)
+                    {
                         tex_samples += 1;
                         tex_alpha_sum += a;
                         if a >= 0.20 {
@@ -1017,7 +1061,7 @@ fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32], atlas: &[u8]) -> V
                     a,
                     b,
                     c,
-                    normal: [nx * inv, ny * inv, nz * inv],
+                    normal: smooth_n,
                     albedo,
                     opacity,
                 });
@@ -1028,18 +1072,24 @@ fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32], atlas: &[u8]) -> V
     out
 }
 
+/// Compact downsampled RGBA8 atlas thumbnail (`(width, height, rgba)`) kept on
+/// `GpuPage` and shared via `Arc` across `shared_atlas` pages so deduplicated
+/// scenery still extracts true textured RGB albedo and alpha cutouts for RT.
+type AtlasThumb = Arc<(usize, usize, Vec<u8>)>;
+
 pub struct GpuPage {
     vertex: wgpu::Buffer,
     index: wgpu::Buffer,
     count: u32,
     normal: Arc<wgpu::BindGroup>,
     reflected: Arc<wgpu::BindGroup>,
+    atlas_thumb: AtlasThumb,
     placements: Vec<PlacementRange>,
     bounds: Vec<PlacementBounds>,
     page_min: [f32; 3],
     page_max: [f32; 3],
     page_has_sdr: bool,
-    rt_triangles: Vec<RtMeshTriangle>,
+    rt_triangles: Arc<[RtMeshTriangle]>,
 }
 #[derive(Clone)]
 struct WorldPageMeta {
@@ -1163,7 +1213,18 @@ impl GpuPage {
         };
         let normal = Arc::new(make(normal));
         let reflected = Arc::new(make(reflected));
-        Self::geometry(device, page, normal, reflected)
+        // Retain mip 4 (256 x used_height/16, ~16-64 KiB) for shared-atlas RT
+        // texture & alpha extraction without keeping the 64 MiB base atlas in RAM.
+        let atlas_thumb: AtlasThumb = if let Some(mip4) = page.mips.get(3) {
+            Arc::new((
+                (SIDE / 16).max(1),
+                (page.used_height / 16).max(1),
+                mip4.clone(),
+            ))
+        } else {
+            Arc::new((SIDE, page.used_height, page.atlas.clone()))
+        };
+        Self::geometry(device, page, normal, reflected, atlas_thumb)
     }
     /// Upload only geometry for a reused atlas. Bind groups keep the exact
     /// original texture/view alive; no second allocation or texture upload.
@@ -1186,6 +1247,7 @@ impl GpuPage {
                 page,
                 Arc::clone(&source.normal),
                 Arc::clone(&source.reflected),
+                Arc::clone(&source.atlas_thumb),
             )
         } else {
             Self::upload(device, queue, layout, sampler, normal, reflected, page)
@@ -1193,6 +1255,9 @@ impl GpuPage {
     }
     pub fn rt_triangles(&self) -> &[RtMeshTriangle] {
         &self.rt_triangles
+    }
+    pub fn rt_triangles_arc(&self) -> Arc<[RtMeshTriangle]> {
+        Arc::clone(&self.rt_triangles)
     }
 
     pub fn page_bounds(&self) -> ([f32; 3], [f32; 3]) {
@@ -1208,9 +1273,22 @@ impl GpuPage {
         page: Page,
         normal: Arc<wgpu::BindGroup>,
         reflected: Arc<wgpu::BindGroup>,
+        atlas_thumb: AtlasThumb,
     ) -> Self {
         use wgpu::util::DeviceExt;
-        let rt_triangles = extract_rt_triangles(&page.vertices, &page.indices, &page.atlas);
+        let rt_triangles: Arc<[RtMeshTriangle]> = if !page.atlas.is_empty() {
+            let atlas_h = page.atlas.len() / (SIDE * 4);
+            extract_rt_triangles(&page.vertices, &page.indices, &page.atlas, SIDE, atlas_h).into()
+        } else {
+            extract_rt_triangles(
+                &page.vertices,
+                &page.indices,
+                &atlas_thumb.2,
+                atlas_thumb.0,
+                atlas_thumb.1,
+            )
+            .into()
+        };
         let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("whole-world object vertices"),
             contents: bytemuck::cast_slice(&page.vertices),
@@ -1227,6 +1305,7 @@ impl GpuPage {
             count: page.indices.len() as u32,
             normal,
             reflected,
+            atlas_thumb,
             placements: page.placements,
             bounds: page.bounds,
             page_min: page.page_min,
@@ -1963,7 +2042,7 @@ mod raywatcher_extract_tests {
             v([4.0, 0.0, 0.0], 0x0000_0000, 2.0),
             v([0.0, 4.0, 0.0], 0x0000_0000, 2.0),
         ];
-        let tris = extract_rt_triangles(&verts, &[0, 1, 2, 3, 4, 5], &[]);
+        let tris = extract_rt_triangles(&verts, &[0, 1, 2, 3, 4, 5], &[], 0, 0);
         assert_eq!(tris.len(), 2);
         assert!(
             (tris[0].opacity - 1.0).abs() < 1e-5,
