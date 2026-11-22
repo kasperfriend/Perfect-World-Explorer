@@ -331,14 +331,33 @@ impl Model {
             // normals, day/night vertex colours and/or lightmap UVs, and a tail
             // of 48 B AABB + "MATERIAL: \0" (80 B) + dwExtraSize (counts its own 4 B).
             const MAT_TAG: &[u8] = b"MATERIAL: \0";
+            let v300_start = p;
             for mesh_idx in 0..count {
-                let _mesh_word = u(b, p)?;
+                let mesh_word = u(b, p)?;
                 p += 4;
                 v300_branch_counters.flags_read += 1;
                 let name_len = u(b, p)? as usize;
                 p += 4;
                 if name_len > 4096 {
-                    return Err("oversized BMD v300 mesh name".into());
+                    if mesh_idx == 0 && b.get(v300_start + 1).is_some_and(|&v| v != 0) {
+                        if let Ok(share_len) = u(b, v300_start + 2) {
+                            let share_len = share_len as usize;
+                            if (1..=4096).contains(&share_len) {
+                                if let Ok((share_file, _)) =
+                                    fixed_lossy_tracked(b, v300_start + 6, share_len)
+                                {
+                                    if share_file.to_ascii_lowercase().ends_with(".bmd") {
+                                        return Err(format!(
+                                            "A3DLitModel v300 shared data file {share_file:?} is unsupported"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Err(format!(
+                        "oversized BMD v300 mesh {mesh_idx} name len={name_len:#x} word={mesh_word:#010x}"
+                    ));
                 }
                 let (name, name_lossy_gbk) = fixed_lossy_tracked(b, p, name_len)?;
                 if name_lossy_gbk {
