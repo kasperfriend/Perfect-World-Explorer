@@ -1255,53 +1255,6 @@ impl SkyGpu {
             bytemuck::bytes_of(&uniform),
         );
     }
-    /// Update sky uniforms using a custom view and projection matrix (used by
-    /// Raywatcher to render a 90-degree cubemap face of the real sky + clouds).
-    pub fn update_custom(
-        &self,
-        queue: &wgpu::Queue,
-        view: Mat4,
-        projection: Mat4,
-        h: u32,
-        frame: SkyFrame,
-        sets: (i32, i32, f32),
-    ) {
-        let inv = sky_inverse(projection, view, false);
-        let (flare_ndc, flare_weight) = flare_lanes(projection, view, frame.sun, false);
-        let flare_ndc = flare_anchor(flare_ndc, sun_ndc_half(90.0), frame.night_weight);
-        let uniform = Uniform {
-            inv: inv.to_cols_array_2d(),
-            time: [
-                frame.hour,
-                frame.night_weight,
-                if frame.fog_enabled { 1. } else { 0. },
-                frame.disc_brightness.clamp(0., 1.),
-            ],
-            celestial: [frame.sun[0], frame.sun[1], frame.sun[2], flare_weight],
-            celestial2: frame.moon,
-            background: [
-                frame.background[0],
-                frame.background[1],
-                frame.background[2],
-                sun_ndc_half(90.0),
-            ],
-            tint: [frame.tint[0], frame.tint[1], frame.tint[2], 1.0],
-            sets: [sets.0 as f32, sets.1 as f32, sets.2, frame.night_weight],
-            glow_center: [
-                self.glow_center[0],
-                self.glow_center[1],
-                flare_ndc[0],
-                flare_ndc[1],
-            ],
-            sky: [
-                frame.drift[0],
-                frame.drift[1],
-                2. / h.max(1) as f32,
-                SKY_DRIFT_SCALE,
-            ],
-        };
-        queue.write_buffer(&self.normal_buf, 0, bytemuck::bytes_of(&uniform));
-    }
 
     /// Whether the client disc texture for `sun` decoded from `textures.pck`.
     pub fn disc_texture_present(&self, sun: bool) -> bool {
@@ -1376,6 +1329,53 @@ impl SkyGpu {
             &[],
         );
         pass.draw(0..3, 0..1);
+    }
+    /// Update sky uniforms using a custom view and projection matrix (used by
+    /// Raywatcher to render a 90-degree cubemap face of the real sky + clouds).
+    pub fn update_custom(
+        &self,
+        queue: &wgpu::Queue,
+        view: Mat4,
+        projection: Mat4,
+        h: u32,
+        frame: SkyFrame,
+        sets: (i32, i32, f32),
+    ) {
+        let inv = sky_inverse(projection, view, false);
+        let (flare_ndc, flare_weight) = flare_lanes(projection, view, frame.sun, false);
+        let flare_ndc = flare_anchor(flare_ndc, sun_ndc_half(90.0), frame.night_weight);
+        let uniform = Uniform {
+            inv: inv.to_cols_array_2d(),
+            time: [
+                frame.hour,
+                frame.night_weight,
+                if frame.fog_enabled { 1. } else { 0. },
+                frame.disc_brightness.clamp(0., 1.),
+            ],
+            celestial: [frame.sun[0], frame.sun[1], frame.sun[2], flare_weight],
+            celestial2: frame.moon,
+            background: [
+                frame.background[0],
+                frame.background[1],
+                frame.background[2],
+                sun_ndc_half(90.0),
+            ],
+            tint: [frame.tint[0], frame.tint[1], frame.tint[2], 1.0],
+            sets: [sets.0 as f32, sets.1 as f32, sets.2, frame.night_weight],
+            glow_center: [
+                self.glow_center[0],
+                self.glow_center[1],
+                flare_ndc[0],
+                flare_ndc[1],
+            ],
+            sky: [
+                frame.drift[0],
+                frame.drift[1],
+                2. / h.max(1) as f32,
+                SKY_DRIFT_SCALE,
+            ],
+        };
+        queue.write_buffer(&self.normal_buf, 0, bytemuck::bytes_of(&uniform));
     }
 }
 
