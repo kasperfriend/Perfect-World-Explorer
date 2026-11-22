@@ -657,7 +657,7 @@ impl FarTrees {
                                         (u0[1] + u1[1] + u2[1]) / 3.0,
                                     ];
                                     let (albedo, alpha) = sample_rgba_uv(img, uv_c);
-                                    if alpha < 0.40 {
+                                    if alpha < 0.18 {
                                         continue;
                                     }
                                     lod_tris.push(RtTreeTriangle {
@@ -667,7 +667,7 @@ impl FarTrees {
                                         normal: norm,
                                         albedo,
                                         roughness: 0.85,
-                                        opacity: (alpha * 0.78).clamp(0.32, 0.80),
+                                        opacity: alpha.clamp(0.58, 0.95),
                                     });
                                 }
                             } else {
@@ -718,7 +718,7 @@ impl FarTrees {
                                 }
                             }
                         }
-                        if opaque_hits < 2 || alpha_sum <= 1e-4 {
+                        if opaque_hits < 1 || alpha_sum <= 1e-4 {
                             continue;
                         }
                         let albedo = [
@@ -739,40 +739,48 @@ impl FarTrees {
                         };
                         let right = up.cross(n).normalize_or_zero();
                         let bitan = n.cross(right).normalize_or_zero();
-                        // Fit an organic diamond leaf hull scaled to actual opaque coverage
-                        // so RT leaves never cast or reflect rectangular cardboxes.
-                        let hull_scale = (0.34 + 0.20 * coverage.sqrt()).clamp(0.36, 0.52);
+                        // Preserve full lush bush volume (~86% scale) while chamfering
+                        // the 4 sharp 90-degree corners into a rounded 6-vertex organic
+                        // leaf cluster (4 tris) so trees reflect as full bushes without boxes.
+                        let hull_scale = (0.72 + 0.20 * coverage.sqrt()).clamp(0.74, 0.92);
                         let corner = |j: usize| {
                             let c = leaf.corners[j];
                             center + (right * c[0] + bitan * c[1] + n * c[2]) * hull_scale
                         };
                         let (c0, c1, c2, c3) = (corner(0), corner(1), corner(2), corner(3));
-                        let m01 = (c0 + c1) * 0.5;
-                        let m12 = (c1 + c2) * 0.5;
-                        let m23 = (c2 + c3) * 0.5;
-                        let m30 = (c3 + c0) * 0.5;
-                        let opacity = (coverage * 0.72).clamp(0.28, 0.70);
-                        if (m12 - m01).cross(m23 - m01).length_squared() > 1e-8 {
-                            lod_tris.push(RtTreeTriangle {
-                                a: m01,
-                                b: m12,
-                                c: m23,
-                                normal: n,
-                                albedo,
-                                roughness: 0.84,
-                                opacity,
-                            });
-                        }
-                        if (m23 - m01).cross(m30 - m01).length_squared() > 1e-8 {
-                            lod_tris.push(RtTreeTriangle {
-                                a: m01,
-                                b: m23,
-                                c: m30,
-                                normal: n,
-                                albedo,
-                                roughness: 0.84,
-                                opacity,
-                            });
+                        // Chamfer each corner inward by 22% along both adjacent edges.
+                        let v0 = c0.lerp(c1, 0.22);
+                        let v1 = c1.lerp(c0, 0.22);
+                        let v2 = c1.lerp(c2, 0.22);
+                        let v3 = c2.lerp(c1, 0.22);
+                        let v4 = c2.lerp(c3, 0.22);
+                        let v5 = c3.lerp(c2, 0.22);
+                        let v6 = c3.lerp(c0, 0.22);
+                        let v7 = c0.lerp(c3, 0.22);
+                        let ring = [v0, v1, v2, v3, v4, v5, v6, v7];
+                        let opacity = (0.52 + 0.42 * coverage).clamp(0.56, 0.90);
+                        // 4-triangle organic hexagon/octagon fan (every 2nd edge for low tri count + full silhouette).
+                        let poly = [
+                            ring[0].lerp(ring[7], 0.5),
+                            ring[1].lerp(ring[2], 0.5),
+                            ring[3].lerp(ring[4], 0.5),
+                            ring[5].lerp(ring[6], 0.5),
+                            (c0 + c1) * 0.5,
+                            (c2 + c3) * 0.5,
+                        ];
+                        for &(ia, ib, ic) in &[(0, 4, 1), (0, 1, 2), (0, 2, 5), (0, 5, 3)] {
+                            let (pa, pb, pc) = (poly[ia], poly[ib], poly[ic]);
+                            if (pb - pa).cross(pc - pa).length_squared() > 1e-8 {
+                                lod_tris.push(RtTreeTriangle {
+                                    a: pa,
+                                    b: pb,
+                                    c: pc,
+                                    normal: n,
+                                    albedo,
+                                    roughness: 0.84,
+                                    opacity,
+                                });
+                            }
                         }
                     }
                     species_rt_lods.push(lod_tris);

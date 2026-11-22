@@ -137,13 +137,13 @@ bool accept_opacity(uint prim, float2 bary, uint seed) {
     uint _unused = seed;
     float bw = max(1.0 - bary.x - bary.y, 0.0);
     float edge_dist = min(bary.x, min(bary.y, bw));
-    float edge_mask = (opacity < 0.92) ? smoothstep(0.015, 0.18, edge_dist) : 1.0;
-    // Coarse organic leaf-clump modulation + fine deterministic micro-dither.
-    uint cx = uint(bary.x * 8.0);
-    uint cy = uint(bary.y * 8.0);
+    float edge_mask = (opacity < 0.94) ? smoothstep(0.0, 0.05, edge_dist) : 1.0;
+    // Subtle organic leaf-clump modulation + fine deterministic micro-dither.
+    uint cx = uint(bary.x * 10.0);
+    uint cy = uint(bary.y * 10.0);
     uint ch = prim * 2654435761u ^ cx * 2246822519u ^ cy * 3266489917u;
     ch ^= ch >> 15u;
-    float clump = 0.62 + 0.56 * (float(ch & 0xffu) / 255.0);
+    float clump = 0.78 + 0.34 * (float(ch & 0xffu) / 255.0);
     float eff_opacity = saturate(opacity * edge_mask * clump);
     uint h = prim * 747796405u ^ uint(bary.x * 64.0) * 2891336453u ^ uint(bary.y * 64.0) * 1664525u;
     h ^= h >> 16u;
@@ -441,11 +441,11 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     // Distance-scaled bias prevents self-intersection between the exact 1:1
     // raster depth surface and the BVH/BLAS geometry at all view distances.
     float steepness = 1.0 - saturate(normal.y);
-    float slope_bias = steepness * (0.65 + dist * 0.006);
+    float slope_bias = steepness * (0.75 + dist * 0.0065);
     float bias = max(params.effects.z, max(0.18, dist * 0.0035)) + slope_bias;
-    float3 ray_origin = world_pos + normal * bias - view_dir * (bias * 0.40);
-    float shadow_t_min = max(bias * 0.85, 0.45);
-    float ao_t_min = max(bias * 0.75, 0.35);
+    float3 ray_origin = world_pos + normal * bias + float3(0.0, 1.0, 0.0) * (steepness * 0.55) - view_dir * (bias * 0.35);
+    float shadow_t_min = max(bias * 1.15, 0.60 + steepness * 0.85);
+    float ao_t_min = max(bias * 0.80, 0.40);
     float n_dot_l = max(dot(normal, params.sun_dir.xyz), 0.0);
 
     float fog_t = 0.0;
@@ -595,14 +595,16 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
         accum_refl_dist += refl_dist;
 
-        // Real multi-bounce (1..=6) path-traced coloured diffuse GI with unbiased
-        // Russian Roulette (bounces 2..=6 stay active), zero sky-wash white tint
-        // in layered mode, and zero daytime GI energy at night.
-        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01 && sun_strength > 0.005) {
+        // Real physically-grounded Ray-Traced Global Illumination (Sky Hemisphere +
+        // 1..=6 bounce coloured surface indirect lighting). Replaces flat raster ambient
+        // in layered mode so there is zero double-ambient grey tint and real sky/sun
+        // bounce colour bleeding across terrain, buildings, and overhangs.
+        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
             {
-                uint gi_taps = (dist < 100.0) ? 2u : 1u;
+                uint gi_taps = (dist < 90.0) ? 4u : ((dist < 180.0) ? 2u : 1u);
                 float3 gi_sum = float3(0.0, 0.0, 0.0);
-                float bounce_max_t = min(params.lens.y, 96.0);
+                float bounce_max_t = min(params.lens.y, 72.0);
+                float day_gi_scale = 0.03 + 0.97 * sun_strength;
                 for (uint g = 0u; g < gi_taps; g = g + 1u) {
                     float3 throughput = float3(1.0, 1.0, 1.0);
                     float3 b_origin = ray_origin;
@@ -645,22 +647,23 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                                 : bmat.albedo.rgb;
                             float b_avg = dot(b_base_albedo, float3(0.3333, 0.3333, 0.3333));
                             float3 b_chroma = clamp(
-                                float3(b_avg, b_avg, b_avg) + (b_base_albedo - b_avg) * 1.25,
+                                float3(b_avg, b_avg, b_avg) + (b_base_albedo - b_avg) * 1.35,
                                 float3(0.04, 0.04, 0.04),
-                                float3(0.92, 0.92, 0.92));
-                            float3 off_in = b_chroma * params.sun_colour.xyz * (b_ndl * b_shadow * 1.15);
+                                float3(0.94, 0.94, 0.94));
+                            float3 off_in = b_chroma * (
+                                params.sun_colour.xyz * (b_ndl * b_shadow * 1.65)
+                                + params.ambient.xyz * (params.tuning.z * 0.30));
                             float3 incoming = off_in;
                             if (bounce == 0u) {
                                 float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
                                 float b_w = saturate(b_screen.a);
-                                float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 0.95 * sun_strength);
+                                float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 1.15 * sun_strength + 0.12 * day_gi_scale);
                                 incoming = lerp(off_in, on_in, b_w);
                             }
-                            // Clamp per-ray firefly spikes so stochastic GI never speckles stone walls.
-                            incoming = min(incoming, float3(1.15, 1.15, 1.15));
-                            gi_sum += throughput * incoming * (params.tuning.w * 0.95 * (1.0 - fog_t));
+                            incoming = min(incoming, float3(1.65, 1.65, 1.65));
+                            gi_sum += throughput * incoming * (params.tuning.w * (1.0 - fog_t));
                             if (bounce + 1u < tap_bounces) {
-                                throughput *= clamp(b_chroma * 1.05, float3(0.12, 0.12, 0.12), float3(0.90, 0.90, 0.90));
+                                throughput *= clamp(b_chroma * 1.08, float3(0.08, 0.08, 0.08), float3(0.88, 0.88, 0.88));
                                 if (bounce >= 2u) {
                                     float rr = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.32, 0.92);
                                     if (rand01(state) > rr) {
@@ -676,13 +679,13 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                                 b_step_bias = b_bias;
                             }
                         } else {
-                            // Subtle sky-hemisphere bounce from the real rendered sky cubemap
-                            // so open terrain and crevices receive directional sky GI without white-wash.
-                            float sky_scale = layered
-                                ? ((bounce == 0u) ? 0.13 : 0.05)
-                                : ((bounce == 0u) ? 0.22 : 0.08);
-                            float3 sky_bounce = min(sample_sky_env(d), float3(1.1, 1.1, 1.1));
-                            gi_sum += throughput * sky_bounce * (params.tuning.w * sky_scale * sun_strength * (1.0 - fog_t));
+                            // Real directional sky-dome GI from rendered SkyGpu + CloudGpu cubemap
+                            // (blue overhead sky at noon, warm gold at sunset, near-black at night).
+                            float3 raw_sky = min(sample_sky_env(d), float3(1.35, 1.35, 1.35));
+                            float sky_l = dot(raw_sky, float3(0.2126, 0.7152, 0.0722));
+                            float3 vivid_sky = max(float3(sky_l, sky_l, sky_l) + (raw_sky - sky_l) * 1.35, float3(0.0, 0.0, 0.0));
+                            float sky_w = (bounce == 0u) ? 0.48 : 0.22;
+                            gi_sum += throughput * vivid_sky * (params.tuning.w * sky_w * day_gi_scale * (1.0 - fog_t));
                             break;
                         }
                     }
@@ -756,7 +759,11 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float amb_f = 1.0 - sun_f;
         float v_sun = bits_shadows ? avg_shadow : 1.0;
         float v_ao = bits_ao ? avg_open : 1.0;
-        float separated_lf = (amb_f * v_ao + sun_f * v_sun) * point_shadow_mod;
+        bool gi_active = bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01;
+        // When GI is active, replace the flat raster ambient (`amb_f`) with real
+        // sky + multi-bounce RT GI instead of adding GI on top (prevents grey wash).
+        float amb_keep = gi_active ? lerp(1.0, 0.06, gi_fade) : 1.0;
+        float separated_lf = (amb_f * v_ao * amb_keep + sun_f * v_sun) * point_shadow_mod;
         out_lf = lerp(separated_lf, 1.0, fog_t);
         out_rgb = avg_gi + point_lighting;
     } else {

@@ -1061,7 +1061,7 @@ fn extract_rt_triangles(
                 // subdivide into 4 midpoint sub-triangles and drop empty transparent corners
                 // so BMD trees (City of Plume giant tree, blossoms) never cast cardbox shadows.
                 if let Some(ta) = tex_alpha {
-                    if ta < 0.90 && out.len() + 4 <= MAX_RT_TRIS_PER_PAGE {
+                    if ta < 0.90 && out.len() < 96_000 && out.len() + 4 <= MAX_RT_TRIS_PER_PAGE {
                         let mid3 = |p: [f32; 3], q: [f32; 3]| {
                             [
                                 (p[0] + q[0]) * 0.5,

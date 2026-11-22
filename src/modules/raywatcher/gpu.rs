@@ -921,11 +921,11 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let bits_gi = (effects & 16u) != 0u;
 
     let steepness = 1.0 - clamp(normal.y, 0.0, 1.0);
-    let slope_bias = steepness * (0.65 + dist * 0.006);
+    let slope_bias = steepness * (0.75 + dist * 0.0065);
     let bias = max(params.effects.z, max(0.18, dist * 0.0035)) + slope_bias;
-    let ray_origin = point + normal * bias - view_dir * (bias * 0.40);
-    let shadow_t_min = max(bias * 0.85, 0.45);
-    let ao_t_min = max(bias * 0.75, 0.35);
+    let ray_origin = point + normal * bias + vec3<f32>(0.0, 1.0, 0.0) * (steepness * 0.55) - view_dir * (bias * 0.35);
+    let shadow_t_min = max(bias * 1.15, 0.60 + steepness * 0.85);
+    let ao_t_min = max(bias * 0.80, 0.40);
     let n_dot_l = max(dot(normal, params.sun_dir.xyz), 0.0);
 
     var fog_t = 0.0;
@@ -1047,11 +1047,12 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         // Real multi-bounce (1..=6) path-traced coloured diffuse GI with unbiased
         // Russian Roulette (bounces 2..=6 stay active), zero sky-wash white tint
         // in layered mode, and zero daytime GI energy at night.
-        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01 && sun_strength > 0.005) {
+        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
             {
-                let gi_taps = select(1u, 2u, dist < 100.0);
+                let gi_taps = select(select(1u, 2u, dist < 180.0), 4u, dist < 90.0);
                 var gi_sum = vec3<f32>(0.0);
-                let bounce_max_t = min(params.lens.y, 96.0);
+                let bounce_max_t = min(params.lens.y, 72.0);
+                let day_gi_scale = 0.03 + 0.97 * sun_strength;
                 for (var g = 0u; g < gi_taps; g = g + 1u) {
                     var throughput = vec3<f32>(1.0);
                     var b_origin = ray_origin;
@@ -1111,9 +1112,11 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                                 b_step_bias = b_bias;
                             }
                         } else {
-                            let sky_scale = select(select(0.08, 0.22, bounce == 0u), select(0.05, 0.13, bounce == 0u), layered);
-                            let sky_bounce = min(sample_sky_env(d), vec3<f32>(1.1));
-                            gi_sum = gi_sum + throughput * sky_bounce * (params.tuning.w * sky_scale * sun_strength * (1.0 - fog_t));
+                            let raw_sky = min(sample_sky_env(d), vec3<f32>(1.35));
+                            let sky_l = dot(raw_sky, vec3<f32>(0.2126, 0.7152, 0.0722));
+                            let vivid_sky = max(vec3<f32>(sky_l) + (raw_sky - vec3<f32>(sky_l)) * 1.35, vec3<f32>(0.0));
+                            let sky_w = select(0.22, 0.48, bounce == 0u);
+                            gi_sum = gi_sum + throughput * vivid_sky * (params.tuning.w * sky_w * day_gi_scale * (1.0 - fog_t));
                             break;
                         }
                     }
@@ -1186,7 +1189,9 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let amb_f = 1.0 - sun_f;
         let v_sun = select(1.0, avg_shadow, bits_shadows);
         let v_ao = select(1.0, avg_open, bits_ao);
-        let separated_lf = (amb_f * v_ao + sun_f * v_sun) * point_shadow_mod;
+        let gi_active = bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01;
+        let amb_keep = select(1.0, mix(1.0, 0.06, gi_fade), gi_active);
+        let separated_lf = (amb_f * v_ao * amb_keep + sun_f * v_sun) * point_shadow_mod;
         out_lf = mix(separated_lf, 1.0, fog_t);
         out_rgb = avg_gi + point_lighting;
     } else {
@@ -1483,7 +1488,7 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     // within strict depth/normal bounds to eliminate rotation noise, then snap
     // razor-sharp as soon as temporal history converges.
     let disocc = 1.0 - clamp((centre_moments.w - 1.0) / 3.0, 0.0, 1.0);
-    let inv_sigma = (1.0 / max(params.weights.x * sqrt(centre_variance), 1e-6)) * mix(0.55, 0.25, disocc);
+    let inv_sigma = (1.0 / max(params.weights.x * sqrt(centre_variance), 1e-6)) * mix(0.35, 0.18, disocc);
     let lf_edge_k = mix(4.5, 2.5, disocc);
     let inv_depth_denom = 1.0 / max(params.weights.z * max(abs(centre_depth), 1e-3), 1e-6);
     let centre_raw = textureLoad(history_colour, pixel, 0);
@@ -1734,12 +1739,10 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
         layered = max(raster.rgb * light_factor + rt.rgb, vec3<f32>(0.0));
     } else {
         let r_max = max(raster.r, max(raster.g, raster.b));
-        let full_albedo = select(
-            vec3<f32>(0.24),
-            clamp(raster.rgb / max(r_max, 0.28), vec3<f32>(0.0), vec3<f32>(1.0))
-                * clamp(r_max * 1.35, 0.24, 0.95),
-            r_max > 0.012,
-        );
+        // Preserve crisp per-pixel texture colour at all brightnesses (day & night),
+        // never substituting a flat grey constant on dark night walls under point lights.
+        let albedo_gain = clamp(0.75 / max(r_max, 0.002), 1.0, 40.0);
+        let full_albedo = clamp(raster.rgb * albedo_gain, vec3<f32>(0.0), vec3<f32>(0.95));
         layered = max(raster.rgb * light_factor + full_albedo * rt.rgb, vec3<f32>(0.0));
     }
     return vec4<f32>(layered, raster.a);

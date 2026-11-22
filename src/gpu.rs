@@ -3866,7 +3866,7 @@ impl Renderer {
             // moving; distant scenery beyond `detail_radius` uses compact proxies.
             let detail_radius = view_distance.clamp(512.0, 1024.0);
             let detail_radius_sq = detail_radius * detail_radius;
-            const REAL_MESH_TRI_BUDGET: usize = 420_000;
+            const REAL_MESH_TRI_BUDGET: usize = 900_000;
 
             let mut real_meshes = Vec::new();
             let mut page_tris = Vec::new();
@@ -3896,13 +3896,15 @@ impl Renderer {
                 })
                 .collect();
             candidate_pages.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-            let mut queued_tris = 0usize;
+            // Queue ALL candidate pages within `detail_radius`: atlas pages span
+            // large regions, and `harvest.rs` distance-culls individual triangles
+            // on the background worker so nearby big buildings on later pages are
+            // never dropped when earlier pages are dense.
             for (_, idx) in candidate_pages {
                 let page = &pages_slice[idx];
                 let tris = page.rt_triangles();
-                if !tris.is_empty() && queued_tris < REAL_MESH_TRI_BUDGET {
+                if !tris.is_empty() {
                     real_mesh_pages += 1;
-                    queued_tris += tris.len();
                     page_tris.push(page.rt_triangles_arc());
                 }
             }
@@ -3915,7 +3917,7 @@ impl Renderer {
             // (never a box) only when the triangle budget is exhausted.
             let tree_lod_scale =
                 self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees);
-            let tree_tri_budget = 140_000usize;
+            let tree_tri_budget = 260_000usize;
             let mut tree_tris = Vec::new();
             let (real_tree_instances, real_tree_tris, tree_canopy_fallbacks) =
                 self.far_trees.harvest_rt_triangles(
@@ -4042,6 +4044,8 @@ impl Renderer {
             self.queue_map_runs(tmat);
             let mut tframe = self.frame;
             tframe.daylight = 1.0;
+            tframe.sun = [0.0, 1.0, 0.0, -1.0];
+            tframe.light = [0.55, 0.45, 1.0, 1.0];
             tframe.fog_range = [1e6, 2e6, 0.0, 0.0];
             let tuniform = tframe.uniform(
                 tmat,

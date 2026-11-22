@@ -518,14 +518,19 @@ impl Harvester {
                 // Unpack O(1)-cloned page Arc slices entirely off the main thread.
                 // Never stride individual triangles (`step > 1` skips every 2nd
                 // triangle of quads, turning sails/walls into checkerboards).
+                let cull_r = far.clamp(512.0, 960.0);
                 let mut page_added = 0usize;
                 for tris in &page_tris {
                     if tris.is_empty() || page_added >= page_tri_budget {
                         break;
                     }
-                    let take = tris.len().min(page_tri_budget - page_added);
-                    real_meshes.reserve(take);
-                    for t in &tris[..take] {
+                    for t in tris.iter() {
+                        if page_added >= page_tri_budget {
+                            break;
+                        }
+                        if (t.a[0] - eye.x).abs() > cull_r || (t.a[2] - eye.z).abs() > cull_r {
+                            continue;
+                        }
                         real_meshes.push(MeshTriangle {
                             a: Vec3::from_array(t.a),
                             b: Vec3::from_array(t.b),
@@ -535,8 +540,8 @@ impl Harvester {
                             roughness: 0.72,
                             opacity: t.opacity,
                         });
+                        page_added += 1;
                     }
-                    page_added += take;
                 }
                 let before_mesh = triangles.len();
                 push_real_meshes(&mut triangles, &mut materials, &real_meshes);

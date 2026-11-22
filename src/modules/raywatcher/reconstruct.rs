@@ -283,12 +283,10 @@ fn fs(i: VOut) -> FOut {
     var out: FOut;
     let layered = prep_flags.x > 0.5;
     let r_max = max(raster_rgb.r, max(raster_rgb.g, raster_rgb.b));
-    let full_albedo = select(
-        vec3<f32>(0.24),
-        clamp(raster_rgb / max(r_max, 0.28), vec3<f32>(0.0), vec3<f32>(1.0))
-            * clamp(r_max * 1.35, 0.24, 0.95),
-        r_max > 0.012,
-    );
+    // Recover crisp per-pixel textured albedo directly from `raster_rgb` at all
+    // brightnesses (day & night), never substituting a flat grey constant on dark walls.
+    let albedo_gain = clamp(0.75 / max(r_max, 0.002), 1.0, 40.0);
+    let full_albedo = clamp(raster_rgb * albedo_gain, vec3<f32>(0.0), vec3<f32>(0.95));
     // Modulate demodulated GI/point-light irradiance (`c.rgb`) by crisp full-res
     // raster albedo on opaque surfaces so DLSS RR never stamps a grey tint over buildings.
     let modulated_gi = select(full_albedo * c.rgb, c.rgb, n.w <= 0.12);
