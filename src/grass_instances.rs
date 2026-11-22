@@ -252,7 +252,7 @@ impl Gpu {
             assert!(source.contains(marker));
             source = source.replacen(
                 marker,
-                "if camera.sun.w>=0. {return vec4<f32>(grass_pass_fog(grass_lighting(i.world,i.grass_area,raw_tex.rgb),i.pos.w,i.grass_refraction),1.);} let g_light=(camera.light.x+camera.light.y*0.5)*camera.light.zww; return vec4<f32>(grass_pass_fog(tex.rgb*g_light,i.pos.w,i.grass_refraction),1.);",
+                "if camera.sun.w>=0. {return vec4<f32>(grass_pass_fog(grass_lighting(i.world,i.grass_area,raw_tex.rgb),i.pos.w,i.grass_refraction),1.);} let g_light=select(vec3<f32>(1.),(camera.light.x+camera.light.y*0.5)*camera.light.zww,camera.light.x+camera.light.y>0.001); return vec4<f32>(grass_pass_fog(tex.rgb*g_light,i.pos.w,i.grass_refraction),1.);",
                 1,
             );
             source.push_str(GRASS_LIGHT_WGSL);
