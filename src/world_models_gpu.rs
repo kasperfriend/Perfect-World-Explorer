@@ -1003,6 +1003,10 @@ impl World {
     }
 
     /// Quads the world's animated effects produced this frame.
+    /// Active dynamic GFX point lights published into the scene light grid this frame.
+    pub fn dynamic_lights(&self) -> &[DynamicLight] {
+        self.grid.dynamic_lights()
+    }
     pub fn effect_quad_count(&self) -> usize {
         self.effect_quads.len()
     }

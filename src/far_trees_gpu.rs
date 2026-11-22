@@ -679,12 +679,14 @@ impl FarTrees {
                         };
                         let right = up.cross(n).normalize_or_zero();
                         let bitan = n.cross(right).normalize_or_zero();
+                        // Inset leaf billboard corners slightly to match the alpha-cutout
+                        // foliage silhouette instead of the full rectangular card margin.
                         let corner = |j: usize| {
                             let c = leaf.corners[j];
-                            center + right * c[0] + bitan * c[1] + n * c[2]
+                            center + (right * c[0] + bitan * c[1] + n * c[2]) * 0.78
                         };
                         let (p0, p1, p2, p3) = (corner(0), corner(1), corner(2), corner(3));
-                        let opacity = alpha.clamp(0.42, 0.88);
+                        let opacity = (alpha * 0.65).clamp(0.28, 0.68);
                         if (p1 - p0).cross(p2 - p0).length_squared() > 1e-8 {
                             lod_tris.push(RtTreeTriangle {
                                 a: p0,

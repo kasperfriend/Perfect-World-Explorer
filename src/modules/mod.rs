@@ -74,12 +74,17 @@ impl Modules {
         // The add-ons each own their state; the host only clones the two
         // handles they need (client root and the loaded world space).
         let populator = Populator::new(element.clone(), map.clone(), map_dir);
-        // Raywatcher resolves its SDK folder from the executable's directory,
-        // which is the element's parent: the same rule the upscalers use.
-        let exe_dir = element
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| element.clone());
+        // Raywatcher resolves its SDK folder from the explorer executable's
+        // directory (NOT the PW game client's `element/` folder).
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(|| {
+                element
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| element.clone())
+            });
         Self {
             walker: Walker::with_host(element.clone(), map, water, scene, ornaments),
             librarian: librarian::Librarian::new(element),

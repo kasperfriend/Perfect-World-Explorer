@@ -259,6 +259,31 @@ impl Raywatcher {
         &self.sdk_dir
     }
 
+    /// Sync the host's configured upscaler SDK directory (same folder DLSS/FSR/XeSS
+    /// use) into Raywatcher so `nvngx_dlssd.dll` is found whenever it sits in the
+    /// upscaler SDK folder, `PW_UPSCALER_SDK_DIR`, `<exe>/sdk`, or beside the exe.
+    pub fn sync_sdk_dir(&mut self, upscale_sdk_dir: impl AsRef<Path>) {
+        let upscale_sdk_dir = upscale_sdk_dir.as_ref();
+        if !self.settings.sdk_dir.trim().is_empty() {
+            return;
+        }
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| upscale_sdk_dir.to_path_buf());
+        let (resolved, note) = resolve_sdk_dir_candidates(upscale_sdk_dir, &exe_dir);
+        if resolved != self.sdk_dir {
+            let dlss_present = resolved.join("nvngx_dlssd.dll").is_file();
+            eprintln!(
+                "[Raywatcher] synced SDK folder: {} (nvngx_dlssd.dll: {})",
+                resolved.display(),
+                if dlss_present { "present" } else { "missing" },
+            );
+            self.sdk_dir = resolved;
+            self.sdk_fallback_note = note;
+        }
+    }
+
     /// The plan for this frame, given the extent the world is rendered at.
     ///
     /// This is the only place a [`Plan`] is created, so the renderer, the
@@ -712,9 +737,71 @@ fn resolve_sdk_dir_with_env(
             );
             return (exe_sdk, Some(note));
         }
+        if !env_has_dlssd && fallback.join("nvngx_dlssd.dll").is_file() {
+            let note = format!(
+                "PW_UPSCALER_SDK_DIR ({}) lacked nvngx_dlssd.dll; fell back to {}",
+                dir.display(),
+                fallback.display(),
+            );
+            return (fallback.to_path_buf(), Some(note));
+        }
         return (dir.to_path_buf(), None);
     }
+    if !exe_sdk.join("nvngx_dlssd.dll").is_file() && fallback.join("nvngx_dlssd.dll").is_file() {
+        return (fallback.to_path_buf(), None);
+    }
     (exe_sdk, None)
+}
+
+fn resolve_sdk_dir_candidates(upscale_sdk_dir: &Path, exe_dir: &Path) -> (PathBuf, Option<String>) {
+    let env_dir = std::env::var("PW_UPSCALER_SDK_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let exe_sdk = if exe_dir.ends_with("sdk") {
+        exe_dir.to_path_buf()
+    } else {
+        exe_dir.join("sdk")
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if !upscale_sdk_dir.as_os_str().is_empty() {
+        candidates.push(upscale_sdk_dir.to_path_buf());
+    }
+    if let Some(ref d) = env_dir {
+        if !candidates.contains(d) {
+            candidates.push(d.clone());
+        }
+    }
+    if !candidates.contains(&exe_sdk) {
+        candidates.push(exe_sdk.clone());
+    }
+    if !candidates.contains(&exe_dir.to_path_buf()) {
+        candidates.push(exe_dir.to_path_buf());
+    }
+    for dir in &candidates {
+        if dir.join("nvngx_dlssd.dll").is_file() {
+            let note = if let Some(first) = candidates.first() {
+                if first != dir {
+                    Some(format!(
+                        "{} lacked nvngx_dlssd.dll; using {}",
+                        first.display(),
+                        dir.display()
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            return (dir.clone(), note);
+        }
+    }
+    if !upscale_sdk_dir.as_os_str().is_empty() {
+        (upscale_sdk_dir.to_path_buf(), None)
+    } else {
+        resolve_sdk_dir_with_env("", exe_dir, env_dir.as_deref())
+    }
 }
 
 #[cfg(test)]
@@ -757,10 +844,8 @@ mod tests {
             disabled.overrides.directional_light
         );
         assert_eq!(enabled.overrides.ambient, disabled.overrides.ambient);
-        assert_eq!(
-            enabled.overrides.reflection_pass,
-            disabled.overrides.reflection_pass
-        );
+        assert!(enabled.overrides.reflection_pass);
+        assert!(!disabled.overrides.reflection_pass);
         assert_eq!(enabled.overrides.occlusion, disabled.overrides.occlusion);
         assert_eq!(
             enabled.overrides.atmosphere_fog,
@@ -785,7 +870,7 @@ mod tests {
         assert!(layered.active);
         assert!(!layered.overrides.directional_light);
         assert!(!layered.overrides.ambient);
-        assert!(!layered.overrides.reflection_pass);
+        assert!(layered.overrides.reflection_pass);
         assert!(!layered.overrides.occlusion);
         assert!(!layered.overrides.atmosphere_fog);
         assert!(layered.overrides.suppress_baked_shadows);
@@ -1005,5 +1090,27 @@ mod tests {
         assert!(note2.is_none());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_sdk_dir_finds_nvngx_dlssd_in_upscale_sdk_dir() {
+        let base = std::env::temp_dir().join(format!("pwe_rw_sync_sdk_{}", std::process::id()));
+        let wrong_dir = base.join("game_root");
+        let upscale_dir = base.join("upscaler_sdk");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&wrong_dir).unwrap();
+        std::fs::create_dir_all(&upscale_dir).unwrap();
+        std::fs::write(upscale_dir.join("nvngx_dlssd.dll"), b"stub").unwrap();
+
+        let mut m = Raywatcher::new(&wrong_dir);
+        m.sync_sdk_dir(&upscale_dir);
+        assert_eq!(m.sdk_dir(), upscale_dir.as_path());
+        let (dlss, _) = super::reconstruct::probe_offline(m.sdk_dir(), true);
+        assert!(
+            dlss.available,
+            "DLSS RR should be available once synced to upscale_sdk_dir"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

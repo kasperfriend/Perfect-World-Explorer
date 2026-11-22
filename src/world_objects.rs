@@ -852,7 +852,7 @@ pub struct RtMeshTriangle {
 /// Hard per-page cap on retained CPU triangles so whole-world preloads across
 /// hundreds of pages stay within a few megabytes of RAM while near-camera
 /// buildings and props retain real mesh silhouettes for shadows & reflections.
-const MAX_RT_TRIS_PER_PAGE: usize = 8192;
+const MAX_RT_TRIS_PER_PAGE: usize = 32768;
 
 fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32]) -> Vec<RtMeshTriangle> {
     let tri_count = indices.len() / 3;
@@ -887,24 +887,42 @@ fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32]) -> Vec<RtMeshTrian
                     let bl = (d & 0xff) as f32 / 255.0;
                     [r * r, g * g, bl * bl]
                 };
-                let c0 = decode(v0.diffuse);
-                let c1 = decode(v1.diffuse);
-                let c2 = decode(v2.diffuse);
-                let albedo = [
-                    ((c0[0] + c1[0] + c2[0]) / 3.0).clamp(0.08, 0.92),
-                    ((c0[1] + c1[1] + c2[1]) / 3.0).clamp(0.08, 0.92),
-                    ((c0[2] + c1[2] + c2[2]) / 3.0).clamp(0.08, 0.92),
-                ];
+                let has_rgb = ((v0.diffuse | v1.diffuse | v2.diffuse) & 0x00ff_ffff) != 0;
+                let albedo = if has_rgb {
+                    let c0 = decode(v0.diffuse);
+                    let c1 = decode(v1.diffuse);
+                    let c2 = decode(v2.diffuse);
+                    [
+                        ((c0[0] + c1[0] + c2[0]) / 3.0).clamp(0.12, 0.92),
+                        ((c0[1] + c1[1] + c2[1]) / 3.0).clamp(0.12, 0.92),
+                        ((c0[2] + c1[2] + c2[2]) / 3.0).clamp(0.12, 0.92),
+                    ]
+                } else {
+                    // Unbaked `.bmd` vertices default `day_diffuse` to 0; use a neutral
+                    // stone/wood midtone so reflections and GI bounces are not black.
+                    [0.42, 0.40, 0.37]
+                };
                 let a0 = ((v0.diffuse >> 24) & 0xff) as f32 / 255.0;
                 let a1 = ((v1.diffuse >> 24) & 0xff) as f32 / 255.0;
                 let a2 = ((v2.diffuse >> 24) & 0xff) as f32 / 255.0;
                 let v_alpha = ((a0 + a1 + a2) / 3.0).clamp(0.0, 1.0);
                 let kind = v0.kind;
                 let is_sdr_blend = (kind > 2.01 && kind < 2.03) || (kind > 2.11 && kind < 2.13);
-                let band_opacity = if is_sdr_blend {
-                    0.55
+                // Opaque scenery/buildings (`!is_sdr_blend && kind <= 3.5`) often carry
+                // alpha byte 0x00 in `.bmd` `day_diffuse` (`0x00RRGGBB` or `0`), so
+                // multiplying by `v_alpha` would make whole buildings transparent to RT rays.
+                let opacity = if is_sdr_blend {
+                    if v_alpha > 0.01 {
+                        (v_alpha * 0.65).clamp(0.25, 0.85)
+                    } else {
+                        0.55
+                    }
                 } else if kind > 3.5 {
-                    0.62
+                    if v_alpha > 0.01 {
+                        (v_alpha * 0.75).clamp(0.35, 0.90)
+                    } else {
+                        0.65
+                    }
                 } else {
                     1.0
                 };
@@ -914,7 +932,7 @@ fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32]) -> Vec<RtMeshTrian
                     c,
                     normal: [nx * inv, ny * inv, nz * inv],
                     albedo,
-                    opacity: (v_alpha * band_opacity).clamp(0.0, 1.0),
+                    opacity,
                 });
             }
         }
@@ -1831,5 +1849,49 @@ mod page_tests {
             assert!(cmds.iter().all(|c| c.start <= c.end));
             assert!(cmds.len() <= order.len());
         }
+    }
+}
+
+#[cfg(test)]
+mod raywatcher_extract_tests {
+    use super::*;
+
+    #[test]
+    fn opaque_bmd_triangles_with_zero_vertex_alpha_remain_fully_opaque() {
+        let v = |pos: [f32; 3], diffuse: u32, kind: f32| Vertex {
+            pos,
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0, 0.0],
+            color: [1.0, 1.0, 1.0, 1.0],
+            kind,
+            diffuse,
+            night_diffuse: diffuse,
+        };
+        let verts = vec![
+            v([0.0, 0.0, 0.0], 0x0080_7060, 2.0),
+            v([4.0, 0.0, 0.0], 0x0080_7060, 2.0),
+            v([0.0, 4.0, 0.0], 0x0080_7060, 2.0),
+            // Unbaked day_diffuse == 0
+            v([0.0, 0.0, 0.0], 0x0000_0000, 2.0),
+            v([4.0, 0.0, 0.0], 0x0000_0000, 2.0),
+            v([0.0, 4.0, 0.0], 0x0000_0000, 2.0),
+        ];
+        let tris = extract_rt_triangles(&verts, &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(tris.len(), 2);
+        assert!(
+            (tris[0].opacity - 1.0).abs() < 1e-5,
+            "opaque building with 0x00 alpha must stay opacity=1.0, got {}",
+            tris[0].opacity
+        );
+        assert!(
+            (tris[1].opacity - 1.0).abs() < 1e-5,
+            "unbaked opaque building with diffuse=0 must stay opacity=1.0, got {}",
+            tris[1].opacity
+        );
+        assert!(
+            tris[1].albedo[0] >= 0.35,
+            "unbaked opaque building should use neutral midtone albedo, got {:?}",
+            tris[1].albedo
+        );
     }
 }

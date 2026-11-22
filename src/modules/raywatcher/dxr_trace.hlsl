@@ -463,9 +463,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             uint gi_taps = 4u;
             float3 est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
             float3 receiver_albedo = clamp(
-                raster_rgb / max(est_direct, float3(0.30, 0.30, 0.30)),
-                float3(0.12, 0.12, 0.12),
-                float3(0.90, 0.90, 0.90));
+                raster_rgb / max(est_direct, float3(0.25, 0.25, 0.25)),
+                float3(0.18, 0.18, 0.18),
+                float3(0.92, 0.92, 0.92));
             float3 gi_sum = float3(0.0, 0.0, 0.0);
             for (uint g = 0u; g < gi_taps; g = g + 1u) {
                 float u1 = (float(g) + rand01(state)) / float(gi_taps);
@@ -490,15 +490,15 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
                     float3 incoming = float3(0.0, 0.0, 0.0);
                     if (b_screen.a >= 0.5) {
-                        incoming = b_screen.rgb * (0.25 + 0.75 * b_ndl * b_shadow);
+                        incoming = b_screen.rgb * (0.35 + 0.85 * b_ndl * b_shadow);
                     } else {
                         Material bmat = material_of(bhit.index);
-                        incoming = bmat.albedo.rgb * (params.sun_colour.xyz * (b_ndl * b_shadow * 1.25) + params.ambient.xyz * (params.tuning.z * 0.35));
+                        incoming = bmat.albedo.rgb * (params.sun_colour.xyz * (b_ndl * b_shadow * 1.60) + params.ambient.xyz * (params.tuning.z * 0.50));
                     }
-                    gi_sum += receiver_albedo * incoming * (params.tuning.w * 0.85 * (1.0 - fog_t));
+                    gi_sum += receiver_albedo * incoming * (params.tuning.w * 1.55 * (1.0 - fog_t));
                 } else {
                     float3 sky_bounce = sample_sky_env(d);
-                    gi_sum += receiver_albedo * sky_bounce * (params.tuning.w * 0.22 * (1.0 - fog_t));
+                    gi_sum += receiver_albedo * sky_bounce * (params.tuning.w * 0.58 * (1.0 - fog_t));
                 }
             }
             accum_gi += gi_sum * (1.0 / float(gi_taps));
@@ -511,6 +511,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     uint debug_mode = uint(round(params.counts.w));
     bool pl_shadows_enabled = params.point_light_meta.y > 0.5;
     float3 point_lighting = float3(0.0, 0.0, 0.0);
+    float3 pl_debug_lit = float3(0.0, 0.0, 0.0);
+    float pl_debug_shadow = 0.0;
     float pl_w_total = 0.0;
     float pl_w_lit = 0.0;
     if ((pl_shadows_enabled || !layered || debug_mode == 6u) && bits_lighting) {
@@ -533,6 +535,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         float w = pl_ci.w * atten * pl_ndl;
                         pl_w_total += w;
                         pl_w_lit += w * pl_vis;
+                        pl_debug_lit += pl_ci.rgb * (w * pl_vis);
+                        pl_debug_shadow += w * (1.0 - pl_vis);
                         if (!layered) {
                             point_lighting += raster_rgb * pl_ci.rgb * (w * pl_vis);
                         }
@@ -601,21 +605,17 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         out_lf = 1.0;
         store_refl = float3(0.0, 0.0, 0.0);
     } else if (debug_mode == 6u) {
-        out_rgb = float3(point_vis, point_vis, point_vis);
+        out_rgb = pl_debug_lit * 2.0 + float3(0.55, 0.04, 0.14) * clamp(pl_debug_shadow * 2.5, 0.0, 1.0);
         out_lf = 1.0;
         store_refl = float3(0.0, 0.0, 0.0);
     } else if (debug_mode == 7u) {
         float occ_kind = 0.0;
-        if (n_dot_l > 0.02) {
-            Hit sh = closest_hit(ray_origin, params.sun_dir.xyz, bias * 0.5, params.lens.y);
-            if (sh.index != 0xffffffffu) {
-                occ_kind = tris[sh.index].a.w;
-            }
-        }
-        if (occ_kind < 0.5) {
-            Hit ah = closest_hit(ray_origin, normal, bias * 0.5, ao_radius);
-            if (ah.index != 0xffffffffu) {
-                occ_kind = tris[ah.index].a.w;
+        if (roughness <= 0.12) {
+            occ_kind = 1.0;
+        } else {
+            Hit ph = closest_hit(params.eye.xyz, view_dir, 0.1, params.lens.y);
+            if (ph.index != 0xffffffffu) {
+                occ_kind = tris[ph.index].a.w;
             }
         }
         out_rgb = kind_colour(occ_kind);

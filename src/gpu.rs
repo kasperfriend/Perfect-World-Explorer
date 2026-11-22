@@ -2940,7 +2940,7 @@ impl Renderer {
         self.last_sky_frame = Some((frame, main_sets));
         self.sky
             .update(&self.queue, direction, w, h, frame, main_sets, false);
-        if camera.water_reflections {
+        if camera.water_reflections && !self.raywatcher_overrides.reflection_pass {
             self.sky
                 .update(&self.queue, direction, w, h, frame, reflected_sets, true);
         }
@@ -4149,18 +4149,62 @@ impl Renderer {
                 if colour.length_squared() <= 1e-5 {
                     return None;
                 }
+                let raw_int = l.diffuse[3];
+                let intensity = if raw_int > 0.01 {
+                    raw_int.clamp(0.25, 4.0)
+                } else {
+                    1.0
+                };
                 Some((
                     dist_sq,
                     crate::modules::raywatcher::frame::PointLight {
                         position: pos,
                         radius,
                         colour,
-                        intensity: l.diffuse[3].clamp(0.25, 4.0),
+                        intensity,
                         casts_shadow: true,
                     },
                 ))
             })
             .collect();
+        if let Some(models) = &self.models {
+            for dl in models.dynamic_lights() {
+                let radius = dl.radius.max(0.0);
+                if radius <= 0.05 {
+                    continue;
+                }
+                let pos = glam::Vec3::from_array(dl.position);
+                let dist_sq = pos.distance_squared(camera.pos);
+                let max_d = params.far + radius;
+                if dist_sq > max_d * max_d {
+                    continue;
+                }
+                let colour = glam::Vec3::new(
+                    dl.color[0].max(0.0),
+                    dl.color[1].max(0.0),
+                    dl.color[2].max(0.0),
+                );
+                if colour.length_squared() <= 1e-5 {
+                    continue;
+                }
+                let raw_int = dl.color[3];
+                let intensity = if raw_int > 0.01 {
+                    raw_int.clamp(0.25, 4.0)
+                } else {
+                    1.0
+                };
+                point_lights.push((
+                    dist_sq,
+                    crate::modules::raywatcher::frame::PointLight {
+                        position: pos,
+                        radius,
+                        colour,
+                        intensity,
+                        casts_shadow: true,
+                    },
+                ));
+            }
+        }
         point_lights.sort_by(|a, b| a.0.total_cmp(&b.0));
         let active_point_lights: Vec<crate::modules::raywatcher::frame::PointLight> =
             point_lights.into_iter().take(16).map(|(_, l)| l).collect();
@@ -4342,7 +4386,11 @@ impl Renderer {
                     w as f32,
                     h as f32,
                     camera.far,
-                    if camera.water_reflections { 1. } else { 0. },
+                    if camera.water_reflections && !self.raywatcher_overrides.reflection_pass {
+                        1.
+                    } else {
+                        0.
+                    },
                 ],
                 animation: [
                     crate::water_gpu::normal_phase(frame.elapsed64),
@@ -4350,7 +4398,16 @@ impl Renderer {
                     0.,
                     crate::water_gpu::normal_offset_angle(frame.elapsed64),
                 ],
-                edge_mode: [if camera.water_reflections { 1. } else { 0. }, 0., 0., 0.],
+                edge_mode: [
+                    if camera.water_reflections && !self.raywatcher_overrides.reflection_pass {
+                        1.
+                    } else {
+                        0.
+                    },
+                    0.,
+                    0.,
+                    0.,
+                ],
                 // Water-surface fog: the client binds the region's own triple
                 // (white 100..400 above water, blue 10..60 below).
                 fog: frame.active_fog_range,
@@ -4497,7 +4554,9 @@ impl Renderer {
         // this copy can never be read: the only frame that needs it is one with
         // reflections off, where no per-plane pass runs and the surface still
         // samples the refraction by screen UV.
-        if !camera.water_reflections
+        let raster_water_reflections =
+            camera.water_reflections && !self.raywatcher_overrides.reflection_pass;
+        if !raster_water_reflections
             && self
                 .water_batches
                 .iter()
@@ -4565,7 +4624,7 @@ impl Renderer {
                 );
             });
         }
-        if !camera.water_reflections {
+        if !camera.water_reflections || self.raywatcher_overrides.reflection_pass {
             let mut e = self.device.create_command_encoder(&Default::default());
             for batch in &visible {
                 if batch.simple {
@@ -5890,6 +5949,10 @@ pub fn run(
         &t.scene,
         whole_ornaments.to_vec(),
     );
+    renderer
+        .modules
+        .raywatcher_mut()
+        .sync_sdk_dir(&settings.upscale_sdk_dir);
     // Add-ons get read access to the world's effect catalogue the moment the
     // world has one: the same grouped index the World tab's census uses, so a
     // module can look up what the map ships without opening the archive
@@ -7264,6 +7327,10 @@ pub fn run(
                             // Raywatcher decides before the world pass which
                             // original effects to leave off, so a replaced
                             // effect never draws twice (or at all).
+                            renderer
+                                .modules
+                                .raywatcher_mut()
+                                .sync_sdk_dir(&settings.upscale_sdk_dir);
                             let ray_overrides = renderer
                                 .raywatcher_plan(world_extent, camera_jumped);
                             renderer.raywatcher_overrides = ray_overrides;

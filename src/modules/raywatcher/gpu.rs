@@ -994,7 +994,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         if (bits_gi && params.frame.z >= 1.0 && params.tuning.w > 0.0) {
             let gi_taps = 4u;
             let est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
-            let receiver_albedo = clamp(raster_rgb / max(est_direct, vec3<f32>(0.30)), vec3<f32>(0.12), vec3<f32>(0.90));
+            let receiver_albedo = clamp(raster_rgb / max(est_direct, vec3<f32>(0.25)), vec3<f32>(0.18), vec3<f32>(0.92));
             var gi_sum = vec3<f32>(0.0);
             for (var g = 0u; g < gi_taps; g = g + 1u) {
                 let u1 = (f32(g) + next_f32(&state)) / f32(gi_taps);
@@ -1016,15 +1016,15 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                     let b_screen = sample_screen_radiance(bhit_world, bhit.t);
                     var incoming = vec3<f32>(0.0);
                     if (b_screen.a >= 0.5) {
-                        incoming = b_screen.rgb * (0.25 + 0.75 * b_ndl * b_shadow);
+                        incoming = b_screen.rgb * (0.35 + 0.85 * b_ndl * b_shadow);
                     } else {
                         let bmaterial = material_of(bhit.index);
-                        incoming = bmaterial.albedo.rgb * (params.sun_colour.xyz * (b_ndl * b_shadow * 1.25) + params.ambient.xyz * (params.tuning.z * 0.35));
+                        incoming = bmaterial.albedo.rgb * (params.sun_colour.xyz * (b_ndl * b_shadow * 1.60) + params.ambient.xyz * (params.tuning.z * 0.50));
                     }
-                    gi_sum = gi_sum + receiver_albedo * incoming * (params.tuning.w * 0.85 * (1.0 - fog_t));
+                    gi_sum = gi_sum + receiver_albedo * incoming * (params.tuning.w * 1.55 * (1.0 - fog_t));
                 } else {
                     let sky_bounce = sample_sky_env(d);
-                    gi_sum = gi_sum + receiver_albedo * sky_bounce * (params.tuning.w * 0.22 * (1.0 - fog_t));
+                    gi_sum = gi_sum + receiver_albedo * sky_bounce * (params.tuning.w * 0.58 * (1.0 - fog_t));
                 }
             }
             accum_gi = accum_gi + gi_sum * (1.0 / f32(gi_taps));
@@ -1037,6 +1037,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let debug_mode = u32(round(params.counts.w));
     let pl_shadows_enabled = params.point_light_meta.y > 0.5;
     var point_lighting = vec3<f32>(0.0);
+    var pl_debug_lit = vec3<f32>(0.0);
+    var pl_debug_shadow = 0.0;
     var pl_w_total = 0.0;
     var pl_w_lit = 0.0;
     if ((pl_shadows_enabled || !layered || debug_mode == 6u) && bits_lighting) {
@@ -1059,6 +1061,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                         let w = pl_ci.w * atten * pl_ndl;
                         pl_w_total = pl_w_total + w;
                         pl_w_lit = pl_w_lit + w * pl_vis;
+                        pl_debug_lit = pl_debug_lit + pl_ci.rgb * (w * pl_vis);
+                        pl_debug_shadow = pl_debug_shadow + w * (1.0 - pl_vis);
                         if (!layered) {
                             point_lighting = point_lighting + raster_rgb * pl_ci.rgb * (w * pl_vis);
                         }
@@ -1124,22 +1128,19 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         out_lf = 1.0;
         store_refl = vec3<f32>(0.0);
     } else if (debug_mode == 6u) {
-        out_rgb = vec3<f32>(point_vis);
+        out_rgb = pl_debug_lit * 2.0 + vec3<f32>(0.55, 0.04, 0.14) * clamp(pl_debug_shadow * 2.5, 0.0, 1.0);
         out_lf = 1.0;
         store_refl = vec3<f32>(0.0);
     } else if (debug_mode == 7u) {
-        // Phase 0: OccluderKind — per-triangle kind stored in tri.normal.w.
+        // OccluderKind — primary BVH/TLAS surface hit + water mask so water (cyan),
+        // terrain (orange), real meshes (green), and distant proxies (magenta) are all visible.
         var occ_kind = 0.0;
-        if (n_dot_l > 0.02) {
-            let sh = closest_hit(ray_origin, params.sun_dir.xyz, bias * 0.5, params.lens.y);
-            if (sh.index != 0xffffffffu) {
-                occ_kind = tris[sh.index].a.w;
-            }
-        }
-        if (occ_kind < 0.5) {
-            let ah = closest_hit(ray_origin, normal, bias * 0.5, ao_radius);
-            if (ah.index != 0xffffffffu) {
-                occ_kind = tris[ah.index].a.w;
+        if (roughness <= 0.12) {
+            occ_kind = 1.0;
+        } else {
+            let ph = closest_hit(params.eye.xyz, view_dir, 0.1, params.lens.y);
+            if (ph.index != 0xffffffffu) {
+                occ_kind = tris[ph.index].a.w;
             }
         }
         out_rgb = kind_colour(occ_kind);

@@ -81,6 +81,7 @@ impl RasterOverrides {
         }
         if !plan.replace_raster {
             return Self {
+                reflection_pass: plan.effects.reflections,
                 suppress_baked_shadows: plan.effects.shadows,
                 ..Self::NONE
             };
@@ -130,6 +131,9 @@ impl RasterOverrides {
         }
         if self.atmosphere_fog {
             parts.push("atmosphere");
+        }
+        if self.suppress_baked_shadows {
+            parts.push("baked shadows");
         }
         if parts.is_empty() {
             "raster effects untouched".to_string()
@@ -601,7 +605,7 @@ mod tests {
         assert!(on_ov.suppress_baked_shadows);
         assert!(!on_ov.directional_light);
         assert!(!on_ov.ambient);
-        assert!(!on_ov.reflection_pass);
+        assert!(on_ov.reflection_pass);
         assert!(!on_ov.atmosphere_fog);
 
         s.effects.shadows = false;
