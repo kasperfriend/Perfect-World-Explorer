@@ -153,7 +153,12 @@ impl FrameSnapshot {
         // therefore exactly "the raster sun and sky terms are off": what is left
         // is the texture, lit only by the ray image's own contribution, which
         // the Raywatcher compose pass wrote into the same target.
-        let light = if self.overrides.ambient || self.overrides.directional_light {
+        let light = if self.overrides.ambient && self.overrides.directional_light {
+            // In opt-in `replace_raster` mode, output unlit 1:1 textured albedo
+            // (`light = 1.0`) so Raywatcher's RT trace relights terrain and
+            // meshes cleanly instead of multiplying against black (0.0).
+            [1., 0., 1., 1.]
+        } else if self.overrides.ambient || self.overrides.directional_light {
             let mut light = self.light;
             if self.overrides.ambient {
                 light[0] = 0.;
@@ -1739,7 +1744,7 @@ fn bmd_baked_rgb(day:u32, night:u32, night_factor:f32)->vec3<u32> {
 }
 @vertex fn vs(i:VIn)->VOut { var o:VOut; var pos=i.pos; var norm=i.normal;
  if i.kind>4.5 { let d=normalize(camera.direction.xyz); let az=atan2(d.z,d.x); let el=asin(clamp(d.y,-1.,1.)); let rho=i.color.w; let q=vec3<f32>(cos(el)*i.normal.x-sin(el)*i.normal.z,i.normal.y,sin(el)*i.normal.x+cos(el)*i.normal.z); let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. { v=i.normal; }pos+=vec3<f32>(v.x,v.z,v.y);norm=vec3<f32>(0.,1.,0.); }
- o.pos=camera.matrix*vec4<f32>(pos,1.);o.bmd_refraction=1.;if camera.clip.y<0. && i.kind>1.5 && i.kind<2.5 {o.bmd_refraction=bmd_refraction_transmittance(pos);}o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.diffuse=vec3<f32>(bmd_baked_rgb(i.diffuse,i.night_diffuse,1.-camera.direction.w))/255.;o.opacity=f32((i.diffuse>>24u)&255u)/255.;return o; }
+ o.pos=camera.matrix*vec4<f32>(pos,1.);o.bmd_refraction=1.;if camera.clip.y<0. && i.kind>1.5 && i.kind<2.5 {o.bmd_refraction=bmd_refraction_transmittance(pos);}o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;let baked_rgb=vec3<f32>(bmd_baked_rgb(i.diffuse,i.night_diffuse,1.-camera.direction.w))/255.;o.diffuse=select(baked_rgb,select(vec3<f32>(0.20+0.34*camera.direction.w),vec3<f32>(0.5),camera.light.x>0.99 && camera.light.y<0.01),camera.sun.w<0.);o.opacity=f32((i.diffuse>>24u)&255u)/255.;return o; }
 fn sdr_blend_band(kind:f32)->bool { return (kind>2.01 && kind<2.03)||(kind>2.11 && kind<2.13); }
 fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || (i.kind>1.5 && i.kind<2.05)) && camera.clip.w == 0. && (front == (camera.clip.z != 0.)) {discard;} if camera.clip.y != 0.0 && (i.world.y-camera.clip.x)*camera.clip.y < 0.0 {discard;} if i.kind>0.5 && i.kind<1.05 {return vec4<f32>(fogged(i.color.rgb,i.pos.w),1.);} if i.kind>1.05 && i.kind<1.25 {return vec4<f32>(bmd_pass_fog(clamp(i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.)),i.pos.w,i.bmd_refraction),1.);} let uv_dx=dpdx(i.uv);let uv_dy=dpdy(i.uv);var uv=i.uv; if i.kind>1.5 {let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(uv_dx*dims),length(uv_dy*dims)),1.)),0.,7.);let border=0.5*exp2(mip);let half_pixel=min(vec2<f32>(border)/dims,scale*0.499);let sdr_v=select(0.,-0.5*camera.grass_wind.x,sdr_blend_band(i.kind));let local=fract((i.uv-i.color.xy)/scale+vec2<f32>(0.,sdr_v))*scale;uv=i.color.xy+clamp(local,half_pixel,scale-half_pixel);} let raw_tex=textureSampleGrad(atlas,atlas_sampler,uv,uv_dx*camera.lod.y,uv_dy*camera.lod.y);let encoded=raw_tex.rgb;let linear=select(encoded/12.92,pow((encoded+0.055)/1.055,vec3<f32>(2.4)),encoded>vec3<f32>(0.04045));let tex=vec4<f32>(linear,raw_tex.a);if !sdr_blend_band(i.kind) && ((i.kind>1.5 && i.kind<2.5) || i.kind>3.5) && tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9) {discard;} if i.kind>1.5 && i.kind<2.5 {let c=clamp(raw_tex.rgb*i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.));let rgb=select(c/12.92,pow((c+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));return vec4<f32>(bmd_pass_fog(rgb,i.pos.w,i.bmd_refraction),select(1.,raw_tex.a*i.opacity,sdr_blend_band(i.kind)));} let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.pos.w),1.); }
 @fragment fn fs(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
@@ -2764,16 +2769,29 @@ impl Renderer {
         let daylight = crate::environment::daylight(camera.time_of_day);
         let angle = (camera.time_of_day - 6.0) * std::f32::consts::PI / 12.0;
         let twilight = (1. - ((angle.sin().abs()) / 0.35).clamp(0., 1.)) * daylight;
-        let sun = [
-            angle.cos() * 0.8,
-            angle.sin().max(0.05),
-            0.46,
-            if camera.terrain_lightmaps && !self.raywatcher_overrides.suppress_baked_shadows {
-                daylight
-            } else {
-                -1.
-            },
-        ];
+        let region_light_pre = camera.regional_light.or(self.retained_regional_light);
+        let authored_pre = region_light_pre
+            .map(|l| l.material_direction().toward_sun())
+            .unwrap_or([0.6, -0.4, 0.8]);
+        let (tracked_dir, _, _, _) = crate::modules::raywatcher::frame::tracked_celestial_light(
+            camera.time_of_day,
+            authored_pre,
+            region_light_pre.as_ref(),
+        );
+        let sun = if self.raywatcher_overrides.suppress_baked_shadows {
+            [tracked_dir.x, tracked_dir.y, tracked_dir.z, -1.]
+        } else {
+            [
+                angle.cos() * 0.8,
+                angle.sin().max(0.05),
+                0.46,
+                if camera.terrain_lightmaps {
+                    daylight
+                } else {
+                    -1.
+                },
+            ]
+        };
         let light = [
             0.17 + 0.38 * daylight,
             0.07 + 0.38 * daylight,
@@ -3781,9 +3799,11 @@ impl Renderer {
         let config = crate::modules::raywatcher::harvest::HarvestConfig::default();
         let view_forward = camera.direction();
         let view_distance = if settings.ray_length > 0. {
-            settings.ray_length
+            settings
+                .ray_length
+                .clamp(128.0, crate::modules::raywatcher::plan::MAX_RAY_LENGTH)
         } else {
-            camera.far
+            crate::modules::raywatcher::plan::DEFAULT_RAY_LENGTH
         };
         // Once whole-world pages are loaded, ignore `local_pages.len()` so
         // crossing a terrain block boundary does not spam BVH/BLAS rebuilds.
@@ -3806,22 +3826,20 @@ impl Renderer {
             content_hash,
         ) && !self.raywatcher_harvest.is_building_in_background()
         {
-            use crate::modules::raywatcher::harvest::{
-                Frustum, InstanceProxy, MeshTriangle, WaterSurface,
-            };
+            use crate::modules::raywatcher::harvest::{Frustum, MeshTriangle, WaterSurface};
             let _ = Frustum::from_view_projection(matrix);
             // Keep a focused nearest-first real-mesh bubble around the camera
             // (covering both on-screen and off-screen reflected buildings) with a
             // bounded triangle budget so BLAS/BVH rebuilds stay hitch-free while
             // moving; distant scenery beyond `detail_radius` uses compact proxies.
-            let detail_radius = view_distance.clamp(256.0, 512.0);
+            let detail_radius = view_distance.clamp(512.0, 1024.0);
             let detail_radius_sq = detail_radius * detail_radius;
-            const REAL_MESH_TRI_BUDGET: usize = 180_000;
+            const REAL_MESH_TRI_BUDGET: usize = 320_000;
 
             let mut real_meshes = Vec::new();
             let mut real_mesh_pages = 0usize;
-            let mut proxy_fallback_models = 0usize;
-            let mut proxies = Vec::new();
+            let proxy_fallback_models = 0usize;
+            let proxies = Vec::new();
             let pages_slice = if self.world_done {
                 &self.world_pages[..]
             } else {
@@ -3866,77 +3884,23 @@ impl Renderer {
                         });
                         ti += step;
                     }
-                } else {
-                    for b in page.placement_bounds() {
-                        let bmin = Vec3::from_array(b.min);
-                        let bmax = Vec3::from_array(b.max);
-                        let centre = (bmin + bmax) * 0.5;
-                        let half = (bmax - bmin) * 0.5;
-                        proxies.push(InstanceProxy {
-                            centre,
-                            half,
-                            albedo: [0.46, 0.44, 0.40],
-                            yaw: 0.0,
-                        });
-                        proxy_fallback_models += 1;
-                    }
                 }
             }
-
-            // Scenery beyond `detail_radius` uses compact box proxies so
-            // far-horizon shadows still cast without exceeding BVH budgets.
-            if self.world_done {
-                let main_slot = crate::world_objects::GpuPage::world_view_slot(
-                    crate::scenery_visibility::Pass::Main,
-                );
-                let far_cull_sq = (view_distance + 128.0) * (view_distance + 128.0);
-                for cmd in &self.world_draw_cmds[main_slot].cmds {
-                    let bmin = Vec3::from_array(cmd.min);
-                    let bmax = Vec3::from_array(cmd.max);
-                    let centre = (bmin + bmax) * 0.5;
-                    let half = (bmax - bmin) * 0.5;
-                    let d2 = centre.distance_squared(camera.pos);
-                    if d2 > detail_radius_sq && d2 <= far_cull_sq {
-                        proxies.push(InstanceProxy {
-                            centre,
-                            half,
-                            albedo: [0.46, 0.44, 0.40],
-                            yaw: 0.0,
-                        });
-                        proxy_fallback_models += 1;
-                    }
-                }
-            } else {
-                for page in &self.local_pages {
-                    for b in page.placement_bounds() {
-                        let bmin = Vec3::from_array(b.min);
-                        let bmax = Vec3::from_array(b.max);
-                        let centre = (bmin + bmax) * 0.5;
-                        let half = (bmax - bmin) * 0.5;
-                        if centre.distance_squared(camera.pos) > detail_radius_sq {
-                            proxies.push(InstanceProxy {
-                                centre,
-                                half,
-                                albedo: [0.46, 0.44, 0.40],
-                                yaw: 0.0,
-                            });
-                            proxy_fallback_models += 1;
-                        }
-                    }
-                }
-            }
+            // Do not emit coarse axis-aligned bounding boxes (`InstanceProxy`):
+            // solid boxes create rectangular shadow blocks and boxy water
+            // reflections. Real meshes already cover the full detail bubble.
             // Phase 4: Harvest the same runtime SpeedTree LOD geometry the
             // raster draws (branches, fronds, alpha-tested leaves) matching
             // view distance, falling back to an alpha-tested crossed canopy
             // (never a box) only when the triangle budget is exhausted.
             let tree_lod_scale =
                 self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees);
-            let tree_tri_budget = 60_000usize;
+            let tree_tri_budget = 140_000usize;
             let mut tree_tris = Vec::new();
             let (real_tree_instances, real_tree_tris, tree_canopy_fallbacks) =
                 self.far_trees.harvest_rt_triangles(
                     camera.pos,
-                    detail_radius.min(384.0),
+                    detail_radius.min(640.0),
                     tree_lod_scale,
                     tree_tri_budget,
                     &mut tree_tris,
@@ -4051,11 +4015,21 @@ impl Renderer {
             settings.reflection_roughness_cutoff,
             2e-3,
         );
+        let region_light_rw = camera.regional_light.or(self.retained_regional_light);
+        let authored_rw = region_light_rw
+            .map(|l| l.material_direction().toward_sun())
+            .unwrap_or([0.6, -0.4, 0.8]);
+        let (cel_dir, cel_col, cel_int, _is_moon) =
+            crate::modules::raywatcher::frame::tracked_celestial_light(
+                camera.time_of_day,
+                authored_rw,
+                region_light_rw.as_ref(),
+            );
         let sun = Sun {
-            direction: lighting.direction,
-            colour: lighting.diffuse,
+            direction: cel_dir,
+            colour: cel_col,
             angular_radius: settings.sun_radius_degrees.to_radians(),
-            intensity: lighting.daylight,
+            intensity: cel_int,
         };
         let params = FrameParams {
             eye: camera.pos,
@@ -4064,11 +4038,7 @@ impl Renderer {
             extent: render_extent,
             grid: plan.grid,
             near: CAMERA_NEAR,
-            far: if settings.ray_length > 0. {
-                settings.ray_length
-            } else {
-                camera.far
-            },
+            far: view_distance,
             jitter,
             frame: self.modules.raywatcher().frame_index(),
             history_valid: u32::from(!reset_history),

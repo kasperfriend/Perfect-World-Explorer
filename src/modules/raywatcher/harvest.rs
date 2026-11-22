@@ -32,6 +32,11 @@ pub const KIND_WATER: f32 = 1.0;
 pub const KIND_TERRAIN_LOD: f32 = 2.0;
 pub const KIND_REAL_MESH: f32 = 3.0;
 pub const KIND_PROXY: f32 = 4.0;
+/// Hard cap on total BVH/BLAS triangles (~38 MB) so extreme `ray_length` values
+/// can never exceed `wgpu::Limits::max_buffer_size` or `max_storage_buffer_binding_size`.
+pub const MAX_SCENE_TRIANGLES: usize = 600_000;
+/// Maximum horizontal terrain harvest radius (world units).
+const MAX_TERRAIN_HARVEST_FAR: f32 = 2048.0;
 
 /// How the harvest is bounded. Every field is a knob the module's UI could
 /// expose later; the defaults are what a 1080p frame at 60 Hz can afford.
@@ -523,6 +528,9 @@ impl Harvester {
                 );
                 let proxy_tris = triangles.len() - before_proxy;
 
+                if triangles.len() > MAX_SCENE_TRIANGLES {
+                    triangles.truncate(MAX_SCENE_TRIANGLES);
+                }
                 let total_tris = triangles.len();
                 let note = if total_tris == 0 {
                     Some("no geometry inside the visible frustum yet".to_string())
@@ -1349,10 +1357,11 @@ fn push_terrain_frustum(
         surface: [0.92, 0.0, 0.0, 1.0],
     });
 
-    let min_cx = ((eye.x - far) / chunk_size).floor() as i32;
-    let max_cx = ((eye.x + far) / chunk_size).floor() as i32;
-    let min_cz = ((eye.z - far) / chunk_size).floor() as i32;
-    let max_cz = ((eye.z + far) / chunk_size).floor() as i32;
+    let clamped_far = far.clamp(64.0, MAX_TERRAIN_HARVEST_FAR);
+    let min_cx = ((eye.x - clamped_far) / chunk_size).floor() as i32;
+    let max_cx = ((eye.x + clamped_far) / chunk_size).floor() as i32;
+    let min_cz = ((eye.z - clamped_far) / chunk_size).floor() as i32;
+    let max_cz = ((eye.z + clamped_far) / chunk_size).floor() as i32;
 
     for cz in min_cz..=max_cz {
         let z0 = cz as f32 * chunk_size;
@@ -1376,7 +1385,7 @@ fn push_terrain_frustum(
                 0.0
             };
             let dist = (dx * dx + dz * dz).sqrt();
-            if dist > far {
+            if dist > clamped_far {
                 continue;
             }
             let _ = frustum;
@@ -2292,6 +2301,29 @@ mod tests {
             assert_eq!(t.normal[3], 0.0, "normal[3] must remain 0.0");
             assert_eq!(t.kind(), KIND_REAL_MESH, "kind must be stored in a[3]");
         }
+    }
+
+    #[test]
+    fn frustum_build_caps_triangles_safely_at_extreme_ray_length() {
+        let flat = |_x: f32, _z: f32| 0.0f32;
+        let mut tris = Vec::new();
+        let mut mats = Vec::new();
+        let eye = Vec3::new(0.0, 20.0, 0.0);
+        let frustum = Frustum::from_view_projection(glam::Mat4::IDENTITY);
+        let cfg = HarvestConfig::default();
+        push_terrain_frustum(
+            &mut tris, &mut mats, eye, &frustum, 64_000.0, 2.0, cfg, &flat,
+        );
+        assert!(
+            tris.len() <= MAX_SCENE_TRIANGLES,
+            "extreme ray_length produced {} triangles (cap {})",
+            tris.len(),
+            MAX_SCENE_TRIANGLES
+        );
+        assert!(
+            tris.len() > 1000,
+            "terrain should still cover visible range"
+        );
     }
 
     #[test]

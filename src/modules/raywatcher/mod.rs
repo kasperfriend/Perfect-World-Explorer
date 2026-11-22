@@ -429,10 +429,13 @@ impl Raywatcher {
                 .suffix("°"),
         );
         ui.add(
-            egui::Slider::new(&mut settings.ray_length, 0.0..=64000.0)
+            egui::Slider::new(&mut settings.ray_length, 0.0..=plan::MAX_RAY_LENGTH)
                 .text("ray length")
                 .suffix(" u")
                 .logarithmic(true),
+        )
+        .on_hover_text(
+            "Maximum RT trace & scene harvest distance (0 = default 1024 u, max 4096 u).",
         );
         ui.add(egui::Slider::new(&mut settings.ambient_strength, 0.0..=2.0).text("ambient"));
         ui.add(egui::Slider::new(&mut settings.bounce_strength, 0.0..=2.0).text("bounce strength"));

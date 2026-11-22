@@ -510,6 +510,44 @@ fn region_direction(light: &crate::environment::RegionalLight) -> Option<Vec3> {
     (d.length_squared() > 0.5).then_some(d)
 }
 
+/// Resolve the active directional shadow-caster from the client's tracked
+/// sky clock (`sky_time::evaluate` + `sky_celestial::direction`):
+/// - During the day (`sun_elevation > 0.03`), tracks the visible **Sun** disc.
+/// - During the night (`moon_elevation > 0.03`), tracks the visible **Moon** disc
+///   with soft cool moonlight so the moon casts real shadows while keeping GI dark.
+/// Returns `(direction_toward_light, colour, intensity, is_moon)`.
+pub fn tracked_celestial_light(
+    hour: f32,
+    authored: [f32; 3],
+    region: Option<&crate::environment::RegionalLight>,
+) -> (Vec3, Vec3, f32, bool) {
+    let daylight = crate::environment::daylight(hour);
+    let fallback = LightingRecord::derive(hour, daylight, region, Vec3::ZERO, (0.0, 0.0));
+    let Some(state) = crate::sky_time::evaluate(hour, authored) else {
+        return (fallback.direction, fallback.diffuse, daylight, false);
+    };
+    if state.sun_elevation > 0.03 {
+        let raw = crate::sky_celestial::direction(state.sun_elevation, state.azimuth);
+        let dir = Vec3::from_array(raw).normalize_or_zero();
+        let elev_fade = ((state.sun_elevation - 0.03) / 0.15).clamp(0.0, 1.0);
+        let intensity = (daylight.max(elev_fade * 0.65)).clamp(0.0, 1.0);
+        if dir.length_squared() > 0.5 {
+            return (dir, fallback.diffuse, intensity, false);
+        }
+    } else if state.moon_elevation > 0.03 {
+        let raw = crate::sky_celestial::direction(state.moon_elevation, state.azimuth);
+        let dir = Vec3::from_array(raw).normalize_or_zero();
+        let elev_fade = ((state.moon_elevation - 0.03) / 0.15).clamp(0.0, 1.0);
+        // Subtle cool moonlight: strong enough to cast crisp directional moon
+        // shadows, dim enough that night stays genuinely dark (and GI stays off).
+        let moon_col = Vec3::new(0.32, 0.42, 0.62) * 0.28;
+        if dir.length_squared() > 0.5 {
+            return (dir, moon_col, elev_fade * 0.45, true);
+        }
+    }
+    (fallback.direction, fallback.diffuse, daylight, false)
+}
+
 /// Everything one ray pass needs that is not in [`LightingRecord`].
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct FrameParams {
@@ -1124,6 +1162,31 @@ mod tests {
         assert!(
             surface_qualifies_for_reflection(0.06, cutoff),
             "water surfaces (0.06) must still qualify for reflections"
+        );
+    }
+
+    #[test]
+    fn tracked_celestial_light_follows_sun_at_noon_and_moon_at_midnight() {
+        let authored = [0.6, -0.4, 0.8];
+        let (sun_dir, sun_col, sun_int, sun_is_moon) =
+            tracked_celestial_light(12.0, authored, None);
+        assert!(!sun_is_moon, "noon should track the sun");
+        assert!(
+            sun_dir.y > 0.3,
+            "noon sun should be high in the sky: {sun_dir:?}"
+        );
+        assert!(sun_int > 0.5 && sun_col.length() > 0.5);
+
+        let (moon_dir, moon_col, moon_int, moon_is_moon) =
+            tracked_celestial_light(0.0, authored, None);
+        assert!(moon_is_moon, "midnight should track the moon");
+        assert!(
+            moon_dir.y > 0.1,
+            "midnight moon should be above horizon: {moon_dir:?}"
+        );
+        assert!(
+            moon_int > 0.0 && moon_col.z > moon_col.x,
+            "moonlight should be cool-tinted"
         );
     }
 }

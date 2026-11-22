@@ -1630,10 +1630,13 @@ pub fn harvest_rt_tree_species(
     for (d2, si, pos) in candidates {
         let sp = &species_list[si];
         let dist = d2.sqrt();
-        // Match `LOD_COMPUTE` thresholds (`height * 5 * scale`, `height * 16 * scale`).
-        let lod_idx = if dist < sp.height * 5.0 * scale {
+        // Use LOD0 only very close to the camera and medium/coarse real LODs
+        // further out so 5x-8x more trees fit inside the real-mesh RT budget
+        // with full trunk/branch/leaf silhouettes instead of falling back.
+        let _ = scale;
+        let lod_idx = if dist < 32.0 {
             0
-        } else if dist < sp.height * 16.0 * scale {
+        } else if dist < 120.0 {
             1.min(sp.lods.len() - 1)
         } else {
             sp.lods.len() - 1

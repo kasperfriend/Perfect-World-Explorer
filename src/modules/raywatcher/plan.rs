@@ -357,7 +357,7 @@ impl Default for Settings {
             samples: 1,
             denoise_iterations: 2,
             sun_radius_degrees: 0.6,
-            ray_length: 0.,
+            ray_length: DEFAULT_RAY_LENGTH,
             ambient_strength: 1.,
             bounce_strength: 1.,
             reflection_roughness_cutoff: 0.4,
@@ -377,6 +377,11 @@ pub const BOUNCES_RANGE: (u32, u32) = (0, 6);
 pub const SAMPLES_RANGE: (u32, u32) = (1, 4);
 /// Denoiser iteration bounds.
 pub const DENOISE_RANGE: (u32, u32) = (1, 5);
+/// Default ray trace & scene harvest distance (world units).
+pub const DEFAULT_RAY_LENGTH: f32 = 1024.0;
+/// Maximum ray length allowed by the UI and sanitizer to keep BVH/BLAS buffers
+/// safely below GPU storage-buffer size limits.
+pub const MAX_RAY_LENGTH: f32 = 4096.0;
 
 impl Settings {
     /// Clamp every numeric field into its advertised range. A settings file is
@@ -388,7 +393,7 @@ impl Settings {
             .denoise_iterations
             .clamp(DENOISE_RANGE.0, DENOISE_RANGE.1);
         self.sun_radius_degrees = finite_or(self.sun_radius_degrees, 0.6).clamp(0., 10.);
-        self.ray_length = finite_or(self.ray_length, 0.).clamp(0., 64000.);
+        self.ray_length = finite_or(self.ray_length, DEFAULT_RAY_LENGTH).clamp(0., MAX_RAY_LENGTH);
         self.ambient_strength = finite_or(self.ambient_strength, 1.).clamp(0., 2.);
         self.bounce_strength = finite_or(self.bounce_strength, 1.).clamp(0., 2.);
         self.reflection_roughness_cutoff =
@@ -819,7 +824,7 @@ mod tests {
         assert_eq!(s.samples, SAMPLES_RANGE.0);
         assert_eq!(s.denoise_iterations, DENOISE_RANGE.0);
         assert_eq!(s.sun_radius_degrees, 0.6);
-        assert_eq!(s.ray_length, 0.);
+        assert_eq!(s.ray_length, DEFAULT_RAY_LENGTH);
         assert_eq!(s.ambient_strength, 0.);
         assert_eq!(s.bounce_strength, 2.);
         assert_eq!(s.reflection_roughness_cutoff, 1.);
