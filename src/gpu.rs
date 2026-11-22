@@ -3866,7 +3866,7 @@ impl Renderer {
             // moving; distant scenery beyond `detail_radius` uses compact proxies.
             let detail_radius = view_distance.clamp(512.0, 1024.0);
             let detail_radius_sq = detail_radius * detail_radius;
-            const REAL_MESH_TRI_BUDGET: usize = 320_000;
+            const REAL_MESH_TRI_BUDGET: usize = 420_000;
 
             let mut real_meshes = Vec::new();
             let mut page_tris = Vec::new();
@@ -4243,82 +4243,104 @@ impl Renderer {
                         ));
                     }
                 }
-                // Also harvest luminous additive world effects (torches, magic glows,
-                // lanterns, spells) clustered within 6 u so effects cast real shadowed light.
-                if let Some(models) = &self.models {
-                    let mut effect_clusters: Vec<(glam::Vec3, glam::Vec3, f32, f32)> =
-                        Vec::with_capacity(32);
-                    let max_eff_d_sq = (params.far + 48.0) * (params.far + 48.0);
-                    for q in models.effect_quads() {
-                        // D3DBLEND_ONE (2) = additive emissive glow.
-                        if q.destination_blend != 2 || q.mesh.is_some() {
-                            continue;
-                        }
-                        let a = q.color[3].clamp(0.0, 1.0);
-                        if a < 0.08 {
-                            continue;
-                        }
-                        // Cheap vertex-0 distance pre-rejection before luminance/extent math.
-                        let p0 = glam::Vec3::from_array(q.positions[0]);
-                        if p0.distance_squared(camera.pos) > max_eff_d_sq {
-                            continue;
-                        }
-                        let col = glam::Vec3::new(
-                            q.color[0].max(0.0),
-                            q.color[1].max(0.0),
-                            q.color[2].max(0.0),
-                        ) * a;
-                        let lum = col.x * 0.2126 + col.y * 0.7152 + col.z * 0.0722;
-                        if lum < 0.08 {
-                            continue;
-                        }
-                        let p1 = glam::Vec3::from_array(q.positions[1]);
-                        let p2 = glam::Vec3::from_array(q.positions[2]);
-                        let p3 = glam::Vec3::from_array(q.positions[3]);
-                        let center = (p0 + p1 + p2 + p3) * 0.25;
-                        if !center.is_finite() {
-                            continue;
-                        }
-                        let dist_sq = center.distance_squared(camera.pos);
-                        let extent = p0.distance(p3).max(p1.distance(p2)).clamp(0.5, 16.0);
-                        let radius = (extent * 4.5).clamp(12.0, 48.0);
-                        let max_d = params.far + radius;
-                        if dist_sq > max_d * max_d {
-                            continue;
-                        }
-                        if let Some(existing) = effect_clusters
-                            .iter_mut()
-                            .find(|(pos, _, _, _)| pos.distance_squared(center) < 36.0)
-                        {
-                            existing.1 = existing.1.max(col);
-                            existing.2 = existing.2.max(radius);
-                            existing.3 = (existing.3 + lum * 0.35).min(3.5);
-                        } else if effect_clusters.len() < 32 {
-                            effect_clusters.push((
-                                center,
-                                col,
-                                radius,
-                                (lum * 2.0).clamp(0.6, 3.0),
-                            ));
-                        }
-                    }
-                    for (pos, col, radius, intensity) in effect_clusters {
-                        let dist_sq = pos.distance_squared(camera.pos);
-                        point_lights.push((
-                            dist_sq,
-                            crate::modules::raywatcher::frame::PointLight {
-                                position: pos,
-                                radius,
-                                colour: col,
-                                intensity,
-                                casts_shadow: true,
-                            },
-                        ));
-                    }
+                // Prioritize stable static & dynamic point lights first (up to 12 slots,
+                // sorted deterministically so lights never swap/flicker frame-to-frame).
+                point_lights.sort_by(|a, b| a.0.total_cmp(&b.0));
+                if point_lights.len() > 12 {
+                    point_lights.truncate(12);
                 }
-                if point_lights.len() > 16 {
-                    point_lights.select_nth_unstable_by(16, |a, b| a.0.total_cmp(&b.0));
-                    point_lights.truncate(16);
+                let eff_slots = 16usize.saturating_sub(point_lights.len());
+                // Harvest glowing additive world effects on a stable 8u spatial grid so
+                // animated particles produce steady illumination without flickering or
+                // evicting static map torches/lanterns.
+                if eff_slots > 0 {
+                    if let Some(models) = &self.models {
+                        let mut grid: std::collections::HashMap<
+                            (i32, i32, i32),
+                            (glam::Vec3, glam::Vec3, f32, f32, u32),
+                        > = std::collections::HashMap::with_capacity(32);
+                        let max_eff_d_sq = (params.far + 48.0) * (params.far + 48.0);
+                        for q in models.effect_quads() {
+                            if q.destination_blend != 2 || q.mesh.is_some() {
+                                continue;
+                            }
+                            let a = q.color[3].clamp(0.0, 1.0);
+                            if a < 0.12 {
+                                continue;
+                            }
+                            let p0 = glam::Vec3::from_array(q.positions[0]);
+                            if p0.distance_squared(camera.pos) > max_eff_d_sq {
+                                continue;
+                            }
+                            let col = glam::Vec3::new(
+                                q.color[0].max(0.0),
+                                q.color[1].max(0.0),
+                                q.color[2].max(0.0),
+                            ) * a;
+                            let lum = col.x * 0.2126 + col.y * 0.7152 + col.z * 0.0722;
+                            if lum < 0.10 {
+                                continue;
+                            }
+                            let p1 = glam::Vec3::from_array(q.positions[1]);
+                            let p2 = glam::Vec3::from_array(q.positions[2]);
+                            let p3 = glam::Vec3::from_array(q.positions[3]);
+                            let center = (p0 + p1 + p2 + p3) * 0.25;
+                            if !center.is_finite() {
+                                continue;
+                            }
+                            let extent = p0.distance(p3).max(p1.distance(p2)).clamp(0.5, 16.0);
+                            let radius = (extent * 4.0).clamp(14.0, 42.0);
+                            let cell = (
+                                (center.x / 8.0).floor() as i32,
+                                (center.y / 8.0).floor() as i32,
+                                (center.z / 8.0).floor() as i32,
+                            );
+                            let entry = grid.entry(cell).or_insert((
+                                glam::Vec3::ZERO,
+                                glam::Vec3::ZERO,
+                                0.0,
+                                0.0,
+                                0,
+                            ));
+                            entry.0 += center;
+                            entry.1 = entry.1.max(col);
+                            entry.2 = entry.2.max(radius);
+                            entry.3 = entry.3.max(lum);
+                            entry.4 += 1;
+                        }
+                        let mut eff_lights: Vec<(
+                            f32,
+                            crate::modules::raywatcher::frame::PointLight,
+                        )> = grid
+                            .into_values()
+                            .filter_map(|(pos_sum, col, radius, max_lum, cnt)| {
+                                if cnt == 0 {
+                                    return None;
+                                }
+                                let pos = pos_sum / cnt as f32;
+                                let dist_sq = pos.distance_squared(camera.pos);
+                                let max_d = params.far + radius;
+                                if dist_sq > max_d * max_d {
+                                    return None;
+                                }
+                                // Steady clamped intensity avoids single-particle flash flicker.
+                                let intensity = (0.75 + max_lum * 0.85).clamp(0.8, 1.65);
+                                Some((
+                                    dist_sq,
+                                    crate::modules::raywatcher::frame::PointLight {
+                                        position: pos,
+                                        radius,
+                                        colour: col,
+                                        intensity,
+                                        casts_shadow: true,
+                                    },
+                                ))
+                            })
+                            .collect();
+                        eff_lights.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        eff_lights.truncate(eff_slots);
+                        point_lights.extend(eff_lights);
+                    }
                 }
                 point_lights.into_iter().map(|(_, l)| l).collect()
             } else {

@@ -887,9 +887,12 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let bits_ao = (effects & 8u) != 0u;
     let bits_gi = (effects & 16u) != 0u;
 
-    let slope_bias = (1.0 - clamp(normal.y, 0.0, 1.0)) * (0.25 + dist * 0.0025);
-    let bias = max(params.effects.z, max(0.15, dist * 0.003)) + slope_bias;
-    let ray_origin = point + normal * bias - view_dir * (bias * 0.35);
+    let steepness = 1.0 - clamp(normal.y, 0.0, 1.0);
+    let slope_bias = steepness * (0.65 + dist * 0.006);
+    let bias = max(params.effects.z, max(0.18, dist * 0.0035)) + slope_bias;
+    let ray_origin = point + normal * bias - view_dir * (bias * 0.40);
+    let shadow_t_min = max(bias * 0.85, 0.45);
+    let ao_t_min = max(bias * 0.75, 0.35);
     let n_dot_l = max(dot(normal, params.sun_dir.xyz), 0.0);
 
     var fog_t = 0.0;
@@ -926,7 +929,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let sun_onb = orthonormal_basis(params.sun_dir.xyz);
     let spread_tan = select(0.0, tan(params.lens.z), params.lens.z > 1e-4);
     let sun_luma = luminance(params.sun_colour.xyz);
-    let sun_strength = smoothstep(0.16, 0.36, sun_luma);
+    let sun_strength = smoothstep(0.28, 0.48, sun_luma);
     let gi_fade = 1.0 - clamp((dist - 150.0) / 70.0, 0.0, 1.0);
     let est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
     let receiver_albedo = clamp(raster_rgb / max(est_direct, vec3<f32>(0.18)), vec3<f32>(0.08), vec3<f32>(0.92));
@@ -943,7 +946,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                     let theta = f32(k) * 2.39996323 + rot_angle + f32(s) * 1.6180339;
                     shadow_dir = normalize(params.sun_dir.xyz + sun_onb * vec3<f32>(cos(theta) * r, sin(theta) * r, 0.0));
                 }
-                if (occluded(ray_origin, shadow_dir, bias * 0.5, params.lens.y, state ^ k)) {
+                if (occluded(ray_origin, shadow_dir, shadow_t_min, params.lens.y, state ^ k)) {
                     sun_hits = sun_hits + 1u;
                 }
             }
@@ -959,7 +962,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let phi = f32(i) * 2.39996323 + rot_angle + f32(s) * 0.7548776;
                 let r = sqrt(u1);
                 let d = onb * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
-                if (occluded(ray_origin, d, bias * 0.5, ao_radius, state ^ i)) {
+                if (occluded(ray_origin, d, ao_t_min, ao_radius, state ^ i)) {
                     hits = hits + 1u;
                 }
             }
@@ -1078,7 +1081,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                         }
                     }
                 }
-                accum_gi = accum_gi + receiver_albedo * gi_sum * (gi_fade / f32(gi_taps));
+                accum_gi = accum_gi + gi_sum * (gi_fade / f32(gi_taps));
             }
         }
     }
@@ -1095,11 +1098,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var pl_w_lit = 0.0;
     if (bits_lighting) {
         let pl_count = min(u32(round(params.point_light_meta.x)), 16u);
-        let r_max = max(raster_rgb.r, max(raster_rgb.g, raster_rgb.b));
-        let pl_albedo = select(
-            vec3<f32>(0.42),
-            clamp(raster_rgb / max(r_max, 0.28), vec3<f32>(0.22), vec3<f32>(0.95)),
-            r_max > 0.02);
+        // Pure incoming point-light irradiance; COMPOSITE_SHADER modulates by full-res raster albedo.
         for (var li = 0u; li < pl_count; li = li + 1u) {
             let pl_pr = params.point_lights_pos_rad[li];
             let pl_ci = params.point_lights_col_int[li];
@@ -1120,7 +1119,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                         pl_w_lit = pl_w_lit + w * pl_vis;
                         pl_debug_lit = pl_debug_lit + pl_ci.rgb * (w * pl_vis);
                         pl_debug_shadow = pl_debug_shadow + w * (1.0 - pl_vis);
-                        point_lighting = point_lighting + pl_albedo * pl_ci.rgb * (w * pl_vis * 1.85);
+                        point_lighting = point_lighting + pl_ci.rgb * (w * pl_vis * 2.1);
                     }
                 }
             }
@@ -1156,7 +1155,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     } else {
         let direct = select(vec3<f32>(0.0), params.sun_colour.xyz * (n_dot_l * avg_shadow), bits_lighting);
         let ambient = params.ambient.xyz * (avg_open * params.tuning.z);
-        let relit = raster_rgb * (direct + ambient) + avg_gi + point_lighting;
+        let relit = raster_rgb * (direct + ambient + avg_gi + point_lighting);
         out_rgb = mix(relit, params.fog_colour.xyz, fog_t);
         out_lf = 1.0;
     }
@@ -1447,7 +1446,7 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     // razor-sharp as soon as temporal history converges.
     let disocc = 1.0 - clamp((centre_moments.w - 1.0) / 3.0, 0.0, 1.0);
     let inv_sigma = (1.0 / max(params.weights.x * sqrt(centre_variance), 1e-6)) * mix(1.0, 0.35, disocc);
-    let lf_edge_k = mix(24.0, 8.0, disocc);
+    let lf_edge_k = mix(4.5, 2.5, disocc);
     let inv_depth_denom = 1.0 / max(params.weights.z * max(abs(centre_depth), 1e-3), 1e-6);
     let centre_raw = textureLoad(history_colour, pixel, 0);
     let centre = centre_raw.rgb;
@@ -1462,7 +1461,7 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var moment1 = centre_moments.x * w0;
     var moment2 = centre_moments.y * w0;
     let step = i32(params.misc.x);
-    let filter_lf = (step <= 1) || (step <= 2 && disocc > 0.25);
+    let filter_lf = step <= 2;
     for (var dy = -1; dy <= 1; dy = dy + 1) {
         let wy = kernel_weight(dy);
         for (var dx = -1; dx <= 1; dx = dx + 1) {
@@ -1501,7 +1500,7 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 moment1 = moment1 + moments.x * w_rgb;
                 moment2 = moment2 + moments.y * w_rgb;
             }
-            if (filter_lf && ndot > 0.85) {
+            if (filter_lf && ndot > 0.88) {
                 let w_lf = base_w * exp(-abs(centre_raw.a - sample_raw.a) * lf_edge_k);
                 if (w_lf > 1e-6) {
                     sum_lf = sum_lf + sample_raw.a * w_lf;
@@ -1638,7 +1637,10 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
         vec2<i32>(0),
         ndim - vec2<i32>(1),
     );
-    let n_center = load_unit_normal(n_center_coord);
+    let norm_raw = textureLoad(src_normals, n_center_coord, 0);
+    let n_len = length(norm_raw.xyz);
+    let n_center = select(vec3<f32>(0.0, 1.0, 0.0), norm_raw.xyz / n_len, n_len > 1e-4);
+    let center_roughness = norm_raw.w;
 
     let rt_f = i.uv * vec2<f32>(rt_dim) - vec2<f32>(0.5);
     let rt_base = vec2<i32>(round(rt_f));
@@ -1681,7 +1683,23 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
     let rt_fallback = textureLoad(src_rt, clamp(rt_base, vec2<i32>(0), rt_dim - vec2<i32>(1)), 0);
     let rt = select(rt_fallback, rt_sum / w_sum, w_sum > 1e-5);
     let light_factor = clamp(rt.a, 0.0, 1.0);
-    let layered = max(raster.rgb * light_factor + rt.rgb, vec3<f32>(0.0));
+    // Water (`roughness <= 0.12`) carries additive mirror reflections in `rt.rgb`.
+    // Land, buildings, and trees carry demodulated pure GI + point-light irradiance
+    // in `rt.rgb`, modulated here by the crisp full-resolution original raster texture
+    // so GI never stamps a blurry low-res grey copy over raster models.
+    var layered = vec3<f32>(0.0);
+    if (center_roughness <= 0.12) {
+        layered = max(raster.rgb * light_factor + rt.rgb, vec3<f32>(0.0));
+    } else {
+        let r_max = max(raster.r, max(raster.g, raster.b));
+        let full_albedo = select(
+            vec3<f32>(0.24),
+            clamp(raster.rgb / max(r_max, 0.28), vec3<f32>(0.0), vec3<f32>(1.0))
+                * clamp(r_max * 1.35, 0.24, 0.95),
+            r_max > 0.012,
+        );
+        layered = max(raster.rgb * light_factor + full_albedo * rt.rgb, vec3<f32>(0.0));
+    }
     return vec4<f32>(layered, raster.a);
 }
 "#;

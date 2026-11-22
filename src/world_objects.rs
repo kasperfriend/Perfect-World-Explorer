@@ -852,7 +852,7 @@ pub struct RtMeshTriangle {
 /// Hard per-page cap on retained CPU triangles so whole-world preloads across
 /// hundreds of pages stay within a few megabytes of RAM while near-camera
 /// buildings and props retain real mesh silhouettes for shadows & reflections.
-const MAX_RT_TRIS_PER_PAGE: usize = 32768;
+const MAX_RT_TRIS_PER_PAGE: usize = 131_072;
 
 #[inline]
 fn srgb_to_linear_u8(v: u8) -> f32 {
@@ -914,7 +914,7 @@ fn extract_rt_triangles(
     if tri_count == 0 {
         return Vec::new();
     }
-    let step = (tri_count / MAX_RT_TRIS_PER_PAGE).max(1);
+    // Never stride individual triangles (step > 1 deletes every 2nd triangle of quads!).
     let mut out = Vec::with_capacity(tri_count.min(MAX_RT_TRIS_PER_PAGE));
     let mut t = 0usize;
     while t < tri_count && out.len() < MAX_RT_TRIS_PER_PAGE {
@@ -1000,8 +1000,8 @@ fn extract_rt_triangles(
                     None
                 };
                 if let Some(ta) = tex_alpha {
-                    if ta < 0.22 {
-                        t += step;
+                    if ta < 0.08 {
+                        t += 1;
                         continue;
                     }
                 }
@@ -1067,7 +1067,7 @@ fn extract_rt_triangles(
                 });
             }
         }
-        t += step;
+        t += 1;
     }
     out
 }

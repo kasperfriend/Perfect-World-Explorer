@@ -351,7 +351,7 @@ struct Out {@builtin(position) pos:vec4<f32>,@location(0) normal:vec3<f32>,@loca
  // Complementary ordered coverage: old and new snapshots never both draw
  // at the same pixel, while the tree is fully visible at the endpoints.
  if i.fade.y>0.5 {let xy=vec2<u32>(i.pos.xy)%vec2<u32>(4u);let b=(((xy.x&1u)^(xy.y&1u))*8u)+((xy.y&1u)*4u)+((((xy.x>>1u)&1u)^((xy.y>>1u)&1u))*2u)+((xy.y>>1u)&1u);let d=(f32(b)+0.5)/16.;if (i.fade.y<1.5 && d<i.fade.x)||(i.fade.y>1.5 && d>=i.fade.x){discard;}}
- if camera.region_ambient.w>0.5 {
+ if camera.region_ambient.w>0.5 && camera.sun.w>=0. {
   let lambert=max(dot(normalize(i.normal),normalize(camera.region_direction.xyz)),0.);
   // These are regional light coefficients, not the original SpeedTree
   // material constants. The branch-only PS 1.4 shader's x2 operation is
@@ -664,7 +664,7 @@ impl FarTrees {
                             (leaf.uv[0][1] + leaf.uv[1][1] + leaf.uv[2][1] + leaf.uv[3][1]) * 0.25,
                         ];
                         let (albedo, alpha) = sample_rgba_uv(&tree.composite, uv_mid);
-                        if alpha < 0.35 {
+                        if alpha < 0.45 {
                             continue;
                         }
                         let n = leaf
@@ -679,30 +679,34 @@ impl FarTrees {
                         };
                         let right = up.cross(n).normalize_or_zero();
                         let bitan = n.cross(right).normalize_or_zero();
-                        // Inset leaf billboard corners slightly to match the alpha-cutout
-                        // foliage silhouette instead of the full rectangular card margin.
+                        // Trim square billboard corners into an organic diamond leaf hull
+                        // from the 4 edge midpoints so RT leaves never appear as flat boxes.
                         let corner = |j: usize| {
                             let c = leaf.corners[j];
-                            center + (right * c[0] + bitan * c[1] + n * c[2]) * 0.62
+                            center + (right * c[0] + bitan * c[1] + n * c[2]) * 0.56
                         };
-                        let (p0, p1, p2, p3) = (corner(0), corner(1), corner(2), corner(3));
-                        let opacity = (alpha * 0.65).clamp(0.28, 0.68);
-                        if (p1 - p0).cross(p2 - p0).length_squared() > 1e-8 {
+                        let (c0, c1, c2, c3) = (corner(0), corner(1), corner(2), corner(3));
+                        let m01 = (c0 + c1) * 0.5;
+                        let m12 = (c1 + c2) * 0.5;
+                        let m23 = (c2 + c3) * 0.5;
+                        let m30 = (c3 + c0) * 0.5;
+                        let opacity = (alpha * 0.72).clamp(0.35, 0.78);
+                        if (m12 - m01).cross(m23 - m01).length_squared() > 1e-8 {
                             lod_tris.push(RtTreeTriangle {
-                                a: p0,
-                                b: p1,
-                                c: p2,
+                                a: m01,
+                                b: m12,
+                                c: m23,
                                 normal: n,
                                 albedo,
                                 roughness: 0.84,
                                 opacity,
                             });
                         }
-                        if (p2 - p0).cross(p3 - p0).length_squared() > 1e-8 {
+                        if (m23 - m01).cross(m30 - m01).length_squared() > 1e-8 {
                             lod_tris.push(RtTreeTriangle {
-                                a: p0,
-                                b: p2,
-                                c: p3,
+                                a: m01,
+                                b: m23,
+                                c: m30,
                                 normal: n,
                                 albedo,
                                 roughness: 0.84,

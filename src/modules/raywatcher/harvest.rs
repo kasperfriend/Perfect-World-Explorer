@@ -516,16 +516,16 @@ impl Harvester {
                     );
                 }
                 // Unpack O(1)-cloned page Arc slices entirely off the main thread.
+                // Never stride individual triangles (`step > 1` skips every 2nd
+                // triangle of quads, turning sails/walls into checkerboards).
                 let mut page_added = 0usize;
                 for tris in &page_tris {
                     if tris.is_empty() || page_added >= page_tri_budget {
                         break;
                     }
-                    let remaining = page_tri_budget - page_added;
-                    let step = (tris.len() / remaining.max(1)).max(1);
-                    let mut ti = 0usize;
-                    while ti < tris.len() && page_added < page_tri_budget {
-                        let t = &tris[ti];
+                    let take = tris.len().min(page_tri_budget - page_added);
+                    real_meshes.reserve(take);
+                    for t in &tris[..take] {
                         real_meshes.push(MeshTriangle {
                             a: Vec3::from_array(t.a),
                             b: Vec3::from_array(t.b),
@@ -535,9 +535,8 @@ impl Harvester {
                             roughness: 0.72,
                             opacity: t.opacity,
                         });
-                        page_added += 1;
-                        ti += step;
                     }
+                    page_added += take;
                 }
                 let before_mesh = triangles.len();
                 push_real_meshes(&mut triangles, &mut materials, &real_meshes);
@@ -1428,7 +1427,7 @@ fn push_terrain_frustum(
             // within 0.1 world units on slopes and paths (no sharp wedges).
             let _ = fine_step;
             let cells_per_chunk = (chunk_size / base_cell.max(0.5)).round().max(8.0) as u32;
-            let (lod_band, divs) = if dist <= 64.0 {
+            let (lod_band, divs) = if dist <= 128.0 {
                 (0usize, cells_per_chunk.min(128))
             } else if dist <= near_r {
                 (0usize, (cells_per_chunk / 2).clamp(16, 64))

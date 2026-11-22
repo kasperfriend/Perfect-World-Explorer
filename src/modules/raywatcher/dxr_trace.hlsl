@@ -127,7 +127,10 @@ bool accept_opacity(uint prim, float2 bary, uint seed) {
     if (opacity >= 0.99) {
         return true;
     }
-    uint h = prim * 747796405u ^ uint(bary.x * 4096.0) * 2891336453u ^ uint(bary.y * 4096.0) * 1664525u ^ seed;
+    // Temporally stable deterministic cutout in primitive barycentric space
+    // (ignores frame-varying `seed` so foliage shadows never flicker white/black).
+    uint _unused = seed;
+    uint h = prim * 747796405u ^ uint(bary.x * 64.0) * 2891336453u ^ uint(bary.y * 64.0) * 1664525u;
     h ^= h >> 16u;
     float r = float(h & 0xffffu) / 65536.0;
     return r < opacity;
@@ -391,9 +394,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
 
     // Distance-scaled bias prevents self-intersection between the exact 1:1
     // raster depth surface and the BVH/BLAS geometry at all view distances.
-    float slope_bias = (1.0 - saturate(normal.y)) * (0.25 + dist * 0.0025);
-    float bias = max(params.effects.z, max(0.15, dist * 0.003)) + slope_bias;
-    float3 ray_origin = world_pos + normal * bias - view_dir * (bias * 0.35);
+    float steepness = 1.0 - saturate(normal.y);
+    float slope_bias = steepness * (0.65 + dist * 0.006);
+    float bias = max(params.effects.z, max(0.18, dist * 0.0035)) + slope_bias;
+    float3 ray_origin = world_pos + normal * bias - view_dir * (bias * 0.40);
+    float shadow_t_min = max(bias * 0.85, 0.45);
+    float ao_t_min = max(bias * 0.75, 0.35);
     float n_dot_l = max(dot(normal, params.sun_dir.xyz), 0.0);
 
     float fog_t = 0.0;
@@ -440,7 +446,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float3 sun_b = cross(params.sun_dir.xyz, sun_t);
     float spread_tan = (params.lens.z > 1e-4) ? tan(params.lens.z) : 0.0;
     float sun_luma = dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722));
-    float sun_strength = smoothstep(0.16, 0.36, sun_luma);
+    float sun_strength = smoothstep(0.28, 0.48, sun_luma);
     float gi_fade = 1.0 - saturate((dist - 150.0) / 70.0);
     float3 est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
     float3 receiver_albedo = clamp(
@@ -466,9 +472,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 bool hit_s = false;
                 if (dist > 96.0) {
                     // Distant shadows (>96u): pure fixed-function RT-core opaque hit (zero shader ejection).
-                    hit_s = occluded_fast(ray_origin, shadow_dir, bias * 0.5, params.lens.y);
+                    hit_s = occluded_fast(ray_origin, shadow_dir, shadow_t_min, params.lens.y);
                 } else {
-                    hit_s = occluded(ray_origin, shadow_dir, bias * 0.5, params.lens.y, state ^ k);
+                    hit_s = occluded(ray_origin, shadow_dir, shadow_t_min, params.lens.y, state ^ k);
                 }
                 if (hit_s) {
                     sun_hits = sun_hits + 1u;
@@ -490,7 +496,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 sincos(phi, s_phi, c_phi);
                 float z = sqrt(max(0.0, 1.0 - u1));
                 float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + normal * z;
-                if (occluded_fast(ray_origin, d, bias * 0.5, ao_radius)) {
+                if (occluded_fast(ray_origin, d, ao_t_min, ao_radius)) {
                     hits = hits + 1u;
                 }
             }
@@ -624,7 +630,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         }
                     }
                 }
-                accum_gi += receiver_albedo * gi_sum * (gi_fade / float(gi_taps));
+                accum_gi += gi_sum * (gi_fade / float(gi_taps));
             }
         }
     }
@@ -641,10 +647,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float pl_w_lit = 0.0;
     if (bits_lighting) {
         uint pl_count = min(uint(round(params.point_light_meta.x)), 16u);
-        float r_max = max(raster_rgb.r, max(raster_rgb.g, raster_rgb.b));
-        float3 pl_albedo = (r_max > 0.02)
-            ? clamp(raster_rgb / max(r_max, 0.28), float3(0.22, 0.22, 0.22), float3(0.95, 0.95, 0.95))
-            : float3(0.42, 0.42, 0.42);
+        // Pure incoming point-light irradiance; COMPOSITE_SHADER modulates by full-res raster albedo.
         for (uint li = 0u; li < pl_count; li = li + 1u) {
             float4 pl_pr = params.point_lights_pos_rad[li];
             float4 pl_ci = params.point_lights_col_int[li];
@@ -665,7 +668,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         pl_w_lit += w * pl_vis;
                         pl_debug_lit += pl_ci.rgb * (w * pl_vis);
                         pl_debug_shadow += w * (1.0 - pl_vis);
-                        point_lighting += pl_albedo * pl_ci.rgb * (w * pl_vis * 1.85);
+                        point_lighting += pl_ci.rgb * (w * pl_vis * 2.1);
                     }
                 }
             }
@@ -704,7 +707,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // instead of low-poly proxy boxes, relit purely by RT sun + RT ambient + point lights.
         float3 direct = bits_lighting ? (params.sun_colour.xyz * (n_dot_l * avg_shadow)) : float3(0.0, 0.0, 0.0);
         float3 ambient = params.ambient.xyz * (avg_open * params.tuning.z);
-        float3 relit = raster_rgb * (direct + ambient) + avg_gi + point_lighting;
+        float3 relit = raster_rgb * (direct + ambient + avg_gi + point_lighting);
         out_rgb = lerp(relit, params.fog_colour.xyz, fog_t);
         out_lf = 1.0;
     }
