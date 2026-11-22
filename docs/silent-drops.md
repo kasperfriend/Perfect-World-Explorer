@@ -5,7 +5,7 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | category | sites |
 |---|---|
 | named | 5 |
-| unreachable | 118 |
+| unreachable | 121 |
 | fix | 0 |
 | ? | 0 |
 
@@ -35,7 +35,7 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/client_detect.rs` | 1477 | `ok-question` | **probe** | `let declared = u64::from(u32::from_le_bytes(prefix[4..8].try_into().ok()?));` |
 | `src/client_detect.rs` | 1494 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(end - 4)).ok()?;` |
 | `src/client_detect.rs` | 1496 | `ok-question` | **probe** | `file.read_exact(&mut word).ok()?;` |
-| `src/direct_storage.rs` | 167 | `let-underscore` | **unreachable** | `let _ = (file, ranges);` |
+| `src/direct_storage.rs` | 195 | `let-underscore` | **unreachable** | `let _ = (file, ranges);` |
 | `src/dlss/fg.rs` | 200 | `let-underscore` | **unreachable** | `let _ = queue;` |
 | `src/dlss/fg.rs` | 305 | `let-underscore` | **unreachable** | `let _ = ring.retire(slot_index, &raw_queue, "DLSS FG");` |
 | `src/dlss/imp.rs` | 415 | `let-underscore` | **unreachable** | `let _ = queue;` |
@@ -81,27 +81,30 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/gpu.rs` | 479 | `let-underscore` | **unreachable** | `let _ = write!(` |
 | `src/gpu.rs` | 2542 | `let-underscore` | **unreachable** | `let _ = sky_transition.author(` |
 | `src/gpu.rs` | 3843 | `let-underscore` | **unreachable** | `let _ = e.begin_render_pass(&wgpu::RenderPassDescriptor {` |
-| `src/gpu.rs` | 5670 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
-| `src/gpu.rs` | 6502 | `unwrap_or_default` | **named** | `elapsed.unwrap_or_default(),` |
-| `src/gpu.rs` | 7301 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
-| `src/gpu.rs` | 7456 | `let-underscore` | **unreachable** | `let _ = &mut pass;` |
-| `src/gpu.rs` | 7717 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
-| `src/gpu.rs` | 7983 | `unwrap_or_default` | **unreachable** | `let on = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();` |
-| `src/gpu.rs` | 7986 | `unwrap_or_default` | **unreachable** | `let off = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();` |
-| `src/gpu.rs` | 8052 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
+| `src/gpu.rs` | 5957 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
+| `src/gpu.rs` | 6789 | `unwrap_or_default` | **named** | `elapsed.unwrap_or_default(),` |
+| `src/gpu.rs` | 7659 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
+| `src/gpu.rs` | 7814 | `let-underscore` | **unreachable** | `let _ = &mut pass;` |
+| `src/gpu.rs` | 8105 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
+| `src/gpu.rs` | 8371 | `unwrap_or_default` | **unreachable** | `let on = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();` |
+| `src/gpu.rs` | 8374 | `unwrap_or_default` | **unreachable** | `let off = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();` |
+| `src/gpu.rs` | 8440 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
 | `src/grass_random.rs` | 144 | `else-continue` | **unreachable** | `else {` |
 | `src/latency.rs` | 309 | `let-underscore` | **unreachable** | `let _ = end(1);` |
-| `src/launcher_ui.rs` | 143 | `ok-question` | **probe** | `decode(&fs::read(settings_file()?).ok()?)` |
+| `src/launcher_ui.rs` | 221 | `ok-question` | **probe** | `decode(&fs::read(settings_file()?).ok()?)` |
 | `src/load_status.rs` | 160 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
+| `src/loading_screen.rs` | 292 | `ok-question` | **probe** | `let number = number.parse::<u32>().ok()?;` |
+| `src/loading_screen.rs` | 397 | `ok-question` | **probe** | `let raw = std::env::var("PWE_LOADING_PICTURE").ok()?;` |
+| `src/loading_screen.rs` | 714 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default();` |
 | `src/model_asset.rs` | 362 | `unwrap_or_default` | **unreachable** | `(primary, beside.unwrap_or_default())` |
 | `src/model_dds.rs` | 191 | `let-underscore` | **unreachable** | `let _ = offset;` |
 | `src/model_draw_gpu.rs` | 693 | `else-continue` | **unreachable** | `else {` |
 | `src/music.rs` | 42 | `ok-question` | **probe** | `.ok()?;` |
 | `src/objects.rs` | 273 | `let-underscore` | **unreachable** | `let _ = MODEL_LOAD_LOGGER.set(logger);` |
-| `src/pck.rs` | 550 | `ok-question` | **probe** | `let len = fs::metadata(path).ok()?.len();` |
-| `src/pck.rs` | 557 | `ok-question` | **probe** | `let file = File::open(&pkx).ok()?;` |
-| `src/pck.rs` | 558 | `ok-question` | **probe** | `let len = file.metadata().ok()?.len();` |
-| `src/pck.rs` | 979 | `unwrap_or_default` | **unreachable** | `let mut name = self.path.file_stem().unwrap_or_default().to_os_string();` |
+| `src/pck.rs` | 604 | `ok-question` | **probe** | `let len = fs::metadata(path).ok()?.len();` |
+| `src/pck.rs` | 611 | `ok-question` | **probe** | `let file = File::open(&pkx).ok()?;` |
+| `src/pck.rs` | 612 | `ok-question` | **probe** | `let len = file.metadata().ok()?.len();` |
+| `src/pck.rs` | 1033 | `unwrap_or_default` | **unreachable** | `let mut name = self.path.file_stem().unwrap_or_default().to_os_string();` |
 | `src/sky_gpu.rs` | 1448 | `ok-question` | **probe** | `let mut file = File::open(element.join("configs.pck")).ok()?;` |
 | `src/sky_gpu.rs` | 1449 | `ok-question` | **probe** | `let entries = crate::angelica_pck::directory(&mut file).ok()?;` |
 | `src/sky_gpu.rs` | 1456 | `ok-question` | **probe** | `let list_bytes = pck::read_entry(&mut file, list).ok()?;` |
@@ -127,13 +130,14 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/weather_gpu.rs` | 74 | `unwrap_or_default` | **unreachable** | `rain.speed_variation.unwrap_or_default(),` |
 | `src/weather_gpu.rs` | 76 | `unwrap_or_default` | **unreachable** | `snow.speed_variation.unwrap_or_default(),` |
 | `src/weather_gpu.rs` | 313 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default();` |
-| `src/windows_setup.rs` | 120 | `ok-question` | **probe** | `.ok()?` |
-| `src/windows_setup.rs` | 442 | `let-underscore` | **unreachable** | `let _ = std::fs::write(std::path::PathBuf::from(path), message.as_bytes());` |
-| `src/windows_setup.rs` | 447 | `let-underscore` | **unreachable** | `let _ = tx.send(message);` |
-| `src/windows_setup.rs` | 581 | `let-underscore` | **unreachable** | `let _ = ready_tx.send(());` |
-| `src/windows_setup.rs` | 651 | `let-underscore` | **unreachable** | `let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(2));` |
-| `src/windows_setup.rs` | 667 | `let-underscore` | **unreachable** | `let _ = thread.join();` |
-| `src/windows_setup.rs` | 758 | `ok-question` | **probe** | `let data = fs::read(settings_file()?).ok()?;` |
+| `src/windows_setup.rs` | 123 | `ok-question` | **probe** | `.ok()?` |
+| `src/windows_setup.rs` | 445 | `let-underscore` | **unreachable** | `let _ = std::fs::write(std::path::PathBuf::from(path), message.as_bytes());` |
+| `src/windows_setup.rs` | 450 | `let-underscore` | **unreachable** | `let _ = tx.send(message);` |
+| `src/windows_setup.rs` | 1299 | `let-underscore` | **unreachable** | `let _ = ready_tx.send(());` |
+| `src/windows_setup.rs` | 1330 | `let-underscore` | **unreachable** | `let _ = ready_tx.send(());` |
+| `src/windows_setup.rs` | 1430 | `let-underscore` | **unreachable** | `let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(5));` |
+| `src/windows_setup.rs` | 1446 | `let-underscore` | **unreachable** | `let _ = thread.join();` |
+| `src/windows_setup.rs` | 1539 | `ok-question` | **probe** | `let data = fs::read(settings_file()?).ok()?;` |
 | `src/world_audio.rs` | 108 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
 | `src/world_audio.rs` | 220 | `let-underscore` | **unreachable** | `let _ = self.tx.send(request);` |
 | `src/world_audio.rs` | 222 | `let-underscore` | **unreachable** | `let _ = request;` |
@@ -149,25 +153,26 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/world_catalog.rs` | 426 | `ok-question` | **probe** | `let bytes = fs::read(dir.join("precinct.clt")).ok()?;` |
 | `src/world_catalog.rs` | 427 | `ok-question` | **probe** | `let text = decode_client_text(&bytes).ok()?;` |
 | `src/world_catalog.rs` | 461 | `ok-question` | **probe** | `let number = digits.parse::<u32>().ok()?;` |
-| `src/world_handoff.rs` | 112 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
-| `src/world_handoff.rs` | 122 | `let-underscore` | **unreachable** | `let _ = fs::write(&files.focus, b"focused");` |
-| `src/world_handoff.rs` | 123 | `let-underscore` | **unreachable** | `let _ = fs::remove_file(&files.hwnd);` |
-| `src/world_handoff.rs` | 124 | `let-underscore` | **unreachable** | `let _ = fs::remove_file(&files.ready);` |
-| `src/world_handoff.rs` | 125 | `let-underscore` | **unreachable** | `let _ = fs::remove_file(&files.status);` |
-| `src/world_handoff.rs` | 141 | `let-underscore` | **unreachable** | `let _ = fs::write(&self.focus, value);` |
-| `src/world_handoff.rs` | 152 | `ok-question` | **probe** | `.ok()?` |
-| `src/world_handoff.rs` | 160 | `let-underscore` | **unreachable** | `let _ = fs::remove_file(path);` |
-| `src/world_handoff.rs` | 194 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Progress(status.clone()));` |
-| `src/world_handoff.rs` | 221 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Ready { activated });` |
-| `src/world_handoff.rs` | 225 | `let-underscore` | **unreachable** | `let _ = child.kill();` |
-| `src/world_handoff.rs` | 226 | `let-underscore` | **unreachable** | `let _ = child.wait();` |
-| `src/world_handoff.rs` | 228 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Failed(reason));` |
-| `src/world_handoff.rs` | 237 | `let-underscore` | **unreachable** | `let _ = child.kill();` |
-| `src/world_handoff.rs` | 238 | `let-underscore` | **unreachable** | `let _ = child.wait();` |
-| `src/world_handoff.rs` | 266 | `let-underscore` | **unreachable** | `let _ = fs::write(path, hwnd.to_string());` |
-| `src/world_handoff.rs` | 274 | `let-underscore` | **unreachable** | `let _ = fs::write(path, message.as_bytes());` |
-| `src/world_handoff.rs` | 282 | `let-underscore` | **unreachable** | `let _ = fs::write(path, format!("{FAILED_PREFIX}{reason}"));` |
-| `src/world_handoff.rs` | 298 | `let-underscore` | **unreachable** | `let _ = fs::write(path, b"ready");` |
+| `src/world_handoff.rs` | 117 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
+| `src/world_handoff.rs` | 127 | `let-underscore` | **unreachable** | `let _ = fs::write(&files.focus, b"focused");` |
+| `src/world_handoff.rs` | 128 | `let-underscore` | **unreachable** | `let _ = fs::remove_file(&files.hwnd);` |
+| `src/world_handoff.rs` | 129 | `let-underscore` | **unreachable** | `let _ = fs::remove_file(&files.ready);` |
+| `src/world_handoff.rs` | 130 | `let-underscore` | **unreachable** | `let _ = fs::remove_file(&files.status);` |
+| `src/world_handoff.rs` | 146 | `let-underscore` | **unreachable** | `let _ = fs::write(&self.focus, value);` |
+| `src/world_handoff.rs` | 157 | `ok-question` | **probe** | `.ok()?` |
+| `src/world_handoff.rs` | 165 | `let-underscore` | **unreachable** | `let _ = fs::remove_file(path);` |
+| `src/world_handoff.rs` | 200 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Progress(status.clone()));` |
+| `src/world_handoff.rs` | 205 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::WindowShown);` |
+| `src/world_handoff.rs` | 231 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Ready { activated });` |
+| `src/world_handoff.rs` | 235 | `let-underscore` | **unreachable** | `let _ = child.kill();` |
+| `src/world_handoff.rs` | 236 | `let-underscore` | **unreachable** | `let _ = child.wait();` |
+| `src/world_handoff.rs` | 238 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Failed(reason));` |
+| `src/world_handoff.rs` | 247 | `let-underscore` | **unreachable** | `let _ = child.kill();` |
+| `src/world_handoff.rs` | 248 | `let-underscore` | **unreachable** | `let _ = child.wait();` |
+| `src/world_handoff.rs` | 276 | `let-underscore` | **unreachable** | `let _ = fs::write(path, hwnd.to_string());` |
+| `src/world_handoff.rs` | 284 | `let-underscore` | **unreachable** | `let _ = fs::write(path, message.as_bytes());` |
+| `src/world_handoff.rs` | 292 | `let-underscore` | **unreachable** | `let _ = fs::write(path, format!("{FAILED_PREFIX}{reason}"));` |
+| `src/world_handoff.rs` | 308 | `let-underscore` | **unreachable** | `let _ = fs::write(path, b"ready");` |
 | `src/world_objects.rs` | 653 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Error(e));` |
 | `src/world_objects.rs` | 681 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
 | `src/world_objects.rs` | 696 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |

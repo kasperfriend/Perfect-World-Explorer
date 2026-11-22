@@ -12,24 +12,24 @@
 
 src/model_dds.rs:191 unreachable bytes past the declared mip chain are ignored on purpose; a short file is refused above, so nothing is lost
 src/gfx_light.rs:366 unreachable the version gate was removed deliberately; `version` is kept only to document what used to gate the layout
-src/direct_storage.rs:167 unreachable the non-DirectStorage build's stub; there is no result to lose when the feature is compiled out
+src/direct_storage.rs:195 unreachable the non-DirectStorage build's stub; there is no result to lose when the feature is compiled out
 src/latency.rs:309 unreachable an end-of-frame latency marker's return code is a driver status, not content; no loader category owns it
 src/objects.rs:273 unreachable OnceLock::set: a second logger would be a programming error, and the first is the one used
 src/gfx_file.rs:1395 unreachable `accurate_aabb` is intentionally unread: the flag describes a bound this build derives instead
 src/gfx_player.rs:1748 unreachable `root_path` is intentionally unread at this call site; the path is carried by the element
-src/gpu.rs:7456 unreachable `&mut pass` reborrow to end a borrow; no value is produced
+src/gpu.rs:7814 unreachable `&mut pass` reborrow to end a borrow; no value is produced
 src/gpu.rs:2542 unreachable `author()` writes into the recorder it is given; the return value carries nothing
 src/gpu.rs:3843 unreachable begin_render_pass returns the encoder-owned pass, which is then used through the handle
-src/gpu.rs:5670 unreachable cursor grab can legitimately fail in windowed mode and is retried; not content
-src/gpu.rs:7301 unreachable cursor grab can legitimately fail in windowed mode and is retried; not content
+src/gpu.rs:5957 unreachable cursor grab can legitimately fail in windowed mode and is retried; not content
+src/gpu.rs:7659 unreachable cursor grab can legitimately fail in windowed mode and is retried; not content
 src/gfx_player.rs:3349 unreachable let-else on a control that is not a Fractal: this loop asks for the Fractal, so another kind is not a loss
 src/model_draw_gpu.rs:693 unreachable let-else on a mesh that is absent by construction: draw_alpha_mesh is only called for indices alpha_meshes lists
 src/xess/imp.rs:323 unreachable `queue` is kept alive past the call; no result
 src/xess/fg.rs:506 unreachable `queue` is kept alive past the call; no result
-src/windows_setup.rs:447 unreachable mpsc send to the UI: a closed receiver means the window is gone, and the work is moot
-src/windows_setup.rs:581 unreachable mpsc ready signal: a closed receiver means the caller stopped waiting
-src/windows_setup.rs:651 unreachable recv_timeout on a ready signal is advisory: the timeout is the point
-src/windows_setup.rs:667 unreachable thread.join on a worker whose result is read through the channel above
+src/windows_setup.rs:450 unreachable mpsc send to the UI: a closed receiver means the window is gone, and the work is moot
+src/windows_setup.rs:1299 unreachable mpsc ready signal: a closed receiver means the caller stopped waiting
+src/windows_setup.rs:1430 unreachable recv_timeout on a ready signal is advisory: the timeout is the point
+src/windows_setup.rs:1446 unreachable thread.join on a worker whose result is read through the channel above
 src/world_audio.rs:220 unreachable mpsc send to the mixer: a closed receiver means audio is shutting down
 src/world_audio.rs:222 unreachable `request` is dropped after a failed send, which is the same as the receiver being gone
 src/world_audio.rs:290 unreachable mpsc status to the UI: a closed receiver means the window is gone
@@ -37,21 +37,21 @@ src/world_audio.rs:297 unreachable mpsc status to the UI: a closed receiver mean
 src/world_audio.rs:322 unreachable mpsc status to the UI: a closed receiver means the window is gone
 src/world_audio.rs:379 unreachable mpsc status to the UI: a closed receiver means the window is gone
 src/world_audio.rs:385 unreachable mpsc status to the UI: a closed receiver means the window is gone
-src/world_handoff.rs:194 unreachable mpsc progress to the UI: a closed receiver means the window is gone
-src/world_handoff.rs:221 unreachable mpsc ready to the UI: a closed receiver means the window is gone
-src/world_handoff.rs:225 unreachable child.kill on a process we are abandoning
-src/world_handoff.rs:226 unreachable child.wait after kill; the exit status of an abandoned child carries nothing
-src/world_handoff.rs:228 unreachable mpsc failure to the UI: a closed receiver means the window is gone
-src/world_handoff.rs:237 unreachable child.kill on a process we are abandoning
-src/world_handoff.rs:238 unreachable child.wait after kill; the exit status of an abandoned child carries nothing
+src/world_handoff.rs:200 unreachable mpsc progress to the UI: a closed receiver means the window is gone
+src/world_handoff.rs:231 unreachable mpsc ready to the UI: a closed receiver means the window is gone
+src/world_handoff.rs:235 unreachable child.kill on a process we are abandoning
+src/world_handoff.rs:236 unreachable child.wait after kill; the exit status of an abandoned child carries nothing
+src/world_handoff.rs:238 unreachable mpsc failure to the UI: a closed receiver means the window is gone
+src/world_handoff.rs:247 unreachable child.kill on a process we are abandoning
+src/world_handoff.rs:248 unreachable child.wait after kill; the exit status of an abandoned child carries nothing
 src/world_objects.rs:653 unreachable mpsc error to the UI: a closed receiver means the window is gone
 src/world_objects.rs:681 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
 src/world_objects.rs:696 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
 src/world_objects.rs:706 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
 src/world_objects.rs:712 unreachable mpsc done to the UI: a closed receiver means the window is gone
 src/world_objects.rs:958 unreachable mpsc done to the UI: a closed receiver means the window is gone
-src/gpu.rs:7717 unreachable mpsc send of a worker result whose receiver is the caller that already returned
-src/gpu.rs:8052 unreachable mpsc send of a worker result whose receiver is the caller that already returned
+src/gpu.rs:8105 unreachable mpsc send of a worker result whose receiver is the caller that already returned
+src/gpu.rs:8440 unreachable mpsc send of a worker result whose receiver is the caller that already returned
 src/dlss/fg.rs:200 unreachable an SDK destroy call's status: the context is being torn down
 src/dlss/fg.rs:305 unreachable an SDK destroy call's status: the context is being torn down
 src/dlss/imp.rs:415 unreachable an SDK destroy call's status: the context is being torn down
@@ -96,31 +96,17 @@ src/dlss/loader.rs:1567 unreachable a cleanup status on teardown; the context is
 src/fsr/fg.rs:568 unreachable an absent SDK option is the documented default value
 src/fsr/fg.rs:578 unreachable an absent SDK option is the documented default value
 src/fsr/imp.rs:1404 unreachable an absent SDK option is the documented default value
-src/gpu.rs:7983 unreachable an absent frame option is the documented default value
-src/gpu.rs:7986 unreachable an absent frame option is the documented default value
 src/gpu.rs:473 unreachable a write! into a String cannot fail; the result is the byte count
 src/gpu.rs:479 unreachable a write! into a String cannot fail; the result is the byte count
 src/model_asset.rs:362 unreachable an absent optional field is the documented default of the record
 src/world_audio.rs:108 unreachable an absent optional field is the documented default of the setting
-src/world_handoff.rs:112 unreachable an absent optional field is the documented default of the handoff request
 src/gfx_effect_gpu.rs:555 unreachable the scratch pool is empty-handed a fresh Vec, which is what the pool is for
 src/load_status.rs:160 unreachable `reasons` returns Vec; unfit lock gives no reasons, which is the honest empty answer
-src/windows_setup.rs:442 unreachable mpsc progress send to the UI: a closed receiver means the window is gone
 src/terrain_store.rs:453 unreachable a directory removal whose failure the next create reports
 src/terrain_store.rs:626 unreachable a cleanup unlink of a temp file
 src/terrain_store.rs:639 unreachable a cleanup unlink of a temp file
 src/terrain_store.rs:806 unreachable a cleanup unlink of a temp file
 src/terrain_store.rs:808 unreachable a cleanup unlink of a temp file
-src/world_handoff.rs:122 unreachable an unlink of a stale marker
-src/world_handoff.rs:123 unreachable an unlink of a stale marker
-src/world_handoff.rs:124 unreachable an unlink of a stale marker
-src/world_handoff.rs:125 unreachable an unlink of a stale marker
-src/world_handoff.rs:141 unreachable an unlink of a stale marker
-src/world_handoff.rs:160 unreachable an unlink of a stale marker
-src/world_handoff.rs:266 unreachable an unlink of a stale marker
-src/world_handoff.rs:274 unreachable an unlink of a stale marker
-src/world_handoff.rs:282 unreachable an unlink of a stale marker
-src/world_handoff.rs:298 unreachable an unlink of a stale marker
 src/world_page_cache.rs:243 unreachable a cache eviction unlink; a failure is retried on the next write
 src/world_page_cache.rs:302 unreachable a cache eviction unlink; a failure is retried on the next write
 src/world_catalog.rs:90 unreachable an absent record set is the documented default: this instance simply has no list entry
@@ -132,3 +118,21 @@ src/gfx_effect_gpu.rs:821 unreachable else-continue over an element kind this pa
 # check above has already proven `n` is in range. A stem-less path cannot occur
 # because a package rejected every path without a file stem when it opened.
 src/pck.rs unreachable caller already range-checked n; the stem exists because Package::open rejects a path without one; code: let mut name = self.path.file_stem().unwrap_or_default().to_os_string();
+
+src/windows_setup.rs:1330 unreachable mpsc ready signal: a closed receiver means the caller stopped waiting
+src/world_handoff.rs:205 unreachable mpsc window-shown signal to the UI: a closed receiver means the window is gone
+src/gpu.rs:8371 unreachable an absent frame option is the documented default value
+src/gpu.rs:8374 unreachable an absent frame option is the documented default value
+src/loading_screen.rs:714 unreachable pre-epoch system clock falls back to zero duration for random seed
+src/windows_setup.rs:445 unreachable mpsc progress send to the UI: a closed receiver means the window is gone
+src/world_handoff.rs:117 unreachable an absent optional field is the documented default of the handoff request
+src/world_handoff.rs:127 unreachable an unlink of a stale marker
+src/world_handoff.rs:128 unreachable an unlink of a stale marker
+src/world_handoff.rs:129 unreachable an unlink of a stale marker
+src/world_handoff.rs:130 unreachable an unlink of a stale marker
+src/world_handoff.rs:146 unreachable an unlink of a stale marker
+src/world_handoff.rs:165 unreachable an unlink of a stale marker
+src/world_handoff.rs:276 unreachable an unlink of a stale marker
+src/world_handoff.rs:284 unreachable an unlink of a stale marker
+src/world_handoff.rs:292 unreachable an unlink of a stale marker
+src/world_handoff.rs:308 unreachable an unlink of a stale marker
