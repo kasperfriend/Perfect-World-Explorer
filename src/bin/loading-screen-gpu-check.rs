@@ -90,6 +90,8 @@ fn build_pck(files: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut footer = vec![0u8; 280];
     footer[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
     footer[8..12].copy_from_slice(&(table_pos ^ MASK).to_le_bytes());
+    let desc = b"Angelica File Package, Perfect World Co. Ltd.";
+    footer[16..16 + desc.len()].copy_from_slice(desc);
     footer[268..272].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
     footer[272..276].copy_from_slice(&(files.len() as u32).to_le_bytes());
     footer[276..280].copy_from_slice(&0x20002u32.to_le_bytes());
