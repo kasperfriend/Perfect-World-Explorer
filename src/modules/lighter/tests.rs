@@ -5471,3 +5471,18 @@ fn c6_enabling_lighter_starts_cold_ray_worker_before_reload_completes() {
         super::ReloadOutcome::Pending
     );
 }
+
+#[test]
+fn f1_overlay_hold_last_frame_state_resets_cleanly_on_history_reset() {
+    let mut lighter = Lighter::default();
+    lighter.settings.mode = Mode::Hardware;
+    lighter.settings.ray_lighting = true;
+    lighter.settings.reference = false;
+    lighter.last_overlay_extent = Some([1280, 720, 1920, 1080]);
+    lighter.frame_index = 5;
+    lighter.reset_history();
+    assert_eq!(
+        lighter.last_overlay_extent, None,
+        "reset_history must clear last_overlay_extent so stale overlays are never re-composited"
+    );
+}

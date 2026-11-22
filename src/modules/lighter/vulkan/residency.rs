@@ -6,8 +6,10 @@ use super::*;
 use crate::modules::lighter::residency::{texel_capacity, Cursor, Source, Span, Stats, Target};
 
 const BLAS_PER_BATCH: usize = 8;
+const STARTUP_BLAS_PER_BATCH: usize = 32;
 const MESHES_PER_POLL: usize = 512;
 const PRIMITIVES_PER_BATCH: usize = 32 * 1024;
+const STARTUP_PRIMITIVES_PER_BATCH: usize = 128 * 1024;
 
 /// A second command buffer on the same provisioned Vulkan queue. Fence
 /// polling controls staging reuse; there is no queue wait or ownership
@@ -69,7 +71,7 @@ impl Lane {
                 d.create_query_pool(
                     &vk::QueryPoolCreateInfo::builder()
                         .query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
-                        .query_count(BLAS_PER_BATCH as u32),
+                        .query_count(STARTUP_BLAS_PER_BATCH.max(BLAS_PER_BATCH) as u32),
                     None,
                 )
             }
@@ -357,10 +359,21 @@ impl ResidentUpload {
             }
             let count = mesh.rt_triangles as usize;
             // A single indivisible BLAS may exceed the triangle target.
+            // During initial startup, batch up to STARTUP_BLAS_PER_BATCH /
+            // STARTUP_PRIMITIVES_PER_BATCH per submit (well below TDR while
+            // avoiding 500+ single-BLAS frames).
+            let max_blas = if self.startup {
+                STARTUP_BLAS_PER_BATCH
+            } else {
+                BLAS_PER_BATCH
+            };
+            let max_primitives = if self.startup {
+                STARTUP_PRIMITIVES_PER_BATCH
+            } else {
+                PRIMITIVES_PER_BATCH
+            };
             if !builds.is_empty()
-                && (self.startup
-                    || builds.len() == BLAS_PER_BATCH
-                    || primitives + count > PRIMITIVES_PER_BATCH)
+                && (builds.len() == max_blas || primitives + count > max_primitives)
             {
                 break;
             }

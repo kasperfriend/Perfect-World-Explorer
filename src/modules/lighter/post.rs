@@ -193,6 +193,12 @@ impl History {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LastOutput {
+    Filtered,
+    History(usize),
+}
+
 pub(super) struct Post {
     layout: wgpu::BindGroupLayout,
     accumulate: wgpu::ComputePipeline,
@@ -201,6 +207,7 @@ pub(super) struct Post {
     history: [Option<Storage>; 2],
     filtered: Option<Storage>,
     history_write: usize,
+    last_output: Option<LastOutput>,
     accumulate_bind: Bindings<4, 2>,
     denoise_bind: Bindings<4, 4>,
     buffers_created: u64,
@@ -264,6 +271,7 @@ impl Post {
             history: [None, None],
             filtered: None,
             history_write: 0,
+            last_output: None,
             accumulate_bind: Bindings::default(),
             denoise_bind: Bindings::default(),
             buffers_created: 1,
@@ -284,6 +292,20 @@ impl Post {
                 .filter_map(|s| s.as_ref())
                 .map(|s| s.0.size())
                 .sum::<u64>()
+    }
+
+    /// Returns the last completed post-processed buffer owned solely by `Post`
+    /// (never the raw Vulkan interop buffer), safe to re-composite while Vulkan
+    /// RT is busy tracing the next frame.
+    pub(super) fn last_output(&self) -> Option<&wgpu::Buffer> {
+        match self.last_output? {
+            LastOutput::Filtered => self.filtered.as_ref().map(|s| &s.0),
+            LastOutput::History(slot) => self.history[slot].as_ref().map(|s| &s.0),
+        }
+    }
+
+    pub(super) fn clear_last_output(&mut self) {
+        self.last_output = None;
     }
 
     pub(super) fn allocation_counts(&self) -> (u64, u64) {
@@ -337,6 +359,7 @@ impl Post {
             self.buffers_created +=
                 u64::from(allocate(&mut self.filtered, "Lighter filtered image"));
         }
+        self.last_output = None;
         if !denoise && !progress {
             if let Some(t) = timed {
                 t.stamp(encoder, 2);
@@ -376,6 +399,7 @@ impl Post {
         if progress {
             let next = &self.history[self.history_write].as_ref().unwrap().0;
             let previous = &self.history[self.history_write ^ 1].as_ref().unwrap().0;
+            let written_slot = self.history_write;
             self.history_write ^= 1;
             let label = "Lighter accumulate radiance";
             let bind = self.accumulate_bind.get(
@@ -386,6 +410,7 @@ impl Post {
             );
             dispatch(encoder, label, &self.accumulate, bind);
             image = next;
+            self.last_output = Some(LastOutput::History(written_slot));
         }
         if let Some(t) = timed {
             t.stamp(encoder, 2);
@@ -415,6 +440,11 @@ impl Post {
                 dispatch(encoder, label, pipeline, bind);
                 image = next;
             }
+            self.last_output = if stages % 2 == 1 {
+                Some(LastOutput::Filtered)
+            } else {
+                None
+            };
         }
         image
     }

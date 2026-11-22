@@ -1359,6 +1359,9 @@ pub struct Lighter {
     screen_written: bool,
     screen_last_flags: u32,
     last_trace_extent: (u32, u32),
+    /// Extent of the last completed overlay frame held in `self.post`, used to
+    /// re-composite seamlessly when Vulkan RT is still tracing the next frame.
+    last_overlay_extent: Option<[u32; 4]>,
     last_primary: [u64; 2],
     game_profile: Option<[f32; 4]>,
     game_profile_active: bool,
@@ -1440,6 +1443,7 @@ impl Default for Lighter {
             screen_written: false,
             screen_last_flags: 0,
             last_trace_extent: (0, 0),
+            last_overlay_extent: None,
             last_primary: [0, 0],
             game_profile: game_profile::requested(),
             game_profile_active: false,
@@ -2064,6 +2068,7 @@ impl Lighter {
         // Post-processing state depends on history; reset it so the next
         // progressive render rebuilds Post with a clean history_write index.
         self.post = None;
+        self.last_overlay_extent = None;
     }
 
     pub fn fail_frame(&mut self, error: String) {
@@ -2614,8 +2619,41 @@ impl Lighter {
             }
             match self.prepare_window_frame(device, w, h, true) {
                 Ok(false) => {
-                    if self.hardware.is_some() && self.cold_ray.is_none() {
+                    let staging_initial = self.cold_ray.is_none()
+                        && self
+                            .hardware
+                            .as_ref()
+                            .is_some_and(|h| !h.initial_residency_done(self.revision));
+                    if staging_initial {
                         self.status = Some("Staging initial RT acceleration structures…".into());
+                        return Ok(false);
+                    }
+                    if self.cold_ray.is_some() {
+                        return Ok(false);
+                    }
+                    // Initial residency is done; Vulkan RT is simply still finishing
+                    // the previous frame's trace. Re-composite the last completed
+                    // denoised overlay buffer from `self.post` (never touching raw
+                    // Vulkan output) so RT shadows and lighting never blink off.
+                    if let (Some(post), Some(present), Some(last_extent)) = (
+                        &self.post,
+                        &mut self.present_overlay,
+                        self.last_overlay_extent,
+                    ) {
+                        if last_extent[2] == w && last_extent[3] == h {
+                            if let Some(last_buf) = post.last_output() {
+                                present.draw(
+                                    device,
+                                    queue,
+                                    encoder,
+                                    last_buf,
+                                    last_extent,
+                                    raster_depth,
+                                    target,
+                                );
+                                return Ok(true);
+                            }
+                        }
                     }
                     return Ok(false);
                 }
@@ -2631,6 +2669,26 @@ impl Lighter {
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         let ready = self.prepare_frame(device, w, h)?;
         if !ready {
+            if let (Some(post), Some(present), Some(last_extent)) = (
+                &self.post,
+                &mut self.present_overlay,
+                self.last_overlay_extent,
+            ) {
+                if last_extent[2] == w && last_extent[3] == h {
+                    if let Some(last_buf) = post.last_output() {
+                        present.draw(
+                            device,
+                            queue,
+                            encoder,
+                            last_buf,
+                            last_extent,
+                            raster_depth,
+                            target,
+                        );
+                        return Ok(true);
+                    }
+                }
+            }
             return Ok(false);
         }
         self.log_session_if_needed();
@@ -2846,6 +2904,11 @@ impl Lighter {
         }
         self.frame_error = None;
         self.last_trace_extent = (rw, rh);
+        self.last_overlay_extent = if self.post.as_ref().and_then(|p| p.last_output()).is_some() {
+            Some(frame.extent)
+        } else {
+            None
+        };
         self.frame_index += 1;
 
         // Record verbose frame timing sample and keep ring buffer for CSV export.

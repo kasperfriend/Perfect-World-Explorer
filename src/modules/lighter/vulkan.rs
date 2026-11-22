@@ -1295,6 +1295,10 @@ impl Renderer {
         }
     }
 
+    pub(super) fn initial_residency_done(&self, revision: u64) -> bool {
+        self.revision == Some(revision)
+    }
+
     pub(super) fn initial_residency(
         &mut self,
         revision: u64,
@@ -1304,7 +1308,9 @@ impl Renderer {
         if self.revision == Some(revision) {
             return Ok((true, super::residency::Stats::default()));
         }
-        let limit = 1 << 20;
+        // 16 MiB staging batches keep each GPU transfer well under 1 ms while
+        // cutting initial world upload from ~140 frames (~25s) to ~10 frames.
+        let limit = 16 << 20;
         if self.stage_resident_inner(revision, packet, textures, limit, true)? {
             return self
                 .publish_resident(revision, textures)
