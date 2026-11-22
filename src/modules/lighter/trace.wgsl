@@ -1906,24 +1906,28 @@ fn render_overlay_pixel(id: vec2<u32>) {
         }
     }
 
-    // 4. Fresnel-weighted RT reflections (grazing/water/glossy surfaces, distance-culled).
+    // 4. Fresnel-weighted RT reflections (crisp on flat water-like surfaces, restrained on matte terrain/walls).
     let refl_fade = 1.0 - smoothstep(220.0, 280.0, dist);
     if (frame.options.x & REFLECTIONS) != 0u && refl_fade > 0.01 {
         let ndotv = max(dot(n, v), 0.0);
         let fresnel = 0.04 + 0.96 * pow(1.0 - ndotv, 5.0);
-        if fresnel > 0.12 {
+        let is_water_like = n.y > 0.96;
+        let refl_thresh = select(0.30, 0.08, is_water_like);
+        if fresnel > refl_thresh {
             let refl_dir = reflect(-v, n);
             if dot(refl_dir, n) > 0.0 {
                 let refl_dist = min(frame.eye.w, 256.0);
                 let r_ray = Ray(origin, refl_dir, 0.02, refl_dist, 0.0, 0.03, 0.5, pixel_id);
                 let r_hit = intersect(r_ray, Query(SPECULAR, SECONDARY_MASK, false, vec2<u32>(NIL)));
+                let hit_scale = select(0.14, 0.48, is_water_like);
+                let sky_scale = select(0.08, 0.28, is_water_like);
                 if r_hit.instance != NIL {
                     let rs = surface(r_hit, r_ray);
                     let r_ndotl = max(dot(rs.n, light_dir), 0.0);
                     let r_lit = rs.color.rgb * (light_color * r_ndotl + frame.ambient.rgb) + rs.emission;
-                    added_rgb += r_lit * (fresnel * 0.40 * refl_fade);
+                    added_rgb += r_lit * (fresnel * hit_scale * refl_fade);
                 } else {
-                    added_rgb += environment(r_ray, true) * (fresnel * 0.22 * refl_fade);
+                    added_rgb += environment(r_ray, true) * (fresnel * sky_scale * refl_fade);
                 }
             }
         }

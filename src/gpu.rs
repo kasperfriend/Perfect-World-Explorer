@@ -2918,15 +2918,13 @@ impl Renderer {
         let daylight = crate::environment::daylight(camera.time_of_day);
         let angle = (camera.time_of_day - 6.0) * std::f32::consts::PI / 12.0;
         let twilight = (1. - ((angle.sin().abs()) / 0.35).clamp(0., 1.)) * daylight;
+        let use_terrain_lightmaps = camera.terrain_lightmaps
+            && !(!self.local_scenery_skipped && self.lighter.suppresses_native_terrain_shadows());
         let sun = [
             angle.cos() * 0.8,
             angle.sin().max(0.05),
             0.46,
-            if camera.terrain_lightmaps {
-                daylight
-            } else {
-                -1.
-            },
+            if use_terrain_lightmaps { daylight } else { -1. },
         ];
         let light = [
             0.17 + 0.38 * daylight,
@@ -3095,7 +3093,9 @@ impl Renderer {
         };
         self.sky
             .update(&self.queue, direction, w, h, frame, main_sets, false);
-        if camera.water_reflections {
+        let native_water_reflections = camera.water_reflections
+            && !(!self.local_scenery_skipped && self.lighter.suppresses_native_water_reflections());
+        if native_water_reflections {
             self.sky
                 .update(&self.queue, direction, w, h, frame, reflected_sets, true);
         }
@@ -4024,6 +4024,8 @@ impl Renderer {
         );
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&normal));
+        let native_water_reflections = camera.water_reflections
+            && !(!self.local_scenery_skipped && self.lighter.suppresses_native_water_reflections());
         self.water.update(
             &self.queue,
             &crate::water_gpu::WaterUniform {
@@ -4034,7 +4036,7 @@ impl Renderer {
                     w as f32,
                     h as f32,
                     camera.far,
-                    if camera.water_reflections { 1. } else { 0. },
+                    if native_water_reflections { 1. } else { 0. },
                 ],
                 animation: [
                     crate::water_gpu::normal_phase(frame.elapsed64),
@@ -4042,7 +4044,7 @@ impl Renderer {
                     0.,
                     crate::water_gpu::normal_offset_angle(frame.elapsed64),
                 ],
-                edge_mode: [if camera.water_reflections { 1. } else { 0. }, 0., 0., 0.],
+                edge_mode: [if native_water_reflections { 1. } else { 0. }, 0., 0., 0.],
                 // Water-surface fog: the client binds the region's own triple
                 // (white 100..400 above water, blue 10..60 below).
                 fog: frame.active_fog_range,
@@ -4189,7 +4191,7 @@ impl Renderer {
         // this copy can never be read: the only frame that needs it is one with
         // reflections off, where no per-plane pass runs and the surface still
         // samples the refraction by screen UV.
-        if !camera.water_reflections
+        if !native_water_reflections
             && self
                 .water_batches
                 .iter()
@@ -4257,7 +4259,7 @@ impl Renderer {
                 );
             });
         }
-        if !camera.water_reflections {
+        if !native_water_reflections {
             let mut e = self.device.create_command_encoder(&Default::default());
             for batch in &visible {
                 if batch.simple {

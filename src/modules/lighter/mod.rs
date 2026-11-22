@@ -1686,6 +1686,20 @@ impl Lighter {
         self.overlays_world() && self.frame_index > 0
     }
 
+    /// True once the hybrid RT overlay is actively casting dynamic RT shadows
+    /// onto the rasterized world, so Native static baked terrain lightmap
+    /// shadows can step aside to prevent double-shadow collision.
+    pub fn suppresses_native_terrain_shadows(&self) -> bool {
+        self.overlay_ready() && self.settings.shadows
+    }
+
+    /// True once the hybrid RT overlay is actively tracing RT reflections, so
+    /// Native planar water mirror passes can step aside to prevent double
+    /// reflection collision and save two extra scene passes per water plane.
+    pub fn suppresses_native_water_reflections(&self) -> bool {
+        self.overlay_ready() && self.settings.reflections
+    }
+
     /// Identify the specific Lighter stage that has not completed yet.
     pub fn pending_stage(&self) -> &'static str {
         if !self.armed {

@@ -5486,3 +5486,39 @@ fn f1_overlay_hold_last_frame_state_resets_cleanly_on_history_reset() {
         "reset_history must clear last_overlay_extent so stale overlays are never re-composited"
     );
 }
+
+#[test]
+fn f2_overlay_suppresses_colliding_native_shadows_and_water_reflections_only_when_ready() {
+    let mut lighter = Lighter::default();
+    lighter.armed = true;
+    lighter.has_hardware_device = true;
+    lighter.adapter_supports_compute = true;
+    lighter.native_backend = wgpu::Backend::Vulkan;
+    lighter.install(Ok((Builder::default().finish(), Textures::default())));
+    lighter.settings.mode = Mode::Off;
+    lighter.settings.ray_lighting = true;
+    lighter.settings.shadows = true;
+    lighter.settings.reflections = true;
+    assert!(!lighter.suppresses_native_terrain_shadows());
+    assert!(!lighter.suppresses_native_water_reflections());
+
+    // Enabled in Hardware overlay mode, but before first overlay frame (still compiling/staging):
+    // Native lighting/reflections must remain intact until RT overlay actually draws.
+    lighter.settings.mode = Mode::Hardware;
+    lighter.frame_index = 0;
+    assert!(!lighter.suppresses_native_terrain_shadows());
+    assert!(!lighter.suppresses_native_water_reflections());
+
+    // Once overlay is live (frame_index > 0): suppress colliding Native baked shadows and
+    // planar water reflections according to the active RT toggles.
+    lighter.frame_index = 1;
+    assert!(lighter.suppresses_native_terrain_shadows());
+    assert!(lighter.suppresses_native_water_reflections());
+
+    lighter.settings.shadows = false;
+    assert!(!lighter.suppresses_native_terrain_shadows());
+    assert!(lighter.suppresses_native_water_reflections());
+
+    lighter.settings.reflections = false;
+    assert!(!lighter.suppresses_native_water_reflections());
+}
