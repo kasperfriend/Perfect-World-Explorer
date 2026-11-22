@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_FILES: usize = 10;
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
@@ -205,6 +205,7 @@ pub struct Logger {
     level: Mutex<LogLevel>,
     log_dir: Option<PathBuf>,
     frame_count: Mutex<u64>,
+    started: Instant,
 }
 
 fn dir_writable(dir: &Path) -> bool {
@@ -269,6 +270,7 @@ impl Logger {
             level: Mutex::new(LogLevel::Off),
             log_dir: Some(default_log_dir()),
             frame_count: Mutex::new(0),
+            started: Instant::now(),
         }
     }
 
@@ -499,10 +501,8 @@ impl Logger {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let line = format!(
-            "[{ts}] {stage}: {message}
-"
-        );
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let line = format!("[{ts}] [+{elapsed:.1}s] {stage}: {message}\n");
         let file = match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => f,
             Err(_) => return false,
@@ -548,5 +548,51 @@ mod tests {
         }
         let _ = rotate(&root);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod c7_tests {
+    use super::*;
+
+    #[test]
+    fn c7_logger_info_includes_elapsed_stage_time_and_session_driver() {
+        let dir = std::env::temp_dir().join(format!("pwe_c7_log_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let logger = Logger {
+            level: Mutex::new(LogLevel::Normal),
+            log_dir: Some(dir.clone()),
+            frame_count: Mutex::new(0),
+            started: Instant::now(),
+        };
+        assert!(logger.write(&LogEntry::Session(SessionHeader {
+            commit: Some("test-sha".into()),
+            build_date: None,
+            os_version: Some("windows".into()),
+            gpu: Some("RTX 3080".into()),
+            driver: Some("NVIDIA 621.14".into()),
+            vulkan_version: Some("Vulkan".into()),
+            heap_size_mb: None,
+            graphics_upscaler: None,
+            graphics_frame_gen: None,
+            module_settings: "mode=Hardware".into(),
+            env_vars: Vec::new(),
+        })));
+        assert!(logger.info(
+            "COLD_RAY",
+            "Compiling Hardware RT trace pipeline (variant: overlay)… done in 0.1s"
+        ));
+        let body = fs::read_to_string(dir.join("lighter.log")).unwrap();
+        assert!(
+            body.contains("driver: NVIDIA 621.14"),
+            "missing driver: {body}"
+        );
+        assert!(body.contains("[+"), "missing elapsed [+N.Ns] tag: {body}");
+        assert!(
+            body.contains("COLD_RAY: Compiling Hardware RT trace pipeline"),
+            "missing stage line: {body}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
