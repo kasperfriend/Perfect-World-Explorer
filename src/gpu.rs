@@ -1744,7 +1744,7 @@ fn bmd_baked_rgb(day:u32, night:u32, night_factor:f32)->vec3<u32> {
 }
 @vertex fn vs(i:VIn)->VOut { var o:VOut; var pos=i.pos; var norm=i.normal;
  if i.kind>4.5 { let d=normalize(camera.direction.xyz); let az=atan2(d.z,d.x); let el=asin(clamp(d.y,-1.,1.)); let rho=i.color.w; let q=vec3<f32>(cos(el)*i.normal.x-sin(el)*i.normal.z,i.normal.y,sin(el)*i.normal.x+cos(el)*i.normal.z); let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. { v=i.normal; }pos+=vec3<f32>(v.x,v.z,v.y);norm=vec3<f32>(0.,1.,0.); }
- o.pos=camera.matrix*vec4<f32>(pos,1.);o.bmd_refraction=1.;if camera.clip.y<0. && i.kind>1.5 && i.kind<2.5 {o.bmd_refraction=bmd_refraction_transmittance(pos);}o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;let baked_rgb=vec3<f32>(bmd_baked_rgb(i.diffuse,i.night_diffuse,1.-camera.direction.w))/255.;o.diffuse=select(baked_rgb,select(vec3<f32>(0.20+0.34*camera.direction.w),vec3<f32>(0.5),camera.light.x>0.99 && camera.light.y<0.01),camera.sun.w<0.);o.opacity=f32((i.diffuse>>24u)&255u)/255.;return o; }
+ o.pos=camera.matrix*vec4<f32>(pos,1.);o.bmd_refraction=1.;if camera.clip.y<0. && i.kind>1.5 && i.kind<2.5 {o.bmd_refraction=bmd_refraction_transmittance(pos);}o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;let baked_rgb=vec3<f32>(bmd_baked_rgb(i.diffuse,i.night_diffuse,1.-camera.direction.w))/255.;let bmd_ndl=max(dot(normalize(norm),normalize(camera.sun.xyz)),0.);let bmd_rt=vec3<f32>((camera.light.x+camera.light.y*bmd_ndl)*0.5)*camera.light.zww;o.diffuse=select(baked_rgb,bmd_rt,camera.sun.w<0.);o.opacity=f32((i.diffuse>>24u)&255u)/255.;return o; }
 fn sdr_blend_band(kind:f32)->bool { return (kind>2.01 && kind<2.03)||(kind>2.11 && kind<2.13); }
 fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || (i.kind>1.5 && i.kind<2.05)) && camera.clip.w == 0. && (front == (camera.clip.z != 0.)) {discard;} if camera.clip.y != 0.0 && (i.world.y-camera.clip.x)*camera.clip.y < 0.0 {discard;} if i.kind>0.5 && i.kind<1.05 {return vec4<f32>(fogged(i.color.rgb,i.pos.w),1.);} if i.kind>1.05 && i.kind<1.25 {return vec4<f32>(bmd_pass_fog(clamp(i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.)),i.pos.w,i.bmd_refraction),1.);} let uv_dx=dpdx(i.uv);let uv_dy=dpdy(i.uv);var uv=i.uv; if i.kind>1.5 {let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(uv_dx*dims),length(uv_dy*dims)),1.)),0.,7.);let border=0.5*exp2(mip);let half_pixel=min(vec2<f32>(border)/dims,scale*0.499);let sdr_v=select(0.,-0.5*camera.grass_wind.x,sdr_blend_band(i.kind));let local=fract((i.uv-i.color.xy)/scale+vec2<f32>(0.,sdr_v))*scale;uv=i.color.xy+clamp(local,half_pixel,scale-half_pixel);} let raw_tex=textureSampleGrad(atlas,atlas_sampler,uv,uv_dx*camera.lod.y,uv_dy*camera.lod.y);let encoded=raw_tex.rgb;let linear=select(encoded/12.92,pow((encoded+0.055)/1.055,vec3<f32>(2.4)),encoded>vec3<f32>(0.04045));let tex=vec4<f32>(linear,raw_tex.a);if !sdr_blend_band(i.kind) && ((i.kind>1.5 && i.kind<2.5) || i.kind>3.5) && tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9) {discard;} if i.kind>1.5 && i.kind<2.5 {let c=clamp(raw_tex.rgb*i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.));let rgb=select(c/12.92,pow((c+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));return vec4<f32>(bmd_pass_fog(rgb,i.pos.w,i.bmd_refraction),select(1.,raw_tex.a*i.opacity,sdr_blend_band(i.kind)));} let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.pos.w),1.); }
 @fragment fn fs(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
@@ -2994,7 +2994,15 @@ impl Renderer {
             camera.client_tree_wind_preview,
         );
         let tree_bounds = [camera.pos.x, camera.pos.z, tree_blend, elapsed];
-        let (region_ambient, region_diffuse, region_direction) = camera.region_uniform();
+        let (region_ambient, region_diffuse, mut region_direction) = camera.region_uniform();
+        if self.raywatcher_overrides.suppress_baked_shadows {
+            region_direction = [
+                tracked_dir.x,
+                tracked_dir.y,
+                tracked_dir.z,
+                region_direction[3],
+            ];
+        }
         let grass_eye = [
             camera.pos.x,
             camera.pos.y,
@@ -3812,8 +3820,15 @@ impl Renderer {
         } else {
             self.local_pages.len() as u64
         };
+        let hw_probed = settings.mode == crate::modules::raywatcher::plan::RayTracingMode::Hardware
+            && self.raywatcher_hw_probe.as_ref().is_some_and(|(ok, _)| *ok);
+        let skip_cpu_bvh = self
+            .raywatcher_gpu
+            .as_ref()
+            .map_or(hw_probed, |g| g.dxr_active());
         let content_hash = (active_pages_len << 16)
             ^ (self.water_batches.len() as u64)
+            ^ (u64::from(skip_cpu_bvh) << 61)
             ^ (u64::from(self.world_done) << 62);
         let t_rw_frame = std::time::Instant::now();
         // Poll any completed background BVH build without blocking the frame.
@@ -3960,6 +3975,7 @@ impl Renderer {
                 real_meshes,
                 proxies,
                 water,
+                skip_cpu_bvh,
             );
         }
         self.modules

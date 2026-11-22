@@ -145,8 +145,8 @@ Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
     ray.TMin = t_min;
     ray.TMax = t_max;
 
-    RayQuery<RAY_FLAG_NONE> q;
-    q.TraceRayInline(scene_tlas, RAY_FLAG_NONE, 0xffu, ray);
+    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(scene_tlas, RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
     uint opaque_offset = uint(round(params.fog.w));
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
@@ -158,6 +158,41 @@ Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
     }
 
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
+        uint tri_count = uint(params.counts.x);
+        if (prim < tri_count) {
+            float3 n = normalize(tris[prim].n.xyz);
+            if (dot(n, dir) > 0.0) {
+                n = -n;
+            }
+            hit.index = prim;
+            hit.t = q.CommittedRayT();
+            hit.normal = n;
+        }
+    }
+    return hit;
+}
+
+// Pure fixed-function RT-core closest-hit (RAY_FLAG_FORCE_OPAQUE | SKIP_PROCEDURAL_PRIMITIVES):
+// zero shader ejection, single Proceed() call, used for secondary GI bounces.
+Hit closest_hit_fast(float3 origin, float3 dir, float t_min, float t_max) {
+    Hit hit;
+    hit.index = 0xffffffffu;
+    hit.t = t_max;
+    hit.normal = float3(0.0, 1.0, 0.0);
+
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = dir;
+    ray.TMin = t_min;
+    ray.TMax = t_max;
+
+    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(scene_tlas, RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
+    q.Proceed();
+
+    if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        uint opaque_offset = uint(round(params.fog.w));
         uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
         uint tri_count = uint(params.counts.x);
         if (prim < tri_count) {
@@ -278,8 +313,8 @@ bool occluded(float3 origin, float3 dir, float t_min, float t_max, uint seed) {
     ray.TMin = t_min;
     ray.TMax = t_max;
 
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER> q;
-    q.TraceRayInline(scene_tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xffu, ray);
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(scene_tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
     uint opaque_offset = uint(round(params.fog.w));
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
@@ -289,6 +324,21 @@ bool occluded(float3 origin, float3 dir, float t_min, float t_max, uint seed) {
             }
         }
     }
+    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+
+// Pure fixed-function RT-core any-hit occlusion (FORCE_OPAQUE + ACCEPT_FIRST_HIT):
+// zero shader ejection, used for short-range AO and secondary GI/reflection shadows.
+bool occluded_fast(float3 origin, float3 dir, float t_min, float t_max) {
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = dir;
+    ray.TMin = t_min;
+    ray.TMax = t_max;
+
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(scene_tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
+    q.Proceed();
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
@@ -377,8 +427,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     // 4 IGN-rotated stratified cosine-weighted contact AO rays (skipped beyond
     // 260u where 4u contact occlusion is sub-pixel).
     float ao_radius = clamp(params.fog.z, 2.0, 6.0);
-    uint ao_samples = 4u;
-    float ao_fade = 1.0 - saturate((dist - 220.0) / 40.0);
+    uint ao_samples = (dist < 48.0) ? 3u : ((dist < 140.0) ? 2u : 1u);
+    float ao_fade = 1.0 - saturate((dist - 200.0) / 40.0);
     float rot_angle = ign(id.xy, uint(params.frame.x)) * (2.0 * PI);
 
     float3 up = abs(normal.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
@@ -393,7 +443,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // 2-tap IGN-rotated Vogel-disk soft sun shadow penumbra.
         float shadow = 1.0;
         if (bits_shadows && n_dot_l > 0.02) {
-            uint sun_taps = params.lens.z > 1e-4 ? 2u : 1u;
+            uint sun_taps = (params.lens.z > 1e-4 && dist < 160.0) ? 2u : 1u;
             uint sun_hits = 0u;
             float spread_tan = tan(params.lens.z);
             for (uint k = 0u; k < sun_taps; k = k + 1u) {
@@ -425,7 +475,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 sincos(phi, s_phi, c_phi);
                 float z = sqrt(max(0.0, 1.0 - u1));
                 float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + normal * z;
-                if (occluded(ray_origin, d, bias * 0.5, ao_radius, state ^ i)) {
+                if (occluded_fast(ray_origin, d, bias * 0.5, ao_radius)) {
                     hits = hits + 1u;
                 }
             }
@@ -457,7 +507,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float r_shadow = 1.0;
                     if (bits_shadows && r_ndl > 0.02) {
                         float3 rhit_pos = hit_pos + rhit.normal * bias;
-                        if (occluded(rhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y, state ^ 0x517cc1b7u)) {
+                        if (occluded_fast(rhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y)) {
                             r_shadow = 0.0;
                         }
                     }
@@ -476,10 +526,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
 
         // Real multi-bounce (1..=6) path-traced diffuse GI with Russian Roulette
         // termination, real sunlit coloured bounce by day, and zero energy at night.
-        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0) {
-            float sun_strength = saturate(dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722)) * 1.4);
+        float gi_fade = 1.0 - saturate((dist - 180.0) / 80.0);
+        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
+            float sun_luma = dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722));
+            float sun_strength = smoothstep(0.18, 0.38, sun_luma);
             if (sun_strength > 0.005) {
-                uint gi_taps = 2u;
+                uint gi_taps = (max_bounces <= 1u && dist < 80.0) ? 2u : 1u;
                 float3 est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
                 float3 receiver_albedo = clamp(
                     raster_rgb / max(est_direct, float3(0.25, 0.25, 0.25)),
@@ -504,7 +556,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         float z = sqrt(max(0.0, 1.0 - u1));
                         float3 d = b_t * (r * c_phi) + b_b * (r * s_phi) + b_n * z;
                         float bounce_max_t = (bounce == 0u) ? min(params.lens.y, 96.0) : min(params.lens.y, 48.0);
-                        Hit bhit = closest_hit(b_origin, d, b_step_bias, bounce_max_t);
+                        Hit bhit = (bounce == 0u) ? closest_hit(b_origin, d, b_step_bias, bounce_max_t) : closest_hit_fast(b_origin, d, b_step_bias, bounce_max_t);
                         if (bhit.index != 0xffffffffu) {
                             float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
                             float3 bhit_world = b_origin + d * bhit.t;
@@ -512,7 +564,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                             float b_shadow = 1.0;
                             if (bits_shadows && b_ndl > 0.01) {
                                 float3 bhit_pos = bhit_world + bhit.normal * b_bias;
-                                if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ (g * 73u + bounce * 31u + 11u))) {
+                                if (occluded_fast(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y)) {
                                     b_shadow = 0.0;
                                 }
                             }
@@ -547,7 +599,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         }
                     }
                 }
-                accum_gi += gi_sum * (1.0 / float(gi_taps));
+                accum_gi += gi_sum * (gi_fade / float(gi_taps));
             }
         }
     }

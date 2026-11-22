@@ -131,6 +131,7 @@ mod imp {
     const D3D12_ELEMENTS_LAYOUT_ARRAY: u32 = 0;
     const D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES: u32 = 0;
     const D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE: u32 = 0x1;
+    const D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION: u32 = 0x2;
 
     // `MIDL_INTERFACE("8b4f173b-2fea-4b80-8f58-4307191ab95d")`
     const IID_ID3D12_DEVICE5: GUID = GUID {
@@ -901,10 +902,9 @@ mod imp {
             }
             let opaque_tri_count = opaque_tris.len() as u32;
             let alpha_tri_count = alpha_tris.len() as u32;
-            let mut tris_ordered: Vec<RayTriangle> = Vec::with_capacity(raw_tris.len());
-            tris_ordered.extend_from_slice(&opaque_tris);
-            tris_ordered.extend_from_slice(&alpha_tris);
-            let tris_data: &[RayTriangle] = &tris_ordered;
+            opaque_tris.extend_from_slice(&alpha_tris);
+            drop(alpha_tris);
+            let tris_data: &[RayTriangle] = &opaque_tris;
             let tri_count = tris_data.len() as u32;
             let mat_count = mats_data.len() as u32;
 
@@ -984,7 +984,7 @@ mod imp {
                 if alpha_tri_count > 0 {
                     geoms.push(GeometryDesc {
                         ty: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
-                        flags: 0, // Alpha-tested foliage only
+                        flags: D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION, // Alpha-tested foliage only (1 any-hit max)
                         triangles: GeometryTrianglesDesc {
                             transform3x4: 0,
                             index_format: DXGI_FORMAT_UNKNOWN,

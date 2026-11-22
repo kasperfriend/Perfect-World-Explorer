@@ -465,6 +465,7 @@ impl Harvester {
         real_meshes: Vec<MeshTriangle>,
         instances: Vec<InstanceProxy>,
         water: Vec<WaterSurface>,
+        skip_cpu_bvh: bool,
     ) {
         if self.pending_bg.is_some() {
             return;
@@ -538,7 +539,11 @@ impl Harvester {
                     None
                 };
                 let t_bvh = std::time::Instant::now();
-                let scene = std::sync::Arc::new(SceneGeometry::build(triangles, materials));
+                let scene = std::sync::Arc::new(if skip_cpu_bvh {
+                    SceneGeometry::build_triangles_only(triangles, materials)
+                } else {
+                    SceneGeometry::build(triangles, materials)
+                });
                 let bvh_ms = t_bvh.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
                 if std::env::var_os("PWE_RT_DEBUG").is_some() {

@@ -353,6 +353,21 @@ impl SceneGeometry {
         self.triangles.is_empty()
     }
 
+    /// Package harvested triangles and materials without building a CPU SAH BVH.
+    /// Used when DXR hardware ray tracing is active and builds a GPU BLAS/TLAS
+    /// directly on the RT cores, saving 30-80 ms of CPU time per rebuild.
+    pub fn build_triangles_only(triangles: Vec<RayTriangle>, materials: Vec<RayMaterial>) -> Self {
+        Self {
+            triangles,
+            materials,
+            nodes: Vec::new(),
+            order: Vec::new(),
+            bounds: Bounds::EMPTY,
+            depth: 0,
+            widest_leaf: 0,
+        }
+    }
+
     /// Triangles in the tree.
     pub fn triangle_count(&self) -> usize {
         self.triangles.len()

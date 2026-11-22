@@ -918,8 +918,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var accum_gi = vec3<f32>(0.0);
 
     let ao_radius = clamp(params.fog.z, 2.0, 6.0);
-    let ao_samples = 4u;
-    let ao_fade = 1.0 - clamp((dist - 220.0) / 40.0, 0.0, 1.0);
+    let ao_samples = select(select(1u, 2u, dist < 140.0), 3u, dist < 48.0);
+    let ao_fade = 1.0 - clamp((dist - 200.0) / 40.0, 0.0, 1.0);
     let rot_angle = ign(id.xy, u32(params.frame.x)) * (2.0 * PI);
     let onb = orthonormal_basis(normal);
     let sun_onb = orthonormal_basis(params.sun_dir.xyz);
@@ -927,7 +927,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var s = 0u; s < samples; s = s + 1u) {
         var shadow = 1.0;
         if (bits_shadows && n_dot_l > 0.02) {
-            let sun_taps = select(1u, 2u, params.lens.z > 1e-4);
+            let sun_taps = select(1u, 2u, params.lens.z > 1e-4 && dist < 160.0);
             var sun_hits = 0u;
             let spread_tan = tan(params.lens.z);
             for (var k = 0u; k < sun_taps; k = k + 1u) {
@@ -1002,10 +1002,12 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
 
         // Real multi-bounce (1..=6) path-traced diffuse GI with Russian Roulette
         // termination, real sunlit coloured bounce by day, and zero energy at night.
-        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0) {
-            let sun_strength = clamp(luminance(params.sun_colour.xyz) * 1.4, 0.0, 1.0);
+        let gi_fade = 1.0 - clamp((dist - 180.0) / 80.0, 0.0, 1.0);
+        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
+            let sun_luma = luminance(params.sun_colour.xyz);
+            let sun_strength = smoothstep(0.18, 0.38, sun_luma);
             if (sun_strength > 0.005) {
-                let gi_taps = 2u;
+                let gi_taps = select(1u, 2u, max_bounces <= 1u && dist < 80.0);
                 let est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
                 let receiver_albedo = clamp(raster_rgb / max(est_direct, vec3<f32>(0.25)), vec3<f32>(0.18), vec3<f32>(0.92));
                 var gi_sum = vec3<f32>(0.0);
@@ -1064,7 +1066,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                         }
                     }
                 }
-                accum_gi = accum_gi + gi_sum * (1.0 / f32(gi_taps));
+                accum_gi = accum_gi + gi_sum * (gi_fade / f32(gi_taps));
             }
         }
     }
@@ -2079,7 +2081,11 @@ impl SceneBuffers {
         let dummy_node = [<BvhNode as bytemuck::Zeroable>::zeroed()];
         let dummy_ord = [0u32];
         let dummy_mat = [<RayMaterial as bytemuck::Zeroable>::zeroed()];
-        let tri_slice = if scene.triangles.is_empty() {
+        // When `scene.nodes` is empty (DXR-only scene built with
+        // `build_triangles_only`), DXR owns its own D3D12 BLAS/TLAS & VRAM
+        // buffers, so skip uploading ~60 MB of unused wgpu storage buffers.
+        let dxr_only = !scene.triangles.is_empty() && scene.nodes.is_empty();
+        let tri_slice = if scene.triangles.is_empty() || dxr_only {
             &dummy_tri[..]
         } else {
             &scene.triangles[..]
@@ -2094,7 +2100,7 @@ impl SceneBuffers {
         } else {
             &scene.order[..]
         };
-        let mat_slice = if scene.materials.is_empty() {
+        let mat_slice = if scene.materials.is_empty() || dxr_only {
             &dummy_mat[..]
         } else {
             &scene.materials[..]
@@ -3987,6 +3993,11 @@ impl RaywatcherGpu {
     }
 
     /// Number of history frames accumulated. Zero after [`Self::reset`].
+    /// Returns `true` when DXR hardware ray tracing is active on this device.
+    pub fn dxr_active(&self) -> bool {
+        self.dxr.is_some()
+    }
+
     pub fn frames(&self) -> u32 {
         self.frames
     }
