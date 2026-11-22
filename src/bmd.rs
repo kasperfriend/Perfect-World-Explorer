@@ -431,7 +431,12 @@ impl Model {
                     && p.checked_add(n16).is_some_and(has_mat_at)
                     && !p.checked_add(n8).is_some_and(has_mat_at);
                 let color_branch = if mat_at_p {
-                    material = Some(parse_material(b, &mut p)?);
+                    if p.checked_add(80).is_none_or(|e| e > b.len()) {
+                        return Err("truncated material".into());
+                    }
+                    let mut mat_p = p;
+                    material = parse_material(b, &mut mat_p).ok();
+                    p = if material.is_some() { mat_p } else { p + 80 };
                     if p.checked_add(n8).is_none_or(|e| e > b.len()) {
                         return Err("truncated BMD mesh data".into());
                     }
@@ -530,7 +535,7 @@ impl Model {
                 {
                     let mut mat_p = p + 48;
                     material = parse_material(b, &mut mat_p).ok();
-                    let dw_pos = mat_p;
+                    let dw_pos = if material.is_some() { mat_p } else { p + 128 };
                     let extra_size = u(b, dw_pos)? as usize;
                     if (4..=65536).contains(&extra_size)
                         && dw_pos.checked_add(extra_size).is_some_and(|e| e <= b.len())
@@ -1132,6 +1137,56 @@ mod tests {
             model.meshes[1].color_branch,
             Some(V300ColorBranch::LightmapUvNeutralFallback)
         );
+    }
+
+    #[test]
+    fn parses_v300_tail_dw_extra_size_20_even_with_nonfinite_material_float() {
+        let mut b = Vec::new();
+        let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+        put(&mut b, 0x42584f4d);
+        put(&mut b, 0x80000001);
+        b.push(0);
+        put(&mut b, 0x10000302);
+        b.extend_from_slice(&[0; 48]);
+        put(&mut b, 2);
+
+        // Mesh 0: lightmap_neutral with a NaN float inside MATERIAL and extra_size=20.
+        put(&mut b, 0x0000_0001);
+        put(&mut b, 2);
+        b.extend_from_slice(b"m0");
+        put(&mut b, 5);
+        b.extend_from_slice(b"a.dds");
+        put(&mut b, 3);
+        put(&mut b, 1);
+        for i in 0..3u32 {
+            put(&mut b, (i as f32).to_bits());
+            put(&mut b, 0.0f32.to_bits());
+            put(&mut b, 1.0f32.to_bits());
+            put(&mut b, 0xffffffff);
+            put(&mut b, 0.0f32.to_bits());
+            put(&mut b, 1.0f32.to_bits());
+        }
+        put(&mut b, 0);
+        put(&mut b, 1);
+        put(&mut b, 2);
+        b.extend_from_slice(&[0; 36]);
+        for uv in [0.25f32, 0.5, 0.75, 0.125, 0.5, 0.5] {
+            put(&mut b, uv.to_bits());
+        }
+        b.extend_from_slice(&[0; 48]);
+        b.extend_from_slice(b"MATERIAL: \0");
+        put(&mut b, f32::NAN.to_bits());
+        b.extend_from_slice(&[0; 65]);
+        put(&mut b, 20);
+        b.extend_from_slice(&[0; 16]);
+
+        // Mesh 1: immediately follows dwExtraSize=20.
+        push_v300_mesh(&mut b, true, false, b"m1", b"b.dds", [0; 3], [0; 3], 22);
+
+        let model = Model::parse(&b).unwrap();
+        assert_eq!(model.meshes.len(), 2);
+        assert!(model.meshes[0].material.is_none());
+        assert_eq!(model.meshes[1].name, "m1");
     }
 
     #[test]
