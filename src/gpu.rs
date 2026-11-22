@@ -2323,6 +2323,7 @@ impl Renderer {
         );
         // Both paths consume the same loaded sources. The native path has
         // finished borrowing them; transfer the placement list to Lighter.
+        let device = std::sync::Arc::new(device);
         let lighter_feed = if lighter.armed() {
             match lighter_host::Feed::new(
                 t,
@@ -2333,6 +2334,10 @@ impl Renderer {
             ) {
                 Ok(mut feed) => {
                     feed.install_initial(&mut lighter, &m, &device);
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    if let Err(err) = lighter.start_cold_ray_compile(&device) {
+                        lighter.log_error("cold_ray_prestart", &err);
+                    }
                     Some(feed)
                 }
                 Err(error) => {
@@ -2700,7 +2705,7 @@ impl Renderer {
             world_width: t.width,
             world_height: t.height,
             world_spacing: t.grid_spacing,
-            device: std::sync::Arc::new(device),
+            device,
             queue,
             pipeline,
             scenery_pipeline,

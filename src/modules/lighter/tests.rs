@@ -5436,3 +5436,38 @@ fn c5_overlay_shader_variant_compiles_with_naga_and_is_smaller() {
         "expected >30% SPIR-V reduction for overlay variant ({overlay_spirv_bytes} vs {full_spirv_bytes})"
     );
 }
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[test]
+fn c6_enabling_lighter_starts_cold_ray_worker_before_reload_completes() {
+    let mut lighter = Lighter::default();
+    lighter.armed = true;
+    lighter.paced_startup = true;
+    lighter.has_hardware_device = true;
+    lighter.adapter_supports_compute = true;
+    lighter.native_backend = wgpu::Backend::Vulkan;
+    lighter.settings.mode = Mode::Hardware;
+    lighter.settings.ray_lighting = true;
+    lighter.settings.reference = false;
+    lighter.install(Ok((Builder::default().finish(), Textures::default())));
+
+    assert!(
+        !lighter.cold_ray_in_flight(),
+        "worker should not be running before compile starts"
+    );
+
+    let (_tx, rx) = std::sync::mpsc::channel();
+    lighter.cold_ray = Some(rx);
+    lighter.cold_ray_deadline = Some(super::ColdRayDeadline::start(std::time::Instant::now()));
+
+    assert!(
+        lighter.cold_ray_in_flight(),
+        "cold-ray worker must be active before reload completes"
+    );
+    assert_eq!(lighter.pending_stage(), "pipeline compile pending");
+    let req = lighter.settings;
+    assert_eq!(
+        lighter.resolve_reload_check(&req, false),
+        super::ReloadOutcome::Pending
+    );
+}

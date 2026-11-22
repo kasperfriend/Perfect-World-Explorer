@@ -2239,6 +2239,92 @@ impl Lighter {
         self.status_line = Some(format!("{stage}: {reason}"));
     }
 
+    /// True when the background Vulkan RT pipeline compile worker is currently running.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    pub(crate) fn cold_ray_in_flight(&self) -> bool {
+        self.cold_ray.is_some()
+    }
+
+    /// Begin background Vulkan RT pipeline compilation immediately when Lighter
+    /// is enabled, without waiting for the first frame or reload to finish.
+    /// Returns `Ok(true)` if a new background worker was started.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    pub(crate) fn start_cold_ray_compile(
+        &mut self,
+        device: &std::sync::Arc<wgpu::Device>,
+    ) -> Result<bool, String> {
+        if !self.paced_startup
+            || self.settings.mode != Mode::Hardware
+            || self.unavailable().is_some()
+            || self.hardware.is_some()
+            || self.cold_ray.is_some()
+        {
+            return Ok(false);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let device = device.clone();
+        let compact = self.compact_terrain;
+        let reuse = self.screen_reuse != 0;
+        let temporal = self.reconstruction.is_some();
+        let hybrid = self.settings.hybrid_primary;
+        let game = self.game_profile.is_some() && hybrid;
+        let variant = self.desired_shader_variant();
+        let pages = self
+            .world
+            .as_ref()
+            .filter(|_| self.bc_pages)
+            .map(|w| w.textures.bc_pages.clone());
+        let stage: u64 = 0;
+        self.cold_ray_deadline = Some(ColdRayDeadline::start(Instant::now()));
+        std::thread::Builder::new()
+            .name("lighter-pipeline-startup".into())
+            .spawn(move || {
+                let tx_prog = std::sync::Mutex::new(tx.clone());
+                let progress = |step: &str| {
+                    if let Ok(guard) = tx_prog.lock() {
+                        let _ = guard.send(ColdRayBuild::Progress(stage, step.to_owned()));
+                    }
+                };
+                let build = |temporal| {
+                    vulkan::Renderer::new(
+                        &device,
+                        compact,
+                        reuse,
+                        pages.as_ref(),
+                        temporal,
+                        game,
+                        variant,
+                        &progress,
+                    )
+                };
+                let made = match build(temporal) {
+                    Err(error) if temporal && !crate::gpu::reconstruction_device_lost(&error) => {
+                        eprintln!(
+                            "Lighter temporal tracer unavailable; using portable resolve: {error}"
+                        );
+                        build(false).map(|r| (r, false))
+                    }
+                    other => other.map(|r| (r, temporal)),
+                }
+                .map(|(mut r, enabled)| {
+                    if hybrid {
+                        r.prewarm_primary(&progress);
+                    }
+                    (r, enabled)
+                });
+                let _ = tx.send(ColdRayBuild::Done(made));
+            })
+            .map_err(|e| format!("start Lighter pipeline worker: {e}"))?;
+        let msg = format!(
+            "started background Vulkan RT pipeline compilation (variant: {})",
+            variant.label()
+        );
+        self.logger.info("COLD_RAY", &msg);
+        self.status_line = Some(msg);
+        self.cold_ray = Some(rx);
+        Ok(true)
+    }
+
     pub(crate) fn prepare_window_frame(
         &mut self,
         device: &std::sync::Arc<wgpu::Device>,
@@ -2274,52 +2360,8 @@ impl Lighter {
             && self.settings.mode == Mode::Hardware
             && self.unavailable().is_none()
         {
-            use std::sync::mpsc::{channel, TryRecvError};
-            if self.hardware.is_none() && self.cold_ray.is_none() {
-                let (tx, rx) = channel();
-                let device = device.clone();
-                let compact = self.compact_terrain;
-                let reuse = self.screen_reuse != 0;
-                let temporal = self.reconstruction.is_some();
-                let hybrid = self.settings.hybrid_primary;
-                let game = self.game_profile.is_some() && hybrid;
-                let variant = self.desired_shader_variant();
-                let pages = self
-                    .world
-                    .as_ref()
-                    .filter(|_| self.bc_pages)
-                    .map(|w| w.textures.bc_pages.clone());
-                let stage: u64 = 0;
-                self.cold_ray_deadline = Some(ColdRayDeadline::start(Instant::now()));
-                std::thread::Builder::new().name("lighter-pipeline-startup".into()).spawn(move || {
-                    let tx_prog = std::sync::Mutex::new(tx.clone());
-                    let progress = |step: &str| {
-                        if let Ok(guard) = tx_prog.lock() {
-                            let _ = guard.send(ColdRayBuild::Progress(stage, step.to_owned()));
-                        }
-                    };
-                    let build = |temporal| vulkan::Renderer::new(&device, compact, reuse, pages.as_ref(), temporal, game, variant, &progress);
-                    let made = match build(temporal) {
-                        Err(error) if temporal && !crate::gpu::reconstruction_device_lost(&error) => {
-                            eprintln!("Lighter temporal tracer unavailable; using portable resolve: {error}");
-                            build(false).map(|r| (r, false))
-                        }
-                        other => other.map(|r| (r, temporal)),
-                    }.map(|(mut r, enabled)| {
-                        if hybrid {
-                            r.prewarm_primary(&progress);
-                        }
-                        (r, enabled)
-                    });
-                    // On a closed channel the unused result drops before our
-                    // Arc. There is no queue work or imported image to drain.
-                    let _ = tx.send(ColdRayBuild::Done(made));
-                }).map_err(|e| format!("start Lighter pipeline worker: {e}"))?;
-                self.logger.info(
-                    "COLD_RAY",
-                    "started background Vulkan RT pipeline compilation",
-                );
-                self.cold_ray = Some(rx);
+            use std::sync::mpsc::TryRecvError;
+            if self.start_cold_ray_compile(device)? {
                 return Ok(false);
             }
             if let Some(rx) = &self.cold_ray {
