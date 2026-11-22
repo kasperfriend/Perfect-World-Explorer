@@ -542,6 +542,8 @@ mod tests {
         pack.extend((276u32 ^ mask ^ 0x59374231).to_le_bytes());
         pack.extend(record);
         let mut footer = [0u8; 280];
+        let desc = b"Angelica File Package, Perfect World Co. Ltd.";
+        footer[16..16 + desc.len()].copy_from_slice(desc);
         for (offset, value) in [
             (0, 0xfdfdfeee),
             (8, directory ^ mask),
