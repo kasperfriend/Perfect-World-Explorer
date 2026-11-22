@@ -147,16 +147,18 @@ Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
 
     RayQuery<RAY_FLAG_NONE> q;
     q.TraceRayInline(scene_tlas, RAY_FLAG_NONE, 0xffu, ray);
+    uint opaque_offset = uint(round(params.fog.w));
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
-            if (accept_opacity(q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), 0u)) {
+            uint cand_prim = q.CandidatePrimitiveIndex() + (q.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
+            if (accept_opacity(cand_prim, q.CandidateTriangleBarycentrics(), 0u)) {
                 q.CommitNonOpaqueTriangleHit();
             }
         }
     }
 
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-        uint prim = q.CommittedPrimitiveIndex();
+        uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
         uint tri_count = uint(params.counts.x);
         if (prim < tri_count) {
             float3 n = normalize(tris[prim].n.xyz);
@@ -278,9 +280,11 @@ bool occluded(float3 origin, float3 dir, float t_min, float t_max, uint seed) {
 
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER> q;
     q.TraceRayInline(scene_tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xffu, ray);
+    uint opaque_offset = uint(round(params.fog.w));
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
-            if (accept_opacity(q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), seed)) {
+            uint cand_prim = q.CandidatePrimitiveIndex() + (q.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
+            if (accept_opacity(cand_prim, q.CandidateTriangleBarycentrics(), seed)) {
                 q.CommitNonOpaqueTriangleHit();
             }
         }
@@ -337,7 +341,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
 
     // Distance-scaled bias prevents self-intersection between the exact 1:1
     // raster depth surface and the BVH/BLAS geometry at all view distances.
-    float slope_bias = (1.0 - saturate(normal.y)) * 0.25;
+    float slope_bias = (1.0 - saturate(normal.y)) * (0.25 + dist * 0.0025);
     float bias = max(params.effects.z, max(0.15, dist * 0.003)) + slope_bias;
     float3 ray_origin = world_pos + normal * bias - view_dir * (bias * 0.35);
     float n_dot_l = max(dot(normal, params.sun_dir.xyz), 0.0);
@@ -349,7 +353,19 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         fog_t = saturate((dist - fog_start) / (fog_end - fog_start));
     }
 
+    uint debug_mode_early = uint(round(params.counts.w));
+    // Early-out on 100% fogged horizon pixels where layered RT weight is 0.
+    if (fog_t >= 0.99 && layered && debug_mode_early == 0u) {
+        out_colour[id.xy] = float4(0.0, 0.0, 0.0, 1.0);
+        out_guide[id.xy] = float4(1.0, 1.0, dist, 1.0);
+        out_reflection[id.xy] = float4(0.0, 0.0, 0.0, 1.0);
+        out_normals[id.xy] = float4(normal, roughness);
+        out_albedo[id.xy] = float4(raster_rgb, roughness);
+        return;
+    }
+
     uint samples = max(uint(params.frame.y), 1u);
+    uint max_bounces = min(uint(round(params.frame.z)), 6u);
     uint state = id.x * 0x9e3779b9u ^ id.y * 0x85ebca6bu ^ uint(params.frame.x) * 0xc2b2ae35u;
 
     float accum_shadow = 0.0;
@@ -358,10 +374,11 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float accum_refl_dist = 0.0;
     float3 accum_gi = float3(0.0, 0.0, 0.0);
 
-    // Phase 6: 8 stratified cosine-weighted hemisphere AO samples within
-    // world-space contact radius (eliminates coarse 2-tap circle blotches).
+    // 4 IGN-rotated stratified cosine-weighted contact AO rays (skipped beyond
+    // 260u where 4u contact occlusion is sub-pixel).
     float ao_radius = clamp(params.fog.z, 2.0, 6.0);
-    uint ao_samples = 8u;
+    uint ao_samples = 4u;
+    float ao_fade = 1.0 - saturate((dist - 220.0) / 40.0);
     float rot_angle = ign(id.xy, uint(params.frame.x)) * (2.0 * PI);
 
     float3 up = abs(normal.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
@@ -373,10 +390,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float3 sun_b = cross(params.sun_dir.xyz, sun_t);
 
     for (uint s = 0u; s < samples; s = s + 1u) {
-        // Phase 5: Decorrelated 4-sample Vogel-disk soft sun shadow penumbra.
+        // 2-tap IGN-rotated Vogel-disk soft sun shadow penumbra.
         float shadow = 1.0;
         if (bits_shadows && n_dot_l > 0.02) {
-            uint sun_taps = params.lens.z > 1e-4 ? 4u : 1u;
+            uint sun_taps = params.lens.z > 1e-4 ? 2u : 1u;
             uint sun_hits = 0u;
             float spread_tan = tan(params.lens.z);
             for (uint k = 0u; k < sun_taps; k = k + 1u) {
@@ -396,9 +413,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
         accum_shadow += shadow;
 
-        // Phase 6: 8-sample stratified cosine-weighted contact ambient occlusion.
+        // 4-sample stratified cosine-weighted contact ambient occlusion.
         float open = 1.0;
-        if (bits_ao) {
+        if (bits_ao && ao_fade > 0.01) {
             uint hits = 0u;
             for (uint i = 0u; i < ao_samples; i = i + 1u) {
                 float u1 = (float(i) + rand01(state)) / float(ao_samples);
@@ -412,13 +429,11 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     hits = hits + 1u;
                 }
             }
-            open = 1.0 - float(hits) / float(ao_samples);
+            open = lerp(1.0, 1.0 - float(hits) / float(ao_samples), ao_fade);
         }
         accum_open += open;
 
-        // Phase 4: GGX importance-sampled rough reflections with on-screen
-        // textured raster hit colour (falling back to harvested baked albedo
-        // off-screen) and raster sky reflection on miss + Fresnel.
+        // GGX importance-sampled rough reflections with smooth screen/off-screen blending.
         float refl_dist = params.lens.y;
         if (bits_reflections && roughness <= params.effects.x) {
             float3 h = ggx_sample(normal, roughness, rand01(state), rand01(state));
@@ -459,13 +474,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
         accum_refl_dist += refl_dist;
 
-        // Phase 6: 4-tap stratified cosine-weighted diffuse GI with stable
-        // receiver albedo, on-screen radiance cache / off-screen baked albedo
-        // bounce, and real SkyGpu+CloudGpu cubemap sky bounce on misses.
-        if (bits_gi && params.frame.z >= 1.0 && params.tuning.w > 0.0) {
+        // Real multi-bounce (1..=6) path-traced diffuse GI with Russian Roulette
+        // termination, real sunlit coloured bounce by day, and zero energy at night.
+        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0) {
             float sun_strength = saturate(dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722)) * 1.4);
             if (sun_strength > 0.005) {
-                uint gi_taps = 4u;
+                uint gi_taps = 2u;
                 float3 est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
                 float3 receiver_albedo = clamp(
                     raster_rgb / max(est_direct, float3(0.25, 0.25, 0.25)),
@@ -473,35 +487,64 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float3(0.92, 0.92, 0.92));
                 float3 gi_sum = float3(0.0, 0.0, 0.0);
                 for (uint g = 0u; g < gi_taps; g = g + 1u) {
-                    float u1 = (float(g) + rand01(state)) / float(gi_taps);
-                    float phi = float(g) * 2.39996323 + rot_angle + 1.0471975 + float(s) * 0.7548776;
-                    float r = sqrt(u1);
-                    float s_phi, c_phi;
-                    sincos(phi, s_phi, c_phi);
-                    float z = sqrt(max(0.0, 1.0 - u1));
-                    float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + normal * z;
-                    Hit bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 96.0));
-                    if (bhit.index != 0xffffffffu) {
-                        float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
-                        float3 bhit_world = ray_origin + d * bhit.t;
-                        float b_bias = max(bias, length(bhit_world - params.eye.xyz) * 0.004);
-                        float b_shadow = 1.0;
-                        if (bits_shadows && b_ndl > 0.01) {
-                            float3 bhit_pos = bhit_world + bhit.normal * b_bias;
-                            if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ (g * 73u + 11u))) {
-                                b_shadow = 0.0;
+                    float3 throughput = receiver_albedo;
+                    float3 b_origin = ray_origin;
+                    float3 b_t = t_axis;
+                    float3 b_b = b_axis;
+                    float3 b_n = normal;
+                    float b_step_bias = bias;
+                    for (uint bounce = 0u; bounce < max_bounces; bounce = bounce + 1u) {
+                        float u1 = (bounce == 0u) ? ((float(g) + rand01(state)) / float(gi_taps)) : rand01(state);
+                        float phi = (bounce == 0u)
+                            ? (float(g) * 2.39996323 + rot_angle + 1.0471975 + float(s) * 0.7548776)
+                            : (2.0 * PI * rand01(state));
+                        float r = sqrt(u1);
+                        float s_phi, c_phi;
+                        sincos(phi, s_phi, c_phi);
+                        float z = sqrt(max(0.0, 1.0 - u1));
+                        float3 d = b_t * (r * c_phi) + b_b * (r * s_phi) + b_n * z;
+                        float bounce_max_t = (bounce == 0u) ? min(params.lens.y, 96.0) : min(params.lens.y, 48.0);
+                        Hit bhit = closest_hit(b_origin, d, b_step_bias, bounce_max_t);
+                        if (bhit.index != 0xffffffffu) {
+                            float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
+                            float3 bhit_world = b_origin + d * bhit.t;
+                            float b_bias = max(b_step_bias, length(bhit_world - params.eye.xyz) * 0.004);
+                            float b_shadow = 1.0;
+                            if (bits_shadows && b_ndl > 0.01) {
+                                float3 bhit_pos = bhit_world + bhit.normal * b_bias;
+                                if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ (g * 73u + bounce * 31u + 11u))) {
+                                    b_shadow = 0.0;
+                                }
                             }
+                            Material bmat = material_of(bhit.index);
+                            float3 off_in = bmat.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow * 2.25);
+                            float3 incoming = off_in;
+                            if (bounce == 0u) {
+                                float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
+                                float b_w = saturate(b_screen.a);
+                                float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 1.55 * sun_strength);
+                                incoming = lerp(off_in, on_in, b_w);
+                            }
+                            gi_sum += throughput * incoming * (params.tuning.w * 1.65 * (1.0 - fog_t));
+                            if (bounce + 1u < max_bounces) {
+                                throughput *= clamp(bmat.albedo.rgb * 1.15, float3(0.10, 0.10, 0.10), float3(0.85, 0.85, 0.85));
+                                float max_tp = max(throughput.r, max(throughput.g, throughput.b));
+                                if (bounce >= 1u && max_tp < 0.04) {
+                                    break;
+                                }
+                                b_origin = bhit_world + bhit.normal * b_bias;
+                                b_n = bhit.normal;
+                                float3 bup = abs(b_n.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+                                b_t = normalize(cross(bup, b_n));
+                                b_b = cross(b_n, b_t);
+                                b_step_bias = b_bias;
+                            }
+                        } else {
+                            float sky_scale = (bounce == 0u) ? 0.08 : 0.04;
+                            float3 sky_bounce = sample_sky_env(d);
+                            gi_sum += throughput * sky_bounce * (params.tuning.w * sky_scale * sun_strength * (1.0 - fog_t));
+                            break;
                         }
-                        float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
-                        float b_w = saturate(b_screen.a);
-                        Material bmat = material_of(bhit.index);
-                        float3 off_in = bmat.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow * 2.25);
-                        float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 1.55 * sun_strength);
-                        float3 incoming = lerp(off_in, on_in, b_w);
-                        gi_sum += receiver_albedo * incoming * (params.tuning.w * 1.65 * (1.0 - fog_t));
-                    } else {
-                        float3 sky_bounce = sample_sky_env(d);
-                        gi_sum += receiver_albedo * sky_bounce * (params.tuning.w * 0.08 * sun_strength * (1.0 - fog_t));
                     }
                 }
                 accum_gi += gi_sum * (1.0 / float(gi_taps));

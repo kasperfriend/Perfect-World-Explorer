@@ -3889,12 +3889,14 @@ impl Renderer {
                 let main_slot = crate::world_objects::GpuPage::world_view_slot(
                     crate::scenery_visibility::Pass::Main,
                 );
+                let far_cull_sq = (view_distance + 128.0) * (view_distance + 128.0);
                 for cmd in &self.world_draw_cmds[main_slot].cmds {
                     let bmin = Vec3::from_array(cmd.min);
                     let bmax = Vec3::from_array(cmd.max);
                     let centre = (bmin + bmax) * 0.5;
                     let half = (bmax - bmin) * 0.5;
-                    if centre.distance_squared(camera.pos) > detail_radius_sq {
+                    let d2 = centre.distance_squared(camera.pos);
+                    if d2 > detail_radius_sq && d2 <= far_cull_sq {
                         proxies.push(InstanceProxy {
                             centre,
                             half,
@@ -4142,95 +4144,108 @@ impl Renderer {
                 height: w.height,
             })
             .collect();
-        active_water.sort_by(|a, b| {
-            let da = ((a.bounds[0] + a.bounds[1]) * 0.5 - camera.pos.x).powi(2)
-                + ((a.bounds[2] + a.bounds[3]) * 0.5 - camera.pos.z).powi(2);
-            let db = ((b.bounds[0] + b.bounds[1]) * 0.5 - camera.pos.x).powi(2)
-                + ((b.bounds[2] + b.bounds[3]) * 0.5 - camera.pos.z).powi(2);
-            da.total_cmp(&db)
-        });
-        let mut point_lights: Vec<(f32, crate::modules::raywatcher::frame::PointLight)> = self
-            .model_lights
-            .lights
-            .iter()
-            .filter_map(|l| {
-                let radius = l.range.max(0.0);
-                if radius <= 0.05 {
-                    return None;
-                }
-                let pos = glam::Vec3::from_array(l.position);
-                let dist_sq = pos.distance_squared(camera.pos);
-                let max_d = params.far + radius;
-                if dist_sq > max_d * max_d {
-                    return None;
-                }
-                let colour = glam::Vec3::new(
-                    l.diffuse[0].max(0.0),
-                    l.diffuse[1].max(0.0),
-                    l.diffuse[2].max(0.0),
-                );
-                if colour.length_squared() <= 1e-5 {
-                    return None;
-                }
-                let raw_int = l.diffuse[3];
-                let intensity = if raw_int > 0.01 {
-                    raw_int.clamp(0.25, 4.0)
-                } else {
-                    1.0
-                };
-                Some((
-                    dist_sq,
-                    crate::modules::raywatcher::frame::PointLight {
-                        position: pos,
-                        radius,
-                        colour,
-                        intensity,
-                        casts_shadow: true,
-                    },
-                ))
-            })
-            .collect();
-        if let Some(models) = &self.models {
-            for dl in models.dynamic_lights() {
-                let radius = dl.radius.max(0.0);
-                if radius <= 0.05 {
-                    continue;
-                }
-                let pos = glam::Vec3::from_array(dl.position);
-                let dist_sq = pos.distance_squared(camera.pos);
-                let max_d = params.far + radius;
-                if dist_sq > max_d * max_d {
-                    continue;
-                }
-                let colour = glam::Vec3::new(
-                    dl.color[0].max(0.0),
-                    dl.color[1].max(0.0),
-                    dl.color[2].max(0.0),
-                );
-                if colour.length_squared() <= 1e-5 {
-                    continue;
-                }
-                let raw_int = dl.color[3];
-                let intensity = if raw_int > 0.01 {
-                    raw_int.clamp(0.25, 4.0)
-                } else {
-                    1.0
-                };
-                point_lights.push((
-                    dist_sq,
-                    crate::modules::raywatcher::frame::PointLight {
-                        position: pos,
-                        radius,
-                        colour,
-                        intensity,
-                        casts_shadow: true,
-                    },
-                ));
-            }
+        if active_water.len() > 16 {
+            active_water.select_nth_unstable_by(16, |a, b| {
+                let da = ((a.bounds[0] + a.bounds[1]) * 0.5 - camera.pos.x).powi(2)
+                    + ((a.bounds[2] + a.bounds[3]) * 0.5 - camera.pos.z).powi(2);
+                let db = ((b.bounds[0] + b.bounds[1]) * 0.5 - camera.pos.x).powi(2)
+                    + ((b.bounds[2] + b.bounds[3]) * 0.5 - camera.pos.z).powi(2);
+                da.total_cmp(&db)
+            });
+            active_water.truncate(16);
         }
-        point_lights.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let need_point_lights = plan.point_light_shadows
+            || !layered
+            || plan.debug_view == crate::modules::raywatcher::plan::DebugView::PointLights;
         let active_point_lights: Vec<crate::modules::raywatcher::frame::PointLight> =
-            point_lights.into_iter().take(16).map(|(_, l)| l).collect();
+            if need_point_lights {
+                let mut point_lights: Vec<(f32, crate::modules::raywatcher::frame::PointLight)> =
+                    self.model_lights
+                        .lights
+                        .iter()
+                        .filter_map(|l| {
+                            let radius = l.range.max(0.0);
+                            if radius <= 0.05 {
+                                return None;
+                            }
+                            let pos = glam::Vec3::from_array(l.position);
+                            let dist_sq = pos.distance_squared(camera.pos);
+                            let max_d = params.far + radius;
+                            if dist_sq > max_d * max_d {
+                                return None;
+                            }
+                            let colour = glam::Vec3::new(
+                                l.diffuse[0].max(0.0),
+                                l.diffuse[1].max(0.0),
+                                l.diffuse[2].max(0.0),
+                            );
+                            if colour.length_squared() <= 1e-5 {
+                                return None;
+                            }
+                            let raw_int = l.diffuse[3];
+                            let intensity = if raw_int > 0.01 {
+                                raw_int.clamp(0.25, 4.0)
+                            } else {
+                                1.0
+                            };
+                            Some((
+                                dist_sq,
+                                crate::modules::raywatcher::frame::PointLight {
+                                    position: pos,
+                                    radius,
+                                    colour,
+                                    intensity,
+                                    casts_shadow: true,
+                                },
+                            ))
+                        })
+                        .collect();
+                if let Some(models) = &self.models {
+                    for dl in models.dynamic_lights() {
+                        let radius = dl.radius.max(0.0);
+                        if radius <= 0.05 {
+                            continue;
+                        }
+                        let pos = glam::Vec3::from_array(dl.position);
+                        let dist_sq = pos.distance_squared(camera.pos);
+                        let max_d = params.far + radius;
+                        if dist_sq > max_d * max_d {
+                            continue;
+                        }
+                        let colour = glam::Vec3::new(
+                            dl.color[0].max(0.0),
+                            dl.color[1].max(0.0),
+                            dl.color[2].max(0.0),
+                        );
+                        if colour.length_squared() <= 1e-5 {
+                            continue;
+                        }
+                        let raw_int = dl.color[3];
+                        let intensity = if raw_int > 0.01 {
+                            raw_int.clamp(0.25, 4.0)
+                        } else {
+                            1.0
+                        };
+                        point_lights.push((
+                            dist_sq,
+                            crate::modules::raywatcher::frame::PointLight {
+                                position: pos,
+                                radius,
+                                colour,
+                                intensity,
+                                casts_shadow: true,
+                            },
+                        ));
+                    }
+                }
+                if point_lights.len() > 16 {
+                    point_lights.select_nth_unstable_by(16, |a, b| a.0.total_cmp(&b.0));
+                    point_lights.truncate(16);
+                }
+                point_lights.into_iter().map(|(_, l)| l).collect()
+            } else {
+                Vec::new()
+            };
         gpu.record(
             &self.device,
             &self.queue,

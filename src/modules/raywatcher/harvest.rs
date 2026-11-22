@@ -1436,14 +1436,49 @@ fn push_terrain_frustum(
                     let h2 = heights[row1 + ix + 1];
                     let h3 = heights[row1 + ix];
                     let hc = ground(wxc, wzc);
-                    let diag_chord = (h0 + h2) * 0.5;
-                    let overshoot = diag_chord - hc;
+                    let hm_n = ground(wxc, wz0);
+                    let hm_s = ground(wxc, wz1);
+                    let hm_w = ground(wx0, wzc);
+                    let hm_e = ground(wx1, wzc);
+                    let err_c = ((h0 + h2) * 0.5 - hc).abs();
+                    let edge_err = ((h0 + h1) * 0.5 - hm_n)
+                        .abs()
+                        .max(((h3 + h2) * 0.5 - hm_s).abs())
+                        .max(((h0 + h3) * 0.5 - hm_w).abs())
+                        .max(((h1 + h2) * 0.5 - hm_e).abs());
 
-                    if overshoot.abs() > 0.08 {
+                    if edge_err > 0.08 {
+                        // Watertight 8-triangle star pinning both the cell
+                        // centre AND all 4 edge midpoints to exact `ground()`
+                        // heights: eliminates elevated bridges over valley
+                        // roads between hills and seals LOD-boundary T-junctions
+                        // on curved slopes.
+                        let p0 = Vec3::new(wx0, h0, wz0);
+                        let pm_n = Vec3::new(wxc, hm_n, wz0);
+                        let p1 = Vec3::new(wx1, h1, wz0);
+                        let pm_e = Vec3::new(wx1, hm_e, wzc);
+                        let p2 = Vec3::new(wx1, h2, wz1);
+                        let pm_s = Vec3::new(wxc, hm_s, wz1);
+                        let p3 = Vec3::new(wx0, h3, wz1);
+                        let pm_w = Vec3::new(wx0, hm_w, wzc);
+                        let pc = Vec3::new(wxc, hc, wzc);
+                        let ring = [p0, pm_n, p1, pm_e, p2, pm_s, p3, pm_w];
+                        for k in 0..8 {
+                            let a = ring[k];
+                            let b = ring[(k + 1) & 7];
+                            triangles.push(RayTriangle::with_kind(
+                                a,
+                                pc,
+                                b,
+                                tri_normal(a, pc, b),
+                                material,
+                                KIND_TERRAIN_LOD,
+                            ));
+                        }
+                        lod_tris[lod_band] += 8;
+                    } else if err_c > 0.08 {
                         // Watertight 4-triangle fan through the exact centre
-                        // height: hugs curved slopes/valleys across all LOD
-                        // bands while keeping every shared cell boundary edge
-                        // identical to neighbouring quads (zero step cracks).
+                        // height when all 4 perimeter edges are linear.
                         let p0 = Vec3::new(wx0, h0, wz0);
                         let p1 = Vec3::new(wx1, h1, wz0);
                         let p2 = Vec3::new(wx1, h2, wz1);
@@ -2256,6 +2291,33 @@ mod tests {
             );
             assert_eq!(t.normal[3], 0.0, "normal[3] must remain 0.0");
             assert_eq!(t.kind(), KIND_REAL_MESH, "kind must be stored in a[3]");
+        }
+    }
+
+    #[test]
+    fn terrain_frustum_valley_road_has_no_elevated_bridge_over_edges() {
+        // V-shaped road valley running along x = 90 between two steep hills.
+        // At dist ~80u (LOD step 4u), cell [88..92] spans both hills; the
+        // 8-triangle star must pin the North/South edge midpoints (x = 90)
+        // to the road floor instead of bridging across at hill height.
+        let valley = |x: f32, _z: f32| -> f32 { ((x - 90.0).abs() * 1.5).min(12.0) };
+        let mut tris = Vec::new();
+        let mut mats = Vec::new();
+        let eye = Vec3::new(0.0, 10.0, 0.0);
+        let frustum = Frustum::from_view_projection(glam::Mat4::IDENTITY);
+        let cfg = HarvestConfig::default();
+        push_terrain_frustum(
+            &mut tris, &mut mats, eye, &frustum, 160.0, 2.0, cfg, &valley,
+        );
+        // Check right on a coarse cell boundary (z = 0, 4, 8) at road center x = 90.
+        for z in [0.0f32, 4.0, 8.0, 12.0] {
+            let sampled = sample_terrain_tris_height(&tris, 90.0, z)
+                .expect("valley road point must be covered by terrain triangles");
+            let expected = valley(90.0, z);
+            assert!(
+                (sampled - expected).abs() < 0.1,
+                "valley road at (90, {z}) had elevated bridge: sampled={sampled}, expected={expected}"
+            );
         }
     }
 

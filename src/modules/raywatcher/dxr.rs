@@ -76,6 +76,7 @@ impl DxrTracer {
         _src_norm: &wgpu::Texture,
         _src_raster: &wgpu::Texture,
         _src_sky_env: &wgpu::Texture,
+        _copy_sky_env: bool,
     ) {
     }
 
@@ -476,6 +477,7 @@ mod imp {
         _blas: RawBuffer,
         tlas: RawBuffer,
         tri_count: u32,
+        opaque_tri_count: u32,
         mat_count: u32,
     }
 
@@ -873,7 +875,7 @@ mod imp {
                 albedo: [0.5, 0.5, 0.5, 1.0],
                 surface: [0.8, 0.0, 0.0, 0.0],
             }];
-            let tris_data: &[RayTriangle] = if scene.triangles.is_empty() {
+            let raw_tris: &[RayTriangle] = if scene.triangles.is_empty() {
                 &dummy_tri
             } else {
                 &scene.triangles
@@ -883,11 +885,31 @@ mod imp {
             } else {
                 &scene.materials
             };
+            // Partition triangles into opaque (opacity >= 0.99, hardware RT Core
+            // fast path with zero shader ejection) followed by alpha-tested
+            // foliage so 90%+ of intersections never leave fixed-function RT Cores.
+            let mut opaque_tris: Vec<RayTriangle> = Vec::with_capacity(raw_tris.len());
+            let mut alpha_tris: Vec<RayTriangle> = Vec::new();
+            let mat_max = mats_data.len().saturating_sub(1);
+            for &t in raw_tris {
+                let mat_idx = (t.b[3].round().max(0.0) as usize).min(mat_max);
+                if mats_data[mat_idx].surface[3] >= 0.99 {
+                    opaque_tris.push(t);
+                } else {
+                    alpha_tris.push(t);
+                }
+            }
+            let opaque_tri_count = opaque_tris.len() as u32;
+            let alpha_tri_count = alpha_tris.len() as u32;
+            let mut tris_ordered: Vec<RayTriangle> = Vec::with_capacity(raw_tris.len());
+            tris_ordered.extend_from_slice(&opaque_tris);
+            tris_ordered.extend_from_slice(&alpha_tris);
+            let tris_data: &[RayTriangle] = &tris_ordered;
             let tri_count = tris_data.len() as u32;
             let mat_count = mats_data.len() as u32;
 
             // Pack flat [f32; 3] vertex positions (3 vertices per triangle) for
-            // the DXR BLAS triangle geometry descriptor.
+            // the DXR BLAS triangle geometry descriptors.
             let mut verts: Vec<[f32; 3]> = Vec::with_capacity(tris_data.len() * 3);
             for t in tris_data {
                 verts.push([t.a[0], t.a[1], t.a[2]]);
@@ -939,29 +961,52 @@ mod imp {
                     d12::D3D12_RESOURCE_STATE_COPY_DEST,
                 )?;
 
-                let geom = GeometryDesc {
-                    ty: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
-                    flags: 0, // Allow non-opaque alpha-tested foliage queries (Phase 4)
-                    triangles: GeometryTrianglesDesc {
-                        transform3x4: 0,
-                        index_format: DXGI_FORMAT_UNKNOWN,
-                        vertex_format: DXGI_FORMAT_R32G32B32_FLOAT,
-                        index_count: 0,
-                        vertex_count: verts.len() as UINT,
-                        index_buffer: 0,
-                        vertex_buffer: GpuVaAndStride {
-                            start_address: vertices.gpu_va,
-                            stride_in_bytes: size_of::<[f32; 3]>() as u64,
+                let vert_stride = size_of::<[f32; 3]>() as u64;
+                let mut geoms: Vec<GeometryDesc> = Vec::with_capacity(2);
+                if opaque_tri_count > 0 {
+                    geoms.push(GeometryDesc {
+                        ty: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                        flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+                        triangles: GeometryTrianglesDesc {
+                            transform3x4: 0,
+                            index_format: DXGI_FORMAT_UNKNOWN,
+                            vertex_format: DXGI_FORMAT_R32G32B32_FLOAT,
+                            index_count: 0,
+                            vertex_count: opaque_tri_count * 3,
+                            index_buffer: 0,
+                            vertex_buffer: GpuVaAndStride {
+                                start_address: vertices.gpu_va,
+                                stride_in_bytes: vert_stride,
+                            },
                         },
-                    },
-                };
+                    });
+                }
+                if alpha_tri_count > 0 {
+                    geoms.push(GeometryDesc {
+                        ty: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                        flags: 0, // Alpha-tested foliage only
+                        triangles: GeometryTrianglesDesc {
+                            transform3x4: 0,
+                            index_format: DXGI_FORMAT_UNKNOWN,
+                            vertex_format: DXGI_FORMAT_R32G32B32_FLOAT,
+                            index_count: 0,
+                            vertex_count: alpha_tri_count * 3,
+                            index_buffer: 0,
+                            vertex_buffer: GpuVaAndStride {
+                                start_address: vertices.gpu_va
+                                    + (opaque_tri_count as u64) * 3 * vert_stride,
+                                stride_in_bytes: vert_stride,
+                            },
+                        },
+                    });
+                }
                 let blas_inputs = BuildAsInputs {
                     ty: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
                     flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
-                    num_descs: 1,
+                    num_descs: geoms.len() as UINT,
                     descs_layout: D3D12_ELEMENTS_LAYOUT_ARRAY,
                     u: BuildInputsUnion {
-                        p_geometry_descs: &geom,
+                        p_geometry_descs: geoms.as_ptr(),
                     },
                 };
                 let blas_info = device5_get_prebuild_info(device5, &blas_inputs);
@@ -1115,6 +1160,7 @@ mod imp {
                     _blas: blas,
                     tlas,
                     tri_count,
+                    opaque_tri_count,
                     mat_count,
                 })
             }
@@ -1254,20 +1300,26 @@ mod imp {
             src_norm: &wgpu::Texture,
             src_raster: &wgpu::Texture,
             src_sky_env: &wgpu::Texture,
+            copy_sky_env: bool,
         ) {
             let (tw, th) = self.targets.extent;
+            let force_sky = !self.targets.wgpu_tracked_copy_dst || copy_sky_env;
             let pairs = [
-                (src_pos, &self.targets.in_pos.texture, tw, th),
-                (src_norm, &self.targets.in_norm.texture, tw, th),
-                (src_raster, &self.targets.in_raster.texture, tw, th),
+                (src_pos, &self.targets.in_pos.texture, tw, th, true),
+                (src_norm, &self.targets.in_norm.texture, tw, th, true),
+                (src_raster, &self.targets.in_raster.texture, tw, th, true),
                 (
                     src_sky_env,
                     &self.targets.in_sky_env.texture,
                     SKY_ENV_WIDTH,
                     SKY_ENV_HEIGHT,
+                    force_sky,
                 ),
             ];
-            for (src, dst, mw, mh) in pairs {
+            for (src, dst, mw, mh, should_copy) in pairs {
+                if !should_copy {
+                    continue;
+                }
                 let copy_extent = wgpu::Extent3d {
                     width: mw.min(src.width()).min(dst.width()),
                     height: mh.min(src.height()).min(dst.height()),
@@ -1335,7 +1387,9 @@ mod imp {
             let (w, h) = (grid_extent.0.max(1), grid_extent.1.max(1));
             unsafe {
                 let slot_idx = self.ring.acquire("DXR-Trace")?;
-                self.cbvs[slot_idx].write_upload(bytemuck::bytes_of(params))?;
+                let mut dxr_params = *params;
+                dxr_params.fog[3] = self.scene.opaque_tri_count as f32;
+                self.cbvs[slot_idx].write_upload(bytemuck::bytes_of(&dxr_params))?;
                 let list = self.ring.slot_mut(slot_idx).list.as_mut_ptr();
 
                 let in_resources = [

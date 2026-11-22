@@ -886,7 +886,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let bits_ao = (effects & 8u) != 0u;
     let bits_gi = (effects & 16u) != 0u;
 
-    let slope_bias = (1.0 - clamp(normal.y, 0.0, 1.0)) * 0.25;
+    let slope_bias = (1.0 - clamp(normal.y, 0.0, 1.0)) * (0.25 + dist * 0.0025);
     let bias = max(params.effects.z, max(0.15, dist * 0.003)) + slope_bias;
     let ray_origin = point + normal * bias - view_dir * (bias * 0.35);
     let n_dot_l = max(dot(normal, params.sun_dir.xyz), 0.0);
@@ -898,7 +898,18 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         fog_t = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
     }
 
+    let debug_mode_early = u32(round(params.counts.w));
+    if (fog_t >= 0.99 && layered && debug_mode_early == 0u) {
+        textureStore(out_colour, ip, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        textureStore(out_guide, ip, vec4<f32>(1.0, 1.0, dist, 1.0));
+        textureStore(out_reflection, ip, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        textureStore(out_normals, ip, vec4<f32>(normal, roughness));
+        textureStore(out_albedo, ip, vec4<f32>(raster_rgb, roughness));
+        return;
+    }
+
     let samples = max(u32(params.frame.y), 1u);
+    let max_bounces = min(u32(round(params.frame.z)), 6u);
     var state = id.x * 0x9e3779b9u ^ id.y * 0x85ebca6bu ^ u32(params.frame.x) * 0xc2b2ae35u;
     var accum_shadow = 0.0;
     var accum_open = 0.0;
@@ -907,7 +918,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var accum_gi = vec3<f32>(0.0);
 
     let ao_radius = clamp(params.fog.z, 2.0, 6.0);
-    let ao_samples = 8u;
+    let ao_samples = 4u;
+    let ao_fade = 1.0 - clamp((dist - 220.0) / 40.0, 0.0, 1.0);
     let rot_angle = ign(id.xy, u32(params.frame.x)) * (2.0 * PI);
     let onb = orthonormal_basis(normal);
     let sun_onb = orthonormal_basis(params.sun_dir.xyz);
@@ -915,7 +927,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var s = 0u; s < samples; s = s + 1u) {
         var shadow = 1.0;
         if (bits_shadows && n_dot_l > 0.02) {
-            let sun_taps = select(1u, 4u, params.lens.z > 1e-4);
+            let sun_taps = select(1u, 2u, params.lens.z > 1e-4);
             var sun_hits = 0u;
             let spread_tan = tan(params.lens.z);
             for (var k = 0u; k < sun_taps; k = k + 1u) {
@@ -934,7 +946,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         accum_shadow = accum_shadow + shadow;
 
         var open = 1.0;
-        if (bits_ao) {
+        if (bits_ao && ao_fade > 0.01) {
             var hits = 0u;
             for (var i = 0u; i < ao_samples; i = i + 1u) {
                 let u1 = (f32(i) + next_f32(&state)) / f32(ao_samples);
@@ -945,13 +957,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                     hits = hits + 1u;
                 }
             }
-            open = 1.0 - f32(hits) / f32(ao_samples);
+            open = mix(1.0, 1.0 - f32(hits) / f32(ao_samples), ao_fade);
         }
         accum_open = accum_open + open;
 
-        // Phase 4: GGX importance-sampled rough reflections with on-screen
-        // textured raster hit colour (falling back to harvested baked albedo
-        // off-screen) and raster sky reflection on miss + Fresnel.
         var refl_dist = params.lens.y;
         if (bits_reflections && roughness <= params.effects.x) {
             let h = ggx_sample(normal, roughness, next_f32(&state), next_f32(&state));
@@ -991,43 +1000,68 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         accum_refl_dist = accum_refl_dist + refl_dist;
 
-        // Phase 6: 4-tap stratified cosine-weighted diffuse GI with stable
-        // receiver albedo, on-screen radiance cache / off-screen baked albedo
-        // bounce, and real SkyGpu+CloudGpu cubemap sky bounce on misses.
-        if (bits_gi && params.frame.z >= 1.0 && params.tuning.w > 0.0) {
+        // Real multi-bounce (1..=6) path-traced diffuse GI with Russian Roulette
+        // termination, real sunlit coloured bounce by day, and zero energy at night.
+        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0) {
             let sun_strength = clamp(luminance(params.sun_colour.xyz) * 1.4, 0.0, 1.0);
             if (sun_strength > 0.005) {
-                let gi_taps = 4u;
+                let gi_taps = 2u;
                 let est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
                 let receiver_albedo = clamp(raster_rgb / max(est_direct, vec3<f32>(0.25)), vec3<f32>(0.18), vec3<f32>(0.92));
                 var gi_sum = vec3<f32>(0.0);
                 for (var g = 0u; g < gi_taps; g = g + 1u) {
-                    let u1 = (f32(g) + next_f32(&state)) / f32(gi_taps);
-                    let phi = f32(g) * 2.39996323 + rot_angle + 1.0471975 + f32(s) * 0.7548776;
-                    let r = sqrt(u1);
-                    let d = onb * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
-                    let bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 96.0));
-                    if (bhit.index != 0xffffffffu) {
-                        let b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
-                        let bhit_world = ray_origin + d * bhit.t;
-                        let b_bias = max(bias, length(bhit_world - params.eye.xyz) * 0.004);
-                        var b_shadow = 1.0;
-                        if (bits_shadows && b_ndl > 0.01) {
-                            let bhit_pos = bhit_world + bhit.normal * b_bias;
-                            if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ (g * 73u + 11u))) {
-                                b_shadow = 0.0;
-                            }
+                    var throughput = receiver_albedo;
+                    var b_origin = ray_origin;
+                    var b_onb = onb;
+                    var b_step_bias = bias;
+                    for (var bounce = 0u; bounce < max_bounces; bounce = bounce + 1u) {
+                        var u1 = next_f32(&state);
+                        var phi = 2.0 * PI * next_f32(&state);
+                        if (bounce == 0u) {
+                            u1 = (f32(g) + u1) / f32(gi_taps);
+                            phi = f32(g) * 2.39996323 + rot_angle + 1.0471975 + f32(s) * 0.7548776;
                         }
-                        let b_screen = sample_screen_radiance(bhit_world, bhit.t);
-                        let b_w = clamp(b_screen.a, 0.0, 1.0);
-                        let bmaterial = material_of(bhit.index);
-                        let off_in = bmaterial.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow * 2.25);
-                        let on_in = b_screen.rgb * (b_ndl * b_shadow * 1.55 * sun_strength);
-                        let incoming = mix(off_in, on_in, b_w);
-                        gi_sum = gi_sum + receiver_albedo * incoming * (params.tuning.w * 1.65 * (1.0 - fog_t));
-                    } else {
-                        let sky_bounce = sample_sky_env(d);
-                        gi_sum = gi_sum + receiver_albedo * sky_bounce * (params.tuning.w * 0.08 * sun_strength * (1.0 - fog_t));
+                        let r = sqrt(u1);
+                        let d = b_onb * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
+                        let bounce_max_t = select(min(params.lens.y, 48.0), min(params.lens.y, 96.0), bounce == 0u);
+                        let bhit = closest_hit(b_origin, d, b_step_bias, bounce_max_t);
+                        if (bhit.index != 0xffffffffu) {
+                            let b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
+                            let bhit_world = b_origin + d * bhit.t;
+                            let b_bias = max(b_step_bias, length(bhit_world - params.eye.xyz) * 0.004);
+                            var b_shadow = 1.0;
+                            if (bits_shadows && b_ndl > 0.01) {
+                                let bhit_pos = bhit_world + bhit.normal * b_bias;
+                                if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ (g * 73u + bounce * 31u + 11u))) {
+                                    b_shadow = 0.0;
+                                }
+                            }
+                            let bmaterial = material_of(bhit.index);
+                            let off_in = bmaterial.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow * 2.25);
+                            var incoming = off_in;
+                            if (bounce == 0u) {
+                                let b_screen = sample_screen_radiance(bhit_world, bhit.t);
+                                let b_w = clamp(b_screen.a, 0.0, 1.0);
+                                let on_in = b_screen.rgb * (b_ndl * b_shadow * 1.55 * sun_strength);
+                                incoming = mix(off_in, on_in, b_w);
+                            }
+                            gi_sum = gi_sum + throughput * incoming * (params.tuning.w * 1.65 * (1.0 - fog_t));
+                            if (bounce + 1u < max_bounces) {
+                                throughput = throughput * clamp(bmaterial.albedo.rgb * 1.15, vec3<f32>(0.10), vec3<f32>(0.85));
+                                let max_tp = max(throughput.r, max(throughput.g, throughput.b));
+                                if (bounce >= 1u && max_tp < 0.04) {
+                                    break;
+                                }
+                                b_origin = bhit_world + bhit.normal * b_bias;
+                                b_onb = orthonormal_basis(bhit.normal);
+                                b_step_bias = b_bias;
+                            }
+                        } else {
+                            let sky_scale = select(0.04, 0.08, bounce == 0u);
+                            let sky_bounce = sample_sky_env(d);
+                            gi_sum = gi_sum + throughput * sky_bounce * (params.tuning.w * sky_scale * sun_strength * (1.0 - fog_t));
+                            break;
+                        }
                     }
                 }
                 accum_gi = accum_gi + gi_sum * (1.0 / f32(gi_taps));
@@ -1304,6 +1338,11 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let current = cur_raw.rgb + textureLoad(src_reflection, gp, 0).rgb;
     let current_lf = cur_raw.a;
     let depth = textureLoad(src_depth, pixel, 0);
+    if (depth <= 1e-6) {
+        textureStore(out_colour, pixel, vec4<f32>(current, current_lf));
+        textureStore(out_moments, pixel, vec4<f32>(0.0, 0.0, depth, 1.0));
+        return;
+    }
     let prev = reproject(pixel, size);
     let n = min(prev.length, params.misc.z);
     let valid = params.misc.w > 0.5 && n > 0.0;
@@ -1383,6 +1422,11 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let grid_scale = ndim / vec2<f32>(size);
     let gmax = ndim - vec2<f32>(1.0);
     let centre_depth = textureLoad(src_depth, pixel, 0);
+    if (centre_depth <= 1e-6) {
+        textureStore(out_colour, pixel, textureLoad(history_colour, pixel, 0));
+        textureStore(out_moments, pixel, textureLoad(history_moments, pixel, 0));
+        return;
+    }
     let centre_normal = normal_at_scaled(pixel, grid_scale, gmax);
     let centre_moments = textureLoad(history_moments, pixel, 0);
     let centre_variance = variance_of(centre_moments);
@@ -2250,6 +2294,7 @@ pub struct RaywatcherGpu {
     sky_env_view: wgpu::TextureView,
     sky_env_face_cursor: u32,
     sky_env_initialized: bool,
+    sky_env_dirty: bool,
     sky_env_scratch: Option<(
         wgpu::TextureFormat,
         wgpu::Texture,
@@ -2470,6 +2515,7 @@ impl RaywatcherGpu {
             sky_env_view,
             sky_env_face_cursor: 0,
             sky_env_initialized: false,
+            sky_env_dirty: true,
             sky_env_scratch: None,
             output,
             output_view,
@@ -3202,7 +3248,9 @@ impl RaywatcherGpu {
                     &self.grid.gbuf_norm,
                     &self.grid.gbuf_raster,
                     &self.sky_env_tex,
+                    self.sky_env_dirty,
                 );
+                self.sky_env_dirty = false;
                 let pending = std::mem::replace(
                     encoder,
                     device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3558,11 +3606,15 @@ impl RaywatcherGpu {
 
         let faces_to_render: Vec<u32> = if !self.sky_env_initialized {
             self.sky_env_initialized = true;
+            self.sky_env_dirty = true;
             (0..6).collect()
-        } else {
+        } else if self.frames % 4 == 0 {
             let f = self.sky_env_face_cursor % 6;
             self.sky_env_face_cursor = self.sky_env_face_cursor.wrapping_add(1);
+            self.sky_env_dirty = true;
             vec![f]
+        } else {
+            return;
         };
 
         let multi_face = faces_to_render.len() > 1;
