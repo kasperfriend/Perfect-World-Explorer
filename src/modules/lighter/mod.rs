@@ -2239,6 +2239,7 @@ impl Lighter {
         }
         self.present = None;
         self.post = None;
+        self.last_overlay_extent = None;
         self.software = None;
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
@@ -2479,6 +2480,18 @@ impl Lighter {
         h: u32,
         progress: impl Fn(&str) + Sync,
     ) -> Result<bool, String> {
+        let variant = self.desired_shader_variant();
+        self.prepare_frame_for_variant(device, w, h, variant, progress)
+    }
+
+    fn prepare_frame_for_variant(
+        &mut self,
+        device: &wgpu::Device,
+        w: u32,
+        h: u32,
+        variant: ShaderVariant,
+        progress: impl Fn(&str) + Sync,
+    ) -> Result<bool, String> {
         if self.settings.mode != Mode::Off && self.capture && self.timings.is_none() {
             self.timings = profile::Timings::new(device);
         }
@@ -2534,7 +2547,6 @@ impl Lighter {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         if self.settings.mode == Mode::Hardware && self.unavailable().is_none() {
             let (rw, rh) = self.ray_extent(device, w, h)?;
-            let variant = self.desired_shader_variant();
             if self
                 .hardware
                 .as_ref()
@@ -3001,7 +3013,9 @@ impl Lighter {
             return Err(reason.into());
         }
         let [_, _, w, h] = frame.extent;
-        if !self.prepare_frame(device, w, h)? {
+        // Full-frame `render()` always dispatches `render_pixel`, so it must
+        // never run against the stripped `ShaderVariant::Overlay` pipeline.
+        if !self.prepare_frame_for_variant(device, w, h, ShaderVariant::Full, |_| {})? {
             return Ok(false);
         }
         let world = self
