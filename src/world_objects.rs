@@ -854,11 +854,44 @@ pub struct RtMeshTriangle {
 /// buildings and props retain real mesh silhouettes for shadows & reflections.
 const MAX_RT_TRIS_PER_PAGE: usize = 32768;
 
-fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32]) -> Vec<RtMeshTriangle> {
+fn sample_atlas_rgba(
+    atlas: &[u8],
+    atlas_h: usize,
+    v_color: [f32; 4],
+    kind: f32,
+    uv: [f32; 2],
+) -> Option<([f32; 3], f32)> {
+    if atlas.is_empty() || atlas_h == 0 || kind <= 1.5 {
+        return None;
+    }
+    let scale_u = v_color[2];
+    let scale_v = if kind < 2.5 { v_color[3] } else { v_color[2] };
+    if scale_u <= 1e-5 || scale_v <= 1e-5 {
+        return None;
+    }
+    let lu = ((uv[0] - v_color[0]) / scale_u).rem_euclid(1.0) * scale_u;
+    let lv = ((uv[1] - v_color[1]) / scale_v).rem_euclid(1.0) * scale_v;
+    let au = (v_color[0] + lu).clamp(0.0, 0.9999);
+    let av = (v_color[1] + lv).clamp(0.0, 0.9999);
+    let x = ((au * SIDE as f32) as usize).min(SIDE - 1);
+    let y = ((av * atlas_h as f32) as usize).min(atlas_h - 1);
+    let idx = (y * SIDE + x) * 4;
+    if idx + 3 >= atlas.len() {
+        return None;
+    }
+    let r = atlas[idx] as f32 / 255.0;
+    let g = atlas[idx + 1] as f32 / 255.0;
+    let b = atlas[idx + 2] as f32 / 255.0;
+    let a = atlas[idx + 3] as f32 / 255.0;
+    Some(([r * r, g * g, b * b], a))
+}
+
+fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32], atlas: &[u8]) -> Vec<RtMeshTriangle> {
     let tri_count = indices.len() / 3;
     if tri_count == 0 {
         return Vec::new();
     }
+    let atlas_h = atlas.len() / (SIDE * 4);
     let step = (tri_count / MAX_RT_TRIS_PER_PAGE).max(1);
     let mut out = Vec::with_capacity(tri_count.min(MAX_RT_TRIS_PER_PAGE));
     let mut t = 0usize;
@@ -887,31 +920,85 @@ fn extract_rt_triangles(vertices: &[Vertex], indices: &[u32]) -> Vec<RtMeshTrian
                     let bl = (d & 0xff) as f32 / 255.0;
                     [r * r, g * g, bl * bl]
                 };
-                let has_rgb = ((v0.diffuse | v1.diffuse | v2.diffuse) & 0x00ff_ffff) != 0;
-                let albedo = if has_rgb {
-                    let c0 = decode(v0.diffuse);
-                    let c1 = decode(v1.diffuse);
-                    let c2 = decode(v2.diffuse);
+                let kind = v0.kind;
+                let is_sdr_blend = (kind > 2.01 && kind < 2.03) || (kind > 2.11 && kind < 2.13);
+                // Sample real RGBA8 texture atlas at 4 triangle points (centroid + 3 mid-corners)
+                // so buildings, roofs, and BMD foliage cards (like City of Plume giant tree)
+                // get true textured RGB albedo and real alpha cutout coverage instead of grey boxes.
+                let uv_c = [
+                    (v0.uv[0] + v1.uv[0] + v2.uv[0]) / 3.0,
+                    (v0.uv[1] + v1.uv[1] + v2.uv[1]) / 3.0,
+                ];
+                let mut tex_rgb = [0.0f32; 3];
+                let mut tex_rgb_w = 0.0f32;
+                let mut tex_alpha_sum = 0.0f32;
+                let mut tex_samples = 0u32;
+                for uv in [
+                    uv_c,
+                    [(uv_c[0] + v0.uv[0]) * 0.5, (uv_c[1] + v0.uv[1]) * 0.5],
+                    [(uv_c[0] + v1.uv[0]) * 0.5, (uv_c[1] + v1.uv[1]) * 0.5],
+                    [(uv_c[0] + v2.uv[0]) * 0.5, (uv_c[1] + v2.uv[1]) * 0.5],
+                ] {
+                    if let Some((rgb, a)) = sample_atlas_rgba(atlas, atlas_h, v0.color, kind, uv) {
+                        tex_samples += 1;
+                        tex_alpha_sum += a;
+                        if a >= 0.20 {
+                            tex_rgb[0] += rgb[0] * a;
+                            tex_rgb[1] += rgb[1] * a;
+                            tex_rgb[2] += rgb[2] * a;
+                            tex_rgb_w += a;
+                        }
+                    }
+                }
+                let tex_alpha = if tex_samples > 0 {
+                    Some(tex_alpha_sum / tex_samples as f32)
+                } else {
+                    None
+                };
+                if let Some(ta) = tex_alpha {
+                    if ta < 0.22 {
+                        t += step;
+                        continue;
+                    }
+                }
+                let albedo = if tex_rgb_w > 1e-4 {
                     [
-                        ((c0[0] + c1[0] + c2[0]) / 3.0).clamp(0.12, 0.92),
-                        ((c0[1] + c1[1] + c2[1]) / 3.0).clamp(0.12, 0.92),
-                        ((c0[2] + c1[2] + c2[2]) / 3.0).clamp(0.12, 0.92),
+                        (tex_rgb[0] / tex_rgb_w).clamp(0.06, 0.95),
+                        (tex_rgb[1] / tex_rgb_w).clamp(0.06, 0.95),
+                        (tex_rgb[2] / tex_rgb_w).clamp(0.06, 0.95),
                     ]
                 } else {
-                    // Unbaked `.bmd` vertices default `day_diffuse` to 0; use a neutral
-                    // stone/wood midtone so reflections and GI bounces are not black.
-                    [0.42, 0.40, 0.37]
+                    let has_rgb = ((v0.diffuse | v1.diffuse | v2.diffuse) & 0x00ff_ffff) != 0;
+                    if has_rgb {
+                        let c0 = decode(v0.diffuse);
+                        let c1 = decode(v1.diffuse);
+                        let c2 = decode(v2.diffuse);
+                        [
+                            ((c0[0] + c1[0] + c2[0]) / 3.0).clamp(0.12, 0.92),
+                            ((c0[1] + c1[1] + c2[1]) / 3.0).clamp(0.12, 0.92),
+                            ((c0[2] + c1[2] + c2[2]) / 3.0).clamp(0.12, 0.92),
+                        ]
+                    } else {
+                        [0.42, 0.40, 0.37]
+                    }
                 };
                 let a0 = ((v0.diffuse >> 24) & 0xff) as f32 / 255.0;
                 let a1 = ((v1.diffuse >> 24) & 0xff) as f32 / 255.0;
                 let a2 = ((v2.diffuse >> 24) & 0xff) as f32 / 255.0;
                 let v_alpha = ((a0 + a1 + a2) / 3.0).clamp(0.0, 1.0);
-                let kind = v0.kind;
-                let is_sdr_blend = (kind > 2.01 && kind < 2.03) || (kind > 2.11 && kind < 2.13);
-                // Opaque scenery/buildings (`!is_sdr_blend && kind <= 3.5`) often carry
-                // alpha byte 0x00 in `.bmd` `day_diffuse` (`0x00RRGGBB` or `0`), so
-                // multiplying by `v_alpha` would make whole buildings transparent to RT rays.
-                let opacity = if is_sdr_blend {
+                let opacity = if let Some(ta) = tex_alpha {
+                    if ta < 0.92 {
+                        (ta * 0.80).clamp(0.28, 0.86)
+                    } else if is_sdr_blend {
+                        if v_alpha > 0.01 {
+                            (v_alpha * 0.65).clamp(0.25, 0.85)
+                        } else {
+                            0.55
+                        }
+                    } else {
+                        1.0
+                    }
+                } else if is_sdr_blend {
                     if v_alpha > 0.01 {
                         (v_alpha * 0.65).clamp(0.25, 0.85)
                     } else {
@@ -1123,7 +1210,7 @@ impl GpuPage {
         reflected: Arc<wgpu::BindGroup>,
     ) -> Self {
         use wgpu::util::DeviceExt;
-        let rt_triangles = extract_rt_triangles(&page.vertices, &page.indices);
+        let rt_triangles = extract_rt_triangles(&page.vertices, &page.indices, &page.atlas);
         let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("whole-world object vertices"),
             contents: bytemuck::cast_slice(&page.vertices),
@@ -1876,7 +1963,7 @@ mod raywatcher_extract_tests {
             v([4.0, 0.0, 0.0], 0x0000_0000, 2.0),
             v([0.0, 4.0, 0.0], 0x0000_0000, 2.0),
         ];
-        let tris = extract_rt_triangles(&verts, &[0, 1, 2, 3, 4, 5]);
+        let tris = extract_rt_triangles(&verts, &[0, 1, 2, 3, 4, 5], &[]);
         assert_eq!(tris.len(), 2);
         assert!(
             (tris[0].opacity - 1.0).abs() < 1e-5,

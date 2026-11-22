@@ -2773,11 +2773,12 @@ impl Renderer {
         let authored_pre = region_light_pre
             .map(|l| l.material_direction().toward_sun())
             .unwrap_or([0.6, -0.4, 0.8]);
-        let (tracked_dir, _, _, _) = crate::modules::raywatcher::frame::tracked_celestial_light(
-            camera.time_of_day,
-            authored_pre,
-            region_light_pre.as_ref(),
-        );
+        let (tracked_dir, _, tracked_int, tracked_is_moon) =
+            crate::modules::raywatcher::frame::tracked_celestial_light(
+                camera.time_of_day,
+                authored_pre,
+                region_light_pre.as_ref(),
+            );
         let sun = if self.raywatcher_overrides.suppress_baked_shadows {
             [tracked_dir.x, tracked_dir.y, tracked_dir.z, -1.]
         } else {
@@ -2792,12 +2793,28 @@ impl Renderer {
                 },
             ]
         };
-        let light = [
-            0.17 + 0.38 * daylight,
-            0.07 + 0.38 * daylight,
-            1.,
-            1. - 0.18 * twilight,
-        ];
+        let light = if self.raywatcher_overrides.suppress_baked_shadows {
+            if tracked_is_moon {
+                // Real-life night: pitch black ambient in unlit/shadowed areas,
+                // cool directional moonlight where the moon actually hits.
+                [0.008, 0.03 + 0.18 * tracked_int, 1., 1.]
+            } else {
+                // Strong solar elevation curve across the day: low dim golden
+                // dawn/sunset -> crisp bright high noon.
+                let sun_elev = tracked_dir.y.clamp(0.0, 1.0);
+                let amb = 0.025 + 0.24 * sun_elev.powf(0.75);
+                let dir_l = 0.12 + 0.72 * sun_elev.powf(0.65);
+                let warm = 1. - 0.28 * (1. - sun_elev).powf(2.0);
+                [amb, dir_l, 1., warm]
+            }
+        } else {
+            [
+                0.17 + 0.38 * daylight,
+                0.07 + 0.38 * daylight,
+                1.,
+                1. - 0.18 * twilight,
+            ]
+        };
         // The region's authored light, resolved once for every consumer below.
         let region_light = camera.regional_light.or(self.retained_regional_light);
         let authored = region_light
@@ -4024,6 +4041,27 @@ impl Renderer {
             Vec3::from_array(fog.color),
             (fog.start, fog.end),
         );
+        let region_light_rw = camera.regional_light.or(self.retained_regional_light);
+        let authored_rw = region_light_rw
+            .map(|l| l.material_direction().toward_sun())
+            .unwrap_or([0.6, -0.4, 0.8]);
+        let (cel_dir, cel_col, cel_int, is_moon) =
+            crate::modules::raywatcher::frame::tracked_celestial_light(
+                camera.time_of_day,
+                authored_rw,
+                region_light_rw.as_ref(),
+            );
+        let mut lighting = lighting;
+        lighting.direction = cel_dir;
+        lighting.diffuse = cel_col;
+        if is_moon {
+            // Pitch-black night ambient so moon shadows and unlit interiors drop to true dark.
+            lighting.ambient = glam::Vec3::new(0.006, 0.008, 0.014);
+        } else {
+            let sun_elev = cel_dir.y.clamp(0.0, 1.0);
+            let amb_scale = 0.14 + 0.86 * sun_elev.powf(0.7);
+            lighting.ambient *= amb_scale;
+        }
         let transport = crate::modules::raywatcher::shade::TransportConfig::new(
             lighting,
             settings.ambient_strength,
@@ -4031,16 +4069,6 @@ impl Renderer {
             settings.reflection_roughness_cutoff,
             2e-3,
         );
-        let region_light_rw = camera.regional_light.or(self.retained_regional_light);
-        let authored_rw = region_light_rw
-            .map(|l| l.material_direction().toward_sun())
-            .unwrap_or([0.6, -0.4, 0.8]);
-        let (cel_dir, cel_col, cel_int, _is_moon) =
-            crate::modules::raywatcher::frame::tracked_celestial_light(
-                camera.time_of_day,
-                authored_rw,
-                region_light_rw.as_ref(),
-            );
         let sun = Sun {
             direction: cel_dir,
             colour: cel_col,
@@ -4140,7 +4168,8 @@ impl Renderer {
             });
             active_water.truncate(16);
         }
-        let need_point_lights = plan.point_light_shadows
+        let need_point_lights = plan.effects.lighting
+            || plan.point_light_shadows
             || !layered
             || plan.debug_view == crate::modules::raywatcher::plan::DebugView::PointLights;
         let active_point_lights: Vec<crate::modules::raywatcher::frame::PointLight> =
@@ -4218,6 +4247,70 @@ impl Renderer {
                                 position: pos,
                                 radius,
                                 colour,
+                                intensity,
+                                casts_shadow: true,
+                            },
+                        ));
+                    }
+                }
+                // Also harvest luminous additive world effects (torches, magic glows,
+                // lanterns, spells) clustered within 6 u so effects cast real shadowed light.
+                if let Some(models) = &self.models {
+                    let mut effect_clusters: Vec<(glam::Vec3, glam::Vec3, f32, f32)> = Vec::new();
+                    for q in models.effect_quads() {
+                        // D3DBLEND_ONE (2) = additive emissive glow.
+                        if q.destination_blend != 2 || q.mesh.is_some() {
+                            continue;
+                        }
+                        let a = q.color[3].clamp(0.0, 1.0);
+                        let col = glam::Vec3::new(
+                            q.color[0].max(0.0),
+                            q.color[1].max(0.0),
+                            q.color[2].max(0.0),
+                        ) * a;
+                        let lum = col.x * 0.2126 + col.y * 0.7152 + col.z * 0.0722;
+                        if lum < 0.08 {
+                            continue;
+                        }
+                        let p0 = glam::Vec3::from_array(q.positions[0]);
+                        let p1 = glam::Vec3::from_array(q.positions[1]);
+                        let p2 = glam::Vec3::from_array(q.positions[2]);
+                        let p3 = glam::Vec3::from_array(q.positions[3]);
+                        let center = (p0 + p1 + p2 + p3) * 0.25;
+                        if !center.is_finite() {
+                            continue;
+                        }
+                        let dist_sq = center.distance_squared(camera.pos);
+                        let extent = p0.distance(p3).max(p1.distance(p2)).clamp(0.5, 16.0);
+                        let radius = (extent * 4.5).clamp(12.0, 48.0);
+                        let max_d = params.far + radius;
+                        if dist_sq > max_d * max_d {
+                            continue;
+                        }
+                        if let Some(existing) = effect_clusters
+                            .iter_mut()
+                            .find(|(pos, _, _, _)| pos.distance_squared(center) < 36.0)
+                        {
+                            existing.1 = existing.1.max(col);
+                            existing.2 = existing.2.max(radius);
+                            existing.3 = (existing.3 + lum * 0.35).min(3.5);
+                        } else if effect_clusters.len() < 32 {
+                            effect_clusters.push((
+                                center,
+                                col,
+                                radius,
+                                (lum * 2.0).clamp(0.6, 3.0),
+                            ));
+                        }
+                    }
+                    for (pos, col, radius, intensity) in effect_clusters {
+                        let dist_sq = pos.distance_squared(camera.pos);
+                        point_lights.push((
+                            dist_sq,
+                            crate::modules::raywatcher::frame::PointLight {
+                                position: pos,
+                                radius,
+                                colour: col,
                                 intensity,
                                 casts_shadow: true,
                             },

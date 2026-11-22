@@ -363,7 +363,7 @@ struct Out {@builtin(position) pos:vec4<f32>,@location(0) normal:vec3<f32>,@loca
   let light=mix(vec3<f32>(luminance),rgb,0.25);
   return vec4<f32>(fogged(tex.rgb*light,i.pos.w),1.);
  }
- let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.pos.w),1.);}
+ let ndl_raw=dot(normalize(i.normal),normalize(camera.sun.xyz));let ndl=select(max(ndl_raw,0.),abs(ndl_raw)*0.85+0.15,camera.sun.w<0. && i.kind>3.5);let light=camera.light.x+camera.light.y*ndl;return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.pos.w),1.);}
 "#;
 impl FarTrees {
     pub fn new(
@@ -664,7 +664,7 @@ impl FarTrees {
                             (leaf.uv[0][1] + leaf.uv[1][1] + leaf.uv[2][1] + leaf.uv[3][1]) * 0.25,
                         ];
                         let (albedo, alpha) = sample_rgba_uv(&tree.composite, uv_mid);
-                        if alpha < 0.2 {
+                        if alpha < 0.35 {
                             continue;
                         }
                         let n = leaf
@@ -683,7 +683,7 @@ impl FarTrees {
                         // foliage silhouette instead of the full rectangular card margin.
                         let corner = |j: usize| {
                             let c = leaf.corners[j];
-                            center + (right * c[0] + bitan * c[1] + n * c[2]) * 0.78
+                            center + (right * c[0] + bitan * c[1] + n * c[2]) * 0.62
                         };
                         let (p0, p1, p2, p3) = (corner(0), corner(1), corner(2), corner(3));
                         let opacity = (alpha * 0.65).clamp(0.28, 0.68);

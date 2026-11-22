@@ -442,7 +442,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     for (uint s = 0u; s < samples; s = s + 1u) {
         // 2-tap IGN-rotated Vogel-disk soft sun shadow penumbra.
         float shadow = 1.0;
-        if (bits_shadows && n_dot_l > 0.02) {
+        if (bits_shadows && n_dot_l > 0.02 && fog_t < 0.96) {
             uint sun_taps = (params.lens.z > 1e-4 && dist < 160.0) ? 2u : 1u;
             uint sun_hits = 0u;
             float spread_tan = tan(params.lens.z);
@@ -465,7 +465,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
 
         // 4-sample stratified cosine-weighted contact ambient occlusion.
         float open = 1.0;
-        if (bits_ao && ao_fade > 0.01) {
+        if (bits_ao && ao_fade > 0.01 && roughness > 0.12) {
             uint hits = 0u;
             for (uint i = 0u; i < ao_samples; i = i + 1u) {
                 float u1 = (float(i) + rand01(state)) / float(ao_samples);
@@ -524,22 +524,24 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
         accum_refl_dist += refl_dist;
 
-        // Real multi-bounce (1..=6) path-traced diffuse GI with Russian Roulette
-        // termination, real sunlit coloured bounce by day, and zero energy at night.
+        // Real multi-bounce (1..=6) path-traced coloured diffuse GI with unbiased
+        // Russian Roulette (bounces 2..=6 stay active), zero sky-wash white tint
+        // in layered mode, and zero daytime GI energy at night.
         float gi_fade = 1.0 - saturate((dist - 180.0) / 80.0);
         if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
             float sun_luma = dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722));
-            float sun_strength = smoothstep(0.18, 0.38, sun_luma);
+            float sun_strength = smoothstep(0.16, 0.36, sun_luma);
             if (sun_strength > 0.005) {
                 uint gi_taps = (max_bounces <= 1u && dist < 80.0) ? 2u : 1u;
                 float3 est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
                 float3 receiver_albedo = clamp(
-                    raster_rgb / max(est_direct, float3(0.25, 0.25, 0.25)),
-                    float3(0.18, 0.18, 0.18),
+                    raster_rgb / max(est_direct, float3(0.18, 0.18, 0.18)),
+                    float3(0.08, 0.08, 0.08),
                     float3(0.92, 0.92, 0.92));
                 float3 gi_sum = float3(0.0, 0.0, 0.0);
+                float bounce_max_t = min(params.lens.y, 96.0);
                 for (uint g = 0u; g < gi_taps; g = g + 1u) {
-                    float3 throughput = receiver_albedo;
+                    float3 throughput = float3(1.0, 1.0, 1.0);
                     float3 b_origin = ray_origin;
                     float3 b_t = t_axis;
                     float3 b_b = b_axis;
@@ -555,7 +557,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         sincos(phi, s_phi, c_phi);
                         float z = sqrt(max(0.0, 1.0 - u1));
                         float3 d = b_t * (r * c_phi) + b_b * (r * s_phi) + b_n * z;
-                        float bounce_max_t = (bounce == 0u) ? min(params.lens.y, 96.0) : min(params.lens.y, 48.0);
                         Hit bhit;
                         if (bounce == 0u) {
                             bhit = closest_hit(b_origin, d, b_step_bias, bounce_max_t);
@@ -574,20 +575,28 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                                 }
                             }
                             Material bmat = material_of(bhit.index);
-                            float3 off_in = bmat.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow * 2.25);
+                            float b_avg = dot(bmat.albedo.rgb, float3(0.3333, 0.3333, 0.3333));
+                            float3 b_chroma = clamp(
+                                float3(b_avg, b_avg, b_avg) + (bmat.albedo.rgb - b_avg) * 1.35,
+                                float3(0.04, 0.04, 0.04),
+                                float3(0.94, 0.94, 0.94));
+                            float3 off_in = b_chroma * params.sun_colour.xyz * (b_ndl * b_shadow * 2.1);
                             float3 incoming = off_in;
                             if (bounce == 0u) {
                                 float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
                                 float b_w = saturate(b_screen.a);
-                                float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 1.55 * sun_strength);
+                                float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 1.45 * sun_strength);
                                 incoming = lerp(off_in, on_in, b_w);
                             }
-                            gi_sum += throughput * incoming * (params.tuning.w * 1.65 * (1.0 - fog_t));
+                            gi_sum += throughput * incoming * (params.tuning.w * 1.45 * (1.0 - fog_t));
                             if (bounce + 1u < max_bounces) {
-                                throughput *= clamp(bmat.albedo.rgb * 1.15, float3(0.10, 0.10, 0.10), float3(0.85, 0.85, 0.85));
-                                float max_tp = max(throughput.r, max(throughput.g, throughput.b));
-                                if (bounce >= 1u && max_tp < 0.04) {
-                                    break;
+                                throughput *= clamp(b_chroma * 1.05, float3(0.12, 0.12, 0.12), float3(0.90, 0.90, 0.90));
+                                if (bounce >= 2u) {
+                                    float rr = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.32, 0.92);
+                                    if (rand01(state) > rr) {
+                                        break;
+                                    }
+                                    throughput /= rr;
                                 }
                                 b_origin = bhit_world + bhit.normal * b_bias;
                                 b_n = bhit.normal;
@@ -597,14 +606,18 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                                 b_step_bias = b_bias;
                             }
                         } else {
-                            float sky_scale = (bounce == 0u) ? 0.08 : 0.04;
-                            float3 sky_bounce = sample_sky_env(d);
-                            gi_sum += throughput * sky_bounce * (params.tuning.w * sky_scale * sun_strength * (1.0 - fog_t));
+                            // Never add sky-wash in layered mode (raster already has sky ambient);
+                            // only add sky bounce in replace-raster mode so terrain has zero white tint.
+                            if (!layered) {
+                                float sky_scale = (bounce == 0u) ? 0.12 : 0.06;
+                                float3 sky_bounce = sample_sky_env(d);
+                                gi_sum += throughput * sky_bounce * (params.tuning.w * sky_scale * sun_strength * (1.0 - fog_t));
+                            }
                             break;
                         }
                     }
                 }
-                accum_gi += gi_sum * (gi_fade / float(gi_taps));
+                accum_gi += receiver_albedo * gi_sum * (gi_fade / float(gi_taps));
             }
         }
     }
@@ -619,8 +632,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float pl_debug_shadow = 0.0;
     float pl_w_total = 0.0;
     float pl_w_lit = 0.0;
-    if ((pl_shadows_enabled || !layered || debug_mode == 6u) && bits_lighting) {
+    if (bits_lighting) {
         uint pl_count = min(uint(round(params.point_light_meta.x)), 16u);
+        float r_max = max(raster_rgb.r, max(raster_rgb.g, raster_rgb.b));
+        float3 pl_albedo = (r_max > 0.02)
+            ? clamp(raster_rgb / max(r_max, 0.28), float3(0.22, 0.22, 0.22), float3(0.95, 0.95, 0.95))
+            : float3(0.42, 0.42, 0.42);
         for (uint li = 0u; li < pl_count; li = li + 1u) {
             float4 pl_pr = params.point_lights_pos_rad[li];
             float4 pl_ci = params.point_lights_col_int[li];
@@ -633,7 +650,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float atten = point_light_falloff(pl_dist, pl_pr.w);
                     if (atten > 1e-5) {
                         float pl_vis = 1.0;
-                        if (bits_shadows && occluded(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias), state ^ (li * 131u + 17u))) {
+                        if (bits_shadows && occluded_fast(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias))) {
                             pl_vis = 0.0;
                         }
                         float w = pl_ci.w * atten * pl_ndl;
@@ -641,9 +658,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         pl_w_lit += w * pl_vis;
                         pl_debug_lit += pl_ci.rgb * (w * pl_vis);
                         pl_debug_shadow += w * (1.0 - pl_vis);
-                        if (!layered) {
-                            point_lighting += raster_rgb * pl_ci.rgb * (w * pl_vis);
-                        }
+                        point_lighting += pl_albedo * pl_ci.rgb * (w * pl_vis * 1.85);
                     }
                 }
             }
@@ -676,7 +691,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float v_ao = bits_ao ? avg_open : 1.0;
         float separated_lf = (amb_f * v_ao + sun_f * v_sun) * point_shadow_mod;
         out_lf = lerp(separated_lf, 1.0, fog_t);
-        out_rgb = avg_gi;
+        out_rgb = avg_gi + point_lighting;
     } else {
         // Opt-in replace_raster mode: keep 1:1 raster world textures/albedo
         // instead of low-poly proxy boxes, relit purely by RT sun + RT ambient + point lights.

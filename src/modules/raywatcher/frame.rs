@@ -529,23 +529,39 @@ pub fn tracked_celestial_light(
     if state.sun_elevation > 0.03 {
         let raw = crate::sky_celestial::direction(state.sun_elevation, state.azimuth);
         let dir = Vec3::from_array(raw).normalize_or_zero();
-        let elev_fade = ((state.sun_elevation - 0.03) / 0.15).clamp(0.0, 1.0);
-        let intensity = (daylight.max(elev_fade * 0.65)).clamp(0.0, 1.0);
+        let elev_fade = ((state.sun_elevation - 0.03) / 0.14).clamp(0.0, 1.0);
+        let elev_norm = ((state.sun_elevation - 0.03) / 0.85).clamp(0.0, 1.0);
+        let noon_t = (elev_norm / 0.55).clamp(0.0, 1.0);
+        let smooth_noon = noon_t * noon_t * (3.0 - 2.0 * noon_t);
+        // Dramatic physically-inspired solar colour & strength curve across the day:
+        // warm golden low sun at dawn/sunset -> crisp bright white-gold at high noon.
+        let low_sun = Vec3::new(1.22, 0.58, 0.24);
+        let high_sun = Vec3::new(1.12, 1.06, 0.96);
+        let base_tint = low_sun.lerp(high_sun, smooth_noon);
+        let energy = (0.32 + 1.08 * elev_norm.powf(0.62)) * elev_fade;
+        let sun_col = base_tint * energy;
+        let intensity = ((0.28 + 0.72 * elev_norm.powf(0.55)) * elev_fade).clamp(0.0, 1.0);
         if dir.length_squared() > 0.5 {
-            return (dir, fallback.diffuse, intensity, false);
+            return (dir, sun_col, intensity, false);
         }
     } else if state.moon_elevation > 0.03 {
         let raw = crate::sky_celestial::direction(state.moon_elevation, state.azimuth);
         let dir = Vec3::from_array(raw).normalize_or_zero();
-        let elev_fade = ((state.moon_elevation - 0.03) / 0.15).clamp(0.0, 1.0);
-        // Subtle cool moonlight: strong enough to cast crisp directional moon
-        // shadows, dim enough that night stays genuinely dark (and GI stays off).
-        let moon_col = Vec3::new(0.32, 0.42, 0.62) * 0.28;
+        let elev_fade = ((state.moon_elevation - 0.03) / 0.14).clamp(0.0, 1.0);
+        // Cool silvery moonlight: casts real directional moon shadows while
+        // shadowed/unlit regions stay pitch black (and daytime GI stays off).
+        let moon_col = Vec3::new(0.28, 0.38, 0.62) * (0.42 * elev_fade);
         if dir.length_squared() > 0.5 {
             return (dir, moon_col, elev_fade * 0.45, true);
         }
     }
-    (fallback.direction, fallback.diffuse, daylight, false)
+    // Moonless astronomical night: pitch black with minimal starlight.
+    (
+        fallback.direction,
+        Vec3::new(0.01, 0.015, 0.025),
+        0.02,
+        true,
+    )
 }
 
 /// Everything one ray pass needs that is not in [`LightingRecord`].
