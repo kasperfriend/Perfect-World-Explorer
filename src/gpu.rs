@@ -3908,14 +3908,27 @@ impl Renderer {
             let tree_lod_scale =
                 self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees);
             let tree_tri_budget = 140_000usize;
+            let mut tree_tris = Vec::new();
             let (real_tree_instances, real_tree_tris, tree_canopy_fallbacks) =
                 self.far_trees.harvest_rt_triangles(
                     camera.pos,
                     detail_radius,
                     tree_lod_scale,
                     tree_tri_budget,
-                    &mut real_meshes,
+                    &mut tree_tris,
                 );
+            real_meshes.reserve(tree_tris.len());
+            for t in tree_tris {
+                real_meshes.push(MeshTriangle {
+                    a: t.a,
+                    b: t.b,
+                    c: t.c,
+                    normal: t.normal,
+                    albedo: t.albedo,
+                    roughness: t.roughness,
+                    opacity: t.opacity,
+                });
+            }
             if std::env::var_os("PWE_RT_DEBUG").is_some() {
                 eprintln!(
                     "[Raywatcher] harvest: {} real-mesh pages ({} total tris), {} proxy fallbacks, trees(real_inst={}, real_tris={}, canopy_fallbacks={}) (detail_radius={:.0})",

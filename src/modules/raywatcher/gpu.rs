@@ -3463,8 +3463,25 @@ impl RaywatcherGpu {
                 view_formats: &[],
             });
             let scratch_view = scratch_tex.create_view(&Default::default());
-            let (scratch_depth, scratch_depth_view) =
-                depth_plane(device, SKY_ENV_FACE, SKY_ENV_FACE);
+            let scratch_depth = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("raywatcher sky env depth"),
+                size: wgpu::Extent3d {
+                    width: SKY_ENV_FACE,
+                    height: SKY_ENV_FACE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let scratch_depth_view = scratch_depth.create_view(&wgpu::TextureViewDescriptor {
+                aspect: wgpu::TextureAspect::DepthOnly,
+                ..Default::default()
+            });
             let blit_bg = Self::blit_binding(device, &self.pipelines, &scratch_view);
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("raywatcher sky env blit"),

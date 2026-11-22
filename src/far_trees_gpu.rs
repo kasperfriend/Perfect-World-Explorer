@@ -206,11 +206,25 @@ pub fn lod_admits(bounds: Option<[f32; 4]>, p: [f32; 3]) -> bool {
     cutoff_residency::contains(bounds, p)
 }
 
+/// World- or local-space tree triangle retained for ray-tracing harvest.
+/// Kept local to `far_trees_gpu` so standalone GPU check binaries that include
+/// this file directly compile without pulling in `crate::modules`.
+#[derive(Clone, Copy, Debug)]
+pub struct RtTreeTriangle {
+    pub a: glam::Vec3,
+    pub b: glam::Vec3,
+    pub c: glam::Vec3,
+    pub normal: glam::Vec3,
+    pub albedo: [f32; 3],
+    pub roughness: f32,
+    pub opacity: f32,
+}
+
 /// Local-space SpeedTree LOD meshes retained for Raywatcher RT harvesting.
 pub struct RtTreeSpecies {
     pub height: f32,
     pub positions: Vec<[f32; 3]>,
-    pub lods: Vec<Vec<crate::modules::raywatcher::harvest::MeshTriangle>>,
+    pub lods: Vec<Vec<RtTreeTriangle>>,
 }
 
 /// Sample linear RGB + alpha coverage from an RGBA8 texture at normalized UV.
@@ -231,12 +245,7 @@ fn sample_rgba_uv(img: &image::RgbaImage, uv: [f32; 2]) -> ([f32; 3], f32) {
 
 /// Emit a compact alpha-tested crossed-canopy + trunk fallback (NOT a box) when
 /// a distant tree exceeds the RT triangle budget.
-pub fn push_alpha_canopy_fallback(
-    pos: glam::Vec3,
-    height: f32,
-    out: &mut Vec<crate::modules::raywatcher::harvest::MeshTriangle>,
-) {
-    use crate::modules::raywatcher::harvest::MeshTriangle;
+pub fn push_alpha_canopy_fallback(pos: glam::Vec3, height: f32, out: &mut Vec<RtTreeTriangle>) {
     let h = height.max(4.0);
     let trunk_h = h * 0.45;
     let r = (h * 0.28).clamp(1.2, 4.5);
@@ -249,7 +258,7 @@ pub fn push_alpha_canopy_fallback(
         let p_l = c_mid - off;
         let p_r = c_mid + off;
         let n = glam::Vec3::new(-az, 0.25, ax).normalize_or_zero();
-        out.push(MeshTriangle {
+        out.push(RtTreeTriangle {
             a: c_bot,
             b: p_r,
             c: c_top,
@@ -258,7 +267,7 @@ pub fn push_alpha_canopy_fallback(
             roughness: 0.85,
             opacity: 0.58,
         });
-        out.push(MeshTriangle {
+        out.push(RtTreeTriangle {
             a: c_bot,
             b: c_top,
             c: p_l,
@@ -273,7 +282,7 @@ pub fn push_alpha_canopy_fallback(
     let t0 = pos + glam::Vec3::new(-tr, 0.0, 0.0);
     let t1 = pos + glam::Vec3::new(tr, 0.0, 0.0);
     let t2 = pos + glam::Vec3::new(0.0, trunk_h, 0.0);
-    out.push(MeshTriangle {
+    out.push(RtTreeTriangle {
         a: t0,
         b: t1,
         c: t2,
@@ -513,8 +522,7 @@ impl FarTrees {
                 continue;
             }
             let first_batch = batches.len();
-            let mut species_rt_lods: Vec<Vec<crate::modules::raywatcher::harvest::MeshTriangle>> =
-                Vec::with_capacity(tree.lods.len());
+            let mut species_rt_lods: Vec<Vec<RtTreeTriangle>> = Vec::with_capacity(tree.lods.len());
             for lod in &tree.lods {
                 let rocking_base = rocking_samples.len() / 64;
                 rocking_samples.extend(lod.rocking.iter().map(|v| [v[0], v[1], v[2], 0.]));
@@ -601,7 +609,6 @@ impl FarTrees {
                 // Phase 4: Harvest this runtime SpeedTree LOD's real branch,
                 // frond, and leaf triangles with per-material alpha coverage.
                 {
-                    use crate::modules::raywatcher::harvest::MeshTriangle;
                     let mut lod_tris = Vec::new();
                     for (part, img, is_foliage) in [
                         (&lod.branch, &tree.bark, false),
@@ -638,7 +645,7 @@ impl FarTrees {
                             } else {
                                 1.0
                             };
-                            lod_tris.push(MeshTriangle {
+                            lod_tris.push(RtTreeTriangle {
                                 a,
                                 b,
                                 c,
@@ -679,7 +686,7 @@ impl FarTrees {
                         let (p0, p1, p2, p3) = (corner(0), corner(1), corner(2), corner(3));
                         let opacity = alpha.clamp(0.42, 0.88);
                         if (p1 - p0).cross(p2 - p0).length_squared() > 1e-8 {
-                            lod_tris.push(MeshTriangle {
+                            lod_tris.push(RtTreeTriangle {
                                 a: p0,
                                 b: p1,
                                 c: p2,
@@ -690,7 +697,7 @@ impl FarTrees {
                             });
                         }
                         if (p2 - p0).cross(p3 - p0).length_squared() > 1e-8 {
-                            lod_tris.push(MeshTriangle {
+                            lod_tris.push(RtTreeTriangle {
                                 a: p0,
                                 b: p2,
                                 c: p3,
@@ -1270,7 +1277,7 @@ impl FarTrees {
         max_dist: f32,
         lod_scale: f32,
         tri_budget: usize,
-        out: &mut Vec<crate::modules::raywatcher::harvest::MeshTriangle>,
+        out: &mut Vec<RtTreeTriangle>,
     ) -> (usize, usize, usize) {
         harvest_rt_tree_species(&self.rt_species, eye, max_dist, lod_scale, tri_budget, out)
     }
@@ -1594,7 +1601,7 @@ pub fn harvest_rt_tree_species(
     max_dist: f32,
     lod_scale: f32,
     tri_budget: usize,
-    out: &mut Vec<crate::modules::raywatcher::harvest::MeshTriangle>,
+    out: &mut Vec<RtTreeTriangle>,
 ) -> (usize, usize, usize) {
     let max_d2 = max_dist * max_dist;
     let scale = lod_scale.max(0.25);
@@ -1656,11 +1663,10 @@ pub fn harvest_rt_tree_species(
 #[cfg(test)]
 mod raywatcher_tree_tests {
     use super::*;
-    use crate::modules::raywatcher::harvest::MeshTriangle;
 
     #[test]
     fn trees_with_lod_geometry_are_harvested_as_real_alpha_triangles_not_boxes() {
-        let branch = MeshTriangle {
+        let branch = RtTreeTriangle {
             a: glam::Vec3::new(0.0, 0.0, 0.0),
             b: glam::Vec3::new(0.4, 0.0, 0.0),
             c: glam::Vec3::new(0.2, 4.0, 0.0),
@@ -1669,7 +1675,7 @@ mod raywatcher_tree_tests {
             roughness: 0.9,
             opacity: 1.0,
         };
-        let leaf = MeshTriangle {
+        let leaf = RtTreeTriangle {
             a: glam::Vec3::new(-1.0, 4.0, 0.0),
             b: glam::Vec3::new(1.0, 4.0, 0.0),
             c: glam::Vec3::new(0.0, 6.0, 0.0),
