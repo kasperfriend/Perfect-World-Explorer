@@ -24,6 +24,7 @@ struct Params {
     float4 point_light_meta;           // x: active point light count (<= 16)
     float4 point_lights_pos_rad[16];   // xyz: world pos, w: radius
     float4 point_lights_col_int[16];   // rgb: colour, w: intensity
+    float4 terrain_map_bounds;         // x: min_x, y: max_z, z: inv_diameter, w: valid (>0.5)
 };
 
 struct Tri {
@@ -54,6 +55,9 @@ Texture2D<float4> src_gbuf_norm : register(t4);
 Texture2D<float4> src_gbuf_raster : register(t5);
 // Phase 3: Real sky (SkyGpu) + cloud billboards (CloudGpu) in a 3x2 cubemap atlas.
 Texture2D<float4> src_sky_env : register(t6);
+// Top-down real textured terrain albedo map (512x512 around camera anchor) for
+// off-screen reflections and coloured terrain GI bounces.
+Texture2D<float4> src_terrain_map : register(t7);
 
 RWTexture2D<float4> out_colour : register(u0);
 RWTexture2D<float4> out_guide : register(u1);
@@ -127,13 +131,24 @@ bool accept_opacity(uint prim, float2 bary, uint seed) {
     if (opacity >= 0.99) {
         return true;
     }
-    // Temporally stable deterministic cutout in primitive barycentric space
-    // (ignores frame-varying `seed` so foliage shadows never flicker white/black).
+    // Temporally stable organic leaf-cluster cutout in primitive barycentric space:
+    // tapers opacity smoothly to zero along straight triangle edges so foliage cards
+    // never cast or reflect rectangular/triangular cardbox silhouettes.
     uint _unused = seed;
+    float bw = max(1.0 - bary.x - bary.y, 0.0);
+    float edge_dist = min(bary.x, min(bary.y, bw));
+    float edge_mask = (opacity < 0.92) ? smoothstep(0.015, 0.18, edge_dist) : 1.0;
+    // Coarse organic leaf-clump modulation + fine deterministic micro-dither.
+    uint cx = uint(bary.x * 8.0);
+    uint cy = uint(bary.y * 8.0);
+    uint ch = prim * 2654435761u ^ cx * 2246822519u ^ cy * 3266489917u;
+    ch ^= ch >> 15u;
+    float clump = 0.62 + 0.56 * (float(ch & 0xffu) / 255.0);
+    float eff_opacity = saturate(opacity * edge_mask * clump);
     uint h = prim * 747796405u ^ uint(bary.x * 64.0) * 2891336453u ^ uint(bary.y * 64.0) * 1664525u;
     h ^= h >> 16u;
     float r = float(h & 0xffffu) / 65536.0;
-    return r < opacity;
+    return r < eff_opacity;
 }
 
 Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
@@ -290,6 +305,37 @@ float3 sample_sky_env(float3 dir) {
 // environment target (analytic gradient removed from the miss path).
 float3 sample_sky_reflection(float3 dir) {
     return sample_sky_env(dir);
+}
+
+// Sample the top-down real textured terrain map for off-screen terrain reflections
+// and coloured terrain GI bounces (eliminates flat olive-green terrain).
+float3 sample_terrain_albedo(float3 world_pos, float3 fallback) {
+    if (params.terrain_map_bounds.w <= 0.5) {
+        return fallback;
+    }
+    float u = (world_pos.x - params.terrain_map_bounds.x) * params.terrain_map_bounds.z;
+    float v = (params.terrain_map_bounds.y - world_pos.z) * params.terrain_map_bounds.z;
+    if (u < 0.005 || u > 0.995 || v < 0.005 || v > 0.995) {
+        return fallback;
+    }
+    uint w, h;
+    src_terrain_map.GetDimensions(w, h);
+    float fx = u * float(w - 1u);
+    float fy = v * float(h - 1u);
+    int x0 = int(floor(fx));
+    int y0 = int(floor(fy));
+    int x1 = min(x0 + 1, int(w) - 1);
+    int y1 = min(y0 + 1, int(h) - 1);
+    float2 fr = float2(fx - float(x0), fy - float(y0));
+    float3 c00 = src_terrain_map.Load(int3(x0, y0, 0)).rgb;
+    float3 c10 = src_terrain_map.Load(int3(x1, y0, 0)).rgb;
+    float3 c01 = src_terrain_map.Load(int3(x0, y1, 0)).rgb;
+    float3 c11 = src_terrain_map.Load(int3(x1, y1, 0)).rgb;
+    float3 col = lerp(lerp(c00, c10, fr.x), lerp(c01, c11, fr.x), fr.y);
+    if (dot(col, float3(1.0, 1.0, 1.0)) < 1e-4) {
+        return fallback;
+    }
+    return clamp(col, float3(0.03, 0.03, 0.03), float3(0.95, 0.95, 0.95));
 }
 
 float3 ggx_sample(float3 normal, float roughness, float u1, float u2) {
@@ -470,8 +516,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     shadow_dir = normalize(params.sun_dir.xyz + (sun_t * c_th + sun_b * s_th) * r);
                 }
                 bool hit_s = false;
-                if (dist > 96.0) {
-                    // Distant shadows (>96u): pure fixed-function RT-core opaque hit (zero shader ejection).
+                if (dist > 240.0) {
+                    // Distant shadows (>240u): pure fixed-function RT-core opaque hit (zero shader ejection).
                     hit_s = occluded_fast(ray_origin, shadow_dir, shadow_t_min, params.lens.y);
                 } else {
                     hit_s = occluded(ray_origin, shadow_dir, shadow_t_min, params.lens.y, state ^ k);
@@ -524,6 +570,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float3 lit = screen_col.rgb;
                 if (screen_w < 0.99) {
                     Material rmat = material_of(rhit.index);
+                    float rkind = tris[rhit.index].a.w;
+                    float3 r_albedo = (rkind > 1.5 && rkind < 2.5)
+                        ? sample_terrain_albedo(hit_pos, rmat.albedo.rgb)
+                        : rmat.albedo.rgb;
                     float r_ndl = max(dot(rhit.normal, params.sun_dir.xyz), 0.0);
                     float r_shadow = 1.0;
                     if (bits_shadows && r_ndl > 0.02) {
@@ -532,7 +582,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                             r_shadow = 0.0;
                         }
                     }
-                    float3 offscreen_lit = rmat.albedo.rgb * (params.ambient.xyz * params.tuning.z +
+                    float3 offscreen_lit = r_albedo * (params.ambient.xyz * params.tuning.z +
                         params.sun_colour.xyz * (r_ndl * r_shadow));
                     lit = lerp(offscreen_lit, screen_col.rgb, screen_w);
                 }
@@ -550,7 +600,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // in layered mode, and zero daytime GI energy at night.
         if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01 && sun_strength > 0.005) {
             {
-                uint gi_taps = (max_bounces <= 1u && dist < 80.0) ? 2u : 1u;
+                uint gi_taps = (dist < 100.0) ? 2u : 1u;
                 float3 gi_sum = float3(0.0, 0.0, 0.0);
                 float bounce_max_t = min(params.lens.y, 96.0);
                 for (uint g = 0u; g < gi_taps; g = g + 1u) {
@@ -560,7 +610,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float3 b_b = b_axis;
                     float3 b_n = normal;
                     float b_step_bias = bias;
-                    for (uint bounce = 0u; bounce < max_bounces; bounce = bounce + 1u) {
+                    uint tap_bounces = (g == 0u) ? max_bounces : 1u;
+                    for (uint bounce = 0u; bounce < tap_bounces; bounce = bounce + 1u) {
                         float u1 = (bounce == 0u) ? ((float(g) + rand01(state)) / float(gi_taps)) : rand01(state);
                         float phi = (bounce == 0u)
                             ? (float(g) * 2.39996323 + rot_angle + 1.0471975 + float(s) * 0.7548776)
@@ -588,21 +639,27 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                                 }
                             }
                             Material bmat = material_of(bhit.index);
-                            float b_avg = dot(bmat.albedo.rgb, float3(0.3333, 0.3333, 0.3333));
+                            float bkind = tris[bhit.index].a.w;
+                            float3 b_base_albedo = (bkind > 1.5 && bkind < 2.5)
+                                ? sample_terrain_albedo(bhit_world, bmat.albedo.rgb)
+                                : bmat.albedo.rgb;
+                            float b_avg = dot(b_base_albedo, float3(0.3333, 0.3333, 0.3333));
                             float3 b_chroma = clamp(
-                                float3(b_avg, b_avg, b_avg) + (bmat.albedo.rgb - b_avg) * 1.35,
+                                float3(b_avg, b_avg, b_avg) + (b_base_albedo - b_avg) * 1.25,
                                 float3(0.04, 0.04, 0.04),
-                                float3(0.94, 0.94, 0.94));
-                            float3 off_in = b_chroma * params.sun_colour.xyz * (b_ndl * b_shadow * 2.1);
+                                float3(0.92, 0.92, 0.92));
+                            float3 off_in = b_chroma * params.sun_colour.xyz * (b_ndl * b_shadow * 1.15);
                             float3 incoming = off_in;
                             if (bounce == 0u) {
                                 float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
                                 float b_w = saturate(b_screen.a);
-                                float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 1.45 * sun_strength);
+                                float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 0.95 * sun_strength);
                                 incoming = lerp(off_in, on_in, b_w);
                             }
-                            gi_sum += throughput * incoming * (params.tuning.w * 1.45 * (1.0 - fog_t));
-                            if (bounce + 1u < max_bounces) {
+                            // Clamp per-ray firefly spikes so stochastic GI never speckles stone walls.
+                            incoming = min(incoming, float3(1.15, 1.15, 1.15));
+                            gi_sum += throughput * incoming * (params.tuning.w * 0.95 * (1.0 - fog_t));
+                            if (bounce + 1u < tap_bounces) {
                                 throughput *= clamp(b_chroma * 1.05, float3(0.12, 0.12, 0.12), float3(0.90, 0.90, 0.90));
                                 if (bounce >= 2u) {
                                     float rr = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.32, 0.92);
@@ -619,13 +676,13 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                                 b_step_bias = b_bias;
                             }
                         } else {
-                            // Never add sky-wash in layered mode (raster already has sky ambient);
-                            // only add sky bounce in replace-raster mode so terrain has zero white tint.
-                            if (!layered) {
-                                float sky_scale = (bounce == 0u) ? 0.12 : 0.06;
-                                float3 sky_bounce = sample_sky_env(d);
-                                gi_sum += throughput * sky_bounce * (params.tuning.w * sky_scale * sun_strength * (1.0 - fog_t));
-                            }
+                            // Subtle sky-hemisphere bounce from the real rendered sky cubemap
+                            // so open terrain and crevices receive directional sky GI without white-wash.
+                            float sky_scale = layered
+                                ? ((bounce == 0u) ? 0.13 : 0.05)
+                                : ((bounce == 0u) ? 0.22 : 0.08);
+                            float3 sky_bounce = min(sample_sky_env(d), float3(1.1, 1.1, 1.1));
+                            gi_sum += throughput * sky_bounce * (params.tuning.w * sky_scale * sun_strength * (1.0 - fog_t));
                             break;
                         }
                     }

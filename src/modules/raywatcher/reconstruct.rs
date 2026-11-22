@@ -282,13 +282,24 @@ fn fs(i: VOut) -> FOut {
 
     var out: FOut;
     let layered = prep_flags.x > 0.5;
-    let base_rgb = select(c.rgb, raster_rgb * c.a + c.rgb, layered);
+    let r_max = max(raster_rgb.r, max(raster_rgb.g, raster_rgb.b));
+    let full_albedo = select(
+        vec3<f32>(0.24),
+        clamp(raster_rgb / max(r_max, 0.28), vec3<f32>(0.0), vec3<f32>(1.0))
+            * clamp(r_max * 1.35, 0.24, 0.95),
+        r_max > 0.012,
+    );
+    // Modulate demodulated GI/point-light irradiance (`c.rgb`) by crisp full-res
+    // raster albedo on opaque surfaces so DLSS RR never stamps a grey tint over buildings.
+    let modulated_gi = select(full_albedo * c.rgb, c.rgb, n.w <= 0.12);
+    let base_rgb = select(c.rgb, max(raster_rgb * c.a + modulated_gi, vec3<f32>(0.0)), layered);
     out.color = vec4<f32>(base_rgb + r.rgb, 1.0);
     let n_len = length(n.xyz);
     let unit_n = select(vec3<f32>(0.0, 1.0, 0.0), n.xyz / n_len, n_len > 1e-4);
     out.depth = d;
     out.normals = vec4<f32>(unit_n, clamp(n.w, 0.02, 1.0));
-    out.diffuse_albedo = vec4<f32>(a.rgb, 1.0);
+    // Feed crisp full-resolution raster albedo to DLSS RR instead of low-res grid albedo.
+    out.diffuse_albedo = vec4<f32>(select(a.rgb, full_albedo, d > 1e-6), 1.0);
     out.specular_albedo = vec4<f32>(a.a, a.a, a.a, 1.0);
     out.hit_distance = r.a;
     return out;

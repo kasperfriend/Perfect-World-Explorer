@@ -69,6 +69,7 @@ impl DxrTracer {
         Err("DXR 1.1 hardware ray tracing requires Windows + DX12".into())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn copy_gbuf_inputs(
         &mut self,
         _encoder: &mut wgpu::CommandEncoder,
@@ -77,6 +78,8 @@ impl DxrTracer {
         _src_raster: &wgpu::Texture,
         _src_sky_env: &wgpu::Texture,
         _copy_sky_env: bool,
+        _src_terrain_map: &wgpu::Texture,
+        _copy_terrain_map: bool,
     ) {
     }
 
@@ -117,7 +120,7 @@ mod imp {
     use crate::fsr::{raw_dx12, NativeCommandRing, NativeTexture2D};
     use crate::modules::raywatcher::bvh::{RayMaterial, RayTriangle, SceneGeometry};
     use crate::modules::raywatcher::gpu::{
-        RayParams, COLOUR_FORMAT, GUIDE_FORMAT, SKY_ENV_HEIGHT, SKY_ENV_WIDTH,
+        RayParams, COLOUR_FORMAT, GUIDE_FORMAT, SKY_ENV_HEIGHT, SKY_ENV_WIDTH, TERRAIN_MAP_SIZE,
     };
 
     const D3D12_FEATURE_D3D12_OPTIONS5: u32 = 27;
@@ -510,6 +513,7 @@ mod imp {
         in_norm: NativeTexture2D,
         in_raster: NativeTexture2D,
         in_sky_env: NativeTexture2D,
+        in_terrain_map: NativeTexture2D,
         colour: NativeTexture2D,
         guide: NativeTexture2D,
         reflection: NativeTexture2D,
@@ -589,6 +593,20 @@ mod imp {
                     false,
                 )?
             };
+            let in_terrain_map = unsafe {
+                NativeTexture2D::create(
+                    device,
+                    raw_device,
+                    "raywatcher dxr in terrain map",
+                    COLOUR_FORMAT,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    (TERRAIN_MAP_SIZE, TERRAIN_MAP_SIZE),
+                    d12::D3D12_RESOURCE_FLAG_NONE,
+                    in_usage,
+                    state,
+                    false,
+                )?
+            };
             let flags = d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             let usage = wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::TEXTURE_BINDING
@@ -617,6 +635,7 @@ mod imp {
                 in_norm,
                 in_raster,
                 in_sky_env,
+                in_terrain_map,
                 colour,
                 guide,
                 reflection,
@@ -659,7 +678,7 @@ mod imp {
     // 8: u2 out_reflection UAV
     // 9: u3 out_normals UAV
     // 10: u4 out_albedo UAV
-    const HEAP_SLOTS: u32 = 12;
+    const HEAP_SLOTS: u32 = 13;
 
     impl Drop for DxrTracer {
         fn drop(&mut self) {
@@ -746,7 +765,7 @@ mod imp {
             // Root parameter 2: Descriptor table with 5 UAVs (u0..u4)
             let srv_range = d12::D3D12_DESCRIPTOR_RANGE {
                 RangeType: d12::D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                NumDescriptors: 7,
+                NumDescriptors: 8,
                 BaseShaderRegister: 0,
                 RegisterSpace: 0,
                 OffsetInDescriptorsFromTableStart: 0,
@@ -1278,6 +1297,10 @@ mod imp {
                         self.targets.in_sky_env.resource.as_mut_ptr(),
                         DXGI_FORMAT_R16G16B16A16_FLOAT,
                     ),
+                    (
+                        self.targets.in_terrain_map.resource.as_mut_ptr(),
+                        DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    ),
                 ];
                 for (i, (res, fmt)) in in_specs.into_iter().enumerate() {
                     let mut srv: d12::D3D12_SHADER_RESOURCE_VIEW_DESC = zeroed();
@@ -1309,7 +1332,7 @@ mod imp {
                         res,
                         null_mut(),
                         &uav,
-                        self.cpu_handle(7 + i as u32),
+                        self.cpu_handle(8 + i as u32),
                     );
                 }
             }
@@ -1318,6 +1341,7 @@ mod imp {
         /// Copy the wgpu-generated 1:1 depth-derived G-buffer planes into the
         /// shared DX12 input textures. Call on `encoder` and submit `encoder`
         /// to `queue` before calling [`Self::trace`].
+        #[allow(clippy::too_many_arguments)]
         pub fn copy_gbuf_inputs(
             &mut self,
             encoder: &mut wgpu::CommandEncoder,
@@ -1326,9 +1350,12 @@ mod imp {
             src_raster: &wgpu::Texture,
             src_sky_env: &wgpu::Texture,
             copy_sky_env: bool,
+            src_terrain_map: &wgpu::Texture,
+            copy_terrain_map: bool,
         ) {
             let (tw, th) = self.targets.extent;
             let force_sky = !self.targets.wgpu_tracked_copy_dst || copy_sky_env;
+            let force_terrain = !self.targets.wgpu_tracked_copy_dst || copy_terrain_map;
             let pairs = [
                 (src_pos, &self.targets.in_pos.texture, tw, th, true),
                 (src_norm, &self.targets.in_norm.texture, tw, th, true),
@@ -1339,6 +1366,13 @@ mod imp {
                     SKY_ENV_WIDTH,
                     SKY_ENV_HEIGHT,
                     force_sky,
+                ),
+                (
+                    src_terrain_map,
+                    &self.targets.in_terrain_map.texture,
+                    TERRAIN_MAP_SIZE,
+                    TERRAIN_MAP_SIZE,
+                    force_terrain,
                 ),
             ];
             for (src, dst, mw, mh, should_copy) in pairs {
@@ -1433,6 +1467,7 @@ mod imp {
                     self.targets.in_norm.resource.as_mut_ptr(),
                     self.targets.in_raster.resource.as_mut_ptr(),
                     self.targets.in_sky_env.resource.as_mut_ptr(),
+                    self.targets.in_terrain_map.resource.as_mut_ptr(),
                 ];
                 let in_wgpu_state = if self.targets.wgpu_tracked_copy_dst {
                     d12::D3D12_RESOURCE_STATE_COPY_DEST
@@ -1446,8 +1481,8 @@ mod imp {
                     self.targets.normals.resource.as_mut_ptr(),
                     self.targets.albedo.resource.as_mut_ptr(),
                 ];
-                let mut pre_barriers: [d12::D3D12_RESOURCE_BARRIER; 9] = zeroed();
-                for (b, res) in pre_barriers[0..4]
+                let mut pre_barriers: [d12::D3D12_RESOURCE_BARRIER; 10] = zeroed();
+                for (b, res) in pre_barriers[0..5]
                     .iter_mut()
                     .zip(in_resources.iter().copied())
                 {
@@ -1459,7 +1494,7 @@ mod imp {
                         StateAfter: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                     };
                 }
-                for ((b, res), tracked) in pre_barriers[4..9]
+                for ((b, res), tracked) in pre_barriers[5..10]
                     .iter_mut()
                     .zip(resources.iter().copied())
                     .zip(self.targets.wgpu_tracked_copy_src.iter().copied())
@@ -1484,11 +1519,11 @@ mod imp {
                 (*list).SetPipelineState(self.pso);
                 (*list).SetComputeRootConstantBufferView(0, self.cbvs[slot_idx].gpu_va);
                 (*list).SetComputeRootDescriptorTable(1, self.gpu_handle(0));
-                (*list).SetComputeRootDescriptorTable(2, self.gpu_handle(7));
+                (*list).SetComputeRootDescriptorTable(2, self.gpu_handle(8));
                 (*list).Dispatch(w.div_ceil(8), h.div_ceil(4), 1);
 
-                let mut post_barriers: [d12::D3D12_RESOURCE_BARRIER; 9] = zeroed();
-                for (b, res) in post_barriers[0..4]
+                let mut post_barriers: [d12::D3D12_RESOURCE_BARRIER; 10] = zeroed();
+                for (b, res) in post_barriers[0..5]
                     .iter_mut()
                     .zip(in_resources.iter().copied())
                 {
@@ -1500,7 +1535,7 @@ mod imp {
                         StateAfter: in_wgpu_state,
                     };
                 }
-                for ((b, res), tracked) in post_barriers[4..9]
+                for ((b, res), tracked) in post_barriers[5..10]
                     .iter_mut()
                     .zip(resources.iter().copied())
                     .zip(self.targets.wgpu_tracked_copy_src.iter().copied())

@@ -1057,6 +1057,59 @@ fn extract_rt_triangles(
                 } else {
                     1.0
                 };
+                // For alpha-cutout BMD foliage cards (0.08 <= tex_alpha < 0.90),
+                // subdivide into 4 midpoint sub-triangles and drop empty transparent corners
+                // so BMD trees (City of Plume giant tree, blossoms) never cast cardbox shadows.
+                if let Some(ta) = tex_alpha {
+                    if ta < 0.90 && out.len() + 4 <= MAX_RT_TRIS_PER_PAGE {
+                        let mid3 = |p: [f32; 3], q: [f32; 3]| {
+                            [
+                                (p[0] + q[0]) * 0.5,
+                                (p[1] + q[1]) * 0.5,
+                                (p[2] + q[2]) * 0.5,
+                            ]
+                        };
+                        let mid2 =
+                            |p: [f32; 2], q: [f32; 2]| [(p[0] + q[0]) * 0.5, (p[1] + q[1]) * 0.5];
+                        let ab = mid3(a, b);
+                        let bc = mid3(b, c);
+                        let ca = mid3(c, a);
+                        let uv_ab = mid2(v0.uv, v1.uv);
+                        let uv_bc = mid2(v1.uv, v2.uv);
+                        let uv_ca = mid2(v2.uv, v0.uv);
+                        let subs = [
+                            (a, ab, ca, v0.uv, uv_ab, uv_ca),
+                            (ab, b, bc, uv_ab, v1.uv, uv_bc),
+                            (ca, bc, c, uv_ca, uv_bc, v2.uv),
+                            (ab, bc, ca, uv_ab, uv_bc, uv_ca),
+                        ];
+                        for (sa, sb, sc, u0, u1, u2) in subs {
+                            let su = [(u0[0] + u1[0] + u2[0]) / 3.0, (u0[1] + u1[1] + u2[1]) / 3.0];
+                            if let Some((srgb, sa_val)) =
+                                sample_atlas_rgba(atlas, atlas_w, atlas_h, v0.color, kind, su)
+                            {
+                                if sa_val < 0.35 {
+                                    continue;
+                                }
+                                let sub_albedo = [
+                                    srgb[0].clamp(0.06, 0.95),
+                                    srgb[1].clamp(0.06, 0.95),
+                                    srgb[2].clamp(0.06, 0.95),
+                                ];
+                                out.push(RtMeshTriangle {
+                                    a: sa,
+                                    b: sb,
+                                    c: sc,
+                                    normal: smooth_n,
+                                    albedo: sub_albedo,
+                                    opacity: (sa_val * 0.78).clamp(0.28, 0.82),
+                                });
+                            }
+                        }
+                        t += 1;
+                        continue;
+                    }
+                }
                 out.push(RtMeshTriangle {
                     a,
                     b,

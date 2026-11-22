@@ -4019,6 +4019,77 @@ impl Renderer {
             // A resize is a new extent, not a new world.
             gpu.resize(&self.device, depth_extent, plan.grid);
         }
+        // Refresh the 512x512 top-down real textured terrain albedo map whenever
+        // the camera moves to a new 192u snap anchor (once on load, then ~0 ms/frame).
+        let terrain_refresh = self
+            .raywatcher_gpu
+            .as_ref()
+            .and_then(|g| g.terrain_map_refresh_anchor(camera.pos.x, camera.pos.z));
+        if let Some((ax, az)) = terrain_refresh {
+            let prev = std::mem::replace(
+                encoder,
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("raywatcher terrain map"),
+                    }),
+            );
+            self.queue.submit(Some(prev.finish()));
+            let tmat = minimap_matrix(
+                ax,
+                az,
+                crate::modules::raywatcher::gpu::TERRAIN_MAP_HALF_EXTENT,
+            );
+            self.queue_map_runs(tmat);
+            let mut tframe = self.frame;
+            tframe.daylight = 1.0;
+            tframe.fog_range = [1e6, 2e6, 0.0, 0.0];
+            let tuniform = tframe.uniform(
+                tmat,
+                [0.0, -1.0, 0.0, 1.0],
+                [0.0; 4],
+                [0.0; 4],
+                [0.0; 4],
+                [0.0, 1.0, 0.0, 0.0],
+            );
+            self.queue
+                .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&tuniform));
+            if let Some(gpu) = self.raywatcher_gpu.as_mut() {
+                let (cview, dview) =
+                    gpu.prepare_terrain_map_targets(&self.device, destination.format());
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("raywatcher terrain albedo map"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: cview,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: dview,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                self.terrain_gpu.draw(
+                    &mut rp,
+                    false,
+                    &self.vertex,
+                    &self.index,
+                    self.terrain_end,
+                    Some(self.map_terrain_runs.as_slice()),
+                    Some(self.map_far_runs.as_slice()),
+                );
+                drop(rp);
+                gpu.finish_terrain_map_blit(&self.device, encoder, (ax, az));
+            }
+        }
         let Some(gpu) = self.raywatcher_gpu.as_mut() else {
             return;
         };

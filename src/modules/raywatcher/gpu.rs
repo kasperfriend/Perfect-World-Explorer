@@ -60,6 +60,8 @@ pub struct RayParams {
     pub point_lights_pos_rad: [[f32; 4]; 16],
     /// Matching point light colours: `rgb` colour, `w` intensity.
     pub point_lights_col_int: [[f32; 4]; 16],
+    /// Top-down real textured terrain albedo map bounds: `[min_x, max_z, inv_diameter, valid]`.
+    pub terrain_map_bounds: [f32; 4],
 }
 
 impl RayParams {
@@ -160,6 +162,7 @@ impl RayParams {
             ],
             point_lights_pos_rad: pl_pos_rad,
             point_lights_col_int: pl_col_int,
+            terrain_map_bounds: [0.0; 4],
         }
     }
 }
@@ -481,6 +484,7 @@ struct Params {
     point_light_meta: vec4<f32>,
     point_lights_pos_rad: array<vec4<f32>, 16>,
     point_lights_col_int: array<vec4<f32>, 16>,
+    terrain_map_bounds: vec4<f32>,
 };
 
 struct Tri {
@@ -521,6 +525,7 @@ struct Material {
 @group(0) @binding(11) var src_gbuf_norm: texture_2d<f32>;
 @group(0) @binding(12) var src_gbuf_raster: texture_2d<f32>;
 @group(0) @binding(13) var src_sky_env: texture_2d<f32>;
+@group(0) @binding(14) var src_terrain_map: texture_2d<f32>;
 
 const PI: f32 = 3.14159265;
 
@@ -831,6 +836,34 @@ fn sample_sky_reflection(dir: vec3<f32>) -> vec3<f32> {
     return sample_sky_env(dir);
 }
 
+fn sample_terrain_albedo(world_pos: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
+    if (params.terrain_map_bounds.w <= 0.5) {
+        return fallback;
+    }
+    let u = (world_pos.x - params.terrain_map_bounds.x) * params.terrain_map_bounds.z;
+    let v = (params.terrain_map_bounds.y - world_pos.z) * params.terrain_map_bounds.z;
+    if (u < 0.005 || u > 0.995 || v < 0.005 || v > 0.995) {
+        return fallback;
+    }
+    let dim = textureDimensions(src_terrain_map);
+    let fx = u * f32(dim.x - 1u);
+    let fy = v * f32(dim.y - 1u);
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let x1 = min(x0 + 1, i32(dim.x) - 1);
+    let y1 = min(y0 + 1, i32(dim.y) - 1);
+    let fr = vec2<f32>(fx - f32(x0), fy - f32(y0));
+    let c00 = textureLoad(src_terrain_map, vec2<i32>(x0, y0), 0).rgb;
+    let c10 = textureLoad(src_terrain_map, vec2<i32>(x1, y0), 0).rgb;
+    let c01 = textureLoad(src_terrain_map, vec2<i32>(x0, y1), 0).rgb;
+    let c11 = textureLoad(src_terrain_map, vec2<i32>(x1, y1), 0).rgb;
+    let col = mix(mix(c00, c10, fr.x), mix(c01, c11, fr.x), fr.y);
+    if (dot(col, vec3<f32>(1.0)) < 1e-4) {
+        return fallback;
+    }
+    return clamp(col, vec3<f32>(0.03), vec3<f32>(0.95));
+}
+
 fn ggx_sample(normal: vec3<f32>, roughness: f32, u1: f32, u2: f32) -> vec3<f32> {
     if (roughness < 0.06) {
         return normal;
@@ -997,7 +1030,9 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                             r_shadow = 0.0;
                         }
                     }
-                    let offscreen_lit = rmaterial.albedo.rgb * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * (r_ndl * r_shadow));
+                    let rkind = tris[rhit.index].a.w;
+                    let r_albedo = select(rmaterial.albedo.rgb, sample_terrain_albedo(hit_pos, rmaterial.albedo.rgb), rkind > 1.5 && rkind < 2.5);
+                    let offscreen_lit = r_albedo * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * (r_ndl * r_shadow));
                     lit = mix(offscreen_lit, screen_col.rgb, screen_w);
                 }
                 accum_reflection = accum_reflection + lit * fresnel * (1.0 - fog_t);
@@ -1014,7 +1049,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         // in layered mode, and zero daytime GI energy at night.
         if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01 && sun_strength > 0.005) {
             {
-                let gi_taps = select(1u, 2u, max_bounces <= 1u && dist < 80.0);
+                let gi_taps = select(1u, 2u, dist < 100.0);
                 var gi_sum = vec3<f32>(0.0);
                 let bounce_max_t = min(params.lens.y, 96.0);
                 for (var g = 0u; g < gi_taps; g = g + 1u) {
@@ -1022,7 +1057,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                     var b_origin = ray_origin;
                     var b_onb = onb;
                     var b_step_bias = bias;
-                    for (var bounce = 0u; bounce < max_bounces; bounce = bounce + 1u) {
+                    let tap_bounces = select(1u, max_bounces, g == 0u);
+                    for (var bounce = 0u; bounce < tap_bounces; bounce = bounce + 1u) {
                         var u1 = next_f32(&state);
                         var phi = 2.0 * PI * next_f32(&state);
                         if (bounce == 0u) {
@@ -1044,21 +1080,24 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                                 }
                             }
                             let bmaterial = material_of(bhit.index);
-                            let b_avg = dot(bmaterial.albedo.rgb, vec3<f32>(0.3333));
+                            let bkind = tris[bhit.index].a.w;
+                            let b_base_albedo = select(bmaterial.albedo.rgb, sample_terrain_albedo(bhit_world, bmaterial.albedo.rgb), bkind > 1.5 && bkind < 2.5);
+                            let b_avg = dot(b_base_albedo, vec3<f32>(0.3333));
                             let b_chroma = clamp(
-                                vec3<f32>(b_avg) + (bmaterial.albedo.rgb - vec3<f32>(b_avg)) * 1.35,
+                                vec3<f32>(b_avg) + (b_base_albedo - vec3<f32>(b_avg)) * 1.25,
                                 vec3<f32>(0.04),
-                                vec3<f32>(0.94));
-                            let off_in = b_chroma * params.sun_colour.xyz * (b_ndl * b_shadow * 2.1);
+                                vec3<f32>(0.92));
+                            let off_in = b_chroma * params.sun_colour.xyz * (b_ndl * b_shadow * 1.15);
                             var incoming = off_in;
                             if (bounce == 0u) {
                                 let b_screen = sample_screen_radiance(bhit_world, bhit.t);
                                 let b_w = clamp(b_screen.a, 0.0, 1.0);
-                                let on_in = b_screen.rgb * (b_ndl * b_shadow * 1.45 * sun_strength);
+                                let on_in = b_screen.rgb * (b_ndl * b_shadow * 0.95 * sun_strength);
                                 incoming = mix(off_in, on_in, b_w);
                             }
-                            gi_sum = gi_sum + throughput * incoming * (params.tuning.w * 1.45 * (1.0 - fog_t));
-                            if (bounce + 1u < max_bounces) {
+                            incoming = min(incoming, vec3<f32>(1.15));
+                            gi_sum = gi_sum + throughput * incoming * (params.tuning.w * 0.95 * (1.0 - fog_t));
+                            if (bounce + 1u < tap_bounces) {
                                 throughput = throughput * clamp(b_chroma * 1.05, vec3<f32>(0.12), vec3<f32>(0.90));
                                 if (bounce >= 2u) {
                                     let rr = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.32, 0.92);
@@ -1072,11 +1111,9 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                                 b_step_bias = b_bias;
                             }
                         } else {
-                            if (!layered) {
-                                let sky_scale = select(0.06, 0.12, bounce == 0u);
-                                let sky_bounce = sample_sky_env(d);
-                                gi_sum = gi_sum + throughput * sky_bounce * (params.tuning.w * sky_scale * sun_strength * (1.0 - fog_t));
-                            }
+                            let sky_scale = select(select(0.08, 0.22, bounce == 0u), select(0.05, 0.13, bounce == 0u), layered);
+                            let sky_bounce = min(sample_sky_env(d), vec3<f32>(1.1));
+                            gi_sum = gi_sum + throughput * sky_bounce * (params.tuning.w * sky_scale * sun_strength * (1.0 - fog_t));
                             break;
                         }
                     }
@@ -1387,11 +1424,12 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let mean = sum * inv9;
         let stddev = sqrt(max(sum_sq * inv9 - mean * mean, vec3<f32>(0.0))) * params.weights.w;
         let history = clamp(prev.colour, mean - stddev, mean + stddev);
+        let current_clamped = min(current, mean * 1.75 + vec3<f32>(0.12));
         let mean_lf = sum_lf * inv9;
         let std_lf = sqrt(max(sum_lf_sq * inv9 - mean_lf * mean_lf, 0.0)) * params.weights.w;
         let history_lf = clamp(prev.light_factor, mean_lf - std_lf, mean_lf + std_lf);
         let alpha = max(1.0 / (n + 1.0), params.extent.w);
-        blended = mix(history, current, alpha);
+        blended = mix(history, current_clamped, alpha);
         blended_lf = clamp(mix(history_lf, current_lf, alpha), 0.0, 1.0);
         length = min(n + 1.0, params.misc.z);
         let lum = luminance(blended);
@@ -1445,7 +1483,7 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     // within strict depth/normal bounds to eliminate rotation noise, then snap
     // razor-sharp as soon as temporal history converges.
     let disocc = 1.0 - clamp((centre_moments.w - 1.0) / 3.0, 0.0, 1.0);
-    let inv_sigma = (1.0 / max(params.weights.x * sqrt(centre_variance), 1e-6)) * mix(1.0, 0.35, disocc);
+    let inv_sigma = (1.0 / max(params.weights.x * sqrt(centre_variance), 1e-6)) * mix(0.55, 0.25, disocc);
     let lf_edge_k = mix(4.5, 2.5, disocc);
     let inv_depth_denom = 1.0 / max(params.weights.z * max(abs(centre_depth), 1e-3), 1e-6);
     let centre_raw = textureLoad(history_colour, pixel, 0);
@@ -1485,7 +1523,11 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             if (ndot <= 0.0) {
                 continue;
             }
-            let wn = pow(ndot, params.weights.y);
+            // Blend smoothly across gentle curved mesh/terrain triangle seams
+            // (ndot >= 0.88) while stopping cleanly at real 90-degree corners (ndot <= 0.55),
+            // so extra denoiser passes never turn curved trunks or slopes into low-poly facets.
+            let curved_seam = smoothstep(0.55, 0.88, ndot);
+            let wn = curved_seam * curved_seam * pow(ndot, min(params.weights.y, 10.0));
             if (wn < 1e-4) {
                 continue;
             }
@@ -1712,6 +1754,10 @@ pub const GUIDE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const SKY_ENV_FACE: u32 = 128;
 pub const SKY_ENV_WIDTH: u32 = SKY_ENV_FACE * 3;
 pub const SKY_ENV_HEIGHT: u32 = SKY_ENV_FACE * 2;
+/// Resolution of the top-down real textured terrain albedo map (512x512).
+pub const TERRAIN_MAP_SIZE: u32 = 512;
+/// Half-extent (world units) covered around the camera snap anchor (1024x1024 total).
+pub const TERRAIN_MAP_HALF_EXTENT: f32 = 512.0;
 
 fn storage_texture(
     device: &wgpu::Device,
@@ -1873,6 +1919,7 @@ impl Pipelines {
                 texture_entry(11, wgpu::TextureSampleType::Float { filterable: true }),
                 texture_entry(12, wgpu::TextureSampleType::Float { filterable: true }),
                 texture_entry(13, wgpu::TextureSampleType::Float { filterable: true }),
+                texture_entry(14, wgpu::TextureSampleType::Float { filterable: true }),
             ],
         });
         let denoise_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2339,6 +2386,19 @@ pub struct RaywatcherGpu {
         wgpu::BindGroup,
         wgpu::RenderPipeline,
     )>,
+    /// Top-down real textured terrain albedo map (`TERRAIN_MAP_SIZE^2`, `COLOUR_FORMAT`).
+    terrain_map_tex: wgpu::Texture,
+    terrain_map_view: wgpu::TextureView,
+    terrain_map_anchor: Option<(f32, f32)>,
+    terrain_map_dirty: bool,
+    terrain_map_scratch: Option<(
+        wgpu::TextureFormat,
+        wgpu::Texture,
+        wgpu::TextureView,
+        wgpu::Texture,
+        wgpu::TextureView,
+        wgpu::BindGroup,
+    )>,
     /// Interpolated result, at the render extent, for the upscaler to consume.
     pub output: wgpu::Texture,
     pub output_view: wgpu::TextureView,
@@ -2407,6 +2467,23 @@ impl RaywatcherGpu {
             view_formats: &[],
         });
         let sky_env_view = sky_env_tex.create_view(&Default::default());
+        let terrain_map_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("raywatcher terrain albedo map"),
+            size: wgpu::Extent3d {
+                width: TERRAIN_MAP_SIZE,
+                height: TERRAIN_MAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COLOUR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let terrain_map_view = terrain_map_tex.create_view(&Default::default());
         let (w, h) = (render_extent.0.max(1), render_extent.1.max(1));
         let (filter_colour_tex, filter_colour) = {
             let (a, av) = plane(device, "raywatcher filter colour a", w, h, COLOUR_FORMAT);
@@ -2443,6 +2520,7 @@ impl RaywatcherGpu {
             &scene_buffers,
             &grid,
             &sky_env_view,
+            &terrain_map_view,
         );
         let temporal_bind_groups = [
             Self::temporal_binding(
@@ -2552,6 +2630,11 @@ impl RaywatcherGpu {
             sky_env_initialized: false,
             sky_env_dirty: true,
             sky_env_scratch: None,
+            terrain_map_tex,
+            terrain_map_view,
+            terrain_map_anchor: None,
+            terrain_map_dirty: true,
+            terrain_map_scratch: None,
             output,
             output_view,
             guide,
@@ -2569,6 +2652,7 @@ impl RaywatcherGpu {
         scene: &SceneBuffers,
         grid: &GridTargets,
         sky_env_view: &wgpu::TextureView,
+        terrain_map_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("raywatcher scene"),
@@ -2629,6 +2713,10 @@ impl RaywatcherGpu {
                 wgpu::BindGroupEntry {
                     binding: 13,
                     resource: wgpu::BindingResource::TextureView(sky_env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(terrain_map_view),
                 },
             ],
         })
@@ -2884,6 +2972,7 @@ impl RaywatcherGpu {
                 &self.scene,
                 &self.grid,
                 &self.sky_env_view,
+                &self.terrain_map_view,
             );
             self.temporal_bind_groups = [
                 Self::temporal_binding(
@@ -2982,6 +3071,7 @@ impl RaywatcherGpu {
             &self.scene,
             &self.grid,
             &self.sky_env_view,
+            &self.terrain_map_view,
         );
         self.temporal_bind_groups = [
             Self::temporal_binding(
@@ -3098,6 +3188,7 @@ impl RaywatcherGpu {
             &self.scene,
             &self.grid,
             &self.sky_env_view,
+            &self.terrain_map_view,
         );
     }
 
@@ -3248,7 +3339,7 @@ impl RaywatcherGpu {
             pass.dispatch_workgroups(gw.div_ceil(8), gh.div_ceil(8), 1);
         }
 
-        let packed = RayParams::pack(
+        let mut packed = RayParams::pack(
             params,
             plan,
             transport,
@@ -3259,6 +3350,7 @@ impl RaywatcherGpu {
             ],
             point_lights,
         );
+        packed.terrain_map_bounds = self.terrain_map_bounds();
 
         let skip_inhouse = plan.reconstruction
             == super::plan::RayReconstruction::DlssRayReconstruction
@@ -3288,8 +3380,11 @@ impl RaywatcherGpu {
                     &self.grid.gbuf_raster,
                     &self.sky_env_tex,
                     self.sky_env_dirty,
+                    &self.terrain_map_tex,
+                    self.terrain_map_dirty,
                 );
                 self.sky_env_dirty = false;
+                self.terrain_map_dirty = false;
                 let pending = std::mem::replace(
                     encoder,
                     device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3519,6 +3614,165 @@ impl RaywatcherGpu {
     /// On the first frame all 6 faces are populated; subsequent frames refresh
     /// one face per frame so clouds and time-of-day stay live at minimal cost.
     #[allow(clippy::too_many_arguments)]
+    /// World-space bounds `[min_x, max_z, inv_diameter, valid]` of the top-down
+    /// real textured terrain albedo map.
+    pub fn terrain_map_bounds(&self) -> [f32; 4] {
+        match self.terrain_map_anchor {
+            Some((ax, az)) => [
+                ax - TERRAIN_MAP_HALF_EXTENT,
+                az + TERRAIN_MAP_HALF_EXTENT,
+                1.0 / (2.0 * TERRAIN_MAP_HALF_EXTENT),
+                1.0,
+            ],
+            None => [0.0; 4],
+        }
+    }
+
+    /// Returns `Some((anchor_x, anchor_z))` when the top-down terrain albedo map
+    /// should be refreshed (initial frame or camera moved > 192u from last anchor).
+    pub fn terrain_map_refresh_anchor(&self, eye_x: f32, eye_z: f32) -> Option<(f32, f32)> {
+        let snap = 192.0f32;
+        let ax = (eye_x / snap).round() * snap;
+        let az = (eye_z / snap).round() * snap;
+        match self.terrain_map_anchor {
+            Some((old_x, old_z)) if (old_x - ax).abs() < 1.0 && (old_z - az).abs() < 1.0 => None,
+            _ => Some((ax, az)),
+        }
+    }
+
+    /// Prepare scratch render targets (`surface_format` + `Depth32Float`) for
+    /// rendering the top-down terrain pass into `terrain_map_tex`.
+    pub fn prepare_terrain_map_targets(
+        &mut self,
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+    ) -> (&wgpu::TextureView, &wgpu::TextureView) {
+        let need_alloc = self
+            .terrain_map_scratch
+            .as_ref()
+            .is_none_or(|(fmt, ..)| *fmt != surface_format);
+        if need_alloc {
+            let color = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("raywatcher terrain map scratch color"),
+                size: wgpu::Extent3d {
+                    width: TERRAIN_MAP_SIZE,
+                    height: TERRAIN_MAP_SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: surface_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let color_view = color.create_view(&Default::default());
+            let depth = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("raywatcher terrain map scratch depth"),
+                size: wgpu::Extent3d {
+                    width: TERRAIN_MAP_SIZE,
+                    height: TERRAIN_MAP_SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let depth_view = depth.create_view(&Default::default());
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("raywatcher terrain map blit"),
+                layout: &self.pipelines.blit_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&color_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.pipelines.blit_sampler),
+                    },
+                ],
+            });
+            self.terrain_map_scratch =
+                Some((surface_format, color, color_view, depth, depth_view, bg));
+        }
+        let (_, _, ref cview, _, ref dview, _) = self.terrain_map_scratch.as_ref().unwrap();
+        (cview, dview)
+    }
+
+    /// Blit the rendered scratch top-down terrain map into `self.terrain_map_tex`
+    /// (`COLOUR_FORMAT`) and record its world-space anchor.
+    pub fn finish_terrain_map_blit(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        anchor: (f32, f32),
+    ) {
+        if self
+            .blit_pipeline
+            .as_ref()
+            .is_none_or(|(fmt, _)| *fmt != COLOUR_FORMAT)
+        {
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("raywatcher blit"),
+                bind_group_layouts: &[&self.pipelines.blit_layout],
+                push_constant_ranges: &[],
+            });
+            let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("raywatcher blit"),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &self.pipelines.blit_module,
+                    entry_point: "vs",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.pipelines.blit_module,
+                    entry_point: "fs",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: COLOUR_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+            self.blit_pipeline = Some((COLOUR_FORMAT, pipe));
+        }
+        let (Some((_, ref pipe)), Some((_, _, _, _, _, ref bg))) =
+            (&self.blit_pipeline, &self.terrain_map_scratch)
+        else {
+            return;
+        };
+        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("raywatcher terrain map blit"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.terrain_map_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        rp.set_pipeline(pipe);
+        rp.set_bind_group(0, bg, &[]);
+        rp.draw(0..3, 0..1);
+        drop(rp);
+        self.terrain_map_anchor = Some(anchor);
+        self.terrain_map_dirty = true;
+    }
+
     pub fn update_sky_env(
         &mut self,
         device: &wgpu::Device,

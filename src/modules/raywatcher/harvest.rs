@@ -1427,16 +1427,16 @@ fn push_terrain_frustum(
             // within 0.1 world units on slopes and paths (no sharp wedges).
             let _ = fine_step;
             let cells_per_chunk = (chunk_size / base_cell.max(0.5)).round().max(8.0) as u32;
-            let (lod_band, divs) = if dist <= 128.0 {
+            let (lod_band, divs) = if dist <= 160.0 {
                 (0usize, cells_per_chunk.min(128))
-            } else if dist <= near_r {
-                (0usize, (cells_per_chunk / 2).clamp(16, 64))
-            } else if dist <= mid_r {
-                (1usize, (cells_per_chunk / 4).clamp(8, 32))
+            } else if dist <= near_r.max(320.0) {
+                (0usize, (cells_per_chunk / 2).clamp(24, 64))
+            } else if dist <= mid_r.max(640.0) {
+                (1usize, (cells_per_chunk / 4).clamp(16, 32))
             } else if dist <= far_r {
-                (2usize, (cells_per_chunk / 8).clamp(4, 16))
+                (2usize, (cells_per_chunk / 8).clamp(8, 16))
             } else {
-                (3usize, (cells_per_chunk / 16).clamp(2, 8))
+                (3usize, (cells_per_chunk / 16).clamp(4, 8))
             };
             let step = chunk_size / divs as f32;
             let side = (divs + 1) as usize;

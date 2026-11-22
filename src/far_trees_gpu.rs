@@ -632,41 +632,101 @@ impl FarTrees {
                             if cross.length_squared() <= 1e-8 {
                                 continue;
                             }
-                            let uv_mid = [
-                                (v0.uv[0] + v1.uv[0] + v2.uv[0]) / 3.0,
-                                (v0.uv[1] + v1.uv[1] + v2.uv[1]) / 3.0,
-                            ];
-                            let (albedo, alpha) = sample_rgba_uv(img, uv_mid);
-                            let opacity = if is_foliage {
-                                if alpha < 0.2 {
-                                    continue;
+                            let norm = cross.normalize();
+                            if is_foliage {
+                                // Subdivide each frond card triangle into 4 midpoint sub-triangles
+                                // and discard empty transparent corners using real `tree.composite` alpha.
+                                let ab = (a + b) * 0.5;
+                                let bc = (b + c) * 0.5;
+                                let ca = (c + a) * 0.5;
+                                let uv_ab =
+                                    [(v0.uv[0] + v1.uv[0]) * 0.5, (v0.uv[1] + v1.uv[1]) * 0.5];
+                                let uv_bc =
+                                    [(v1.uv[0] + v2.uv[0]) * 0.5, (v1.uv[1] + v2.uv[1]) * 0.5];
+                                let uv_ca =
+                                    [(v2.uv[0] + v0.uv[0]) * 0.5, (v2.uv[1] + v0.uv[1]) * 0.5];
+                                let subs = [
+                                    (a, ab, ca, v0.uv, uv_ab, uv_ca),
+                                    (ab, b, bc, uv_ab, v1.uv, uv_bc),
+                                    (ca, bc, c, uv_ca, uv_bc, v2.uv),
+                                    (ab, bc, ca, uv_ab, uv_bc, uv_ca),
+                                ];
+                                for (sa, sb, sc, u0, u1, u2) in subs {
+                                    let uv_c = [
+                                        (u0[0] + u1[0] + u2[0]) / 3.0,
+                                        (u0[1] + u1[1] + u2[1]) / 3.0,
+                                    ];
+                                    let (albedo, alpha) = sample_rgba_uv(img, uv_c);
+                                    if alpha < 0.40 {
+                                        continue;
+                                    }
+                                    lod_tris.push(RtTreeTriangle {
+                                        a: sa,
+                                        b: sb,
+                                        c: sc,
+                                        normal: norm,
+                                        albedo,
+                                        roughness: 0.85,
+                                        opacity: (alpha * 0.78).clamp(0.32, 0.80),
+                                    });
                                 }
-                                alpha.clamp(0.45, 0.92)
                             } else {
-                                1.0
-                            };
-                            lod_tris.push(RtTreeTriangle {
-                                a,
-                                b,
-                                c,
-                                normal: cross.normalize(),
-                                albedo,
-                                roughness: if is_foliage { 0.85 } else { 0.90 },
-                                opacity,
-                            });
+                                let uv_mid = [
+                                    (v0.uv[0] + v1.uv[0] + v2.uv[0]) / 3.0,
+                                    (v0.uv[1] + v1.uv[1] + v2.uv[1]) / 3.0,
+                                ];
+                                let (albedo, _) = sample_rgba_uv(img, uv_mid);
+                                lod_tris.push(RtTreeTriangle {
+                                    a,
+                                    b,
+                                    c,
+                                    normal: norm,
+                                    albedo,
+                                    roughness: 0.90,
+                                    opacity: 1.0,
+                                });
+                            }
                         }
                     }
                     for leaf in &lod.leaves {
                         let center =
                             glam::Vec3::new(leaf.center[0], leaf.center[2], leaf.center[1]);
-                        let uv_mid = [
-                            (leaf.uv[0][0] + leaf.uv[1][0] + leaf.uv[2][0] + leaf.uv[3][0]) * 0.25,
-                            (leaf.uv[0][1] + leaf.uv[1][1] + leaf.uv[2][1] + leaf.uv[3][1]) * 0.25,
-                        ];
-                        let (albedo, alpha) = sample_rgba_uv(&tree.composite, uv_mid);
-                        if alpha < 0.45 {
+                        // Sample a 3x3 alpha grid across the leaf's UV tile in `tree.composite`
+                        // to compute true opaque foliage coverage & average leaf albedo.
+                        let mut rgb_sum = [0.0f32; 3];
+                        let mut alpha_sum = 0.0f32;
+                        let mut opaque_hits = 0u32;
+                        for gy in 0..3 {
+                            let tv = (gy as f32 + 0.5) / 3.0;
+                            for gx in 0..3 {
+                                let tu = (gx as f32 + 0.5) / 3.0;
+                                let u_top = leaf.uv[0][0] * (1.0 - tu) + leaf.uv[1][0] * tu;
+                                let v_top = leaf.uv[0][1] * (1.0 - tu) + leaf.uv[1][1] * tu;
+                                let u_bot = leaf.uv[3][0] * (1.0 - tu) + leaf.uv[2][0] * tu;
+                                let v_bot = leaf.uv[3][1] * (1.0 - tu) + leaf.uv[2][1] * tu;
+                                let uv = [
+                                    u_top * (1.0 - tv) + u_bot * tv,
+                                    v_top * (1.0 - tv) + v_bot * tv,
+                                ];
+                                let (rgb, a) = sample_rgba_uv(&tree.composite, uv);
+                                if a >= 0.45 {
+                                    opaque_hits += 1;
+                                    alpha_sum += a;
+                                    rgb_sum[0] += rgb[0] * a;
+                                    rgb_sum[1] += rgb[1] * a;
+                                    rgb_sum[2] += rgb[2] * a;
+                                }
+                            }
+                        }
+                        if opaque_hits < 2 || alpha_sum <= 1e-4 {
                             continue;
                         }
+                        let albedo = [
+                            (rgb_sum[0] / alpha_sum).clamp(0.05, 0.92),
+                            (rgb_sum[1] / alpha_sum).clamp(0.05, 0.92),
+                            (rgb_sum[2] / alpha_sum).clamp(0.05, 0.92),
+                        ];
+                        let coverage = opaque_hits as f32 / 9.0;
                         let n = leaf
                             .normal
                             .map(|n| glam::Vec3::new(n[0], n[2], n[1]).normalize_or_zero())
@@ -679,18 +739,19 @@ impl FarTrees {
                         };
                         let right = up.cross(n).normalize_or_zero();
                         let bitan = n.cross(right).normalize_or_zero();
-                        // Trim square billboard corners into an organic diamond leaf hull
-                        // from the 4 edge midpoints so RT leaves never appear as flat boxes.
+                        // Fit an organic diamond leaf hull scaled to actual opaque coverage
+                        // so RT leaves never cast or reflect rectangular cardboxes.
+                        let hull_scale = (0.34 + 0.20 * coverage.sqrt()).clamp(0.36, 0.52);
                         let corner = |j: usize| {
                             let c = leaf.corners[j];
-                            center + (right * c[0] + bitan * c[1] + n * c[2]) * 0.56
+                            center + (right * c[0] + bitan * c[1] + n * c[2]) * hull_scale
                         };
                         let (c0, c1, c2, c3) = (corner(0), corner(1), corner(2), corner(3));
                         let m01 = (c0 + c1) * 0.5;
                         let m12 = (c1 + c2) * 0.5;
                         let m23 = (c2 + c3) * 0.5;
                         let m30 = (c3 + c0) * 0.5;
-                        let opacity = (alpha * 0.72).clamp(0.35, 0.78);
+                        let opacity = (coverage * 0.72).clamp(0.28, 0.70);
                         if (m12 - m01).cross(m23 - m01).length_squared() > 1e-8 {
                             lod_tris.push(RtTreeTriangle {
                                 a: m01,
