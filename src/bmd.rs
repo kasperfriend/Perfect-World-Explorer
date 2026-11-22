@@ -417,16 +417,44 @@ impl Model {
                     v.normal = v3(b, p)?;
                     p += 12;
                 }
+                let n8 = n.checked_mul(8).ok_or("BMD size overflow")?;
+                let mut tail_advance = None;
+                let mut material = None;
+                let mat_at_p = b.get(p..p + MAT_TAG.len()) == Some(MAT_TAG);
                 let has_mat_at = |off: usize| -> bool {
                     off.checked_add(48 + MAT_TAG.len()).is_some_and(|e| {
                         e <= b.len() && &b[off + 48..off + 48 + MAT_TAG.len()] == MAT_TAG
                     })
                 };
-                let n8 = n.checked_mul(8).ok_or("BMD size overflow")?;
                 let n16 = n.checked_mul(16).ok_or("BMD size overflow")?;
-                let double_block = p.checked_add(n16).is_some_and(has_mat_at)
+                let double_block = !mat_at_p
+                    && p.checked_add(n16).is_some_and(has_mat_at)
                     && !p.checked_add(n8).is_some_and(has_mat_at);
-                let color_branch = if double_block {
+                let color_branch = if mat_at_p {
+                    material = Some(parse_material(b, &mut p)?);
+                    if p.checked_add(n8).is_none_or(|e| e > b.len()) {
+                        return Err("truncated BMD mesh data".into());
+                    }
+                    for v in &mut vertices {
+                        v.day_diffuse = u(b, p)?;
+                        p += 4;
+                    }
+                    for v in &mut vertices {
+                        v.night_diffuse = u(b, p)?;
+                        p += 4;
+                    }
+                    v300_branch_counters.colours_read += 1;
+                    if p.checked_add(52).is_some_and(|e| e <= b.len()) {
+                        let dw_pos = p + 48;
+                        let extra_size = u(b, dw_pos)? as usize;
+                        if (4..=65536).contains(&extra_size)
+                            && dw_pos.checked_add(extra_size).is_some_and(|e| e <= b.len())
+                        {
+                            tail_advance = Some(48 + extra_size);
+                        }
+                    }
+                    V300ColorBranch::VertexColorsOnly
+                } else if double_block {
                     p += n8;
                     v300_branch_counters.uv_block_skipped += 1;
                     for v in &mut vertices {
@@ -494,24 +522,27 @@ impl Model {
                 let (opaque_day_words, opaque_night_words) = count_opaque_words(&vertices);
                 // Tail: 48 B AABB + 80 B A3DMaterial ("MATERIAL: \0" + 69 B) +
                 // dwExtraSize (counts its own 4 B; 22 B when strDetailMap is empty -> 150 B total).
-                let mut tail_advance = None;
-                let mut material = None;
-                if p.checked_add(132).is_some_and(|e| e <= b.len())
+                // When MATERIAL preceded the day/night colours (`mat_at_p`), only 48 B AABB +
+                // dwExtraSize remain here.
+                if !mat_at_p
+                    && p.checked_add(132).is_some_and(|e| e <= b.len())
                     && &b[p + 48..p + 48 + MAT_TAG.len()] == MAT_TAG
                 {
                     let mut mat_p = p + 48;
                     material = parse_material(b, &mut mat_p).ok();
-                    let dw_pos = p + 128;
+                    let dw_pos = mat_p;
                     let extra_size = u(b, dw_pos)? as usize;
                     if (4..=65536).contains(&extra_size)
                         && dw_pos.checked_add(extra_size).is_some_and(|e| e <= b.len())
                     {
-                        tail_advance = Some(128 + extra_size);
+                        tail_advance = Some((dw_pos - p) + extra_size);
                     }
                 }
                 if let Some(step) = tail_advance {
                     p += step;
-                } else if p.checked_add(150).is_some_and(|e| e <= b.len()) {
+                } else if mat_at_p && p.checked_add(70).is_some_and(|e| e <= b.len()) {
+                    p += 70;
+                } else if !mat_at_p && p.checked_add(150).is_some_and(|e| e <= b.len()) {
                     let mut mat_p = p + 48;
                     if b.get(mat_p..mat_p + MAT_TAG.len()) == Some(MAT_TAG) {
                         material = parse_material(b, &mut mat_p).ok();
@@ -1036,6 +1067,71 @@ mod tests {
         let log_line = model.meshes[2].colour_log_line("litmodels/world/1/litmodel_1.bmd", 2);
         assert!(log_line.contains("branch=lightmap_neutral"));
         assert!(log_line.contains("first_day=0xff808080"));
+    }
+
+    #[test]
+    fn parses_v300_colours_only_with_material_before_colors_and_non_default_extra_size() {
+        let mut b = Vec::new();
+        let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+        put(&mut b, 0x42584f4d);
+        put(&mut b, 0x80000001);
+        b.push(0);
+        put(&mut b, 0x10000302);
+        b.extend_from_slice(&[0; 48]);
+        put(&mut b, 2);
+
+        // Mesh 0: MATERIAL: \0 before day/night colours, followed by 48 B AABB + dwExtraSize=40.
+        put(&mut b, 0x0000_0001);
+        put(&mut b, 2);
+        b.extend_from_slice(b"m0");
+        put(&mut b, 5);
+        b.extend_from_slice(b"a.dds");
+        put(&mut b, 3);
+        put(&mut b, 1);
+        for i in 0..3u32 {
+            put(&mut b, (i as f32).to_bits());
+            put(&mut b, 0.0f32.to_bits());
+            put(&mut b, 1.0f32.to_bits());
+            put(&mut b, 0xffffffff);
+            put(&mut b, 0.0f32.to_bits());
+            put(&mut b, 1.0f32.to_bits());
+        }
+        put(&mut b, 0);
+        put(&mut b, 1);
+        put(&mut b, 2);
+        b.extend_from_slice(&[0; 36]);
+        b.extend_from_slice(b"MATERIAL: \0");
+        b.extend_from_slice(&[0; 69]);
+        for c in [0xff112233u32, 0xff445566, 0xff778899] {
+            put(&mut b, c);
+        }
+        for c in [0xff010203u32, 0xff040506, 0xff070809] {
+            put(&mut b, c);
+        }
+        b.extend_from_slice(&[0; 48]);
+        put(&mut b, 40);
+        b.extend_from_slice(&[0x55; 36]);
+
+        // Mesh 1: immediately follows dwExtraSize=40.
+        push_v300_mesh(&mut b, true, false, b"m1", b"b.dds", [0; 3], [0; 3], 22);
+
+        let model = Model::parse(&b).unwrap();
+        assert_eq!(model.meshes.len(), 2);
+        assert_eq!(
+            model.meshes[0].color_branch,
+            Some(V300ColorBranch::VertexColorsOnly)
+        );
+        assert!(model.meshes[0].material.is_some());
+        assert_eq!(model.meshes[0].opaque_day_words, 3);
+        assert_eq!(model.meshes[0].opaque_night_words, 3);
+        assert_eq!(model.meshes[0].vertices[0].day_diffuse, 0xff112233);
+        assert_eq!(model.meshes[0].vertices[2].day_diffuse, 0xff778899);
+        assert_eq!(model.meshes[0].vertices[0].night_diffuse, 0xff010203);
+        assert_eq!(model.meshes[1].name, "m1");
+        assert_eq!(
+            model.meshes[1].color_branch,
+            Some(V300ColorBranch::LightmapUvNeutralFallback)
+        );
     }
 
     #[test]
