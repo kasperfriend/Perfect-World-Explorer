@@ -1472,7 +1472,6 @@ extern "system" {
     fn GetMessageW(msg: *mut WinMessage, window: Hwnd, min: u32, max: u32) -> i32;
     fn SetWindowTextW(hwnd: Hwnd, text: *const u16) -> i32;
     fn EnableWindow(hwnd: Hwnd, enable: i32) -> i32;
-    fn SendMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn GetSysColorBrush(index: i32) -> *mut c_void;
     fn LoadCursorW(instance: *mut c_void, name: *const u16) -> *mut c_void;
 }
