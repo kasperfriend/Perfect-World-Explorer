@@ -318,10 +318,10 @@ impl Model {
         p += 48;
         let count = u(b, p)? as usize;
         p += 4;
-        if count > 4096 {
-            return Err("too many meshes".into());
+        if count > 65_536 {
+            return Err(format!("too many meshes ({count}, version={version:#x})"));
         }
-        let mut meshes = Vec::with_capacity(count);
+        let mut meshes = Vec::with_capacity(count.min(4096));
         let mut lossy_gbk_diagnostics = Vec::new();
         let mut v300_branch_counters = V300BranchCounters::default();
         if is_v300 {
@@ -1141,6 +1141,31 @@ mod tests {
             model.meshes[1].color_branch,
             Some(V300ColorBranch::LightmapUvNeutralFallback)
         );
+    }
+
+    #[test]
+    fn parses_v300_model_with_over_4096_meshes() {
+        let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+        let mut b = Vec::new();
+        put(&mut b, 0x42584f4d);
+        put(&mut b, 0x10000302);
+        b.extend_from_slice(&[0; 48]);
+        put(&mut b, 4097);
+        b.extend_from_slice(&[0, 0]);
+        for _ in 0..4097 {
+            push_v300_mesh(
+                &mut b,
+                false,
+                true,
+                b"m",
+                b"t.dds",
+                [0xffffffff; 3],
+                [0xffffffff; 3],
+                16,
+            );
+        }
+        let model = Model::parse(&b).expect("model with 4097 meshes should parse");
+        assert_eq!(model.meshes.len(), 4097);
     }
 
     #[test]

@@ -42,8 +42,31 @@ pub(crate) struct Texture {
     pub(crate) source: Vec<u8>,
     pub(crate) levels: std::sync::OnceLock<Vec<crate::dxt::Level>>,
 }
+fn decode_non_dds_terrain_texture(path: &str, raw: &[u8]) -> Result<crate::dxt::Level, String> {
+    let img = if path.to_ascii_lowercase().ends_with(".tga") {
+        image::load_from_memory_with_format(raw, image::ImageFormat::Tga)
+            .or_else(|_| image::load_from_memory(raw))
+    } else {
+        image::load_from_memory(raw)
+    }
+    .map_err(|e| format!("texture {path}: {e}"))?;
+    let rgba = img.to_rgba8();
+    let (width, height) = (rgba.width(), rgba.height());
+    if width == 0 || height == 0 || width > 16384 || height > 16384 {
+        return Err(format!("texture {path}: dimensions out of bounds"));
+    }
+    Ok(crate::dxt::Level {
+        width,
+        height,
+        rgba: rgba.into_raw(),
+    })
+}
+
 impl Texture {
     pub(crate) fn decode(&self) -> Result<Vec<crate::dxt::Level>, String> {
+        if let Some(levels) = self.levels.get() {
+            return Ok(levels.clone());
+        }
         let info = crate::terrain_sampling::parse_terrain_dds(&self.source)?;
         crate::dxt::decode_chain(
             info.format.four_cc(),
@@ -360,10 +383,23 @@ impl Materials {
             // format the native device would have rejected.
             let info = match crate::terrain_sampling::parse_terrain_dds(&raw) {
                 Ok(info) => info,
-                // Only the stand-in may be re-tried as a placeholder: an
-                // authored DDS the device would reject stays an error.
+                // Non-DDS terrain textures (such as .tga in login/instance maps)
+                // decode through the `image` crate and upload via the decoded fallback.
                 Err(e) if entry_index.contains_key(&path.to_ascii_lowercase()) => {
-                    return Err(format!("texture {path}: {e}"))
+                    if raw.starts_with(b"DDS ") {
+                        return Err(format!("texture {path}: {e}"));
+                    }
+                    let level = decode_non_dds_terrain_texture(path, &raw)?;
+                    let (w, h) = (level.width as usize, level.height as usize);
+                    let levels = std::sync::OnceLock::new();
+                    let _ = levels.set(vec![level]);
+                    textures.push(Texture {
+                        w,
+                        h,
+                        source: raw,
+                        levels,
+                    });
+                    continue;
                 }
                 Err(_) => {
                     let raw = notex_pixels();
@@ -519,15 +555,17 @@ impl Materials {
         let expanded_bytes: usize = textures
             .iter()
             .map(|t| {
-                let info =
-                    crate::terrain_sampling::parse_terrain_dds(&t.source).expect("validated DDS");
-                (0..info.authored_mips)
-                    .map(|mip| {
-                        ((info.width >> mip).max(1) as usize)
-                            * ((info.height >> mip).max(1) as usize)
-                            * 4
-                    })
-                    .sum::<usize>()
+                if let Ok(info) = crate::terrain_sampling::parse_terrain_dds(&t.source) {
+                    (0..info.authored_mips)
+                        .map(|mip| {
+                            ((info.width >> mip).max(1) as usize)
+                                * ((info.height >> mip).max(1) as usize)
+                                * 4
+                        })
+                        .sum::<usize>()
+                } else {
+                    t.w * t.h * 4
+                }
             })
             .sum::<usize>()
             + areas
@@ -781,6 +819,30 @@ mod tests {
         assert_eq!(layer_uv(0, x, y, z).0, z);
         assert_eq!(layer_uv(2, x, y, z).1, -y);
     }
+    #[test]
+    fn non_dds_tga_terrain_texture_decodes_via_fallback() {
+        // Minimal uncompressed 2x2 32-bit BGRA TGA (origin top-left).
+        let tga: Vec<u8> = vec![
+            0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 32, 0x28, 10, 20, 30, 255, 40, 50, 60,
+            255, 70, 80, 90, 255, 100, 110, 120, 255,
+        ];
+        let level = decode_non_dds_terrain_texture("Textures/Maps/test.tga", &tga)
+            .expect("TGA terrain texture should decode");
+        assert_eq!(level.width, 2);
+        assert_eq!(level.height, 2);
+        assert_eq!(&level.rgba[..4], &[30, 20, 10, 255]);
+        let levels = std::sync::OnceLock::new();
+        let _ = levels.set(vec![level]);
+        let tex = Texture {
+            w: 2,
+            h: 2,
+            source: tga,
+            levels,
+        };
+        assert_eq!(tex.decode().unwrap().len(), 1);
+        assert!(crate::terrain_sampling::parse_terrain_dds(&tex.source).is_err());
+    }
+
     #[test]
     fn cutoff_transfers_only_resident_payloads_without_renumbering_areas() {
         let mut m = Materials {
