@@ -15,6 +15,8 @@ use std::{
 };
 const BRIDGE: &[u8] = include_bytes!("../tools/speedtree/speedtree-bake.exe");
 type Hwnd = *mut c_void;
+/// A GDI/Win32 handle, the same pointer shape as [`Hwnd`].
+type Handle = *mut c_void;
 #[repr(C)]
 struct BrowseInfo {
     owner: Hwnd,
@@ -40,6 +42,7 @@ extern "system" {
 #[link(name = "user32")]
 extern "system" {
     fn MessageBoxW(owner: Hwnd, text: *const u16, caption: *const u16, flags: u32) -> i32;
+    fn SendMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
 }
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -449,26 +452,744 @@ pub fn loading_progress(message: String) {
         }
     }
 }
-fn directstorage_state(stats: crate::pck::direct_storage::ReadStats) -> String {
-    if !crate::pck::direct_storage::compiled_in() {
-        return "DirectStorage not built in; standard file I/O is in use".into();
+pub(crate) fn directstorage_state(stats: crate::pck::direct_storage::ReadStats) -> String {
+    // One implementation, shared with the in-viewer overlay: the standalone
+    // window and the overlay must never describe the same counters differently.
+    crate::pck::direct_storage::state_line(stats)
+}
+
+use crate::launcher_ui;
+use crate::launcher_ui::BitmapInfo;
+
+/// Rectangle in client coordinates (`RECT`).
+#[repr(C)]
+struct WindowRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn GetClientRect(window: Hwnd, rect: *mut WindowRect) -> i32;
+    fn PostQuitMessage(code: i32);
+    fn InvalidateRect(window: Hwnd, rect: *const c_void, erase: i32) -> i32;
+}
+
+/// One decoded loading-screen picture and the GDI surface sized to the window.
+///
+/// The artwork is decoded, fitted to the client area and darkened behind the
+/// status strip once, on the loading thread, before the window is shown. It is
+/// the same picture for the whole load, so scaling it per repaint would only add
+/// work to the GDI paint path.
+struct LoadingArt {
+    /// `BITMAPINFOHEADER` followed by top-down 32-bit BGRA pixels.
+    bits: Vec<u8>,
+    /// The picture exactly as it was decoded from the archive.
+    ///
+    /// A window resize must re-fit from this, never from the previous output:
+    /// `fill` crops the source to cover the target, so re-fitting an already
+    /// cropped frame crops it a second time and the picture looks zoomed in and
+    /// clipped on every side. The initial decode does not know the real client
+    /// area yet, so this is the only way a later fit can be correct.
+    source: image::RgbaImage,
+    width: u32,
+    height: u32,
+    /// Archive path of the picture, shown in the window so a screenshot names
+    /// which loading screen the client's archive produced.
+    label: String,
+}
+
+impl LoadingArt {
+    /// Fit `image` to `width` x `height` as a top-down BGRA DIB.
+    fn new(
+        image: &image::RgbaImage,
+        width: u32,
+        height: u32,
+        label: String,
+    ) -> Result<Self, String> {
+        let width = width.max(1);
+        let height = height.max(1);
+        let fitted = crate::loading_screen::fill(image, width, height)?;
+        // The status strip is blended here, once, because GDI cannot alpha-blend
+        // a drawn rectangle over a bitmap.
+        let blended = crate::loading_screen::overlay_strip(
+            fitted.as_raw(),
+            width,
+            height,
+            OVERLAY_STRIP_HEIGHT,
+            OVERLAY_FADE_HEIGHT,
+            OVERLAY_MAX_ALPHA,
+        )?;
+        let mut bits = vec![0u8; std::mem::size_of::<BitmapInfo>()];
+        // BITMAPINFOHEADER: biSize, biWidth, biHeight (negative = top-down),
+        // biPlanes = 1, biBitCount = 32, biCompression = BI_RGB.
+        bits[0..4].copy_from_slice(&40u32.to_le_bytes());
+        bits[4..8].copy_from_slice(&(width as i32).to_le_bytes());
+        bits[8..12].copy_from_slice(&(-(height as i32)).to_le_bytes());
+        bits[12..14].copy_from_slice(&1u16.to_le_bytes());
+        bits[14..16].copy_from_slice(&32u16.to_le_bytes());
+        bits.extend_from_slice(&crate::loading_screen::to_bgra(&blended));
+        Ok(Self {
+            bits,
+            source: image.clone(),
+            width,
+            height,
+            label,
+        })
     }
-    if stats.successes > 0 {
-        return format!(
-            "Using DirectStorage in loading — ACTIVE ({} successful reads)",
-            stats.successes
+
+    /// The header at the front of `bits`. `BitmapInfo` is the 40-byte
+    /// `BITMAPINFOHEADER` this constructor writes.
+    fn info(&self) -> &BitmapInfo {
+        // SAFETY: `bits` starts with exactly one `BitmapInfo`.
+        unsafe { &*(self.bits.as_ptr() as *const BitmapInfo) }
+    }
+
+    fn pixels(&self) -> *const c_void {
+        // SAFETY: the header is `size_of::<BitmapInfo>()` long and the pixel
+        // bytes follow it for `width * height` pixels.
+        unsafe {
+            self.bits
+                .as_ptr()
+                .add(std::mem::size_of::<BitmapInfo>())
+                .cast()
+        }
+    }
+
+    /// Re-fit the original picture to a new client size.
+    ///
+    /// Fitting from `self.source` rather than from the current `bits` is what
+    /// keeps a resize from compounding the cover crop: `fill` always crops the
+    /// source to the target's aspect, so feeding it the previous, already
+    /// cropped result would zoom in once per resize event.
+    fn refit(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let width = width.max(MIN_ART_WIDTH);
+        let height = height.max(MIN_ART_HEIGHT);
+        if self.matches(width, height) {
+            return Ok(());
+        }
+        let source = self.source.clone();
+        *self = Self::new(&source, width, height, self.label.clone())?;
+        Ok(())
+    }
+
+    /// True when the fitted surface already covers a `width` x `height` client
+    /// area.
+    ///
+    /// The comparison applies the same floor `refit` does. Without that, a
+    /// window smaller than the floor would never compare equal and every single
+    /// paint would re-fit and re-compose the whole frame.
+    fn matches(&self, width: u32, height: u32) -> bool {
+        self.width == width.max(MIN_ART_WIDTH) && self.height == height.max(MIN_ART_HEIGHT)
+    }
+}
+
+/// Client area of a window, in pixels, with a safe fallback so a window whose
+/// size cannot be queried still gets a usable canvas.
+unsafe fn client_size(window: Hwnd) -> (u32, u32) {
+    let mut rect = WindowRect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if GetClientRect(window, &mut rect) == 0 || rect.right <= rect.left || rect.bottom <= rect.top {
+        return (1280, 720);
+    }
+    (
+        (rect.right - rect.left) as u32,
+        (rect.bottom - rect.top) as u32,
+    )
+}
+
+fn paint_loading_art(dc: *mut c_void, art: &LoadingArt) {
+    unsafe {
+        // No black pre-fill: `SRCCOPY` already replaces every pixel in the
+        // destination rectangle, and on a composited desktop a surface can be
+        // presented between two GDI calls, so painting black first showed up as
+        // a flash. The artwork is the first thing drawn.
+        launcher_ui::StretchDIBits(
+            dc,
+            0,
+            0,
+            art.width as i32,
+            art.height as i32,
+            0,
+            0,
+            art.width as i32,
+            art.height as i32,
+            art.pixels(),
+            art.info(),
+            0,
+            0x00cc0020, // SRCCOPY
         );
     }
-    if stats.fallbacks > 0 {
-        return format!(
-            "DirectStorage attempts fell back to standard I/O ({} so far)",
-            stats.fallbacks
+}
+
+/// Blit only `top..bottom` of the artwork.
+///
+/// The picture is a top-down DIB, so a row slice of the source maps one-to-one
+/// onto the destination rows; `StretchDIBits` is given the sub-rectangle so a
+/// bar-only repaint does not re-upload a full-screen bitmap.
+fn paint_loading_art_band(dc: *mut c_void, art: &LoadingArt, top: i32, bottom: i32, width: u32) {
+    let top = top.max(0);
+    let bottom = bottom.min(art.height as i32);
+    if bottom <= top {
+        return;
+    }
+    let rows = bottom - top;
+    // The window can be wider than the fitted picture if it grew between the
+    // WM_SIZE that refitted it and this paint; only the overlap is copied and
+    // the remainder is the window's own background.
+    let columns = width.min(art.width) as i32;
+    if columns <= 0 {
+        return;
+    }
+    unsafe {
+        launcher_ui::StretchDIBits(
+            dc,
+            0,
+            top,
+            columns,
+            rows,
+            0,
+            top,
+            columns,
+            rows,
+            art.pixels(),
+            art.info(),
+            0,
+            0x00cc0020, // SRCCOPY
         );
     }
-    if stats.active > 0 {
-        return format!("DirectStorage read in progress ({} active)", stats.active);
+}
+
+/// Draw the status overlay: the DirectStorage state, the throughput graph, the
+/// read totals, the current progress message and an indeterminate loading bar.
+///
+/// The dark strip behind these rows is already blended into the artwork bitmap,
+/// so this only draws text and the bar.
+fn paint_loading_overlay(dc: *mut c_void, width: u32, height: u32, state: &LoadingWindowState) {
+    paint_loading_overlay_band(dc, width, height, state, 0, height as i32);
+}
+
+/// Draw the overlay, touching only rows `top..bottom`.
+///
+/// GDI has no per-call clip in this path, so the band is applied by skipping
+/// any primitive that lies outside it. The five text lines and the bar are
+/// independent rectangles, so this keeps a bar-only repaint to the bar.
+fn paint_loading_overlay_band(
+    dc: *mut c_void,
+    width: u32,
+    height: u32,
+    state: &LoadingWindowState,
+    top: i32,
+    bottom: i32,
+) {
+    let width = width as i32;
+    let height = height as i32;
+    // A 178-pixel strip would cover a tiny window entirely and put its text
+    // above the client area, so the strip follows the window on small sizes
+    // and keeps its designed height on any ordinary screen.
+    let strip = (height / 3).min(OVERLAY_STRIP_HEIGHT as i32).max(64);
+    let margin = (width / 40).clamp(10, 28);
+    let text_top = height - strip + 22;
+    // Does a row range intersect the band being repainted? The band is either
+    // the whole window (a status change) or the bar strip (the sweep tick), so
+    // this is the only clip the overlay needs.
+    let intersects = |row_top: i32, row_bottom: i32| row_top < bottom && row_bottom > top;
+    unsafe {
+        if intersects(text_top, text_top + 20) {
+            launcher_ui::draw_text(
+                dc,
+                margin,
+                text_top,
+                "PERFECT WORLD EXPLORER  —  LOADING WORLD",
+                15,
+                700,
+                launcher_ui::rgb(214, 236, 235),
+            );
+        }
+        if intersects(text_top + 26, text_top + 26 + 20) {
+            launcher_ui::draw_text(
+                dc,
+                margin,
+                text_top + 26,
+                &state.status,
+                13,
+                400,
+                launcher_ui::rgb(233, 244, 243),
+            );
+        }
+        if intersects(text_top + 48, text_top + 48 + 20) {
+            launcher_ui::draw_text(
+                dc,
+                margin,
+                text_top + 48,
+                &state.ds_state,
+                12,
+                400,
+                launcher_ui::rgb(176, 214, 210),
+            );
+        }
+        if intersects(text_top + 68, text_top + 68 + 20) {
+            launcher_ui::draw_text(
+                dc,
+                margin,
+                text_top + 68,
+                &state.graph,
+                12,
+                400,
+                launcher_ui::rgb(176, 214, 210),
+            );
+        }
+        if intersects(text_top + 88, text_top + 88 + 20) {
+            launcher_ui::draw_text(
+                dc,
+                margin,
+                text_top + 88,
+                &state.totals,
+                11,
+                400,
+                launcher_ui::rgb(150, 186, 184),
+            );
+        }
+        // Indeterminate bar: the fill sweeps forward and back, so the load is
+        // visibly alive without claiming a percentage the loader does not have.
+        let bar_top = height - 26;
+        let bar_width = (width - margin * 2).max(120);
+        if intersects(bar_top, bar_top + 6) {
+            launcher_ui::fill_rect(
+                dc,
+                margin,
+                bar_top,
+                bar_width,
+                6,
+                launcher_ui::rgb(38, 66, 74),
+            );
+            let sweep = (bar_width / 4).max(48);
+            let travel = (bar_width - sweep).max(1) as f32;
+            let position = ((state.phase.sin() * 0.5 + 0.5) * travel) as i32;
+            launcher_ui::fill_rect(
+                dc,
+                margin + position,
+                bar_top,
+                sweep,
+                6,
+                launcher_ui::rgb(122, 214, 199),
+            );
+        }
+        // The artwork's archive path (or the reason there is none) in the
+        // corner: it names the picture, so a report of the loading screen is
+        // checkable against the client's own archive.
+        if !state.note.is_empty() && intersects(height - 48, height - 28) {
+            let note_width = launcher_ui::text_width(dc, &state.note, 10);
+            launcher_ui::draw_text(
+                dc,
+                (width - margin - note_width).max(margin),
+                height - 48,
+                &state.note,
+                10,
+                400,
+                launcher_ui::rgb(128, 158, 160),
+            );
+        }
     }
-    "DirectStorage ready; waiting for eligible archive reads (64 KiB+)".into()
+}
+
+/// Everything the window procedure paints. One loading window exists per
+/// process and the procedure cannot borrow the loader thread's stack through
+/// `lpParam` while the message loop runs, so the state lives in a static.
+struct LoadingWindowState {
+    art: Option<LoadingArt>,
+    status: String,
+    ds_state: String,
+    graph: String,
+    totals: String,
+    note: String,
+    /// Bar sweep angle in radians, advanced on the overlay timer.
+    phase: f32,
+}
+
+static LOADING_WINDOW_STATE: std::sync::OnceLock<std::sync::Mutex<Option<LoadingWindowState>>> =
+    std::sync::OnceLock::new();
+
+/// The loading window's state, or `None` if a previous panic poisoned it.
+///
+/// A poisoned lock must never take the paint thread down with it: the window
+/// keeps drawing its plain background and the load itself is unaffected.
+fn lock_loading_state() -> Option<std::sync::MutexGuard<'static, Option<LoadingWindowState>>> {
+    loading_state().lock().ok()
+}
+
+fn loading_state() -> &'static std::sync::Mutex<Option<LoadingWindowState>> {
+    LOADING_WINDOW_STATE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// The window's back buffer: one off-screen surface, resized only when the
+/// client area changes.
+///
+/// The loading window repaints about 25 times a second, and every repaint used
+/// to draw the picture, five text lines and two rectangles straight into the
+/// window's device context. A composited desktop can present that surface
+/// part-way through, so a partially drawn frame reached the screen and the
+/// window appeared to flash. Composing into a memory DC and presenting the
+/// finished frame with a single `BitBlt` makes each frame atomic: either the
+/// previous complete frame or the new complete frame is on screen, never a
+/// half-painted one.
+struct BackBuffer {
+    /// Raw handles are stored as `usize` so the type is `Send`; that is what
+    /// lets one process-wide `Mutex<BackBuffer>` hold it. GDI objects are
+    /// process-wide and used from the single window thread here.
+    memory_dc: usize,
+    bitmap: usize,
+    previous: usize,
+    width: i32,
+    height: i32,
+}
+
+impl BackBuffer {
+    const EMPTY: Self = Self {
+        memory_dc: 0,
+        bitmap: 0,
+        previous: 0,
+        width: 0,
+        height: 0,
+    };
+
+    /// A `width` x `height` memory DC compatible with `dc`, reusing the existing
+    /// surface when the size still matches.
+    ///
+    /// Returns `true` when a surface was created, because a fresh bitmap holds
+    /// undefined pixels and the caller must compose all of it rather than only
+    /// the dirty band.
+    unsafe fn resize(&mut self, dc: Handle, width: i32, height: i32) -> bool {
+        if self.memory_dc != 0 && self.width == width && self.height == height {
+            return false;
+        }
+        self.release();
+        let memory_dc = launcher_ui::CreateCompatibleDC(dc);
+        if memory_dc.is_null() {
+            return false;
+        }
+        let bitmap = launcher_ui::CreateCompatibleBitmap(dc, width, height);
+        if bitmap.is_null() {
+            launcher_ui::DeleteDC(memory_dc);
+            return false;
+        }
+        // The old bitmap comes back so it can be deleted after the DC is done
+        // with it; leaking it would exhaust GDI handles over a long load.
+        let previous = launcher_ui::SelectObject(memory_dc, bitmap);
+        self.memory_dc = memory_dc as usize;
+        self.bitmap = bitmap as usize;
+        self.previous = previous as usize;
+        self.width = width;
+        self.height = height;
+        true
+    }
+
+    /// The off-screen device context, or null when none could be created.
+    fn dc(&self) -> Handle {
+        self.memory_dc as Handle
+    }
+
+    unsafe fn release(&mut self) {
+        if self.memory_dc != 0 {
+            let memory_dc = self.memory_dc as Handle;
+            if self.previous != 0 {
+                launcher_ui::SelectObject(memory_dc, self.previous as Handle);
+            }
+            launcher_ui::DeleteDC(memory_dc);
+        }
+        if self.bitmap != 0 {
+            launcher_ui::DeleteObject(self.bitmap as Handle);
+        }
+        *self = Self::EMPTY;
+    }
+}
+
+/// The one back buffer the paint handler composes into, guarded because the
+/// window procedure is re-entered from the loading thread's message pump.
+static BACK_BUFFER: std::sync::OnceLock<std::sync::Mutex<BackBuffer>> = std::sync::OnceLock::new();
+
+fn back_buffer() -> &'static std::sync::Mutex<BackBuffer> {
+    BACK_BUFFER.get_or_init(|| std::sync::Mutex::new(BackBuffer::EMPTY))
+}
+
+/// `WM_PAINT`: compose the whole frame off-screen, then present it once.
+///
+/// The update rectangle is honoured: the animation tick invalidates only the
+/// bar strip, and repainting a full-screen bitmap for a six-pixel bar would
+/// waste the frame budget and give a composited desktop a chance to catch a
+/// half-drawn surface.
+unsafe fn paint_loading_window(hwnd: Hwnd) {
+    let mut paint: launcher_ui::Paint = std::mem::zeroed();
+    let dc = launcher_ui::BeginPaint(hwnd, &mut paint);
+    if dc.is_null() {
+        return;
+    }
+    let (width, height) = client_size(hwnd);
+    // `rcPaint` is in client coordinates; a zero-area rectangle means the
+    // update region was empty, so there is nothing to compose.
+    let update_top = paint.rect.top.max(0);
+    let update_bottom = paint.rect.bottom.min(height as i32);
+    // An empty update region (or one entirely outside the client area) means
+    // there is nothing to compose. Rows are what the band compositor works in,
+    // so only the vertical extent is needed; the client width is the horizontal
+    // extent for every primitive in this paint path.
+    if paint.rect.left >= width as i32 || paint.rect.right <= 0 || update_bottom <= update_top {
+        launcher_ui::EndPaint(hwnd, &paint);
+        return;
+    }
+    let background = launcher_ui::rgb(12, 24, 30);
+    let mut buffer = match back_buffer().lock() {
+        Ok(buffer) => buffer,
+        Err(_) => {
+            // A poisoned back buffer must not blank the window: paint directly.
+            launcher_ui::fill_rect(dc, 0, 0, width as i32, height as i32, background);
+            launcher_ui::EndPaint(hwnd, &paint);
+            return;
+        }
+    };
+    let fresh_surface = buffer.resize(dc, width as i32, height as i32);
+    let offscreen = buffer.memory_dc != 0;
+    let target = if offscreen {
+        // The back buffer keeps the rest of the frame from the last paint, so
+        // composing only the dirty band leaves the untouched rows exactly as
+        // they were. That is what makes a bar-only repaint cheap.
+        buffer.dc()
+    } else {
+        // Without an off-screen surface the window itself is the target, and it
+        // has no memory of earlier frames: compose the whole client area or the
+        // band-only path would leave the rest of the window unpainted.
+        dc
+    };
+    // A fresh back buffer holds undefined pixels and a window target has no
+    // memory at all, so both have to be composed in full; only a reused buffer
+    // can keep the rest of the last frame.
+    let (mut band_top, mut band_bottom) = if offscreen && !fresh_surface {
+        (update_top, update_bottom)
+    } else {
+        (0, height as i32)
+    };
+    // Compose the band that is actually dirty. Redrawing a full-screen bitmap
+    // for the six-pixel bar would burn the frame budget, and because the picture
+    // blit and the text are separate GDI calls it would also give the desktop
+    // more chances to catch an incomplete frame.
+    //
+    // A poisoned state lock must never leave the window blank, so the fallback
+    // below paints a plain dark fill instead of panicking on the paint thread.
+    let mut guard = lock_loading_state();
+    match guard.as_mut().and_then(|state| state.as_mut()) {
+        Some(state) => {
+            // The client area can differ from the fitted picture between a
+            // WM_SIZE and the paint that follows it (a maximise changes the size
+            // before the message is delivered). Re-fitting here keeps the
+            // picture flush with the window instead of leaving an unpainted
+            // edge, and it is a no-op when the sizes already agree.
+            if let Some(art) = state.art.as_mut() {
+                if !art.matches(width, height) {
+                    if let Err(error) = art.refit(width, height) {
+                        eprintln!("Loading screen artwork could not be refitted: {error}");
+                    }
+                    // A refit rewrites the whole picture, so the band optimisation
+                    // cannot be used for this paint.
+                    band_top = 0;
+                    band_bottom = height as i32;
+                }
+            }
+            match state.art.as_ref() {
+                Some(art) => paint_loading_art_band(target, art, band_top, band_bottom, width),
+                None => launcher_ui::fill_rect(
+                    target,
+                    0,
+                    band_top,
+                    width as i32,
+                    band_bottom - band_top,
+                    background,
+                ),
+            }
+            paint_loading_overlay_band(target, width, height, state, band_top, band_bottom);
+        }
+        None => launcher_ui::fill_rect(
+            target,
+            0,
+            band_top,
+            width as i32,
+            band_bottom - band_top,
+            background,
+        ),
+    }
+    drop(guard);
+    if target != dc {
+        // Present exactly the rows that were composed. A band-only compose is
+        // enough because the window still shows the matching rows of the
+        // previous frame; a full compose (first paint, resize, or a re-fit)
+        // replaces the whole client area at once, so no stale row survives.
+        let present_top = band_top;
+        let present_height = (band_bottom - band_top).max(0);
+        if present_height > 0 {
+            launcher_ui::BitBlt(
+                dc,
+                0,
+                present_top,
+                width as i32,
+                present_height,
+                target,
+                0,
+                present_top,
+                0x00cc0020,
+            );
+        }
+    }
+    launcher_ui::EndPaint(hwnd, &paint);
+}
+
+unsafe extern "system" fn loading_window_proc(
+    hwnd: Hwnd,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    match msg {
+        0x000f => {
+            // WM_PAINT
+            paint_loading_window(hwnd);
+            0
+        }
+        // WM_ERASEBKGND: claim the erase and leave the background alone. Letting
+        // the class brush run would flash its black face on every resize, and
+        // returning 1 without painting is what makes that safe -- the paint
+        // handler immediately covers the whole invalid region with the composed
+        // frame.
+        0x0014 => 1,
+        0x0005 => {
+            // WM_SIZE: refit the artwork instead of stretching a stale bitmap.
+            let width = (lparam as u32 & 0xffff).max(MIN_ART_WIDTH);
+            let height = ((lparam as u32 >> 16) & 0xffff).max(MIN_ART_HEIGHT);
+            if let Some(mut guard) = lock_loading_state() {
+                if let Some(art) = guard.as_mut().and_then(|state| state.art.as_mut()) {
+                    if let Err(error) = art.refit(width, height) {
+                        eprintln!("Loading screen artwork could not be refitted: {error}");
+                    }
+                }
+            }
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
+        0x0113 => {
+            // WM_TIMER: advance the bar sweep. The repaint request comes from
+            // the loading thread's own pump, which also owns the status text, so
+            // the window never depends on this timer being delivered to animate.
+            if let Some(mut guard) = lock_loading_state() {
+                if let Some(state) = guard.as_mut() {
+                    state.phase = (state.phase + 0.10) % std::f32::consts::TAU;
+                }
+            }
+            0
+        }
+        0x0002 => {
+            // WM_DESTROY: give the back buffer's DC and bitmap back before the
+            // message loop exits. Without this the two GDI handles would live
+            // until the process ends, and the loading window is created once per
+            // world load.
+            if let Ok(mut buffer) = back_buffer().lock() {
+                buffer.release();
+            }
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Height of the darkened status strip at the bottom of the loading window, and
+/// the fade above it. The artwork itself covers the whole window; only these
+/// rows are blended toward black so the overlay stays legible.
+/// The smallest fitted surface. Below this the window is too small for the
+/// status text to be readable anyway, so there is nothing to gain from
+/// re-fitting per pixel as a user drags a tiny window.
+const MIN_ART_WIDTH: u32 = 320;
+const MIN_ART_HEIGHT: u32 = 240;
+const OVERLAY_STRIP_HEIGHT: u32 = 178;
+const OVERLAY_FADE_HEIGHT: u32 = 72;
+const OVERLAY_MAX_ALPHA: f32 = 0.78;
+/// `PWE_LOADING_WINDOWED=1` keeps the loading window in its framed size instead
+/// of maximising it. It exists for diagnostics on multi-monitor desktops, not to
+/// change the default: the picture fills the screen by default.
+const LOADING_WINDOWED_ENV: &str = "PWE_LOADING_WINDOWED";
+
+/// Pick the client's random loading screen and decode it for a `width` x
+/// `height` window.
+///
+/// Runs on the loading thread before the window is shown, so a corrupt archive
+/// can only cost this one step: every failure is reported and the window falls
+/// back to its plain background instead of failing the world load.
+/// The loading picture for a destination, decoded and fitted.
+///
+/// `location` is the destination's identity when the load is switching worlds:
+/// its map id and the client's own names for it. The picture is matched against
+/// the archive by those names, then by the session pin, then falls back to a
+/// random picture from the family that suits the window's aspect ratio. A
+/// destination that names no art in the archive takes the random fallback and
+/// says so in the log; nothing is invented to fill the gap.
+fn loading_background(
+    element: &Path,
+    width: u32,
+    height: u32,
+    location: Option<&crate::loading_screen::Location>,
+) -> (Option<LoadingArt>, String) {
+    let word = crate::loading_screen::random_word();
+    let chosen = match location {
+        Some(location) => crate::loading_screen::choose_for_location(
+            element,
+            &location.needles,
+            crate::loading_screen::pinned_picture().as_ref(),
+            width,
+            height,
+            word,
+        )
+        .map(|(picture, source)| {
+            eprintln!(
+                "Loading screen for {} matched by {source}: {}",
+                location.label, picture.path
+            );
+            picture
+        }),
+        None => crate::loading_screen::choose(element, word).map(|picture| {
+            eprintln!("Loading screen: {} chosen at random", picture.path);
+            picture
+        }),
+    };
+    let picture = match chosen {
+        Ok(picture) => picture,
+        Err(error) => {
+            eprintln!("Loading screen artwork unavailable: {error}");
+            return (None, error);
+        }
+    };
+    let image = match crate::loading_screen::decode(element, &picture) {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!("Loading screen artwork could not be decoded: {error}");
+            return (None, error);
+        }
+    };
+    let (source_width, source_height) = image.dimensions();
+    let label = format!("{} ({}x{})", picture.path, source_width, source_height);
+    eprintln!(
+        "Loading screen: {label} from {}, fitted to {width}x{height}",
+        element.join(crate::loading_screen::ARCHIVE_NAME).display()
+    );
+    match LoadingArt::new(&image, width, height, label.clone()) {
+        Ok(art) => (Some(art), label),
+        Err(error) => {
+            eprintln!("Loading screen artwork could not be fitted: {error}");
+            (None, error)
+        }
+    }
 }
 
 pub struct LoadingWindow {
@@ -476,7 +1197,25 @@ pub struct LoadingWindow {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl LoadingWindow {
-    pub fn start() -> Self {
+    /// Open the loading window and start delivering progress.
+    ///
+    /// `client` is the client root, `element` folder or map directory the user
+    /// selected, or `None` before a folder is known; its `surfaces.pck` supplies
+    /// the artwork, chosen at random for this load. The window is borderless and
+    /// maximised - the same style the viewer window uses - so the picture fills
+    /// the screen rather than sitting inside a small frame.
+    pub fn start(client: Option<&Path>) -> Self {
+        Self::start_for(client, None)
+    }
+
+    /// Open the loading window for a specific destination.
+    ///
+    /// [`LoadingWindow::start`] is the same call with no destination, which the
+    /// first load uses because the map has not been resolved yet.
+    pub fn start_for(
+        client: Option<&Path>,
+        location: Option<&crate::loading_screen::Location>,
+    ) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -487,9 +1226,60 @@ impl LoadingWindow {
         {
             *guard = Some(status_tx);
         }
+        let client = client.map(Path::to_path_buf);
+        let location = location.cloned();
         let thread = std::thread::spawn(move || unsafe {
-            let class = wide("STATIC");
+            let class = wide("PerfectWorldExplorerLoading");
             let text = wide("Perfect World Explorer — Loading");
+            let instance = GetModuleHandleW(std::ptr::null());
+            let wc = WindowClass {
+                style: 0,
+                proc: Some(loading_window_proc),
+                class_extra: 0,
+                window_extra: 0,
+                instance,
+                icon: std::ptr::null_mut(),
+                cursor: LoadCursorW(std::ptr::null_mut(), 32512usize as *const u16),
+                // Black: the artwork covers every pixel, and a resize must not
+                // flash the desktop's default face colour.
+                background: GetStockObject(4),
+                menu_name: std::ptr::null(),
+                class_name: class.as_ptr(),
+            };
+            if RegisterClassW(&wc) == 0 {
+                eprintln!("Loading window: cannot register its window class");
+            }
+            // Decode the artwork before the window exists so the first paint is
+            // already the client's picture. The maximised window's client area is
+            // the monitor work area, so a placeholder size is only used if the
+            // artwork is refitted on the first WM_SIZE.
+            let (art, note) = match client.as_deref() {
+                Some(root) => {
+                    let element = crate::loading_screen::element_folder(root);
+                    loading_background(&element, 1280, 720, location.as_ref())
+                }
+                None => (
+                    None,
+                    format!(
+                        "No client folder selected; no {} artwork",
+                        crate::loading_screen::ARCHIVE_NAME
+                    ),
+                ),
+            };
+            if let Some(mut guard) = lock_loading_state() {
+                *guard = Some(LoadingWindowState {
+                    art,
+                    status: "Loading the world...".into(),
+                    ds_state: directstorage_state(crate::pck::direct_storage::read_stats()),
+                    graph: "Read throughput (MiB/s): ······························".into(),
+                    totals:
+                        "DirectStorage: 0 reads / 0 MiB | attempts: 0 | fallback: 0 | active: 0"
+                            .into(),
+                    note,
+                    phase: 0.0,
+                });
+            }
+            let windowed = std::env::var_os(LOADING_WINDOWED_ENV).is_some();
             let hwnd = CreateWindowExW(
                 0,
                 class.as_ptr(),
@@ -497,115 +1287,70 @@ impl LoadingWindow {
                 0x00c00000 | 0x10000000,
                 0x80000000u32 as i32,
                 0x80000000u32 as i32,
-                620,
-                230,
+                1280,
+                720,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                instance,
                 std::ptr::null_mut(),
             );
-            let (status_label, ds_state_label, ds_graph_label, ds_totals_label) = if hwnd.is_null()
-            {
-                (
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            } else {
-                let instance = GetModuleHandleW(std::ptr::null());
-                let status = control(
-                    hwnd,
-                    instance,
-                    "STATIC",
-                    "Loading the world...",
-                    0x50000000,
-                    24,
-                    20,
-                    560,
-                    25,
-                    0,
-                );
-                control(
-                    hwnd,
-                    instance,
-                    "STATIC",
-                    "First launch may take several minutes while trees are prepared.",
-                    0x50000000,
-                    24,
-                    51,
-                    560,
-                    25,
-                    0,
-                );
-                let ds_state = control(
-                    hwnd,
-                    instance,
-                    "STATIC",
-                    "DirectStorage status is being checked...",
-                    0x50000000,
-                    24,
-                    87,
-                    560,
-                    25,
-                    0,
-                );
-                let ds_graph = control(
-                    hwnd,
-                    instance,
-                    "STATIC",
-                    "Read throughput (MiB/s): ······························",
-                    0x50000000,
-                    24,
-                    115,
-                    560,
-                    28,
-                    0,
-                );
-                let ds_totals = control(
-                    hwnd,
-                    instance,
-                    "STATIC",
-                    "DirectStorage: 0 reads / 0 MiB | attempts: 0 | fallback: 0 | active: 0",
-                    0x50000000,
-                    24,
-                    148,
-                    560,
-                    38,
-                    0,
-                );
-                ShowWindow(hwnd, 5);
+            if hwnd.is_null() {
+                eprintln!("Loading window: cannot create its window");
+                let _ = ready_tx.send(());
+                return;
+            }
+            // The first WM_PAINT the show below queues draws the artwork, so the
+            // measurement loop is running before any decode-sized GDI work
+            // happens. The one forced paint is after the state above is
+            // published, so it draws the real picture rather than the
+            // placeholder.
+            ShowWindow(hwnd, if windowed { 5 } else { 3 }); // SW_SHOW / SW_MAXIMIZE
+                                                            // The artwork was decoded against a placeholder size, so fit it once
+                                                            // to the real client area before the first frame is presented. The
+                                                            // WM_SIZE the show above queues would do this too, but doing it here
+                                                            // means the very first paint is already the right size instead of a
+                                                            // briefly mis-scaled picture.
+            let (client_width, client_height) = client_size(hwnd);
+            if let Some(mut guard) = lock_loading_state() {
+                if let Some(art) = guard.as_mut().and_then(|state| state.art.as_mut()) {
+                    if let Err(error) = art.refit(client_width, client_height) {
+                        eprintln!("Loading screen artwork could not be fitted: {error}");
+                    }
+                }
+            }
+            // A replacement process hands this window over before anything in
+            // `gpu::run` runs: the old process reads the handle, hides its own
+            // window and stops fighting this one for the foreground. The paint
+            // is forced first, so the handover never shows an empty window.
+            if crate::world_handoff::is_handoff_child() {
                 UpdateWindow(hwnd);
-                (status, ds_state, ds_graph, ds_totals)
-            };
+                crate::world_handoff::publish_window_handle(hwnd as usize);
+            }
+
             let _ = ready_tx.send(());
 
             let mut samples = std::collections::VecDeque::<f64>::with_capacity(32);
             let mut previous_bytes = 0u64;
             let mut last_sample = std::time::Instant::now();
-            let mut last_state = String::new();
-            let mut last_graph = String::new();
-            let mut last_totals = String::new();
-
+            let mut last_repaint = std::time::Instant::now();
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                 let mut msg: WinMessage = std::mem::zeroed();
                 while PeekMessageW(&mut msg, hwnd, 0, 0, 1) != 0 {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
+                let mut changed = false;
                 while let Ok(text) = status_rx.try_recv() {
-                    if !status_label.is_null() {
-                        SetWindowTextW(status_label, wide(&text).as_ptr());
+                    if let Some(mut guard) = lock_loading_state() {
+                        if let Some(state) = guard.as_mut() {
+                            state.status = text;
+                        }
                     }
+                    changed = true;
                 }
-
                 let now = std::time::Instant::now();
                 let stats = crate::pck::direct_storage::read_stats();
-                let state = directstorage_state(stats);
-                if !ds_state_label.is_null() && state != last_state {
-                    SetWindowTextW(ds_state_label, wide(&state).as_ptr());
-                    last_state = state;
-                }
+                let ds_state = directstorage_state(stats);
                 let totals = format!(
                     "DirectStorage: {} reads / {:.2} MiB | attempts: {} | fallback: {} | active: {}",
                     stats.successes,
@@ -614,11 +1359,7 @@ impl LoadingWindow {
                     stats.fallbacks,
                     stats.active
                 );
-                if !ds_totals_label.is_null() && totals != last_totals {
-                    SetWindowTextW(ds_totals_label, wide(&totals).as_ptr());
-                    last_totals = totals;
-                }
-
+                let mut graph = None;
                 if now.duration_since(last_sample) >= std::time::Duration::from_millis(500) {
                     let elapsed = now.duration_since(last_sample).as_secs_f64();
                     let current_rate = crate::loading_graph::mib_per_second(
@@ -632,23 +1373,61 @@ impl LoadingWindow {
                     }
                     samples.push_back(current_rate);
                     let peak = samples.iter().copied().fold(0.0f64, f64::max);
-                    let graph = format!(
+                    graph = Some(format!(
                         "MiB/s (last 16s; peak {:.1}): {}",
                         peak,
                         crate::loading_graph::sparkline(samples.make_contiguous())
-                    );
-                    if !ds_graph_label.is_null() && graph != last_graph {
-                        SetWindowTextW(ds_graph_label, wide(&graph).as_ptr());
-                        last_graph = graph;
+                    ));
+                }
+                if let Some(mut guard) = lock_loading_state() {
+                    if let Some(state) = guard.as_mut() {
+                        if state.ds_state != ds_state {
+                            state.ds_state = ds_state;
+                            changed = true;
+                        }
+                        if state.totals != totals {
+                            state.totals = totals;
+                            changed = true;
+                        }
+                        if let Some(graph) = graph {
+                            state.graph = graph;
+                            changed = true;
+                        }
                     }
+                }
+                if changed {
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                // The bar's sweep lives in the state, so the window repaints on
+                // its own cadence as well as when a message arrives. Only the
+                // bar strip is invalidated: the artwork and the status lines do
+                // not change between messages, and repainting a full-screen
+                // bitmap 25 times a second is both wasted work and the frame a
+                // composited desktop can catch half-drawn.
+                if now.duration_since(last_repaint) >= std::time::Duration::from_millis(40) {
+                    last_repaint = now;
+                    if let Some(mut guard) = lock_loading_state() {
+                        if let Some(state) = guard.as_mut() {
+                            state.phase = (state.phase + 0.10) % std::f32::consts::TAU;
+                        }
+                    }
+                    // The bar occupies the six rows at `height - 26`; one row of
+                    // slack on each side keeps a rounding difference from
+                    // leaving a stale row behind.
+                    let (client_width, client_height) = client_size(hwnd);
+                    let bar = WindowRect {
+                        left: 0,
+                        top: client_height as i32 - 27,
+                        right: client_width as i32,
+                        bottom: client_height as i32 - 19,
+                    };
+                    InvalidateRect(hwnd, &bar as *const WindowRect as *const c_void, 0);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(40));
             }
-            if !hwnd.is_null() {
-                DestroyWindow(hwnd);
-            }
+            DestroyWindow(hwnd);
         });
-        let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(5));
         Self {
             stop,
             thread: Some(thread),
@@ -665,6 +1444,9 @@ impl Drop for LoadingWindow {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+        if let Some(mut guard) = lock_loading_state() {
+            *guard = None;
         }
     }
 }

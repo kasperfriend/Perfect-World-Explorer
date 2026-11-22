@@ -5,6 +5,60 @@ use flate2::{Decompress, FlushDecompress};
 #[cfg(windows)]
 #[path = "direct_storage.rs"]
 pub(crate) mod direct_storage;
+
+/// Platform-neutral view of the DirectStorage telemetry.
+///
+/// `direct_storage` only exists on Windows, but the in-viewer loading overlay is
+/// compiled on every host and still has to print the same readout. This re-export
+/// keeps one call site in the overlay instead of a `cfg` in the middle of the
+/// paint code; on a host without DirectStorage the counters read zero and the
+/// state line says so, which is exactly what a Windows build without the SDK
+/// prints.
+pub(crate) mod readout {
+    /// The counters the loading UI displays.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(crate) struct Stats {
+        pub attempts: u64,
+        pub successes: u64,
+        pub fallbacks: u64,
+        pub bytes: u64,
+        pub active: usize,
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn stats() -> Stats {
+        let stats = super::direct_storage::read_stats();
+        Stats {
+            attempts: stats.attempts,
+            successes: stats.successes,
+            fallbacks: stats.fallbacks,
+            bytes: stats.bytes,
+            active: stats.active,
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn stats() -> Stats {
+        Stats::default()
+    }
+
+    /// One sentence describing what DirectStorage is doing right now.
+    #[cfg(windows)]
+    pub(crate) fn state_line(stats: Stats) -> String {
+        super::direct_storage::state_line(super::direct_storage::ReadStats {
+            attempts: stats.attempts,
+            successes: stats.successes,
+            fallbacks: stats.fallbacks,
+            bytes: stats.bytes,
+            active: stats.active,
+        })
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn state_line(_stats: Stats) -> String {
+        "DirectStorage is a Windows feature; standard file I/O is in use".into()
+    }
+}
 use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom},

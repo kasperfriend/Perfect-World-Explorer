@@ -38,6 +38,11 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     Progress(String),
+    /// The replacement published its Win32 HWND, so its own window is on
+    /// screen. The old process hides its copy of the loading screen at this
+    /// point: both show the same matched picture, so the swap is invisible and
+    /// only one loading screen is ever visible.
+    WindowShown,
     /// The replacement has drawn its first usable frame. `activated` is false
     /// when the user Alt-Tabbed away or no Win32 HWND was published.
     Ready {
@@ -185,6 +190,7 @@ impl Files {
                     .lock()
                     .expect("world handoff child lock poisoned");
                 let mut previous_status = String::new();
+                let mut announced_window = false;
                 let started = Instant::now();
                 loop {
                     let status = fs::read_to_string(&files.status).ok();
@@ -193,6 +199,10 @@ impl Files {
                             previous_status.clone_from(status);
                             let _ = tx.send(Message::Progress(status.clone()));
                         }
+                    }
+                    if !announced_window && files.published_hwnd().is_some_and(|hwnd| hwnd != 0) {
+                        announced_window = true;
+                        let _ = tx.send(Message::WindowShown);
                     }
                     let snapshot = WatchSnapshot {
                         ready: files.ready.is_file(),

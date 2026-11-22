@@ -7,45 +7,110 @@ use std::{
 };
 type Handle = *mut c_void;
 #[repr(C)]
-struct Rect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
+pub(crate) struct Rect {
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) right: i32,
+    pub(crate) bottom: i32,
 }
+/// `PAINTSTRUCT`, shared with the loading window's paint handler.
 #[repr(C)]
-struct Paint {
-    dc: Handle,
-    erase: i32,
-    rect: Rect,
-    restore: i32,
-    update: i32,
-    reserved: [u8; 32],
+pub(crate) struct Paint {
+    pub(crate) dc: Handle,
+    pub(crate) erase: i32,
+    pub(crate) rect: Rect,
+    pub(crate) restore: i32,
+    pub(crate) update: i32,
+    pub(crate) reserved: [u8; 32],
 }
+/// `BITMAPINFOHEADER`, the header the loading window prepends to its pixels.
 #[repr(C)]
-struct BitmapInfo {
-    size: u32,
-    width: i32,
-    height: i32,
-    planes: u16,
-    bits: u16,
-    compression: u32,
-    image_size: u32,
-    xppm: i32,
-    yppm: i32,
-    colors: u32,
-    important: u32,
+pub(crate) struct BitmapInfo {
+    pub(crate) size: u32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) planes: u16,
+    pub(crate) bits: u16,
+    pub(crate) compression: u32,
+    pub(crate) image_size: u32,
+    pub(crate) xppm: i32,
+    pub(crate) yppm: i32,
+    pub(crate) colors: u32,
+    pub(crate) important: u32,
 }
 #[link(name = "user32")]
 extern "system" {
-    fn BeginPaint(hwnd: Handle, ps: *mut Paint) -> Handle;
-    fn EndPaint(hwnd: Handle, ps: *const Paint) -> i32;
+    pub(crate) fn BeginPaint(hwnd: Handle, ps: *mut Paint) -> Handle;
+    pub(crate) fn EndPaint(hwnd: Handle, ps: *const Paint) -> i32;
     fn FillRect(dc: Handle, rect: *const Rect, brush: Handle) -> i32;
     fn InvalidateRect(hwnd: Handle, rect: *const Rect, erase: i32) -> i32;
 }
+/// GDI text extent, in pixels.
+#[repr(C)]
+struct Size {
+    cx: i32,
+    cy: i32,
+}
+
+/// Fonts the paint path reuses, keyed by `(height, weight)`.
+///
+/// The loading window repaints about 25 times a second. Creating and deleting a
+/// font per text line per frame churned roughly a hundred GDI objects a second
+/// through the process handle table, and a repaint that happens to fail while a
+/// GDI operation cannot be satisfied is exactly what composited windows render as
+/// a black frame. Holding a handful of fonts for the process lifetime removes
+/// that churn: a GDI font is a small kernel object, and this process has four
+/// distinct sizes.
+///
+/// Handles are stored as `usize` because raw pointers are not `Send` and a
+/// `static Mutex` needs its contents to be.
+static FONTS: Mutex<Vec<((i32, i32), usize)>> = Mutex::new(Vec::new());
+
+/// Solid brushes the paint path reuses, keyed by colour.
+///
+/// Same reasoning as [`FONTS`]: the loading window fills two or three rectangles
+/// per frame, and creating a brush for each is needless handle churn on a path
+/// that runs continuously while the world loads.
+static BRUSHES: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
+
+/// The process-lifetime font for `size`/`weight`, created on first use.
+fn font(size: i32, weight: i32) -> Handle {
+    if let Ok(mut fonts) = FONTS.lock() {
+        if let Some((_, handle)) = fonts.iter().find(|(key, _)| *key == (size, weight)) {
+            return *handle as Handle;
+        }
+        let face: Vec<u16> = "Segoe UI".encode_utf16().chain(Some(0)).collect();
+        // SAFETY: `face` is NUL-terminated and outlives the call.
+        let handle = unsafe {
+            CreateFontW(
+                -size,
+                0,
+                0,
+                0,
+                weight,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                5,
+                0,
+                face.as_ptr(),
+            )
+        };
+        if !handle.is_null() {
+            fonts.push(((size, weight), handle as usize));
+        }
+        return handle;
+    }
+    std::ptr::null_mut()
+}
+
 #[link(name = "gdi32")]
 extern "system" {
-    fn StretchDIBits(
+    fn GetTextExtentPoint32W(dc: Handle, text: *const u16, count: i32, size: *mut Size) -> i32;
+    pub(crate) fn StretchDIBits(
         dc: Handle,
         x: i32,
         y: i32,
@@ -61,8 +126,24 @@ extern "system" {
         rop: u32,
     ) -> i32;
     fn CreateSolidBrush(color: u32) -> Handle;
-    fn DeleteObject(obj: Handle) -> i32;
-    fn SelectObject(dc: Handle, obj: Handle) -> Handle;
+    pub(crate) fn DeleteObject(obj: Handle) -> i32;
+    pub(crate) fn SelectObject(dc: Handle, obj: Handle) -> Handle;
+    /// Off-screen device context and its surface, used to compose a frame
+    /// before presenting it in one `BitBlt`.
+    pub(crate) fn CreateCompatibleDC(dc: Handle) -> Handle;
+    pub(crate) fn CreateCompatibleBitmap(dc: Handle, width: i32, height: i32) -> Handle;
+    pub(crate) fn DeleteDC(dc: Handle) -> i32;
+    pub(crate) fn BitBlt(
+        dst: Handle,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        src: Handle,
+        src_x: i32,
+        src_y: i32,
+        rop: u32,
+    ) -> i32;
     fn SetTextColor(dc: Handle, color: u32) -> u32;
     fn SetBkMode(dc: Handle, mode: i32) -> i32;
     fn TextOutW(dc: Handle, x: i32, y: i32, text: *const u16, n: i32) -> i32;
@@ -82,9 +163,6 @@ extern "system" {
         pitch: u32,
         face: *const u16,
     ) -> Handle;
-}
-fn rgb(r: u8, g: u8, b: u8) -> u32 {
-    u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16)
 }
 struct Art {
     pixels: Vec<u8>,
@@ -438,6 +516,39 @@ pub fn key(hwnd: Handle, k: usize) -> usize {
     }
     0
 }
+/// The launcher's accent colour, shared with the loading window's overlay.
+pub fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    r as u32 | (g as u32) << 8 | (b as u32) << 16
+}
+/// Fill one rectangle in a device context. The loading window paints its
+/// status strip with the launcher's own GDI helpers so both native windows use
+/// one text and rectangle path.
+pub unsafe fn fill_rect(dc: Handle, x: i32, y: i32, w: i32, h: i32, color: u32) {
+    rect(dc, x, y, w, h, color)
+}
+/// Draw one line of text with the launcher's font and colours.
+pub unsafe fn draw_text(dc: Handle, x: i32, y: i32, s: &str, size: i32, weight: i32, color: u32) {
+    text(dc, x, y, s, size, weight, color);
+}
+/// Width of `s` at `size` points in the launcher font.
+pub unsafe fn text_width(dc: Handle, s: &str, size: i32) -> i32 {
+    let font = font(size, 400);
+    if font.is_null() {
+        return 0;
+    }
+    let old = SelectObject(dc, font);
+    let mut extent = Size { cx: 0, cy: 0 };
+    let data: Vec<u16> = s.encode_utf16().collect();
+    let measured = GetTextExtentPoint32W(dc, data.as_ptr(), data.len() as i32, &mut extent);
+    SelectObject(dc, old);
+    // A failed measurement must not turn a right-aligned label into a negative
+    // offset; 0 keeps it at the caller's left margin.
+    if measured == 0 {
+        0
+    } else {
+        extent.cx.max(0)
+    }
+}
 unsafe fn rect(dc: Handle, x: i32, y: i32, w: i32, h: i32, color: u32) {
     let r = Rect {
         left: x,
@@ -445,35 +556,45 @@ unsafe fn rect(dc: Handle, x: i32, y: i32, w: i32, h: i32, color: u32) {
         right: x + w,
         bottom: y + h,
     };
-    let b = CreateSolidBrush(color);
+    // SAFETY: `CreateSolidBrush` is only called with a plain `COLORREF`.
+    let b = unsafe { brush(color) };
+    if b.is_null() {
+        return;
+    }
     FillRect(dc, &r, b);
-    DeleteObject(b);
+}
+
+/// The process-lifetime solid brush for `color`, created on first use.
+fn brush(color: u32) -> Handle {
+    if let Ok(mut brushes) = BRUSHES.lock() {
+        if let Some((_, handle)) = brushes.iter().find(|(key, _)| *key == color) {
+            return *handle as Handle;
+        }
+        // SAFETY: a solid brush has no aliasing requirements.
+        let handle = unsafe { CreateSolidBrush(color) };
+        if !handle.is_null() {
+            brushes.push((color, handle as usize));
+        }
+        return handle;
+    }
+    std::ptr::null_mut()
 }
 unsafe fn text(dc: Handle, x: i32, y: i32, s: &str, size: i32, weight: i32, color: u32) {
-    let face: Vec<u16> = "Segoe UI".encode_utf16().chain(Some(0)).collect();
-    let font = CreateFontW(
-        -size,
-        0,
-        0,
-        0,
-        weight,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        5,
-        0,
-        face.as_ptr(),
-    );
+    let font = font(size, weight);
+    if font.is_null() {
+        return;
+    }
     let old = SelectObject(dc, font);
     SetBkMode(dc, 1);
     SetTextColor(dc, color);
     let data: Vec<u16> = s.encode_utf16().collect();
     TextOutW(dc, x, y, data.as_ptr(), data.len() as i32);
     SelectObject(dc, old);
-    DeleteObject(font);
+    // The font belongs to the process-wide cache in `FONTS`, not to this call.
+    // Deleting it here destroyed the handle the first time a label was drawn,
+    // so every later paint selected a dead object and the window stopped
+    // drawing any text at all. `text_width` and `rect` already leave their
+    // cached font and brush alone for the same reason.
 }
 /// Keep one label/value row inside the launcher card, ending with an ellipsis
 /// so a truncated value is visibly truncated instead of silently wrong.
