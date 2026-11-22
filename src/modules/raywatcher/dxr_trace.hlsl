@@ -556,7 +556,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         float z = sqrt(max(0.0, 1.0 - u1));
                         float3 d = b_t * (r * c_phi) + b_b * (r * s_phi) + b_n * z;
                         float bounce_max_t = (bounce == 0u) ? min(params.lens.y, 96.0) : min(params.lens.y, 48.0);
-                        Hit bhit = (bounce == 0u) ? closest_hit(b_origin, d, b_step_bias, bounce_max_t) : closest_hit_fast(b_origin, d, b_step_bias, bounce_max_t);
+                        Hit bhit;
+                        if (bounce == 0u) {
+                            bhit = closest_hit(b_origin, d, b_step_bias, bounce_max_t);
+                        } else {
+                            bhit = closest_hit_fast(b_origin, d, b_step_bias, bounce_max_t);
+                        }
                         if (bhit.index != 0xffffffffu) {
                             float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
                             float3 bhit_world = b_origin + d * bhit.t;
