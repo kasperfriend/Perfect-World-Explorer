@@ -318,6 +318,18 @@ impl Model {
         p += 48;
         let count = u(b, p)? as usize;
         p += 4;
+        if count == u32::MAX as usize {
+            let start = p - 4;
+            let end = b.len().min(start + 128);
+            let hex: String = b[start..end]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            return Err(format!(
+                "v305 sentinel mesh_count=-1 (version={version:#x}, len={}, tail={hex})",
+                b.len()
+            ));
+        }
         if count > 65_536 {
             return Err(format!("too many meshes ({count}, version={version:#x})"));
         }
@@ -1141,6 +1153,23 @@ mod tests {
             model.meshes[1].color_branch,
             Some(V300ColorBranch::LightmapUvNeutralFallback)
         );
+    }
+
+    #[test]
+    fn reports_hex_tail_for_v305_sentinel_mesh_count() {
+        let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+        let mut b = Vec::new();
+        put(&mut b, 0x42584f4d);
+        put(&mut b, 0x10000305);
+        b.extend_from_slice(&[0; 48]);
+        put(&mut b, u32::MAX);
+        put(&mut b, 0x11223344);
+        let err = match Model::parse(&b) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("version=0x10000305"), "{err}");
+        assert!(err.contains("tail=ffffffff44332211"), "{err}");
     }
 
     #[test]
