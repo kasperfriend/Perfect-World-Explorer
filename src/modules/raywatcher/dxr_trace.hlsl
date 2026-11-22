@@ -337,7 +337,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
 
     // Distance-scaled bias prevents self-intersection between the exact 1:1
     // raster depth surface and the BVH/BLAS geometry at all view distances.
-    float bias = max(params.effects.z, max(0.15, dist * 0.003));
+    float slope_bias = (1.0 - saturate(normal.y)) * 0.25;
+    float bias = max(params.effects.z, max(0.15, dist * 0.003)) + slope_bias;
     float3 ray_origin = world_pos + normal * bias - view_dir * (bias * 0.35);
     float n_dot_l = max(dot(normal, params.sun_dir.xyz), 0.0);
 
@@ -433,8 +434,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             if (rhit.index != 0xffffffffu) {
                 float3 hit_pos = ray_origin + reflect_dir * rhit.t;
                 float4 screen_col = sample_screen_radiance(hit_pos, rhit.t);
+                float screen_w = saturate(screen_col.a);
                 float3 lit = screen_col.rgb;
-                if (screen_col.a < 0.5) {
+                if (screen_w < 0.99) {
                     Material rmat = material_of(rhit.index);
                     float r_ndl = max(dot(rhit.normal, params.sun_dir.xyz), 0.0);
                     float r_shadow = 1.0;
@@ -444,8 +446,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                             r_shadow = 0.0;
                         }
                     }
-                    lit = rmat.albedo.rgb * (params.ambient.xyz * params.tuning.z +
+                    float3 offscreen_lit = rmat.albedo.rgb * (params.ambient.xyz * params.tuning.z +
                         params.sun_colour.xyz * (r_ndl * r_shadow));
+                    lit = lerp(offscreen_lit, screen_col.rgb, screen_w);
                 }
                 accum_reflection += lit * fresnel * (1.0 - fog_t);
                 refl_dist = rhit.t;
@@ -460,48 +463,49 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // receiver albedo, on-screen radiance cache / off-screen baked albedo
         // bounce, and real SkyGpu+CloudGpu cubemap sky bounce on misses.
         if (bits_gi && params.frame.z >= 1.0 && params.tuning.w > 0.0) {
-            uint gi_taps = 4u;
-            float3 est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
-            float3 receiver_albedo = clamp(
-                raster_rgb / max(est_direct, float3(0.25, 0.25, 0.25)),
-                float3(0.18, 0.18, 0.18),
-                float3(0.92, 0.92, 0.92));
-            float3 gi_sum = float3(0.0, 0.0, 0.0);
-            for (uint g = 0u; g < gi_taps; g = g + 1u) {
-                float u1 = (float(g) + rand01(state)) / float(gi_taps);
-                float phi = float(g) * 2.39996323 + rot_angle + 1.0471975 + float(s) * 0.7548776;
-                float r = sqrt(u1);
-                float s_phi, c_phi;
-                sincos(phi, s_phi, c_phi);
-                float z = sqrt(max(0.0, 1.0 - u1));
-                float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + normal * z;
-                Hit bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 96.0));
-                if (bhit.index != 0xffffffffu) {
-                    float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
-                    float3 bhit_world = ray_origin + d * bhit.t;
-                    float b_bias = max(bias, length(bhit_world - params.eye.xyz) * 0.004);
-                    float b_shadow = 1.0;
-                    if (bits_shadows && b_ndl > 0.01) {
-                        float3 bhit_pos = bhit_world + bhit.normal * b_bias;
-                        if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ (g * 73u + 11u))) {
-                            b_shadow = 0.0;
+            float sun_strength = saturate(dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722)) * 1.4);
+            if (sun_strength > 0.005) {
+                uint gi_taps = 4u;
+                float3 est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
+                float3 receiver_albedo = clamp(
+                    raster_rgb / max(est_direct, float3(0.25, 0.25, 0.25)),
+                    float3(0.18, 0.18, 0.18),
+                    float3(0.92, 0.92, 0.92));
+                float3 gi_sum = float3(0.0, 0.0, 0.0);
+                for (uint g = 0u; g < gi_taps; g = g + 1u) {
+                    float u1 = (float(g) + rand01(state)) / float(gi_taps);
+                    float phi = float(g) * 2.39996323 + rot_angle + 1.0471975 + float(s) * 0.7548776;
+                    float r = sqrt(u1);
+                    float s_phi, c_phi;
+                    sincos(phi, s_phi, c_phi);
+                    float z = sqrt(max(0.0, 1.0 - u1));
+                    float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + normal * z;
+                    Hit bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 96.0));
+                    if (bhit.index != 0xffffffffu) {
+                        float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
+                        float3 bhit_world = ray_origin + d * bhit.t;
+                        float b_bias = max(bias, length(bhit_world - params.eye.xyz) * 0.004);
+                        float b_shadow = 1.0;
+                        if (bits_shadows && b_ndl > 0.01) {
+                            float3 bhit_pos = bhit_world + bhit.normal * b_bias;
+                            if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ (g * 73u + 11u))) {
+                                b_shadow = 0.0;
+                            }
                         }
-                    }
-                    float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
-                    float3 incoming = float3(0.0, 0.0, 0.0);
-                    if (b_screen.a >= 0.5) {
-                        incoming = b_screen.rgb * (0.35 + 0.85 * b_ndl * b_shadow);
-                    } else {
+                        float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
+                        float b_w = saturate(b_screen.a);
                         Material bmat = material_of(bhit.index);
-                        incoming = bmat.albedo.rgb * (params.sun_colour.xyz * (b_ndl * b_shadow * 1.60) + params.ambient.xyz * (params.tuning.z * 0.50));
+                        float3 off_in = bmat.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow * 2.25);
+                        float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 1.55 * sun_strength);
+                        float3 incoming = lerp(off_in, on_in, b_w);
+                        gi_sum += receiver_albedo * incoming * (params.tuning.w * 1.65 * (1.0 - fog_t));
+                    } else {
+                        float3 sky_bounce = sample_sky_env(d);
+                        gi_sum += receiver_albedo * sky_bounce * (params.tuning.w * 0.08 * sun_strength * (1.0 - fog_t));
                     }
-                    gi_sum += receiver_albedo * incoming * (params.tuning.w * 1.55 * (1.0 - fog_t));
-                } else {
-                    float3 sky_bounce = sample_sky_env(d);
-                    gi_sum += receiver_albedo * sky_bounce * (params.tuning.w * 0.58 * (1.0 - fog_t));
                 }
+                accum_gi += gi_sum * (1.0 / float(gi_taps));
             }
-            accum_gi += gi_sum * (1.0 / float(gi_taps));
         }
     }
 
@@ -565,7 +569,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // V_sun modulates ONLY the sun contribution and AO modulates ONLY the
         // ambient contribution (exact 1:1 identity at V_sun=1, AO=1).
         float sun_e = max(dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722)), 0.0) * n_dot_l;
-        float amb_e = max(dot(params.ambient.xyz, float3(0.2126, 0.7152, 0.0722)) * params.tuning.z, 0.05);
+        float amb_e = max(dot(params.ambient.xyz, float3(0.2126, 0.7152, 0.0722)) * params.tuning.z, 0.005);
         float sun_f = saturate(sun_e / max(sun_e + amb_e, 1e-4));
         float amb_f = 1.0 - sun_f;
         float v_sun = bits_shadows ? avg_shadow : 1.0;

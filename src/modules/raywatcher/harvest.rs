@@ -265,6 +265,7 @@ pub struct Harvester {
     last_build_content_hash: u64,
     last_build_config: Option<HarvestConfig>,
     pending_bg: Option<std::sync::mpsc::Receiver<BgBuildResult>>,
+    last_build_finished: Option<std::time::Instant>,
     /// Why the last build was refused or clipped, for the tab.
     pub note: Option<String>,
     /// Triangles in the last build.
@@ -368,6 +369,11 @@ impl Harvester {
         if self.cached.is_none() {
             return true;
         }
+        if let Some(t) = self.last_build_finished {
+            if t.elapsed() < std::time::Duration::from_millis(1500) {
+                return false;
+            }
+        }
         let far_bucket = (view_distance / 128.0).round() as u32;
         if self.last_build_config != Some(config)
             || self.last_build_terrain_gen != terrain_generation
@@ -424,6 +430,7 @@ impl Harvester {
                 self.last_build_terrain_gen = result.terrain_generation;
                 self.last_build_content_hash = result.content_hash;
                 self.last_build_config = Some(result.config);
+                self.last_build_finished = Some(std::time::Instant::now());
                 self.cached = Some((result.sig, result.scene.clone()));
                 Some(result.scene)
             }
@@ -449,7 +456,7 @@ impl Harvester {
         base_cell: f32,
         terrain_generation: u64,
         content_hash: u64,
-        ground: Option<&dyn Fn(f32, f32) -> f32>,
+        ground: Option<Box<dyn Fn(f32, f32) -> f32 + Send>>,
         real_meshes: Vec<MeshTriangle>,
         instances: Vec<InstanceProxy>,
         water: Vec<WaterSurface>,
@@ -473,66 +480,33 @@ impl Harvester {
         };
         let frustum = Frustum::from_view_projection(view_projection);
 
-        // Sample terrain & water on the calling thread (borrows `ground`, fast
-        // compared to real-mesh bucketing and SAH BVH construction), then hand
-        // off mesh/proxy ingestion + `SceneGeometry::build` to the worker.
+        // Run terrain sampling, mesh/proxy ingestion, and SAH BVH construction
+        // entirely on the background worker thread so moving the camera never
+        // stalls the main render thread.
         let t_start = std::time::Instant::now();
-        let mut triangles = Vec::new();
-        let mut materials = Vec::new();
-        // Phase 1: Water does not cast shadows or AO in the game; do not add
-        // water sheets to the occluder BVH. Reflections trace from the raster
-        // water mask against the scene BVH + sky environment.
         let _ = &water;
         let water_quads = 0usize;
-        let mut terrain_lod_tris = [0usize; 4];
-        if let Some(ground_fn) = ground {
-            let before_terrain = triangles.len();
-            terrain_lod_tris = push_terrain_frustum(
-                &mut triangles,
-                &mut materials,
-                eye,
-                &frustum,
-                far,
-                base_cell.max(0.5),
-                config,
-                ground_fn,
-            );
-            if std::env::var_os("PWE_RT_DEBUG").is_some() && triangles.len() > before_terrain {
-                let mut max_err = 0.0f32;
-                let offsets = [
-                    (0.0, 0.0),
-                    (5.0, 3.0),
-                    (-7.0, 4.0),
-                    (11.0, -9.0),
-                    (-15.0, -12.0),
-                    (22.0, 14.0),
-                    (-25.0, 18.0),
-                    (31.0, -21.0),
-                    (-36.0, -27.0),
-                    (42.0, 33.0),
-                ];
-                for &(ox, oz) in &offsets {
-                    let sx = eye.x + ox;
-                    let sz = eye.z + oz;
-                    let expected = ground_fn(sx, sz);
-                    if let Some(rt_y) =
-                        sample_terrain_tris_height(&triangles[before_terrain..], sx, sz)
-                    {
-                        max_err = max_err.max((rt_y - expected).abs());
-                    }
-                }
-                eprintln!(
-                    "[Raywatcher] Phase 2 terrain height check (10 pts): max_abs_err={max_err:.4}u (base_cell={:.2})",
-                    base_cell.max(0.5)
-                );
-            }
-        }
 
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.pending_bg = Some(rx);
         let _ = std::thread::Builder::new()
             .name("raywatcher-bvh".to_string())
             .spawn(move || {
+                let mut triangles = Vec::new();
+                let mut materials = Vec::new();
+                let mut terrain_lod_tris = [0usize; 4];
+                if let Some(ground_fn) = ground {
+                    terrain_lod_tris = push_terrain_frustum(
+                        &mut triangles,
+                        &mut materials,
+                        eye,
+                        &frustum,
+                        far,
+                        base_cell.max(0.5),
+                        config,
+                        ground_fn.as_ref(),
+                    );
+                }
                 let before_mesh = triangles.len();
                 push_real_meshes(&mut triangles, &mut materials, &real_meshes);
                 let real_mesh_tris = triangles.len() - before_mesh;
@@ -727,6 +701,7 @@ impl Harvester {
         self.last_build_eye = None;
         self.last_build_config = None;
         self.pending_bg = None;
+        self.last_build_finished = None;
     }
 
     pub fn cached(&self) -> Option<&std::sync::Arc<SceneGeometry>> {
@@ -1464,11 +1439,11 @@ fn push_terrain_frustum(
                     let diag_chord = (h0 + h2) * 0.5;
                     let overshoot = diag_chord - hc;
 
-                    if lod_band == 0 && overshoot > 0.05 {
-                        // Concave near-field cell (valley/gully): split into a
-                        // watertight 4-triangle fan through the exact centre
-                        // height so the LOD surface hugs the valley floor and
-                        // cannot bridge above the raster terrain.
+                    if overshoot.abs() > 0.08 {
+                        // Watertight 4-triangle fan through the exact centre
+                        // height: hugs curved slopes/valleys across all LOD
+                        // bands while keeping every shared cell boundary edge
+                        // identical to neighbouring quads (zero step cracks).
                         let p0 = Vec3::new(wx0, h0, wz0);
                         let p1 = Vec3::new(wx1, h1, wz0);
                         let p2 = Vec3::new(wx1, h2, wz1);
@@ -1508,18 +1483,10 @@ fn push_terrain_frustum(
                         ));
                         lod_tris[lod_band] += 4;
                     } else {
-                        // For mid/far concave cells, depress vertices by the
-                        // chord overshoot so coarse distant quads never float
-                        // above the real raster ground.
-                        let drop = if overshoot > 0.05 {
-                            overshoot.min(6.0)
-                        } else {
-                            0.0
-                        };
-                        let p0 = Vec3::new(wx0, h0 - drop, wz0);
-                        let p1 = Vec3::new(wx1, h1 - drop, wz0);
-                        let p2 = Vec3::new(wx1, h2 - drop, wz1);
-                        let p3 = Vec3::new(wx0, h3 - drop, wz1);
+                        let p0 = Vec3::new(wx0, h0, wz0);
+                        let p1 = Vec3::new(wx1, h1, wz0);
+                        let p2 = Vec3::new(wx1, h2, wz1);
+                        let p3 = Vec3::new(wx0, h3, wz1);
                         triangles.push(RayTriangle::with_kind(
                             p0,
                             p2,
@@ -2289,6 +2256,40 @@ mod tests {
             );
             assert_eq!(t.normal[3], 0.0, "normal[3] must remain 0.0");
             assert_eq!(t.kind(), KIND_REAL_MESH, "kind must be stored in a[3]");
+        }
+    }
+
+    #[test]
+    fn terrain_frustum_slopes_have_no_step_cracks_between_adjacent_cells() {
+        let mut tris = Vec::new();
+        let mut mats = Vec::new();
+        let frustum = Frustum::from_view_projection(Mat4::IDENTITY);
+        let config = HarvestConfig::default();
+        let ground = |x: f32, z: f32| -> f32 {
+            (x * 0.03).sin() * 20.0 + (z * 0.025).cos() * 15.0 + 0.002 * x * x
+        };
+        push_terrain_frustum(
+            &mut tris,
+            &mut mats,
+            Vec3::new(0.0, 20.0, 0.0),
+            &frustum,
+            256.0,
+            2.0,
+            config,
+            &ground,
+        );
+        assert!(!tris.is_empty());
+        for t in &tris {
+            for v in [t.a, t.b, t.c] {
+                let expected = ground(v[0], v[2]);
+                assert!(
+                    (v[1] - expected).abs() < 1e-3,
+                    "terrain vertex ({}, {}, {}) detached from ground {expected} (step crack!)",
+                    v[0],
+                    v[1],
+                    v[2]
+                );
+            }
         }
     }
 }

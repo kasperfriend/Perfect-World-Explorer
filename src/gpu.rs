@@ -2803,7 +2803,7 @@ impl Renderer {
         // Disc placement follows the render path 0x4b3e00: each object uses its
         // own recovered elevation curve and the shared regional azimuth.
         // `sun_dir` is a light direction, which 0x4b60b0 stores negated.
-        let (sun, moon) = match crate::sky_time::evaluate(camera.time_of_day, authored) {
+        let (sky_sun, sky_moon) = match crate::sky_time::evaluate(camera.time_of_day, authored) {
             Some(state) => {
                 let fade = |sun: bool| {
                     if camera.celestial_discs {
@@ -2921,8 +2921,8 @@ impl Renderer {
         let frame = crate::sky_gpu::SkyFrame {
             hour: camera.time_of_day,
             night_weight,
-            sun,
-            moon,
+            sun: sky_sun,
+            moon: sky_moon,
             // The 38.16-72.5 degree band has no native mesh; the client covers it
             // with something drawn at 0x799f88 that this build does not, so the
             // viewer blends the frame's atmospheric fog into the cap's own rim
@@ -3785,8 +3785,14 @@ impl Renderer {
         } else {
             camera.far
         };
-        let content_hash = ((self.local_pages.len() as u64) << 32)
-            ^ ((self.world_pages.len() as u64) << 16)
+        // Once whole-world pages are loaded, ignore `local_pages.len()` so
+        // crossing a terrain block boundary does not spam BVH/BLAS rebuilds.
+        let active_pages_len = if self.world_done {
+            self.world_pages.len() as u64
+        } else {
+            self.local_pages.len() as u64
+        };
+        let content_hash = (active_pages_len << 16)
             ^ (self.water_batches.len() as u64)
             ^ (u64::from(self.world_done) << 62);
         let t_rw_frame = std::time::Instant::now();
@@ -3804,36 +3810,51 @@ impl Renderer {
                 Frustum, InstanceProxy, MeshTriangle, WaterSurface,
             };
             let _ = Frustum::from_view_projection(matrix);
-            // Phase 8: Cover the full view distance with real mesh triangles
-            // for every resident scenery page that has them; fall back to box
-            // proxies ONLY when real mesh triangles are unavailable or beyond
-            // view distance (plus procedural trees which have no static mesh).
-            let detail_radius = view_distance.max(config.radius.max(128.0) * 2.0);
+            // Keep a focused nearest-first real-mesh bubble around the camera
+            // (covering both on-screen and off-screen reflected buildings) with a
+            // bounded triangle budget so BLAS/BVH rebuilds stay hitch-free while
+            // moving; distant scenery beyond `detail_radius` uses compact proxies.
+            let detail_radius = view_distance.clamp(256.0, 512.0);
             let detail_radius_sq = detail_radius * detail_radius;
+            const REAL_MESH_TRI_BUDGET: usize = 180_000;
 
             let mut real_meshes = Vec::new();
             let mut real_mesh_pages = 0usize;
             let mut proxy_fallback_models = 0usize;
             let mut proxies = Vec::new();
-            let pages_iter = if self.world_done {
-                self.world_pages.iter()
+            let pages_slice = if self.world_done {
+                &self.world_pages[..]
             } else {
-                self.local_pages.iter()
+                &self.local_pages[..]
             };
-            for page in pages_iter {
-                let (pmin, pmax) = page.page_bounds();
-                let bmin = Vec3::from_array(pmin);
-                let bmax = Vec3::from_array(pmax);
-                let center = (bmin + bmax) * 0.5;
-                let half = (bmax - bmin) * 0.5;
-                let dist_sq = (camera.pos - center).abs().max(half).distance_squared(half);
-                if dist_sq > detail_radius_sq {
-                    continue;
-                }
+            let mut candidate_pages: Vec<(f32, usize)> = pages_slice
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, page)| {
+                    let (pmin, pmax) = page.page_bounds();
+                    let bmin = Vec3::from_array(pmin);
+                    let bmax = Vec3::from_array(pmax);
+                    let center = (bmin + bmax) * 0.5;
+                    let half = (bmax - bmin) * 0.5;
+                    let dist_sq = (camera.pos - center).abs().max(half).distance_squared(half);
+                    if dist_sq <= detail_radius_sq {
+                        Some((dist_sq, idx))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            candidate_pages.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, idx) in candidate_pages {
+                let page = &pages_slice[idx];
                 let tris = page.rt_triangles();
-                if !tris.is_empty() {
+                if !tris.is_empty() && real_meshes.len() < REAL_MESH_TRI_BUDGET {
                     real_mesh_pages += 1;
-                    for t in tris {
+                    let remaining = REAL_MESH_TRI_BUDGET - real_meshes.len();
+                    let step = (tris.len() / remaining.max(1)).max(1);
+                    let mut ti = 0usize;
+                    while ti < tris.len() && real_meshes.len() < REAL_MESH_TRI_BUDGET {
+                        let t = &tris[ti];
                         real_meshes.push(MeshTriangle {
                             a: Vec3::from_array(t.a),
                             b: Vec3::from_array(t.b),
@@ -3843,6 +3864,7 @@ impl Renderer {
                             roughness: 0.72,
                             opacity: t.opacity,
                         });
+                        ti += step;
                     }
                 } else {
                     for b in page.placement_bounds() {
@@ -3907,12 +3929,12 @@ impl Renderer {
             // (never a box) only when the triangle budget is exhausted.
             let tree_lod_scale =
                 self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees);
-            let tree_tri_budget = 140_000usize;
+            let tree_tri_budget = 60_000usize;
             let mut tree_tris = Vec::new();
             let (real_tree_instances, real_tree_tris, tree_canopy_fallbacks) =
                 self.far_trees.harvest_rt_triangles(
                     camera.pos,
-                    detail_radius,
+                    detail_radius.min(384.0),
                     tree_lod_scale,
                     tree_tri_budget,
                     &mut tree_tris,
@@ -3953,10 +3975,11 @@ impl Renderer {
                 .collect();
 
             let base_cell = map_space.map(|s| s.spacing).unwrap_or(2.0);
-            let ground_closure =
-                |x: f32, z: f32| -> f32 { map_space.map(|s| s.ground(x, z)).unwrap_or(0.0) };
-            let ground_ref: Option<&dyn Fn(f32, f32) -> f32> =
-                map_space.map(|_| &ground_closure as &dyn Fn(f32, f32) -> f32);
+            let ground_box: Option<Box<dyn Fn(f32, f32) -> f32 + Send>> =
+                map_space.cloned().map(|ms| {
+                    Box::new(move |x: f32, z: f32| ms.ground(x, z))
+                        as Box<dyn Fn(f32, f32) -> f32 + Send>
+                });
 
             self.raywatcher_harvest.start_background_frustum_build(
                 config,
@@ -3967,7 +3990,7 @@ impl Renderer {
                 base_cell,
                 0,
                 content_hash,
-                ground_ref,
+                ground_box,
                 real_meshes,
                 proxies,
                 water,
