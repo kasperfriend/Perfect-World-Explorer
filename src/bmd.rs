@@ -325,38 +325,39 @@ impl Model {
         let mut lossy_gbk_diagnostics = Vec::new();
         let mut v300_branch_counters = V300BranchCounters::default();
         if is_v300 {
-            // 1.8.x A3DLitModel (0x10000300..=0x10000305): each mesh carries a
-            // u32 header word, length-prefixed GBK name and texture, vertex and
-            // face counts, 24-byte vertices, 32-bit indices (12 B per face),
-            // normals, day/night vertex colours and/or lightmap UVs, and a tail
-            // of 48 B AABB + "MATERIAL: \0" (80 B) + dwExtraSize (counts its own 4 B).
+            // 1.8.x A3DLitModel (0x10000300..=0x10000305): model-level
+            // `bLightMap` (1 B) + `bSharedData` (1 B), then per mesh:
+            // `bSupportLightMap` (1 B) + `bUseLightMap` (1 B), length-prefixed
+            // GBK name and texture, vertex and face counts, 24-byte vertices,
+            // 32-bit indices (12 B per face), normals, day/night vertex
+            // colours and/or lightmap UVs, and AABB + MATERIAL + dwExtraSize.
             const MAT_TAG: &[u8] = b"MATERIAL: \0";
-            let v300_start = p;
-            for mesh_idx in 0..count {
-                let mesh_word = u(b, p)?;
+            let _b_lightmap = *b.get(p).ok_or("truncated BMD v300 bLightMap")? != 0;
+            let b_shared_data = *b.get(p + 1).ok_or("truncated BMD v300 bSharedData")? != 0;
+            p += 2;
+            if b_shared_data {
+                let share_len = u(b, p)? as usize;
                 p += 4;
+                if share_len > 4096 {
+                    return Err("oversized BMD v300 shared-data path".into());
+                }
+                let (share_file, _) = fixed_lossy_tracked(b, p, share_len)?;
+                return Err(format!(
+                    "A3DLitModel v300 shared data file {share_file:?} is unsupported"
+                ));
+            }
+            for mesh_idx in 0..count {
+                let b_support_lm = *b.get(p).ok_or("truncated BMD v300 bSupportLightMap")? != 0;
+                let b_use_lm = *b.get(p + 1).ok_or("truncated BMD v300 bUseLightMap")? != 0;
+                p += 2;
                 v300_branch_counters.flags_read += 1;
                 let name_len = u(b, p)? as usize;
                 p += 4;
                 if name_len > 4096 {
-                    if mesh_idx == 0 && b.get(v300_start + 1).is_some_and(|&v| v != 0) {
-                        if let Ok(share_len) = u(b, v300_start + 2) {
-                            let share_len = share_len as usize;
-                            if (1..=4096).contains(&share_len) {
-                                if let Ok((share_file, _)) =
-                                    fixed_lossy_tracked(b, v300_start + 6, share_len)
-                                {
-                                    if share_file.to_ascii_lowercase().ends_with(".bmd") {
-                                        return Err(format!(
-                                            "A3DLitModel v300 shared data file {share_file:?} is unsupported"
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
                     return Err(format!(
-                        "oversized BMD v300 mesh {mesh_idx} name len={name_len:#x} word={mesh_word:#010x}"
+                        "oversized BMD v300 mesh {mesh_idx} name len={name_len:#x} flags=({},{})",
+                        u8::from(b_support_lm),
+                        u8::from(b_use_lm),
                     ));
                 }
                 let (name, name_lossy_gbk) = fixed_lossy_tracked(b, p, name_len)?;
@@ -566,8 +567,8 @@ impl Model {
                     vertices,
                     indices,
                     color_branch: Some(color_branch),
-                    b_support_lightmap: false,
-                    b_use_lightmap: false,
+                    b_support_lightmap: b_support_lm,
+                    b_use_lightmap: b_use_lm,
                     opaque_day_words,
                     opaque_night_words,
                     name_lossy_gbk,
@@ -961,7 +962,8 @@ mod tests {
         extra_size: u32,
     ) {
         let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
-        put(b, 0x0000_0001);
+        b.push(u8::from(has_uv_block));
+        b.push(u8::from(has_uv_block && !has_color_block));
         put(b, name.len() as u32);
         b.extend_from_slice(name);
         put(b, tex.len() as u32);
@@ -1010,6 +1012,7 @@ mod tests {
         put(&mut b, 0x10000302);
         b.extend_from_slice(&[0; 48]);
         put(&mut b, 3);
+        b.extend_from_slice(&[0, 0]);
         push_v300_mesh(
             &mut b,
             false,
@@ -1084,9 +1087,10 @@ mod tests {
         put(&mut b, 0x10000302);
         b.extend_from_slice(&[0; 48]);
         put(&mut b, 2);
+        b.extend_from_slice(&[0, 0]);
 
         // Mesh 0: MATERIAL: \0 before day/night colours, followed by 48 B AABB + dwExtraSize=40.
-        put(&mut b, 0x0000_0001);
+        b.extend_from_slice(&[0, 0]);
         put(&mut b, 2);
         b.extend_from_slice(b"m0");
         put(&mut b, 5);
@@ -1149,9 +1153,10 @@ mod tests {
         put(&mut b, 0x10000302);
         b.extend_from_slice(&[0; 48]);
         put(&mut b, 2);
+        b.extend_from_slice(&[0, 0]);
 
         // Mesh 0: lightmap_neutral with a NaN float inside MATERIAL and extra_size=20.
-        put(&mut b, 0x0000_0001);
+        b.extend_from_slice(&[1, 1]);
         put(&mut b, 2);
         b.extend_from_slice(b"m0");
         put(&mut b, 5);
@@ -1197,6 +1202,7 @@ mod tests {
         put(&mut b, 0x10000305);
         b.extend_from_slice(&[0; 48]);
         put(&mut b, 1);
+        b.extend_from_slice(&[0, 0]);
         push_v300_mesh(
             &mut b,
             false,
