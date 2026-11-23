@@ -21,9 +21,9 @@ struct Params {
     float4 effects; // x: roughness_cutoff, y: effect_bits, z: bias, w: layered_mode (1=layer over raster, 0=replace)
     float4 fog;     // x: fog_start, y: fog_end, z: ao_radius, w: unused
     float4 counts;  // x: tri_count, y: node_count, z: mat_count, w: debug_view
-    float4 point_light_meta;           // x: active point light count (<= 16)
-    float4 point_lights_pos_rad[16];   // xyz: world pos, w: radius
-    float4 point_lights_col_int[16];   // rgb: colour, w: intensity
+    float4 point_light_meta;           // x: active light count (<= 48), y: pl_shadows, z: write_albedo, w: write_guide
+    float4 point_lights_pos_rad[48];   // xyz: world pos, w: radius
+    float4 point_lights_col_int[48];   // rgb: colour, w: intensity
     float4 terrain_map_bounds;         // x: min_x, y: max_z, z: inv_diameter, w: valid (>0.5)
 };
 
@@ -425,10 +425,14 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float3 sky_rgb = src_gbuf_raster.Load(int3(id.xy, 0)).rgb;
         bool layered_sky = params.effects.w > 0.5;
         out_colour[id.xy] = float4(layered_sky ? float3(0.0, 0.0, 0.0) : sky_rgb, 1.0);
-        out_guide[id.xy] = float4(1.0, 1.0, 0.0, 0.0);
+        if (params.point_light_meta.w > 0.5) {
+            out_guide[id.xy] = float4(1.0, 1.0, 0.0, 0.0);
+        }
         out_reflection[id.xy] = float4(0.0, 0.0, 0.0, 1.0);
         out_normals[id.xy] = float4(0.0, 1.0, 0.0, 1.0);
-        out_albedo[id.xy] = float4(0.0, 0.0, 0.0, 0.04);
+        if (params.point_light_meta.z > 0.5) {
+            out_albedo[id.xy] = float4(0.0, 0.0, 0.0, 0.04);
+        }
         return;
     }
 
@@ -470,10 +474,14 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     // Early-out on 100% fogged horizon pixels where layered RT weight is 0.
     if (fog_t >= 0.99 && layered && debug_mode_early == 0u) {
         out_colour[id.xy] = float4(0.0, 0.0, 0.0, 1.0);
-        out_guide[id.xy] = float4(1.0, 1.0, dist, 1.0);
+        if (params.point_light_meta.w > 0.5) {
+            out_guide[id.xy] = float4(1.0, 1.0, dist, 1.0);
+        }
         out_reflection[id.xy] = float4(0.0, 0.0, 0.0, 1.0);
         out_normals[id.xy] = float4(normal, roughness);
-        out_albedo[id.xy] = float4(raster_rgb, roughness);
+        if (params.point_light_meta.z > 0.5) {
+            out_albedo[id.xy] = float4(raster_rgb, roughness);
+        }
         return;
     }
 
@@ -507,11 +515,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float sun_luma = dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722));
     float sun_strength = smoothstep(0.28, 0.48, sun_luma);
     float gi_fade = 1.0 - saturate((dist - 150.0) / 70.0);
-    float3 est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
-    float3 receiver_albedo = clamp(
-        raster_rgb / max(est_direct, float3(0.18, 0.18, 0.18)),
-        float3(0.08, 0.08, 0.08),
-        float3(0.92, 0.92, 0.92));
 
     for (uint s = 0u; s < samples; s = s + 1u) {
         // 2-tap IGN-rotated Vogel-disk soft sun shadow penumbra.
@@ -671,7 +674,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                                 params.sun_colour.xyz * (b_ndl * b_shadow * 1.65)
                                 + params.ambient.xyz * (params.tuning.z * 0.30));
                             float3 incoming = off_in;
-                            if (bounce == 0u) {
+                            if (bounce == 0u && bhit.t < 40.0) {
                                 float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
                                 float b_w = saturate(b_screen.a);
                                 float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 1.15 * sun_strength + 0.12 * day_gi_scale);
@@ -723,12 +726,16 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float pl_w_total = 0.0;
     float pl_w_lit = 0.0;
     if (bits_lighting) {
-        uint pl_count = min(uint(round(params.point_light_meta.x)), 16u);
-        // Pure incoming point-light irradiance; COMPOSITE_SHADER modulates by full-res raster albedo.
+        uint pl_count = min(uint(round(params.point_light_meta.x)), 48u);
+        uint pl_shadow_rays = 0u;
+        // Pure incoming point-light + world-effect irradiance; COMPOSITE_SHADER modulates by full-res raster albedo.
         for (uint li = 0u; li < pl_count; li = li + 1u) {
             float4 pl_pr = params.point_lights_pos_rad[li];
-            float4 pl_ci = params.point_lights_col_int[li];
             float3 to_l = pl_pr.xyz - world_pos;
+            // Boost #21: Fast 1D AABB reject before dot/sqrt across 48 lights.
+            if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
+                continue;
+            }
             float pl_d2 = dot(to_l, to_l);
             if (pl_d2 > 1e-6 && pl_d2 < pl_pr.w * pl_pr.w) {
                 float pl_dist = sqrt(pl_d2);
@@ -737,10 +744,14 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 if (pl_ndl > 0.001) {
                     float atten = point_light_falloff(pl_dist, pl_pr.w);
                     if (atten > 1e-5) {
+                        float4 pl_ci = params.point_lights_col_int[li];
                         float w = pl_ci.w * atten * pl_ndl;
                         float pl_vis = 1.0;
-                        if (bits_shadows && pl_dist > 1.5 && w > 0.015 && occluded_fast(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias))) {
-                            pl_vis = 0.0;
+                        if (bits_shadows && pl_shadow_rays < 4u && pl_dist > 1.5 && w > 0.018) {
+                            pl_shadow_rays = pl_shadow_rays + 1u;
+                            if (occluded_fast(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias))) {
+                                pl_vis = 0.0;
+                            }
                         }
                         pl_w_total += w;
                         pl_w_lit += w * pl_vis;
@@ -853,10 +864,14 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         store_refl = float3(0.0, 0.0, 0.0);
     }
 
-    float spec_f0 = 0.04 + 0.16 * (1.0 - roughness);
     out_colour[id.xy] = float4(out_rgb, out_lf);
-    out_guide[id.xy] = float4(avg_open, dist / params.lens.y, avg_shadow, roughness);
+    if (params.point_light_meta.w > 0.5) {
+        out_guide[id.xy] = float4(avg_open, dist / params.lens.y, avg_shadow, roughness);
+    }
     out_reflection[id.xy] = float4(store_refl, avg_refl_dist / params.lens.y);
     out_normals[id.xy] = float4(normal, roughness);
-    out_albedo[id.xy] = float4(raster_rgb, spec_f0);
+    if (params.point_light_meta.z > 0.5) {
+        float spec_f0 = 0.04 + 0.16 * (1.0 - roughness);
+        out_albedo[id.xy] = float4(raster_rgb, spec_f0);
+    }
 }

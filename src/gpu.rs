@@ -4239,56 +4239,70 @@ impl Renderer {
             || plan.debug_view == crate::modules::raywatcher::plan::DebugView::PointLights;
         let active_point_lights: Vec<crate::modules::raywatcher::frame::PointLight> =
             if need_point_lights {
+                // Boost #30: Pre-size light list + fast 1D XZ reject before 3D distance.
                 let mut point_lights: Vec<(f32, crate::modules::raywatcher::frame::PointLight)> =
-                    self.model_lights
-                        .lights
-                        .iter()
-                        .filter_map(|l| {
-                            let radius = l.range.max(0.0);
-                            if radius <= 0.05 {
-                                return None;
-                            }
-                            let pos = glam::Vec3::from_array(l.position);
-                            let dist_sq = pos.distance_squared(camera.pos);
-                            let max_d = params.far + radius;
-                            if dist_sq > max_d * max_d {
-                                return None;
-                            }
-                            let colour = glam::Vec3::new(
-                                l.diffuse[0].max(0.0),
-                                l.diffuse[1].max(0.0),
-                                l.diffuse[2].max(0.0),
-                            );
-                            if colour.length_squared() <= 1e-5 {
-                                return None;
-                            }
-                            let raw_int = l.diffuse[3];
-                            let intensity = if raw_int > 0.01 {
-                                raw_int.clamp(0.25, 4.0)
-                            } else {
-                                1.0
-                            };
-                            Some((
-                                dist_sq,
-                                crate::modules::raywatcher::frame::PointLight {
-                                    position: pos,
-                                    radius,
-                                    colour,
-                                    intensity,
-                                    casts_shadow: true,
-                                },
-                            ))
-                        })
-                        .collect();
+                    Vec::with_capacity(64);
+                for l in &self.model_lights.lights {
+                    let radius = l.range.max(0.0);
+                    if radius <= 0.05 {
+                        continue;
+                    }
+                    let max_d = params.far + radius;
+                    let dx = l.position[0] - camera.pos.x;
+                    if dx.abs() > max_d {
+                        continue;
+                    }
+                    let dz = l.position[2] - camera.pos.z;
+                    if dz.abs() > max_d {
+                        continue;
+                    }
+                    let dy = l.position[1] - camera.pos.y;
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    if dist_sq > max_d * max_d {
+                        continue;
+                    }
+                    let colour = glam::Vec3::new(
+                        l.diffuse[0].max(0.0),
+                        l.diffuse[1].max(0.0),
+                        l.diffuse[2].max(0.0),
+                    );
+                    if colour.length_squared() <= 1e-5 {
+                        continue;
+                    }
+                    let raw_int = l.diffuse[3];
+                    let intensity = if raw_int > 0.01 {
+                        raw_int.clamp(0.25, 4.0)
+                    } else {
+                        1.0
+                    };
+                    point_lights.push((
+                        dist_sq,
+                        crate::modules::raywatcher::frame::PointLight {
+                            position: glam::Vec3::from_array(l.position),
+                            radius,
+                            colour,
+                            intensity,
+                            casts_shadow: true,
+                        },
+                    ));
+                }
                 if let Some(models) = &self.models {
                     for dl in models.dynamic_lights() {
                         let radius = dl.radius.max(0.0);
                         if radius <= 0.05 {
                             continue;
                         }
-                        let pos = glam::Vec3::from_array(dl.position);
-                        let dist_sq = pos.distance_squared(camera.pos);
                         let max_d = params.far + radius;
+                        let dx = dl.position[0] - camera.pos.x;
+                        if dx.abs() > max_d {
+                            continue;
+                        }
+                        let dz = dl.position[2] - camera.pos.z;
+                        if dz.abs() > max_d {
+                            continue;
+                        }
+                        let dy = dl.position[1] - camera.pos.y;
+                        let dist_sq = dx * dx + dy * dy + dz * dz;
                         if dist_sq > max_d * max_d {
                             continue;
                         }
@@ -4309,7 +4323,7 @@ impl Renderer {
                         point_lights.push((
                             dist_sq,
                             crate::modules::raywatcher::frame::PointLight {
-                                position: pos,
+                                position: glam::Vec3::from_array(dl.position),
                                 radius,
                                 colour,
                                 intensity,
@@ -4318,101 +4332,197 @@ impl Renderer {
                         ));
                     }
                 }
-                // Prioritize stable static & dynamic point lights first (up to 12 slots,
-                // sorted deterministically so lights never swap/flicker frame-to-frame).
-                point_lights.sort_by(|a, b| a.0.total_cmp(&b.0));
-                if point_lights.len() > 12 {
-                    point_lights.truncate(12);
+                // Reserve up to 24 slots for static/dynamic point lights and leave 24..48
+                // slots for active world effects (Archosaur ring beams, wandering lights,
+                // dungeon entry circles, portals, torches, and 3D effect models).
+                point_lights.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                if point_lights.len() > 24 {
+                    point_lights.truncate(24);
                 }
-                let eff_slots = 16usize.saturating_sub(point_lights.len());
-                // Harvest glowing additive world effects on a stable 8u spatial grid so
-                // animated particles produce steady illumination without flickering or
-                // evicting static map torches/lanterns.
+                let eff_slots = 48usize.saturating_sub(point_lights.len());
                 if eff_slots > 0 {
                     if let Some(models) = &self.models {
+                        // Cluster value: (pos_sum, bmin, bmax, weighted_col_sum, col_w_sum, max_radius, max_lum, count)
                         let mut grid: std::collections::HashMap<
                             (i32, i32, i32),
-                            (glam::Vec3, glam::Vec3, f32, f32, u32),
-                        > = std::collections::HashMap::with_capacity(32);
-                        let max_eff_d_sq = (params.far + 48.0) * (params.far + 48.0);
+                            (
+                                glam::Vec3,
+                                glam::Vec3,
+                                glam::Vec3,
+                                glam::Vec3,
+                                f32,
+                                f32,
+                                f32,
+                                u32,
+                            ),
+                        > = std::collections::HashMap::with_capacity(64);
+                        let max_eff_d = params.far + 64.0;
+                        let max_eff_d_sq = max_eff_d * max_eff_d;
                         for q in models.effect_quads() {
-                            if q.destination_blend != 2 || q.mesh.is_some() {
+                            // Additive (dest=ONE=2, src=ONE=2, or screen dest=INVSRCCOLOR=4)
+                            // OR bright emissive alpha-blended (dest=INVSRCALPHA=6) effects.
+                            let is_additive = q.destination_blend == 2
+                                || q.source_blend == 2
+                                || q.destination_blend == 4;
+                            let is_alpha_emissive = q.destination_blend == 6;
+                            if !is_additive && !is_alpha_emissive {
                                 continue;
                             }
-                            let a = q.color[3].clamp(0.0, 1.0);
-                            if a < 0.12 {
-                                continue;
-                            }
-                            let p0 = glam::Vec3::from_array(q.positions[0]);
-                            if p0.distance_squared(camera.pos) > max_eff_d_sq {
-                                continue;
-                            }
-                            let col = glam::Vec3::new(
-                                q.color[0].max(0.0),
-                                q.color[1].max(0.0),
-                                q.color[2].max(0.0),
-                            ) * a;
-                            let lum = col.x * 0.2126 + col.y * 0.7152 + col.z * 0.0722;
-                            if lum < 0.10 {
-                                continue;
-                            }
-                            let p1 = glam::Vec3::from_array(q.positions[1]);
-                            let p2 = glam::Vec3::from_array(q.positions[2]);
-                            let p3 = glam::Vec3::from_array(q.positions[3]);
-                            let center = (p0 + p1 + p2 + p3) * 0.25;
+
+                            let (center, extent, vert_rgba, tex_name, mat_emissive) =
+                                if let Some(ref mesh) = q.mesh {
+                                    if mesh.vertices.is_empty() {
+                                        continue;
+                                    }
+                                    let mut vmin = glam::Vec3::splat(f32::INFINITY);
+                                    let mut vmax = glam::Vec3::splat(f32::NEG_INFINITY);
+                                    // Stride large meshes so centroid/bounds stay O(1).
+                                    let step = (mesh.vertices.len() / 24).max(1);
+                                    let mut idx = 0usize;
+                                    while idx < mesh.vertices.len() {
+                                        let p = glam::Vec3::from_array(mesh.vertices[idx].position);
+                                        vmin = vmin.min(p);
+                                        vmax = vmax.max(p);
+                                        idx += step;
+                                    }
+                                    let c = (vmin + vmax) * 0.5;
+                                    let ext = (vmax - vmin).length().clamp(1.0, 28.0);
+                                    let em = mesh
+                                        .material
+                                        .map(|m| {
+                                            glam::Vec3::new(
+                                                m.emissive[0].max(0.0),
+                                                m.emissive[1].max(0.0),
+                                                m.emissive[2].max(0.0),
+                                            )
+                                        })
+                                        .unwrap_or(glam::Vec3::ZERO);
+                                    (c, ext, q.color, mesh.texture.as_str(), em)
+                                } else {
+                                    let p0 = glam::Vec3::from_array(q.positions[0]);
+                                    if (p0.x - camera.pos.x).abs() > max_eff_d
+                                        || (p0.z - camera.pos.z).abs() > max_eff_d
+                                    {
+                                        continue;
+                                    }
+                                    let p1 = glam::Vec3::from_array(q.positions[1]);
+                                    let p2 = glam::Vec3::from_array(q.positions[2]);
+                                    let p3 = glam::Vec3::from_array(q.positions[3]);
+                                    let c = (p0 + p1 + p2 + p3) * 0.25;
+                                    let ext = p0.distance(p3).max(p1.distance(p2)).clamp(0.6, 24.0);
+                                    // Read per-corner vertex_colors when present (A3DGridDecalEx
+                                    // beams, rings, curtains, dungeon entry circles).
+                                    let rgba = if let Some(vc) = q.vertex_colors {
+                                        [
+                                            (vc[0][0] + vc[1][0] + vc[2][0] + vc[3][0]) * 0.25,
+                                            (vc[0][1] + vc[1][1] + vc[2][1] + vc[3][1]) * 0.25,
+                                            (vc[0][2] + vc[1][2] + vc[2][2] + vc[3][2]) * 0.25,
+                                            (vc[0][3] + vc[1][3] + vc[2][3] + vc[3][3]) * 0.25,
+                                        ]
+                                    } else {
+                                        q.color
+                                    };
+                                    (c, ext, rgba, q.texture.as_str(), glam::Vec3::ZERO)
+                                };
+
                             if !center.is_finite() {
                                 continue;
                             }
-                            let extent = p0.distance(p3).max(p1.distance(p2)).clamp(0.5, 16.0);
-                            let radius = (extent * 4.0).clamp(14.0, 42.0);
+                            if center.distance_squared(camera.pos) > max_eff_d_sq {
+                                continue;
+                            }
+                            let a = vert_rgba[3].clamp(0.0, 1.0);
+                            if a < (if is_additive { 0.08 } else { 0.20 }) {
+                                continue;
+                            }
+                            let tex_rgb =
+                                glam::Vec3::from_array(models.effect_texture_emissive(tex_name));
+                            let v_rgb = glam::Vec3::new(
+                                vert_rgba[0].max(0.0),
+                                vert_rgba[1].max(0.0),
+                                vert_rgba[2].max(0.0),
+                            );
+                            let mut col = v_rgb * tex_rgb * a + mat_emissive * tex_rgb;
+                            let lum = col.x * 0.2126 + col.y * 0.7152 + col.z * 0.0722;
+                            // Filter out dark smoke/dust/waterfalls while keeping all glowing
+                            // additive & emissive alpha effects (beams, circles, wandering lights).
+                            let min_lum = if is_additive { 0.07 } else { 0.24 };
+                            if lum < min_lum {
+                                continue;
+                            }
+                            if is_alpha_emissive {
+                                col *= 0.75;
+                            }
+                            let radius = (extent * 3.8).clamp(16.0, 56.0);
                             let cell = (
-                                (center.x / 8.0).floor() as i32,
-                                (center.y / 8.0).floor() as i32,
-                                (center.z / 8.0).floor() as i32,
+                                (center.x / 10.0).floor() as i32,
+                                (center.y / 10.0).floor() as i32,
+                                (center.z / 10.0).floor() as i32,
                             );
                             let entry = grid.entry(cell).or_insert((
                                 glam::Vec3::ZERO,
+                                glam::Vec3::splat(f32::INFINITY),
+                                glam::Vec3::splat(f32::NEG_INFINITY),
                                 glam::Vec3::ZERO,
+                                0.0,
                                 0.0,
                                 0.0,
                                 0,
                             ));
+                            let w_col = lum * extent.sqrt();
                             entry.0 += center;
-                            entry.1 = entry.1.max(col);
-                            entry.2 = entry.2.max(radius);
-                            entry.3 = entry.3.max(lum);
-                            entry.4 += 1;
+                            entry.1 = entry.1.min(center);
+                            entry.2 = entry.2.max(center);
+                            entry.3 += col * w_col;
+                            entry.4 += w_col;
+                            entry.5 = entry.5.max(radius);
+                            entry.6 = entry.6.max(lum);
+                            entry.7 += 1;
                         }
                         let mut eff_lights: Vec<(
                             f32,
                             crate::modules::raywatcher::frame::PointLight,
                         )> = grid
                             .into_values()
-                            .filter_map(|(pos_sum, col, radius, max_lum, cnt)| {
-                                if cnt == 0 {
-                                    return None;
-                                }
-                                let pos = pos_sum / cnt as f32;
-                                let dist_sq = pos.distance_squared(camera.pos);
-                                let max_d = params.far + radius;
-                                if dist_sq > max_d * max_d {
-                                    return None;
-                                }
-                                // Steady clamped intensity avoids single-particle flash flicker.
-                                let intensity = (0.75 + max_lum * 0.85).clamp(0.8, 1.65);
-                                Some((
-                                    dist_sq,
-                                    crate::modules::raywatcher::frame::PointLight {
-                                        position: pos,
-                                        radius,
-                                        colour: col,
-                                        intensity,
-                                        casts_shadow: true,
-                                    },
-                                ))
-                            })
+                            .filter_map(
+                                |(pos_sum, bmin, bmax, col_sum, col_w, max_rad, max_lum, cnt)| {
+                                    if cnt == 0 || col_w <= 1e-5 {
+                                        return None;
+                                    }
+                                    let pos = pos_sum / cnt as f32;
+                                    let span = (bmax - bmin).length();
+                                    let radius = (max_rad + span * 0.85).clamp(16.0, 64.0);
+                                    let dist_sq = pos.distance_squared(camera.pos);
+                                    let max_d = params.far + radius;
+                                    if dist_sq > max_d * max_d {
+                                        return None;
+                                    }
+                                    // Luminance-weighted true colour preserves vivid beam/portal/wisp hues
+                                    // instead of washing to white via per-channel `.max()`.
+                                    let mut colour = col_sum / col_w;
+                                    let peak = colour.x.max(colour.y).max(colour.z).max(1e-4);
+                                    if peak > 1.0 {
+                                        colour /= peak;
+                                    } else if peak < 0.75 {
+                                        colour *= (0.75 / peak).min(2.2);
+                                    }
+                                    let size_boost = (1.0 + span * 0.03).min(1.55);
+                                    let intensity =
+                                        ((0.85 + max_lum * 0.95) * size_boost).clamp(0.85, 2.35);
+                                    Some((
+                                        dist_sq,
+                                        crate::modules::raywatcher::frame::PointLight {
+                                            position: pos,
+                                            radius,
+                                            colour,
+                                            intensity,
+                                            casts_shadow: true,
+                                        },
+                                    ))
+                                },
+                            )
                             .collect();
-                        eff_lights.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        eff_lights.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
                         eff_lights.truncate(eff_slots);
                         point_lights.extend(eff_lights);
                     }

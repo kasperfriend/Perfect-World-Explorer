@@ -54,12 +54,12 @@ pub struct RayParams {
     pub fog: [f32; 4],
     /// `x` triangle count, `y` node count, `z` material count, `w` debug view mode.
     pub counts: [f32; 4],
-    /// `x` active point light count (<= 16), `y`/`z`/`w` unused.
+    /// `x` active light count (<= 48), `y` point_light_shadows, `z` write_albedo, `w` write_guide.
     pub point_light_meta: [f32; 4],
-    /// Up to 16 nearest scene point lights: `xyz` world position, `w` radius.
-    pub point_lights_pos_rad: [[f32; 4]; 16],
-    /// Matching point light colours: `rgb` colour, `w` intensity.
-    pub point_lights_col_int: [[f32; 4]; 16],
+    /// Up to 48 nearest scene point + world-effect lights: `xyz` world position, `w` radius.
+    pub point_lights_pos_rad: [[f32; 4]; 48],
+    /// Matching light colours: `rgb` colour, `w` intensity.
+    pub point_lights_col_int: [[f32; 4]; 48],
     /// Top-down real textured terrain albedo map bounds: `[min_x, max_z, inv_diameter, valid]`.
     pub terrain_map_bounds: [f32; 4],
 }
@@ -100,9 +100,9 @@ impl RayParams {
         point_lights: &[super::frame::PointLight],
     ) -> Self {
         let fog = config.lighting.fog_range;
-        let mut pl_pos_rad = [[0.0f32; 4]; 16];
-        let mut pl_col_int = [[0.0f32; 4]; 16];
-        let pl_count = point_lights.len().min(16);
+        let mut pl_pos_rad = [[0.0f32; 4]; 48];
+        let mut pl_col_int = [[0.0f32; 4]; 48];
+        let pl_count = point_lights.len().min(48);
         for (i, l) in point_lights.iter().take(pl_count).enumerate() {
             pl_pos_rad[i] = [l.position.x, l.position.y, l.position.z, l.radius.max(0.0)];
             pl_col_int[i] = [l.colour.x, l.colour.y, l.colour.z, l.intensity.max(0.0)];
@@ -157,8 +157,8 @@ impl RayParams {
             point_light_meta: [
                 pl_count as f32,
                 if plan.point_light_shadows { 1.0 } else { 0.0 },
-                0.0,
-                0.0,
+                1.0,
+                1.0,
             ],
             point_lights_pos_rad: pl_pos_rad,
             point_lights_col_int: pl_col_int,
@@ -486,8 +486,8 @@ struct Params {
     fog: vec4<f32>,
     counts: vec4<f32>,
     point_light_meta: vec4<f32>,
-    point_lights_pos_rad: array<vec4<f32>, 16>,
-    point_lights_col_int: array<vec4<f32>, 16>,
+    point_lights_pos_rad: array<vec4<f32>, 48>,
+    point_lights_col_int: array<vec4<f32>, 48>,
     terrain_map_bounds: vec4<f32>,
 };
 
@@ -1051,7 +1051,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         // Real multi-bounce (1..=6) path-traced coloured diffuse GI with unbiased
         // Russian Roulette (bounces 2..=6 stay active), zero sky-wash white tint
         // in layered mode, and zero daytime GI energy at night.
-        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
+        if (bits_gi && roughness > 0.12 && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
             {
                 let gi_taps = select(select(1u, 2u, dist < 180.0), 4u, dist < 90.0);
                 var gi_sum = vec3<f32>(0.0);
@@ -1141,23 +1141,31 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var pl_w_total = 0.0;
     var pl_w_lit = 0.0;
     if (bits_lighting) {
-        let pl_count = min(u32(round(params.point_light_meta.x)), 16u);
-        // Pure incoming point-light irradiance; COMPOSITE_SHADER modulates by full-res raster albedo.
+        let pl_count = min(u32(round(params.point_light_meta.x)), 48u);
+        var pl_shadow_rays = 0u;
+        // Pure incoming point-light + world-effect irradiance; COMPOSITE_SHADER modulates by full-res raster albedo.
         for (var li = 0u; li < pl_count; li = li + 1u) {
             let pl_pr = params.point_lights_pos_rad[li];
-            let pl_ci = params.point_lights_col_int[li];
             let to_l = pl_pr.xyz - point;
-            let pl_dist = length(to_l);
-            if (pl_dist > 1e-3 && pl_dist < pl_pr.w) {
+            if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
+                continue;
+            }
+            let pl_d2 = dot(to_l, to_l);
+            if (pl_d2 > 1e-6 && pl_d2 < pl_pr.w * pl_pr.w) {
+                let pl_dist = sqrt(pl_d2);
                 let l_dir = to_l / pl_dist;
                 let pl_ndl = max(dot(normal, l_dir), 0.0);
                 if (pl_ndl > 0.001) {
                     let atten = point_light_falloff(pl_dist, pl_pr.w);
                     if (atten > 1e-5) {
+                        let pl_ci = params.point_lights_col_int[li];
                         let w = pl_ci.w * atten * pl_ndl;
                         var pl_vis = 1.0;
-                        if (bits_shadows && pl_dist > 1.5 && w > 0.015 && occluded(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias), state ^ (li * 131u + 17u))) {
-                            pl_vis = 0.0;
+                        if (bits_shadows && pl_shadow_rays < 4u && pl_dist > 1.5 && w > 0.018) {
+                            pl_shadow_rays = pl_shadow_rays + 1u;
+                            if (occluded(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias), state ^ (li * 131u + 17u))) {
+                                pl_vis = 0.0;
+                            }
                         }
                         pl_w_total = pl_w_total + w;
                         pl_w_lit = pl_w_lit + w * pl_vis;
@@ -1553,9 +1561,11 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             if (w_rgb > 1e-6) {
                 sum = sum + sample * w_rgb;
                 weight_sum = weight_sum + w_rgb;
-                let moments = textureLoad(history_moments, p, 0);
-                moment1 = moment1 + moments.x * w_rgb;
-                moment2 = moment2 + moments.y * w_rgb;
+                if (step < 4) {
+                    let moments = textureLoad(history_moments, p, 0);
+                    moment1 = moment1 + moments.x * w_rgb;
+                    moment2 = moment2 + moments.y * w_rgb;
+                }
             }
             if (filter_lf && ndot > 0.88) {
                 let w_lf = base_w * exp(-abs(centre_raw.a - sample_raw.a) * lf_edge_k);
@@ -1569,7 +1579,9 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let inv_w = 1.0 / weight_sum;
     let out_lf = select(centre_raw.a, sum_lf / weight_sum_lf, filter_lf);
     textureStore(out_colour, pixel, vec4<f32>(sum * inv_w, out_lf));
-    textureStore(out_moments, pixel, vec4<f32>(moment1 * inv_w, moment2 * inv_w, centre_moments.z, centre_moments.w));
+    let out_m1 = select(centre_moments.x, moment1 * inv_w, step < 4);
+    let out_m2 = select(centre_moments.y, moment2 * inv_w, step < 4);
+    textureStore(out_moments, pixel, vec4<f32>(out_m1, out_m2, centre_moments.z, centre_moments.w));
 }
 "#;
 
@@ -1592,7 +1604,8 @@ fn compose_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let c = textureLoad(colour, pixel, 0);
     let m = textureLoad(moments, pixel, 0);
     let gdim = vec2<f32>(textureDimensions(guide));
-    let gcoord = vec2<i32>(clamp((vec2<f32>(pixel) + vec2<f32>(0.5)) / extent.xy * gdim, vec2<f32>(0.0), gdim - vec2<f32>(1.0)));
+    let grid_scale = gdim / extent.xy;
+    let gcoord = vec2<i32>(clamp((vec2<f32>(pixel) + vec2<f32>(0.5)) * grid_scale, vec2<f32>(0.0), gdim - vec2<f32>(1.0)));
     let g = textureLoad(guide, gcoord, 0);
     let r = textureLoad(reflection, gcoord, 0);
     textureStore(out_colour, pixel, c);
@@ -3419,6 +3432,8 @@ impl RaywatcherGpu {
                 let dst_guide =
                     (!skip_inhouse || self.dlss_rr.is_none()).then_some(&self.grid.guide);
                 let dst_albedo = skip_inhouse.then_some(&self.grid.albedo);
+                packed.point_light_meta[2] = if dst_albedo.is_some() { 1.0 } else { 0.0 };
+                packed.point_light_meta[3] = if dst_guide.is_some() { 1.0 } else { 0.0 };
                 match dxr.trace(
                     encoder,
                     &packed,

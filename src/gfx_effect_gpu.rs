@@ -148,6 +148,8 @@ struct TextureEntry {
     #[allow(dead_code)]
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    /// Dominant linear emissive RGB extracted once at load time for RT effect lighting.
+    emissive_color: [f32; 3],
 }
 
 struct Bucket {
@@ -423,7 +425,11 @@ impl Draw {
                 },
             );
             let view = texture.create_view(&Default::default());
-            TextureEntry { texture, view }
+            TextureEntry {
+                texture,
+                view,
+                emissive_color: [1.0, 1.0, 1.0],
+            }
         };
         Ok(Self {
             device_format: format,
@@ -458,6 +464,14 @@ impl Draw {
 
     pub fn texture_count(&self) -> usize {
         self.textures.len()
+    }
+
+    /// Cached dominant linear emissive RGB colour of a loaded effect texture.
+    pub fn texture_emissive_color(&self, texture: &str) -> [f32; 3] {
+        self.textures
+            .get(texture)
+            .map(|e| e.emissive_color)
+            .unwrap_or([1.0, 1.0, 1.0])
     }
 
     pub fn vertex_count(&self) -> usize {
@@ -643,8 +657,15 @@ impl Draw {
                         ) {
                             Ok(texture) => {
                                 let view = texture.create_view(&Default::default());
-                                self.textures
-                                    .insert(key.texture.clone(), TextureEntry { texture, view });
+                                let emissive_color = model_texture_gpu::sample_emissive_rgb(&bytes);
+                                self.textures.insert(
+                                    key.texture.clone(),
+                                    TextureEntry {
+                                        texture,
+                                        view,
+                                        emissive_color,
+                                    },
+                                );
                             }
                             Err(error) => self.note_failure(&key.texture, &error),
                         }
@@ -656,7 +677,10 @@ impl Draw {
                     Err(error) => self.note_failure(&key.texture, &error),
                 }
             }
-            let entry = self.textures.get(&key.texture).unwrap_or(&self.fallback);
+            let (entry, loaded) = match self.textures.get(&key.texture) {
+                Some(e) => (e, true),
+                None => (&self.fallback, false),
+            };
             if !self.pipelines.contains_key(&key.pipeline) {
                 let pipeline = self.pipeline(device, key.pipeline)?;
                 self.pipelines.insert(key.pipeline, pipeline);
@@ -673,7 +697,6 @@ impl Draw {
                     self.pipelines.insert(motion, pipeline);
                 }
             }
-            let loaded = self.textures.contains_key(&key.texture);
             let was_fallback = self.buckets.get(key).is_some_and(|b| b.bound_fallback);
             if !self.buckets.contains_key(key) {
                 let binding = self.binding_for(device, entry, key.tile);

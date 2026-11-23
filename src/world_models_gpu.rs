@@ -1028,6 +1028,14 @@ impl World {
         &self.effect_quads
     }
 
+    /// Cached dominant linear emissive RGB colour of a loaded effect texture.
+    pub fn effect_texture_emissive(&self, texture: &str) -> [f32; 3] {
+        match &self.effects {
+            Some(draw) => draw.texture_emissive_color(texture),
+            None => [1.0, 1.0, 1.0],
+        }
+    }
+
     /// Roots whose animated graph would not build, as `origin: error`. Their
     /// lights still run, so these are kept apart from [`Self::gfx_failures`].
     pub fn effect_failures(&self) -> Vec<String> {

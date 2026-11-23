@@ -585,10 +585,11 @@ impl<'a> BuildState<'a> {
             }
         }
         let mid = partition.len() / 2;
+        // Boost #29: Fast finite float ordering avoids NaN/signbit overhead on 1M+ tris.
         partition.select_nth_unstable_by(mid, |&l, &r| {
             let lc = self.centroids[l as usize][axis];
             let rc = self.centroids[r as usize][axis];
-            lc.total_cmp(&rc).then_with(|| l.cmp(&r))
+            lc.partial_cmp(&rc).unwrap_or(std::cmp::Ordering::Equal)
         });
         let (left, right) = partition.split_at_mut(mid);
         self.build_node(left, depth + 1);
