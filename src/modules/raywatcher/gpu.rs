@@ -673,9 +673,8 @@ fn box_hit(minimum: vec3<f32>, maximum: vec3<f32>, origin: vec3<f32>, inv_dir: v
     return select(-1.0, t0, t0 <= t1);
 }
 
-fn triangle_hit(tri: Tri, origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> vec2<f32> {
-    // xy = (distance, barycentric u); no-hit is (-1, 0). Two-sided by
-    // construction, like the CPU reference.
+fn triangle_hit(tri: Tri, origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> vec3<f32> {
+    // xyz = (distance, barycentric u, barycentric v); no-hit is (-1, 0, 0).
     let a = tri.a.xyz;
     let b = tri.b.xyz;
     let c = tri.c.xyz;
@@ -684,24 +683,24 @@ fn triangle_hit(tri: Tri, origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: 
     let p = cross(dir, e2);
     let det = dot(e1, p);
     if (abs(det) < 1e-12) {
-        return vec2<f32>(-1.0, 0.0);
+        return vec3<f32>(-1.0, 0.0, 0.0);
     }
     let inv = 1.0 / det;
     let tv = origin - a;
     let u = dot(tv, p) * inv;
     if (u < -1e-6 || u > 1.000001) {
-        return vec2<f32>(-1.0, 0.0);
+        return vec3<f32>(-1.0, 0.0, 0.0);
     }
     let q = cross(tv, e1);
     let v = dot(dir, q) * inv;
     if (v < -1e-6 || u + v > 1.000001) {
-        return vec2<f32>(-1.0, 0.0);
+        return vec3<f32>(-1.0, 0.0, 0.0);
     }
     let t = dot(e2, q) * inv;
     if (t < t_min || t > t_max) {
-        return vec2<f32>(-1.0, 0.0);
+        return vec3<f32>(-1.0, 0.0, 0.0);
     }
-    return vec2<f32>(t, u);
+    return vec3<f32>(t, u, v);
 }
 
 struct Hit {
@@ -738,7 +737,7 @@ fn closest_hit(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> Hit
             for (var i = 0u; i < count; i = i + 1u) {
                 let tri_index = order[first + i];
                 let result = triangle_hit(tris[tri_index], origin, dir, t_min, hit.t);
-                if (result.x >= 0.0) {
+                if (result.x >= 0.0 && accept_opacity(tri_index, vec2<f32>(result.y, result.z), 0u)) {
                     hit.t = result.x;
                     hit.index = tri_index;
                 }
@@ -772,14 +771,32 @@ fn ign(px: vec2<u32>, frame: u32) -> f32 {
     return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715))));
 }
 
-fn accept_opacity(tri_index: u32, bary_u: f32, seed: u32) -> bool {
+fn unpack_alpha_mask25(f: f32) -> u32 {
+    let r = bitcast<u32>(f);
+    return (r & 0x00ffffffu) | ((r >> 7u) & 0x01000000u);
+}
+
+fn accept_opacity(tri_index: u32, bary: vec2<f32>, seed: u32) -> bool {
+    let raw_lo = bitcast<u32>(tris[tri_index].c.w);
+    let raw_hi = bitcast<u32>(tris[tri_index].n.w);
+    if ((raw_lo | raw_hi) != 0u) {
+        let lo25 = unpack_alpha_mask25(tris[tri_index].c.w);
+        let hi24 = unpack_alpha_mask25(tris[tri_index].n.w);
+        let s = clamp(bary.x, 0.0, 1.0);
+        let t = clamp(bary.y / max(1.0 - s, 1e-4), 0.0, 1.0);
+        let ix = min(u32(s * 7.0), 6u);
+        let iy = min(u32(t * 7.0), 6u);
+        let bit = iy * 7u + ix;
+        let hit_bit = select((hi24 >> (bit - 25u)) & 1u, (lo25 >> bit) & 1u, bit < 25u);
+        return hit_bit != 0u;
+    }
     let mat_count = max(u32(params.counts.z), 1u);
     let mat_idx = min(u32(round(tris[tri_index].b.w)), mat_count - 1u);
     let opacity = materials[mat_idx].surface.w;
     if (opacity >= 0.99) {
         return true;
     }
-    var h = tri_index * 747796405u ^ u32(bary_u * 4096.0) * 2891336453u ^ seed;
+    var h = tri_index * 747796405u ^ u32(bary.x * 4096.0) * 2891336453u ^ seed;
     h = h ^ (h >> 16u);
     return f32(h & 0xffffu) / 65536.0 < opacity;
 }
@@ -808,7 +825,7 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32, seed: u32
             for (var i = 0u; i < count; i = i + 1u) {
                 let tid = order[first + i];
                 let hit_res = triangle_hit(tris[tid], origin, dir, t_min, t_max);
-                if (hit_res.x >= 0.0 && accept_opacity(tid, hit_res.y, seed)) {
+                if (hit_res.x >= 0.0 && accept_opacity(tid, vec2<f32>(hit_res.y, hit_res.z), seed)) {
                     return true;
                 }
             }
@@ -1107,6 +1124,9 @@ fn trace_effect_light_reflections(origin: vec3<f32>, dir: vec3<f32>, max_t: f32,
         let r2_out = r_core * r_core * 6.0;
         if (d2 < r2_out) {
             let ci = params.point_lights_col_int[li];
+            if (ci.w < 0.05) {
+                continue;
+            }
             let u = clamp(d2 / max(r2_out, 0.1), 0.0, 1.0);
             let win = 1.0 - u;
             let orb = (win * win * win) * exp(-u * 3.5) / (1.0 + t_proj * 0.014);
@@ -1327,7 +1347,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
             var hit0 = h0.index != 0xffffffffu;
-            if (hit0 && !accept_opacity(h0.index, 0.5, state)) {
+            if (hit0 && !accept_opacity(h0.index, vec2<f32>(0.33, 0.33), state)) {
                 hit0 = occluded(ray_origin, params.sun_dir.xyz, shadow_t_min, params.lens.y, state);
             }
             var vis_sum = select(1.0, 0.0, hit0);
@@ -1485,128 +1505,98 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         accum_refl_dist = accum_refl_dist + refl_dist;
 
         if (bits_gi && !is_water && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
-            let gi_taps = select(select(1u, 2u, dist < 180.0), 4u, dist < 90.0);
-            var gi_sum = vec3<f32>(0.0);
-            let bounce_max_t = min(params.lens.y, 56.0);
-            let day_gi_scale = 0.03 + 0.97 * sun_strength;
-            for (var g = 0u; g < gi_taps; g = g + 1u) {
-                var throughput = vec3<f32>(1.0);
-                var b_origin = ray_origin;
-                var b_onb = onb;
-                var b_step_bias = bias;
-                let tap_bounces = select(1u, max_bounces, g == 0u);
-                for (var bounce = 0u; bounce < tap_bounces; bounce = bounce + 1u) {
-                    var u1 = next_f32(&state);
-                    var phi = 2.0 * PI * next_f32(&state);
-                    if (bounce == 0u) {
-                        u1 = (f32(g) + u1) / f32(gi_taps);
-                        phi = f32(g) * 2.39996323 + rot_angle + 1.0471975 + f32(s) * 0.7548776;
-                    }
-                    let r = sqrt(u1);
-                    let d = b_onb * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
-                    let bhit = closest_hit(b_origin, d, b_step_bias, bounce_max_t);
-                    if (bhit.index != 0xffffffffu) {
-                        let b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
-                        let bhit_world = b_origin + d * bhit.t;
-                        let b_bias = max(b_step_bias, length(bhit_world - params.eye.xyz) * 0.004);
-                        var b_shadow = 1.0;
-                        if (bits_shadows && bounce < 2u && b_ndl > 0.08) {
-                            let bhit_pos = bhit_world + bhit.normal * b_bias;
-                            if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ (g * 73u + bounce * 31u + 11u))) {
-                                b_shadow = 0.0;
-                            }
-                        }
-                        let bmaterial = material_of(bhit.index);
-                        let bkind = tris[bhit.index].a.w;
-                        let b_base_albedo = select(
-                            detail_offscreen_albedo(bhit_world, bhit.normal, bmaterial.albedo.rgb, bmaterial.surface.w),
-                            sample_terrain_albedo(bhit_world, bmaterial.albedo.rgb),
-                            bkind > 1.5 && bkind < 2.5,
-                        );
-                        let b_avg = dot(b_base_albedo, vec3<f32>(0.3333));
-                        let b_chroma = clamp(
-                            vec3<f32>(b_avg) + (b_base_albedo - vec3<f32>(b_avg)) * 1.25,
-                            vec3<f32>(0.04),
-                            vec3<f32>(0.90));
-                        gi_total_rays = gi_total_rays + 1.0;
-                        // Enhancement #5: Direct multi-bounce colored GI from nearby lanterns, portals & beams.
-                        var gi_pl_direct = vec3<f32>(0.0);
-                        if (bounce == 0u && bits_lighting && pl_count > 0u) {
-                            let pl_cap = min(pl_count, 24u);
-                            for (var pli = 0u; pli < pl_cap; pli = pli + 1u) {
-                                let pr = params.point_lights_pos_rad[pli];
-                                let to_pl = pr.xyz - bhit_world;
-                                if (abs(to_pl.x) >= pr.w || abs(to_pl.z) >= pr.w || abs(to_pl.y) >= pr.w) {
-                                    continue;
-                                }
-                                let r_ndl = dot(bhit.normal, to_pl);
-                                if (r_ndl <= 0.0) {
-                                    continue;
-                                }
-                                let d2 = dot(to_pl, to_pl);
-                                if (d2 <= 1e-4 || d2 >= pr.w * pr.w) {
-                                    continue;
-                                }
-                                let d_l = sqrt(d2);
-                                let att = point_light_falloff(d_l, pr.w);
-                                let ci = params.point_lights_col_int[pli];
-                                gi_pl_direct = gi_pl_direct + ci.rgb * (ci.w * att * (r_ndl / d_l) * 1.35);
-                            }
-                            gi_pl_direct = min(gi_pl_direct, vec3<f32>(1.6));
-                        }
-                        let off_in = b_chroma * (params.sun_colour.xyz * (b_ndl * b_shadow * 1.15) + gi_pl_direct + params.ambient.xyz * (params.tuning.z * 0.20));
-                        var incoming = off_in;
-                        if (bounce == 0u && bhit.t < 40.0) {
-                            let b_screen = sample_screen_radiance(bhit_world, bhit.t);
-                            let b_w = clamp(b_screen.a, 0.0, 1.0);
-                            let on_in = b_screen.rgb * (b_ndl * b_shadow * 0.85 * sun_strength + 0.10 * day_gi_scale);
-                            incoming = mix(off_in, on_in, b_w);
-                        }
-                        let cached = rc_query(bhit_world, bhit.normal, dist + bhit.t);
-                        if (cached.w >= 3.0) {
-                            let cache_blend = select(0.45, 0.25, bounce == 0u);
-                            incoming = mix(incoming, cached.rgb, cache_blend);
-                        }
-                        if (bounce == 0u && g == 0u && ((id.x + id.y + u32(params.frame.x)) & 3u) == 0u) {
-                            rc_update(bhit_world, bhit.normal, dist + bhit.t, incoming);
-                        }
-                        incoming = min(incoming, vec3<f32>(1.10));
-                        gi_sum = gi_sum + throughput * incoming * (params.tuning.w * 0.58 * (1.0 - fog_t));
-                        if (bounce + 1u < tap_bounces) {
-                            throughput = throughput * clamp(b_chroma * 1.02, vec3<f32>(0.08), vec3<f32>(0.84));
-                            if (bounce >= 2u) {
-                                let rr = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.30, 0.88);
-                                if (next_f32(&state) > rr) {
-                                    break;
-                                }
-                                throughput = throughput / rr;
-                            }
-                            b_origin = bhit_world + bhit.normal * b_bias;
-                            b_onb = orthonormal_basis(bhit.normal);
-                            b_step_bias = b_bias;
-                        }
-                    } else {
-                        gi_total_rays = gi_total_rays + 1.0;
-                        gi_sky_hits = gi_sky_hits + 1.0;
-                        let raw_sky = min(sample_sky_env(d), vec3<f32>(0.85));
-                        var vivid_sky = raw_sky;
-                        // Enhancement #15: Golden-hour sunset/dawn sky-bounce warm/cool color grading.
-                        if (params.sun_dir.y > 0.01 && params.sun_dir.y < 0.42 && sun_strength > 0.05) {
-                            let golden_w = 1.0 - smoothstep(0.10, 0.42, params.sun_dir.y);
-                            let sun_align = dot(
-                                normalize(vec3<f32>(d.x, 0.0, d.z) + vec3<f32>(1e-5, 0.0, 0.0)),
-                                normalize(vec3<f32>(params.sun_dir.x, 0.0, params.sun_dir.z) + vec3<f32>(1e-5, 0.0, 0.0)),
-                            );
-                            let warm_cool = mix(vec3<f32>(0.76, 0.84, 1.22), vec3<f32>(1.26, 0.94, 0.68), sun_align * 0.5 + 0.5);
-                            vivid_sky = vivid_sky * mix(vec3<f32>(1.0), warm_cool, golden_w * 0.55);
-                        }
-                        let sky_w = select(0.045, 0.075, bounce == 0u);
-                        gi_sum = gi_sum + throughput * vivid_sky * (params.tuning.w * sky_w * day_gi_scale * (1.0 - fog_t));
-                        break;
+            let bounce_max_t = min(params.lens.y, 65.0);
+            let day_gi_scale = 0.04 + 0.96 * sun_strength;
+            let u1 = next_f32(&state);
+            let phi = rot_angle + 1.0471975 + f32(s) * 2.39996323 + next_f32(&state) * 0.65;
+            let r = sqrt(u1);
+            let d = onb * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
+            let bhit = closest_hit(ray_origin, d, bias, bounce_max_t);
+            var gi_sample = vec3<f32>(0.0);
+            gi_total_rays = gi_total_rays + 1.0;
+            if (bhit.index != 0xffffffffu) {
+                let b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
+                let bhit_world = ray_origin + d * bhit.t;
+                let b_bias = max(bias, length(bhit_world - params.eye.xyz) * 0.004);
+                var b_shadow = 1.0;
+                if (bits_shadows && b_ndl > 0.06) {
+                    let bhit_pos = bhit_world + bhit.normal * b_bias;
+                    if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ 11u)) {
+                        b_shadow = 0.0;
                     }
                 }
+                let bmaterial = material_of(bhit.index);
+                let bkind = tris[bhit.index].a.w;
+                let b_base_albedo = select(
+                    detail_offscreen_albedo(bhit_world, bhit.normal, bmaterial.albedo.rgb, bmaterial.surface.w),
+                    sample_terrain_albedo(bhit_world, bmaterial.albedo.rgb),
+                    bkind > 1.5 && bkind < 2.5,
+                );
+                let b_avg = dot(b_base_albedo, vec3<f32>(0.3333));
+                let b_chroma = clamp(
+                    vec3<f32>(b_avg) + (b_base_albedo - vec3<f32>(b_avg)) * 1.35,
+                    vec3<f32>(0.04),
+                    vec3<f32>(0.92));
+                var gi_pl_direct = vec3<f32>(0.0);
+                if (bits_lighting && pl_count > 0u) {
+                    let pl_cap = min(pl_count, 8u);
+                    for (var pli = 0u; pli < pl_cap; pli = pli + 1u) {
+                        let pr = params.point_lights_pos_rad[pli];
+                        let to_pl = pr.xyz - bhit_world;
+                        if (abs(to_pl.x) >= pr.w || abs(to_pl.z) >= pr.w || abs(to_pl.y) >= pr.w) {
+                            continue;
+                        }
+                        let r_ndl = dot(bhit.normal, to_pl);
+                        if (r_ndl <= 0.0) {
+                            continue;
+                        }
+                        let d2 = dot(to_pl, to_pl);
+                        if (d2 <= 1e-4 || d2 >= pr.w * pr.w) {
+                            continue;
+                        }
+                        let d_l = sqrt(d2);
+                        let att = point_light_falloff(d_l, pr.w);
+                        let ci = params.point_lights_col_int[pli];
+                        gi_pl_direct = gi_pl_direct + ci.rgb * (ci.w * att * (r_ndl / d_l) * 1.45);
+                    }
+                    gi_pl_direct = min(gi_pl_direct, vec3<f32>(2.2));
+                }
+                let off_in = b_chroma * (
+                    params.sun_colour.xyz * (b_ndl * b_shadow * 1.65)
+                    + gi_pl_direct
+                    + params.ambient.xyz * (params.tuning.z * 0.24));
+                var incoming = off_in;
+                if (bhit.t < 28.0 && b_ndl > 0.04) {
+                    let b_screen = sample_screen_radiance(bhit_world, bhit.t);
+                    let b_w = clamp(b_screen.a, 0.0, 1.0);
+                    let on_in = b_screen.rgb * (b_ndl * b_shadow * 1.15 * sun_strength + 0.14 * day_gi_scale);
+                    incoming = mix(off_in, on_in, b_w);
+                }
+                let cached = rc_query(bhit_world, bhit.normal, dist + bhit.t);
+                if (max_bounces >= 2u && cached.w >= 2.0) {
+                    incoming = incoming + b_chroma * min(cached.rgb, vec3<f32>(1.8)) * 0.55;
+                }
+                if (luminance(incoming) > 0.02 && ((id.x + id.y + u32(params.frame.x)) & 3u) == 0u) {
+                    rc_update(bhit_world, bhit.normal, dist + bhit.t, incoming);
+                }
+                incoming = min(incoming, vec3<f32>(2.2));
+                gi_sample = incoming * (params.tuning.w * 0.85 * (1.0 - fog_t));
+            } else {
+                gi_sky_hits = gi_sky_hits + 1.0;
+                let raw_sky = min(sample_sky_env(d), vec3<f32>(1.15));
+                var vivid_sky = raw_sky;
+                if (params.sun_dir.y > 0.01 && params.sun_dir.y < 0.42 && sun_strength > 0.05) {
+                    let golden_w = 1.0 - smoothstep(0.10, 0.42, params.sun_dir.y);
+                    let sun_align = dot(
+                        normalize(vec3<f32>(d.x, 0.0, d.z) + vec3<f32>(1e-5, 0.0, 0.0)),
+                        normalize(vec3<f32>(params.sun_dir.x, 0.0, params.sun_dir.z) + vec3<f32>(1e-5, 0.0, 0.0)),
+                    );
+                    let warm_cool = mix(vec3<f32>(0.76, 0.84, 1.22), vec3<f32>(1.26, 0.94, 0.68), sun_align * 0.5 + 0.5);
+                    vivid_sky = vivid_sky * mix(vec3<f32>(1.0), warm_cool, golden_w * 0.55);
+                }
+                gi_sample = vivid_sky * (params.tuning.w * 0.28 * day_gi_scale * (1.0 - fog_t));
             }
-            accum_gi = accum_gi + min(gi_sum * (gi_fade / f32(gi_taps)), vec3<f32>(1.15));
+            accum_gi = accum_gi + min(gi_sample * gi_fade, vec3<f32>(2.2));
         }
     }
 
@@ -1975,7 +1965,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let bent_sky = mix(0.92, 1.0, clamp(bent_normal.y * 0.5 + 0.5, 0.0, 1.0));
         let v_ao = select(1.0, avg_open * bent_sky * sky_portal_vis, bits_ao);
         let gi_active = bits_gi && !is_water && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01;
-        let amb_keep = select(1.0, mix(1.0, 0.92, gi_fade), gi_active);
+        let amb_keep = select(1.0, mix(1.0, 0.44, gi_fade), gi_active);
         let night_dark_scale = mix(0.28, 1.0, smoothstep(0.0, 0.25, sun_strength));
         let separated_lf = (amb_base * v_ao * amb_keep * night_dark_scale + sun_base * v_sun) * point_shadow_mod;
         out_lf = mix(separated_lf, 1.0, fog_t);

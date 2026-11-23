@@ -218,6 +218,8 @@ pub struct RtTreeTriangle {
     pub albedo: [f32; 3],
     pub roughness: f32,
     pub opacity: f32,
+    /// Real 7x7 (49-bit) texture-sampled alpha cutout mask (`0` = opaque/unmasked).
+    pub alpha_mask: u64,
 }
 
 /// Local-space SpeedTree LOD meshes retained for Raywatcher RT harvesting.
@@ -243,6 +245,54 @@ fn sample_rgba_uv(img: &image::RgbaImage, uv: [f32; 2]) -> ([f32; 3], f32) {
     )
 }
 
+/// Sample a real 7x7 (49-cell) barycentric alpha cutout bitmask and alpha-weighted
+/// linear albedo from `img` over triangle UVs `(u0, u1, u2)`.
+/// Matches the exact `(s, t)` barycentric mapping decoded by `accept_opacity` in HLSL/WGSL.
+fn sample_tri_alpha_mask49(
+    img: &image::RgbaImage,
+    u0: [f32; 2],
+    u1: [f32; 2],
+    u2: [f32; 2],
+    cutoff: f32,
+) -> (u64, [f32; 3], u32) {
+    let mut mask = 0u64;
+    let mut rgb_sum = [0.0f32; 3];
+    let mut w_sum = 0.0f32;
+    let mut hits = 0u32;
+    for iy in 0..7u32 {
+        let t = (iy as f32 + 0.5) / 7.0;
+        for ix in 0..7u32 {
+            let s = (ix as f32 + 0.5) / 7.0;
+            let bx = s;
+            let by = t * (1.0 - s);
+            let bw = 1.0 - bx - by;
+            let uv = [
+                u0[0] * bw + u1[0] * bx + u2[0] * by,
+                u0[1] * bw + u1[1] * bx + u2[1] * by,
+            ];
+            let (rgb, a) = sample_rgba_uv(img, uv);
+            if a >= cutoff {
+                mask |= 1u64 << (iy * 7 + ix);
+                hits += 1;
+                rgb_sum[0] += rgb[0] * a;
+                rgb_sum[1] += rgb[1] * a;
+                rgb_sum[2] += rgb[2] * a;
+                w_sum += a;
+            }
+        }
+    }
+    let albedo = if w_sum > 1e-4 {
+        [
+            (rgb_sum[0] / w_sum).clamp(0.04, 0.92),
+            (rgb_sum[1] / w_sum).clamp(0.04, 0.92),
+            (rgb_sum[2] / w_sum).clamp(0.04, 0.92),
+        ]
+    } else {
+        [0.14, 0.28, 0.11]
+    };
+    (mask, albedo, hits)
+}
+
 /// Emit a compact alpha-tested crossed-canopy + trunk fallback (NOT a box) when
 /// a distant tree exceeds the RT triangle budget.
 pub fn push_alpha_canopy_fallback(pos: glam::Vec3, height: f32, out: &mut Vec<RtTreeTriangle>) {
@@ -266,6 +316,7 @@ pub fn push_alpha_canopy_fallback(pos: glam::Vec3, height: f32, out: &mut Vec<Rt
             albedo: [0.16, 0.28, 0.12],
             roughness: 0.85,
             opacity: 0.58,
+            alpha_mask: 0,
         });
         out.push(RtTreeTriangle {
             a: c_bot,
@@ -275,6 +326,7 @@ pub fn push_alpha_canopy_fallback(pos: glam::Vec3, height: f32, out: &mut Vec<Rt
             albedo: [0.16, 0.28, 0.12],
             roughness: 0.85,
             opacity: 0.58,
+            alpha_mask: 0,
         });
     }
     // Narrow trunk card.
@@ -290,6 +342,7 @@ pub fn push_alpha_canopy_fallback(pos: glam::Vec3, height: f32, out: &mut Vec<Rt
         albedo: [0.22, 0.15, 0.09],
         roughness: 0.90,
         opacity: 1.0,
+        alpha_mask: 0,
     });
 }
 
@@ -634,89 +687,31 @@ impl FarTrees {
                             }
                             let norm = cross.normalize();
                             if is_foliage {
-                                // Subdivide each frond card triangle into 4 midpoint sub-triangles
-                                // and discard empty transparent corners using real `tree.composite` alpha.
-                                let ab = (a + b) * 0.5;
-                                let bc = (b + c) * 0.5;
-                                let ca = (c + a) * 0.5;
-                                let uv_ab =
-                                    [(v0.uv[0] + v1.uv[0]) * 0.5, (v0.uv[1] + v1.uv[1]) * 0.5];
-                                let uv_bc =
-                                    [(v1.uv[0] + v2.uv[0]) * 0.5, (v1.uv[1] + v2.uv[1]) * 0.5];
-                                let uv_ca =
-                                    [(v2.uv[0] + v0.uv[0]) * 0.5, (v2.uv[1] + v0.uv[1]) * 0.5];
-                                let subs = [
-                                    (a, ab, ca, v0.uv, uv_ab, uv_ca),
-                                    (ab, b, bc, uv_ab, v1.uv, uv_bc),
-                                    (ca, bc, c, uv_ca, uv_bc, v2.uv),
-                                    (ab, bc, ca, uv_ab, uv_bc, uv_ca),
-                                ];
-                                for (sa, sb, sc, u0, u1, u2) in subs {
-                                    // Sample 3 points per frond sub-triangle so solid
-                                    // fronds never get punctured into triangular holes.
-                                    let uv_c = [
-                                        (u0[0] + u1[0] + u2[0]) / 3.0,
-                                        (u0[1] + u1[1] + u2[1]) / 3.0,
-                                    ];
-                                    let uv_1 = [(u0[0] + u1[0]) * 0.5, (u0[1] + u1[1]) * 0.5];
-                                    let uv_2 = [(u1[0] + u2[0]) * 0.5, (u1[1] + u2[1]) * 0.5];
-                                    let (c0, a0) = sample_rgba_uv(img, uv_c);
-                                    let (c1, a1) = sample_rgba_uv(img, uv_1);
-                                    let (c2, a2) = sample_rgba_uv(img, uv_2);
-                                    let a_avg = (a0 + a1 + a2) / 3.0;
-                                    let a_max = a0.max(a1).max(a2);
-                                    if a_avg < 0.20 && a_max < 0.34 {
-                                        continue;
-                                    }
-                                    let wsum = (a0 + a1 + a2).max(1e-4);
-                                    let albedo = [
-                                        ((c0[0] * a0 + c1[0] * a1 + c2[0] * a2) / wsum)
-                                            .clamp(0.05, 0.92),
-                                        ((c0[1] * a0 + c1[1] * a1 + c2[1] * a2) / wsum)
-                                            .clamp(0.05, 0.92),
-                                        ((c0[2] * a0 + c1[2] * a1 + c2[2] * a2) / wsum)
-                                            .clamp(0.05, 0.92),
-                                    ];
-                                    // Give SpeedTree frond sub-triangles organic 3D displacement + a
-                                    // perpendicular micro-fin so fronds never appear as flat 2D planes
-                                    // in water reflections or shadows.
-                                    let sub_c = (sa + sb + sc) / 3.0;
-                                    let edge_len = (sb - sa).length().clamp(0.08, 1.4);
-                                    let lift =
-                                        ((sub_c.x * 4.3 + sub_c.z * 5.7).sin()) * edge_len * 0.16;
-                                    let pa = sa + norm * lift;
-                                    let pb = sb - norm * (lift * 0.6);
-                                    let pc = sc + norm * (lift * 0.4);
-                                    let f_op = a_avg.max(a_max * 0.85).clamp(0.64, 0.92);
-                                    lod_tris.push(RtTreeTriangle {
-                                        a: pa,
-                                        b: pb,
-                                        c: pc,
-                                        normal: norm,
-                                        albedo,
-                                        roughness: 0.85,
-                                        opacity: f_op,
-                                    });
-                                    if a_avg >= 0.48 {
-                                        let tangent = (sb - sa).normalize_or_zero();
-                                        let fin_r = (edge_len * 0.32).clamp(0.08, 0.55);
-                                        let fa = sub_c - tangent * fin_r;
-                                        let fb = sub_c + tangent * fin_r;
-                                        let fc = sub_c + norm * (fin_r * 1.15);
-                                        let fin_n = (fb - fa).cross(fc - fa).normalize_or_zero();
-                                        if fin_n.length_squared() > 0.25 {
-                                            lod_tris.push(RtTreeTriangle {
-                                                a: fa,
-                                                b: fb,
-                                                c: fc,
-                                                normal: fin_n,
-                                                albedo,
-                                                roughness: 0.85,
-                                                opacity: (f_op * 0.92).clamp(0.56, 0.88),
-                                            });
-                                        }
-                                    }
+                                let frond_cutoff = lod
+                                    .frond_alpha_ref
+                                    .filter(|r| *r > 1.0)
+                                    .map(|r| (r / 255.0).clamp(0.18, 0.55))
+                                    .unwrap_or(0.32);
+                                let (mut mask, mut albedo, mut hits) =
+                                    sample_tri_alpha_mask49(img, v0.uv, v1.uv, v2.uv, frond_cutoff);
+                                if hits == 0 {
+                                    (mask, albedo, hits) =
+                                        sample_tri_alpha_mask49(img, v0.uv, v1.uv, v2.uv, 0.12);
                                 }
+                                if hits == 0 {
+                                    continue;
+                                }
+                                let coverage = hits as f32 / 49.0;
+                                lod_tris.push(RtTreeTriangle {
+                                    a,
+                                    b,
+                                    c,
+                                    normal: norm,
+                                    albedo,
+                                    roughness: 0.85,
+                                    opacity: (0.45 + 0.48 * coverage).clamp(0.45, 0.92),
+                                    alpha_mask: mask,
+                                });
                             } else {
                                 let uv_mid = [
                                     (v0.uv[0] + v1.uv[0] + v2.uv[0]) / 3.0,
@@ -731,6 +726,7 @@ impl FarTrees {
                                     albedo,
                                     roughness: 0.90,
                                     opacity: 1.0,
+                                    alpha_mask: 0,
                                 });
                             }
                         }
@@ -738,58 +734,43 @@ impl FarTrees {
                     for leaf in &lod.leaves {
                         let center =
                             glam::Vec3::new(leaf.center[0], leaf.center[2], leaf.center[1]);
-                        // Sample a 3x3 alpha grid across the leaf's UV tile in `tree.composite`
-                        // to compute true opaque foliage coverage & average leaf albedo.
-                        let mut rgb_sum = [0.0f32; 3];
-                        let mut alpha_sum = 0.0f32;
-                        let mut opaque_hits = 0u32;
-                        for gy in 0..3 {
-                            let tv = (gy as f32 + 0.5) / 3.0;
-                            for gx in 0..3 {
-                                let tu = (gx as f32 + 0.5) / 3.0;
-                                let u_top = leaf.uv[0][0] * (1.0 - tu) + leaf.uv[1][0] * tu;
-                                let v_top = leaf.uv[0][1] * (1.0 - tu) + leaf.uv[1][1] * tu;
-                                let u_bot = leaf.uv[3][0] * (1.0 - tu) + leaf.uv[2][0] * tu;
-                                let v_bot = leaf.uv[3][1] * (1.0 - tu) + leaf.uv[2][1] * tu;
-                                let uv = [
-                                    u_top * (1.0 - tv) + u_bot * tv,
-                                    v_top * (1.0 - tv) + v_bot * tv,
-                                ];
-                                let (rgb, a) = sample_rgba_uv(&tree.composite, uv);
-                                if a >= 0.28 {
-                                    opaque_hits += 1;
-                                    alpha_sum += a;
-                                    rgb_sum[0] += rgb[0] * a;
-                                    rgb_sum[1] += rgb[1] * a;
-                                    rgb_sum[2] += rgb[2] * a;
-                                }
-                            }
+                        // Sample exact 7x7 (49-bit) alpha cutout silhouettes from `tree.composite`
+                        // for both triangles of this SpeedTree leaf card so shadows and reflections
+                        // reproduce real individual leaves instead of flat boxy quads/diamonds.
+                        let leaf_cutoff = 84.0 / 255.0;
+                        let (mut m0, mut a0, mut h0) = sample_tri_alpha_mask49(
+                            &tree.composite,
+                            leaf.uv[0],
+                            leaf.uv[1],
+                            leaf.uv[2],
+                            leaf_cutoff,
+                        );
+                        let (mut m1, mut a1, mut h1) = sample_tri_alpha_mask49(
+                            &tree.composite,
+                            leaf.uv[0],
+                            leaf.uv[2],
+                            leaf.uv[3],
+                            leaf_cutoff,
+                        );
+                        if h0 + h1 == 0 {
+                            (m0, a0, h0) = sample_tri_alpha_mask49(
+                                &tree.composite,
+                                leaf.uv[0],
+                                leaf.uv[1],
+                                leaf.uv[2],
+                                0.12,
+                            );
+                            (m1, a1, h1) = sample_tri_alpha_mask49(
+                                &tree.composite,
+                                leaf.uv[0],
+                                leaf.uv[2],
+                                leaf.uv[3],
+                                0.12,
+                            );
                         }
-                        if opaque_hits < 1 {
-                            let c_uv = [
-                                (leaf.uv[0][0] + leaf.uv[1][0] + leaf.uv[2][0] + leaf.uv[3][0])
-                                    * 0.25,
-                                (leaf.uv[0][1] + leaf.uv[1][1] + leaf.uv[2][1] + leaf.uv[3][1])
-                                    * 0.25,
-                            ];
-                            let (rgb, a) = sample_rgba_uv(&tree.composite, c_uv);
-                            if a >= 0.12 {
-                                opaque_hits = 1;
-                                alpha_sum = a;
-                                rgb_sum[0] = rgb[0] * a;
-                                rgb_sum[1] = rgb[1] * a;
-                                rgb_sum[2] = rgb[2] * a;
-                            }
-                        }
-                        if opaque_hits < 1 || alpha_sum <= 1e-4 {
+                        if h0 + h1 == 0 {
                             continue;
                         }
-                        let albedo = [
-                            (rgb_sum[0] / alpha_sum).clamp(0.05, 0.92),
-                            (rgb_sum[1] / alpha_sum).clamp(0.05, 0.92),
-                            (rgb_sum[2] / alpha_sum).clamp(0.05, 0.92),
-                        ];
-                        let coverage = opaque_hits as f32 / 9.0;
                         let n = leaf
                             .normal
                             .map(|n| glam::Vec3::new(n[0], n[2], n[1]).normalize_or_zero())
@@ -802,41 +783,49 @@ impl FarTrees {
                         };
                         let right = up.cross(n).normalize_or_zero();
                         let bitan = n.cross(right).normalize_or_zero();
-                        // Emit 2 orthogonal crossed 3D organic leaf-cluster diamonds (4 tris)
-                        // instead of a single flat 2D card plane, so tree canopies have true 3D
-                        // bush volume from every reflection and sun-shadow angle with zero flat planes.
                         let mut avg_r = 0.0f32;
                         for j in 0..4 {
                             let c = leaf.corners[j];
                             avg_r += (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
                         }
-                        let base_r = (avg_r * 0.25).clamp(0.18, 2.2);
-                        let r_h = base_r * (0.64 + 0.22 * coverage.sqrt()).clamp(0.64, 0.86);
-                        let r_v = r_h * 0.88;
-                        let opacity = (0.68 + 0.26 * coverage).clamp(0.68, 0.92);
-                        // Tilt axes per leaf cluster so neighbouring leaves never align into flat sheets.
+                        // Half-extent of the SpeedTree leaf card from its corner radius (diagonal / sqrt(2)).
+                        let half = ((avg_r * 0.25) * 0.7071).clamp(0.16, 2.2);
                         let phase = (center.x * 3.17 + center.y * 5.41 + center.z * 2.73).sin();
                         let (s_a, c_a) = (phase * 1.1).sin_cos();
                         let ax1 = (right * c_a + n * s_a).normalize_or_zero();
                         let ax2 = (n * c_a - right * s_a).normalize_or_zero();
-                        let up_axis = (bitan * 0.88 + glam::Vec3::Y * 0.12).normalize_or_zero();
+                        let up_axis = (bitan * 0.90 + glam::Vec3::Y * 0.10).normalize_or_zero();
+                        // Emit 2 orthogonal crossed 3D leaf cards carrying the exact 49-bit
+                        // texture silhouette so foliage has true 3D volume and crisp leaf cutouts
+                        // from every shadow and reflection angle.
                         for &(horiz, norm_dir) in &[(ax1, ax2), (ax2, ax1)] {
-                            let top = center + up_axis * r_v;
-                            let bot = center - up_axis * r_v;
-                            let left = center - horiz * r_h;
-                            let rgt = center + horiz * r_h;
-                            for &(pa, pb, pc) in &[(bot, rgt, top), (bot, top, left)] {
-                                if (pb - pa).cross(pc - pa).length_squared() > 1e-8 {
-                                    lod_tris.push(RtTreeTriangle {
-                                        a: pa,
-                                        b: pb,
-                                        c: pc,
-                                        normal: norm_dir,
-                                        albedo,
-                                        roughness: 0.84,
-                                        opacity,
-                                    });
-                                }
+                            let c0 = center - horiz * half - up_axis * half;
+                            let c1 = center + horiz * half - up_axis * half;
+                            let c2 = center + horiz * half + up_axis * half;
+                            let c3 = center - horiz * half + up_axis * half;
+                            if h0 > 0 && (c1 - c0).cross(c2 - c0).length_squared() > 1e-8 {
+                                lod_tris.push(RtTreeTriangle {
+                                    a: c0,
+                                    b: c1,
+                                    c: c2,
+                                    normal: norm_dir,
+                                    albedo: a0,
+                                    roughness: 0.84,
+                                    opacity: (0.45 + 0.48 * (h0 as f32 / 49.0)).clamp(0.45, 0.92),
+                                    alpha_mask: m0,
+                                });
+                            }
+                            if h1 > 0 && (c2 - c0).cross(c3 - c0).length_squared() > 1e-8 {
+                                lod_tris.push(RtTreeTriangle {
+                                    a: c0,
+                                    b: c2,
+                                    c: c3,
+                                    normal: norm_dir,
+                                    albedo: a1,
+                                    roughness: 0.84,
+                                    opacity: (0.45 + 0.48 * (h1 as f32 / 49.0)).clamp(0.45, 0.92),
+                                    alpha_mask: m1,
+                                });
                             }
                         }
                     }
@@ -1767,22 +1756,23 @@ pub fn harvest_rt_tree_species(
     let mut real_tris = 0usize;
     let mut fallback_canopies = 0usize;
     let start_len = out.len();
-    const LOD0_D2: f32 = 32.0 * 32.0;
-    const LOD1_D2: f32 = 120.0 * 120.0;
+    const LOD0_D2: f32 = 85.0 * 85.0;
+    const LOD1_D2: f32 = 220.0 * 220.0;
 
     for (d2, si, pos) in candidates {
         let sp = &species_list[si];
-        // Use LOD0 only very close to the camera and medium/coarse real LODs
-        // further out so 5x-8x more trees fit inside the real-mesh RT budget
-        // with full trunk/branch/leaf silhouettes instead of falling back.
         let _ = scale;
-        let lod_idx = if d2 < LOD0_D2 {
+        let mut lod_idx = if d2 < LOD0_D2 {
             0
         } else if d2 < LOD1_D2 {
             1.min(sp.lods.len() - 1)
         } else {
             sp.lods.len() - 1
         };
+        // Never pick a sparse/leaf-stripped outer SpeedTree LOD when a finer LOD has full foliage.
+        while lod_idx > 0 && sp.lods[lod_idx].len() < 12 && !sp.lods[lod_idx - 1].is_empty() {
+            lod_idx -= 1;
+        }
         let src_tris = &sp.lods[lod_idx];
         let used = out.len() - start_len;
         if !src_tris.is_empty() && used + src_tris.len() <= tri_budget {
@@ -1821,6 +1811,7 @@ mod raywatcher_tree_tests {
             albedo: [0.25, 0.16, 0.08],
             roughness: 0.9,
             opacity: 1.0,
+            alpha_mask: 0,
         };
         let leaf = RtTreeTriangle {
             a: glam::Vec3::new(-1.0, 4.0, 0.0),
@@ -1830,6 +1821,7 @@ mod raywatcher_tree_tests {
             albedo: [0.18, 0.42, 0.14],
             roughness: 0.84,
             opacity: 0.65,
+            alpha_mask: 0,
         };
         let species = RtTreeSpecies {
             height: 8.0,

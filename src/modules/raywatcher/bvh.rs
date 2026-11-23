@@ -41,14 +41,55 @@ impl RayTriangle {
         Self::with_kind(a, b, c, normal, material, 0.)
     }
 
-    /// Construct a triangle with a per-triangle source kind stored in
-    /// `a[3]` (keeping `normal` strictly `(nx, ny, nz, 0.0)`).
+    /// Bitmask with all 49 cells of the 7x7 per-triangle alpha cutout mask set.
+    pub const ALPHA_MASK49_ALL: u64 = (1u64 << 49) - 1;
+
+    /// Pack 25 mask bits into a guaranteed finite normal `f32` (bits 0..23 in
+    /// mantissa + exponent LSB, bit 24 in sign bit, exponent prefix `0x3f00_0000`
+    /// -> exponent 0x7e/0x7f, never NaN/Inf/subnormal).
+    #[inline]
+    pub fn pack_alpha_mask25(bits: u32) -> f32 {
+        let b = bits & 0x01ff_ffff;
+        let raw = 0x3f00_0000u32 | (b & 0x00ff_ffff) | ((b & 0x0100_0000) << 7);
+        f32::from_bits(raw)
+    }
+
+    /// Pack a 49-bit (7x7) barycentric alpha cutout mask into `(c.w, normal.w)`.
+    /// Returns `(0.0, 0.0)` when unmasked (`mask == 0` or all 49 bits set).
+    #[inline]
+    pub fn pack_alpha_mask49(mask: u64) -> (f32, f32) {
+        let m = mask & Self::ALPHA_MASK49_ALL;
+        if m == 0 || m == Self::ALPHA_MASK49_ALL {
+            (0.0, 0.0)
+        } else {
+            let lo = (m & 0x01ff_ffff) as u32;
+            let hi = ((m >> 25) & 0x00ff_ffff) as u32;
+            (Self::pack_alpha_mask25(lo), Self::pack_alpha_mask25(hi))
+        }
+    }
+
+    /// Construct a triangle with a per-triangle source kind stored in `a[3]`.
     pub fn with_kind(a: Vec3, b: Vec3, c: Vec3, normal: Vec3, material: u32, kind: f32) -> Self {
+        Self::with_kind_and_mask(a, b, c, normal, material, kind, 0)
+    }
+
+    /// Construct a triangle with source kind in `a[3]` and an optional 7x7 (49-bit)
+    /// real texture alpha cutout mask packed into `(c[3], normal[3])`.
+    pub fn with_kind_and_mask(
+        a: Vec3,
+        b: Vec3,
+        c: Vec3,
+        normal: Vec3,
+        material: u32,
+        kind: f32,
+        alpha_mask: u64,
+    ) -> Self {
+        let (cw, nw) = Self::pack_alpha_mask49(alpha_mask);
         Self {
             a: [a.x, a.y, a.z, kind],
             b: [b.x, b.y, b.z, material as f32],
-            c: [c.x, c.y, c.z, 0.],
-            normal: [normal.x, normal.y, normal.z, 0.],
+            c: [c.x, c.y, c.z, cw],
+            normal: [normal.x, normal.y, normal.z, nw],
         }
     }
 

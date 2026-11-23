@@ -847,6 +847,8 @@ pub struct RtMeshTriangle {
     /// and blend/cutout draw band (solid = 1.0, alpha-blended leaf/banner cards
     /// and cutout foliage < 1.0).
     pub opacity: f32,
+    /// Real 7x7 (49-bit) texture-sampled alpha cutout mask (`0` = opaque/unmasked).
+    pub alpha_mask: u64,
 }
 
 /// Hard per-page cap on retained CPU triangles so whole-world preloads across
@@ -999,38 +1001,96 @@ fn extract_rt_triangles(
                 } else {
                     None
                 };
+                // For any BMD triangle whose texture is not solidly opaque (`ta < 0.96`,
+                // e.g. BMD trees, blossoms, willows, bamboo, bushes, railings, banners),
+                // sample the exact 7x7 (49-bit) texture alpha cutout mask with zero 4x
+                // triangle blowup and zero page-size cutoff.
+                let mut alpha_mask = 0u64;
+                let mut mask_albedo = None;
+                let mut mask_opacity = None;
                 if let Some(ta) = tex_alpha {
-                    if ta < 0.08 {
-                        t += 1;
-                        continue;
+                    if ta < 0.96 {
+                        let mut m_bits = 0u64;
+                        let mut m_rgb = [0.0f32; 3];
+                        let mut m_w = 0.0f32;
+                        let mut m_hits = 0u32;
+                        let mut m_max_a = 0.0f32;
+                        for iy in 0..7u32 {
+                            let tv = (iy as f32 + 0.5) / 7.0;
+                            for ix in 0..7u32 {
+                                let sv = (ix as f32 + 0.5) / 7.0;
+                                let bx = sv;
+                                let by = tv * (1.0 - sv);
+                                let bw = 1.0 - bx - by;
+                                let su = [
+                                    v0.uv[0] * bw + v1.uv[0] * bx + v2.uv[0] * by,
+                                    v0.uv[1] * bw + v1.uv[1] * bx + v2.uv[1] * by,
+                                ];
+                                if let Some((c, a)) =
+                                    sample_atlas_rgba(atlas, atlas_w, atlas_h, v0.color, kind, su)
+                                {
+                                    if a > m_max_a {
+                                        m_max_a = a;
+                                    }
+                                    if a >= 0.30 {
+                                        m_bits |= 1u64 << (iy * 7 + ix);
+                                        m_hits += 1;
+                                        m_rgb[0] += c[0] * a;
+                                        m_rgb[1] += c[1] * a;
+                                        m_rgb[2] += c[2] * a;
+                                        m_w += a;
+                                    }
+                                }
+                            }
+                        }
+                        if m_hits == 0 && m_max_a < 0.12 {
+                            t += 1;
+                            continue;
+                        }
+                        if m_hits > 0 && m_hits < 49 {
+                            alpha_mask = m_bits;
+                            mask_opacity =
+                                Some((0.45 + 0.48 * (m_hits as f32 / 49.0)).clamp(0.45, 0.92));
+                            if m_w > 1e-4 {
+                                mask_albedo = Some([
+                                    (m_rgb[0] / m_w).clamp(0.06, 0.95),
+                                    (m_rgb[1] / m_w).clamp(0.06, 0.95),
+                                    (m_rgb[2] / m_w).clamp(0.06, 0.95),
+                                ]);
+                            }
+                        }
                     }
                 }
-                let albedo = if tex_rgb_w > 1e-4 {
-                    [
-                        (tex_rgb[0] / tex_rgb_w).clamp(0.06, 0.95),
-                        (tex_rgb[1] / tex_rgb_w).clamp(0.06, 0.95),
-                        (tex_rgb[2] / tex_rgb_w).clamp(0.06, 0.95),
-                    ]
-                } else {
-                    let has_rgb = ((v0.diffuse | v1.diffuse | v2.diffuse) & 0x00ff_ffff) != 0;
-                    if has_rgb {
-                        let c0 = decode(v0.diffuse);
-                        let c1 = decode(v1.diffuse);
-                        let c2 = decode(v2.diffuse);
+                let albedo = mask_albedo.unwrap_or_else(|| {
+                    if tex_rgb_w > 1e-4 {
                         [
-                            ((c0[0] + c1[0] + c2[0]) / 3.0).clamp(0.12, 0.92),
-                            ((c0[1] + c1[1] + c2[1]) / 3.0).clamp(0.12, 0.92),
-                            ((c0[2] + c1[2] + c2[2]) / 3.0).clamp(0.12, 0.92),
+                            (tex_rgb[0] / tex_rgb_w).clamp(0.06, 0.95),
+                            (tex_rgb[1] / tex_rgb_w).clamp(0.06, 0.95),
+                            (tex_rgb[2] / tex_rgb_w).clamp(0.06, 0.95),
                         ]
                     } else {
-                        [0.42, 0.40, 0.37]
+                        let has_rgb = ((v0.diffuse | v1.diffuse | v2.diffuse) & 0x00ff_ffff) != 0;
+                        if has_rgb {
+                            let c0 = decode(v0.diffuse);
+                            let c1 = decode(v1.diffuse);
+                            let c2 = decode(v2.diffuse);
+                            [
+                                ((c0[0] + c1[0] + c2[0]) / 3.0).clamp(0.12, 0.92),
+                                ((c0[1] + c1[1] + c2[1]) / 3.0).clamp(0.12, 0.92),
+                                ((c0[2] + c1[2] + c2[2]) / 3.0).clamp(0.12, 0.92),
+                            ]
+                        } else {
+                            [0.42, 0.40, 0.37]
+                        }
                     }
-                };
+                });
                 let a0 = ((v0.diffuse >> 24) & 0xff) as f32 / 255.0;
                 let a1 = ((v1.diffuse >> 24) & 0xff) as f32 / 255.0;
                 let a2 = ((v2.diffuse >> 24) & 0xff) as f32 / 255.0;
                 let v_alpha = ((a0 + a1 + a2) / 3.0).clamp(0.0, 1.0);
-                let opacity = if let Some(ta) = tex_alpha {
+                let opacity = if let Some(mo) = mask_opacity {
+                    mo
+                } else if let Some(ta) = tex_alpha {
                     if ta < 0.92 {
                         (ta * 0.80).clamp(0.28, 0.86)
                     } else if is_sdr_blend {
@@ -1057,91 +1117,6 @@ fn extract_rt_triangles(
                 } else {
                     1.0
                 };
-                // For alpha-cutout BMD foliage cards (0.08 <= tex_alpha < 0.90),
-                // subdivide into 4 midpoint sub-triangles and drop empty transparent corners
-                // so BMD trees (City of Plume giant tree, blossoms) never cast cardbox shadows.
-                if let Some(ta) = tex_alpha {
-                    if ta < 0.90 && out.len() < 96_000 && out.len() + 4 <= MAX_RT_TRIS_PER_PAGE {
-                        let mid3 = |p: [f32; 3], q: [f32; 3]| {
-                            [
-                                (p[0] + q[0]) * 0.5,
-                                (p[1] + q[1]) * 0.5,
-                                (p[2] + q[2]) * 0.5,
-                            ]
-                        };
-                        let mid2 =
-                            |p: [f32; 2], q: [f32; 2]| [(p[0] + q[0]) * 0.5, (p[1] + q[1]) * 0.5];
-                        let ab = mid3(a, b);
-                        let bc = mid3(b, c);
-                        let ca = mid3(c, a);
-                        let uv_ab = mid2(v0.uv, v1.uv);
-                        let uv_bc = mid2(v1.uv, v2.uv);
-                        let uv_ca = mid2(v2.uv, v0.uv);
-                        let subs = [
-                            (a, ab, ca, v0.uv, uv_ab, uv_ca),
-                            (ab, b, bc, uv_ab, v1.uv, uv_bc),
-                            (ca, bc, c, uv_ca, uv_bc, v2.uv),
-                            (ab, bc, ca, uv_ab, uv_bc, uv_ca),
-                        ];
-                        for (sa, sb, sc, u0, u1, u2) in subs {
-                            // Sample 3 points (centroid + 2 mid-edges) so a single
-                            // transparent texel never punches a triangular hole in
-                            // sails, railings, banners, or BMD foliage clusters.
-                            let su_c =
-                                [(u0[0] + u1[0] + u2[0]) / 3.0, (u0[1] + u1[1] + u2[1]) / 3.0];
-                            let su_1 = [(u0[0] + u1[0]) * 0.5, (u0[1] + u1[1]) * 0.5];
-                            let su_2 = [(u1[0] + u2[0]) * 0.5, (u1[1] + u2[1]) * 0.5];
-                            let mut s_rgb = [0.0f32; 3];
-                            let mut s_w = 0.0f32;
-                            let mut s_a_max = 0.0f32;
-                            let mut s_a_sum = 0.0f32;
-                            let mut s_cnt = 0u32;
-                            for su in [su_c, su_1, su_2] {
-                                if let Some((c, a)) =
-                                    sample_atlas_rgba(atlas, atlas_w, atlas_h, v0.color, kind, su)
-                                {
-                                    s_cnt += 1;
-                                    s_a_sum += a;
-                                    if a > s_a_max {
-                                        s_a_max = a;
-                                    }
-                                    if a >= 0.15 {
-                                        s_rgb[0] += c[0] * a;
-                                        s_rgb[1] += c[1] * a;
-                                        s_rgb[2] += c[2] * a;
-                                        s_w += a;
-                                    }
-                                }
-                            }
-                            if s_cnt == 0 {
-                                continue;
-                            }
-                            let sa_avg = s_a_sum / s_cnt as f32;
-                            if sa_avg < 0.18 && s_a_max < 0.35 {
-                                continue;
-                            }
-                            let sub_albedo = if s_w > 1e-4 {
-                                [
-                                    (s_rgb[0] / s_w).clamp(0.06, 0.95),
-                                    (s_rgb[1] / s_w).clamp(0.06, 0.95),
-                                    (s_rgb[2] / s_w).clamp(0.06, 0.95),
-                                ]
-                            } else {
-                                albedo
-                            };
-                            out.push(RtMeshTriangle {
-                                a: sa,
-                                b: sb,
-                                c: sc,
-                                normal: smooth_n,
-                                albedo: sub_albedo,
-                                opacity: (sa_avg.max(s_a_max * 0.75) * 0.92).clamp(0.42, 0.94),
-                            });
-                        }
-                        t += 1;
-                        continue;
-                    }
-                }
                 out.push(RtMeshTriangle {
                     a,
                     b,
@@ -1149,6 +1124,7 @@ fn extract_rt_triangles(
                     normal: smooth_n,
                     albedo,
                     opacity,
+                    alpha_mask,
                 });
             }
         }

@@ -130,6 +130,8 @@ pub struct MeshTriangle {
     pub albedo: [f32; 3],
     pub roughness: f32,
     pub opacity: f32,
+    /// Optional 7x7 (49-bit) texture-sampled alpha cutout mask (`0` = unmasked).
+    pub alpha_mask: u64,
 }
 
 /// Axis-aligned water surface plane harvested from the renderer's water
@@ -558,6 +560,7 @@ impl Harvester {
                             albedo: t.albedo,
                             roughness: 0.72,
                             opacity: t.opacity,
+                            alpha_mask: t.alpha_mask,
                         });
                         page_added += 1;
                     }
@@ -1115,7 +1118,13 @@ fn push_real_meshes(
             dropped += 1;
             continue;
         }
-        let opacity = m.opacity.clamp(0.0, 1.0);
+        let has_mask = m.alpha_mask != 0
+            && (m.alpha_mask & RayTriangle::ALPHA_MASK49_ALL) != RayTriangle::ALPHA_MASK49_ALL;
+        let opacity = if has_mask {
+            m.opacity.clamp(0.15, 0.94)
+        } else {
+            m.opacity.clamp(0.0, 1.0)
+        };
         let r5 = (m.albedo[0].clamp(0.0, 1.0) * 31.0 + 0.5) as u32;
         let g5 = (m.albedo[1].clamp(0.0, 1.0) * 31.0 + 0.5) as u32;
         let b5 = (m.albedo[2].clamp(0.0, 1.0) * 31.0 + 0.5) as u32;
@@ -1137,13 +1146,14 @@ fn push_real_meshes(
             last_mat_id = id;
             id
         };
-        triangles.push(RayTriangle::with_kind(
+        triangles.push(RayTriangle::with_kind_and_mask(
             m.a,
             m.b,
             m.c,
             normal,
             mat_id,
             KIND_REAL_MESH,
+            m.alpha_mask,
         ));
     }
     if dropped > 0 && std::env::var_os("PWE_RT_DEBUG").is_some() {
@@ -1981,6 +1991,7 @@ mod tests {
             albedo: [0.8, 0.2, 0.1],
             roughness: 0.72,
             opacity: 1.0,
+            alpha_mask: 0,
         };
         let water = WaterSurface {
             bounds: [-50.0, 50.0, 40.0, 400.0],
@@ -2354,6 +2365,7 @@ mod tests {
                 albedo: [0.5, 0.4, 0.3],
                 roughness: 0.8,
                 opacity: 1.0,
+                alpha_mask: 0,
             },
             // Zero-area degenerate triangle (must be dropped).
             MeshTriangle {
@@ -2364,6 +2376,7 @@ mod tests {
                 albedo: [0.5, 0.5, 0.5],
                 roughness: 0.8,
                 opacity: 1.0,
+                alpha_mask: 0,
             },
             // NaN vertex triangle (must be dropped).
             MeshTriangle {
@@ -2374,6 +2387,7 @@ mod tests {
                 albedo: [0.5, 0.5, 0.5],
                 roughness: 0.8,
                 opacity: 1.0,
+                alpha_mask: 0,
             },
             // Valid triangle with zero normal (recomputed from geometry).
             MeshTriangle {
@@ -2384,6 +2398,7 @@ mod tests {
                 albedo: [0.3, 0.6, 0.3],
                 roughness: 0.85,
                 opacity: 0.7,
+                alpha_mask: 0,
             },
         ];
         let mut tris = Vec::new();

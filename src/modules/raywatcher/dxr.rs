@@ -983,7 +983,7 @@ mod imp {
             let mut opaque_tri_count = 0u32;
             for t in raw_tris {
                 let mat_idx = ((t.b[3] + 0.5).max(0.0) as usize).min(mat_max);
-                if mat_opaque[mat_idx] {
+                if mat_opaque[mat_idx] && t.c[3].to_bits() == 0 && t.normal[3].to_bits() == 0 {
                     opaque_tri_count += 1;
                 }
             }
@@ -1027,7 +1027,10 @@ mod imp {
                     let mut a_idx = opaque_tri_count as usize;
                     for &t in raw_tris {
                         let mat_idx = ((t.b[3] + 0.5).max(0.0) as usize).min(mat_max);
-                        let dst = if mat_opaque[mat_idx] {
+                        let is_op = mat_opaque[mat_idx]
+                            && t.c[3].to_bits() == 0
+                            && t.normal[3].to_bits() == 0;
+                        let dst = if is_op {
                             let i = o_idx;
                             o_idx += 1;
                             i

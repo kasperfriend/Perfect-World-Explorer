@@ -3919,7 +3919,7 @@ impl Renderer {
             // (never a box) only when the triangle budget is exhausted.
             let tree_lod_scale =
                 self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees);
-            let tree_tri_budget = 260_000usize;
+            let tree_tri_budget = 420_000usize;
             let mut tree_tris = Vec::with_capacity(65_536);
             let (real_tree_instances, real_tree_tris, tree_canopy_fallbacks) =
                 self.far_trees.harvest_rt_triangles(
@@ -3939,6 +3939,7 @@ impl Renderer {
                     albedo: t.albedo,
                     roughness: t.roughness,
                     opacity: t.opacity,
+                    alpha_mask: t.alpha_mask,
                 });
             }
             if std::env::var_os("PWE_RT_DEBUG").is_some() {
@@ -4242,9 +4243,17 @@ impl Renderer {
         let active_point_lights: Vec<crate::modules::raywatcher::frame::PointLight> =
             if need_point_lights {
                 // Boost #30: Pre-size light list + fast 1D XZ reject before 3D distance.
+                let night = crate::environment::night_factor(camera.time_of_day);
                 let mut point_lights: Vec<(f32, crate::modules::raywatcher::frame::PointLight)> =
                     Vec::with_capacity(64);
                 for l in &self.model_lights.lights {
+                    // Retail flag 1 (`l.flags & 1 != 0`) marks night-only lamps/lanterns
+                    // (see `SceneLights::query`); skip them completely during daytime so
+                    // turned-off lamps never light or reflect in water at noon.
+                    let time_scale = if l.flags & 1 != 0 { night } else { 1.0 };
+                    if time_scale <= 0.02 {
+                        continue;
+                    }
                     let radius = l.range.max(0.0);
                     if radius <= 0.05 {
                         continue;
@@ -4267,16 +4276,17 @@ impl Renderer {
                         l.diffuse[0].max(0.0),
                         l.diffuse[1].max(0.0),
                         l.diffuse[2].max(0.0),
-                    );
+                    ) * time_scale;
                     if colour.length_squared() <= 1e-5 {
                         continue;
                     }
                     let raw_int = l.diffuse[3];
-                    let intensity = if raw_int > 0.01 {
+                    let base_int = if raw_int > 0.01 {
                         raw_int.clamp(0.65, 8.0)
                     } else {
                         1.6
                     };
+                    let intensity = base_int * time_scale;
                     point_lights.push((
                         dist_sq,
                         crate::modules::raywatcher::frame::PointLight {

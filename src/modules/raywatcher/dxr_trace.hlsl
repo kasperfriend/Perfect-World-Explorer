@@ -152,32 +152,37 @@ void rc_update(float3 world_pos, float3 normal, float cam_dist, float3 rad) {
     radiance_cache[slot] = float4(blended, w);
 }
 
+uint unpack_alpha_mask25(float f) {
+    uint r = asuint(f);
+    return (r & 0x00ffffffu) | ((r >> 7u) & 0x01000000u);
+}
+
 bool accept_opacity(uint prim, float2 bary, uint seed, uint tri_count) {
     if (prim >= tri_count) {
         return false;
+    }
+    uint raw_lo = asuint(tris[prim].c.w);
+    uint raw_hi = asuint(tris[prim].n.w);
+    if ((raw_lo | raw_hi) != 0u) {
+        uint lo25 = unpack_alpha_mask25(tris[prim].c.w);
+        uint hi24 = unpack_alpha_mask25(tris[prim].n.w);
+        float s = saturate(bary.x);
+        float t = saturate(bary.y / max(1.0 - s, 1e-4));
+        uint ix = min(uint(s * 7.0), 6u);
+        uint iy = min(uint(t * 7.0), 6u);
+        uint bit = iy * 7u + ix;
+        uint hit_bit = (bit < 25u) ? ((lo25 >> bit) & 1u) : ((hi24 >> (bit - 25u)) & 1u);
+        return hit_bit != 0u;
     }
     float opacity = material_of(prim).surface.w;
     if (opacity >= 0.99) {
         return true;
     }
     uint _unused = seed;
-    float clump = 1.0;
-    if (opacity < 0.96) {
-        // Organic leaf-edge feathering + multi-scale breakup removes flat polygonal leaf edges.
-        float bw = max(0.0, 1.0 - bary.x - bary.y);
-        float edge_d = min(bary.x, min(bary.y, bw));
-        float edge_fade = smoothstep(0.0, 0.08, edge_d);
-        uint cx = uint(bary.x * 11.0);
-        uint cy = uint(bary.y * 11.0);
-        uint ch = prim * 2654435761u ^ cx * 2246822519u ^ cy * 3266489917u;
-        ch ^= ch >> 15u;
-        clump = (0.72 + 0.50 * (float(ch & 0xffu) / 255.0)) * edge_fade;
-    }
-    float eff_opacity = saturate(opacity * clump);
     uint h = prim * 747796405u ^ uint(bary.x * 64.0) * 2891336453u ^ uint(bary.y * 64.0) * 1664525u;
     h ^= h >> 16u;
     float r = float(h & 0xffffu) / 65536.0;
-    return r < eff_opacity;
+    return r < opacity;
 }
 
 Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max, uint opaque_offset, uint tri_count) {
@@ -1035,152 +1040,106 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
         accum_refl_dist += refl_dist;
 
-        // Calibrated multi-bounce RT GI + Feature #6 (3D World-Space Radiance Cache)
-        // + Feature #10 (Detailed off-screen albedo). Zero chalky grey/white wash!
+        // Physically-based 1-ray Diffuse GI + 3D World-Space Radiance Cache multi-bounce:
+        // Fast single `closest_hit_fast` hemisphere ray per sample replaces flat ambient with
+        // true directional sky-dome irradiance and strong colored sunlit/lantern surface bounce.
         if (bits_gi && !is_water && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
-            // Opt #2: Adaptive GI tap count (2 < 55u, 1 >= 55u) with temporal/DLSS-RR convergence.
-            uint gi_taps = (dist < 55.0) ? 2u : 1u;
-            float3 gi_sum = float3(0.0, 0.0, 0.0);
-            float bounce_max_t = min(params.lens.y, 50.0);
-            float gi_shadow_max_t = min(params.lens.y, 180.0);
-            float day_gi_scale = 0.03 + 0.97 * sun_strength;
-            for (uint g = 0u; g < gi_taps; g = g + 1u) {
-                float3 throughput = float3(1.0, 1.0, 1.0);
-                float3 b_origin = ray_origin;
-                float3 b_t = t_axis;
-                float3 b_b = b_axis;
-                float3 b_n = normal;
-                float b_step_bias = bias;
-                uint tap_bounces = (g == 0u) ? max_bounces : 1u;
-                for (uint bounce = 0u; bounce < tap_bounces; bounce = bounce + 1u) {
-                    float u1 = (bounce == 0u) ? ((float(g) + rand01(state)) / float(gi_taps)) : rand01(state);
-                    float phi = (bounce == 0u)
-                        ? (float(g) * 2.39996323 + rot_angle + 1.0471975 + float(s) * 0.7548776)
-                        : (2.0 * PI * rand01(state));
-                    float r = sqrt(u1);
-                    float s_phi, c_phi;
-                    sincos(phi, s_phi, c_phi);
-                    float z = sqrt(max(0.0, 1.0 - u1));
-                    float3 d = b_t * (r * c_phi) + b_b * (r * s_phi) + b_n * z;
-                    Hit bhit;
-                    if (bounce == 0u && dist < 45.0) {
-                        bhit = closest_hit(b_origin, d, b_step_bias, bounce_max_t, opaque_offset, tri_count);
-                    } else {
-                        bhit = closest_hit_fast(b_origin, d, b_step_bias, bounce_max_t, opaque_offset, tri_count);
-                    }
-                    if (bhit.index != 0xffffffffu) {
-                        float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
-                        float3 bhit_world = b_origin + d * bhit.t;
-                        float b_bias = max(b_step_bias, (dist + bhit.t) * 0.004);
-                        float b_shadow = 1.0;
-                        // Opt #2: Radiance Cache early-out on secondary bounces (bounce >= 1):
-                        // converged cache cells terminate deep paths immediately without extra rays.
-                        float4 cached = rc_query(bhit_world, bhit.normal, dist + bhit.t);
-                        if (bounce >= 1u && cached.w >= 6.0) {
-                            gi_sum += throughput * min(cached.rgb, float3(1.15, 1.15, 1.15)) * (params.tuning.w * 0.58 * (1.0 - fog_t));
-                            break;
-                        }
-                        if (bits_shadows && bounce < 2u && b_ndl > 0.08) {
-                            float3 bhit_pos = bhit_world + bhit.normal * b_bias;
-                            if (occluded_fast(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, gi_shadow_max_t)) {
-                                b_shadow = 0.0;
-                            }
-                        }
-                        Material bmat = material_of(bhit.index);
-                        float bkind = tris[bhit.index].a.w;
-                        float3 b_base_albedo = (bkind > 1.5 && bkind < 2.5)
-                            ? sample_terrain_albedo_fast(bhit_world, bmat.albedo.rgb)
-                            : detail_offscreen_albedo(bhit_world, bhit.normal, bmat.albedo.rgb, bmat.surface.w);
-                        float b_avg = dot(b_base_albedo, float3(0.3333, 0.3333, 0.3333));
-                        float3 b_chroma = clamp(
-                            float3(b_avg, b_avg, b_avg) + (b_base_albedo - b_avg) * 1.25,
-                            float3(0.04, 0.04, 0.04),
-                            float3(0.90, 0.90, 0.90));
-                        gi_total_rays += 1.0;
-                        // Enhancement #5: Direct multi-bounce colored GI from nearby lanterns, portals & beams.
-                        float3 gi_pl_direct = float3(0.0, 0.0, 0.0);
-                        if (bounce == 0u && bits_lighting && pl_count > 0u) {
-                            uint pl_cap = min(pl_count, 24u);
-                            for (uint pli = 0u; pli < pl_cap; pli = pli + 1u) {
-                                float4 pr = params.point_lights_pos_rad[pli];
-                                float3 to_pl = pr.xyz - bhit_world;
-                                if (abs(to_pl.x) >= pr.w || abs(to_pl.z) >= pr.w || abs(to_pl.y) >= pr.w) {
-                                    continue;
-                                }
-                                float r_ndl = dot(bhit.normal, to_pl);
-                                if (r_ndl <= 0.0) {
-                                    continue;
-                                }
-                                float d2 = dot(to_pl, to_pl);
-                                if (d2 <= 1e-4 || d2 >= pr.w * pr.w) {
-                                    continue;
-                                }
-                                float inv_d = rsqrt(d2);
-                                float d_l = d2 * inv_d;
-                                float att = point_light_falloff(d_l, pr.w);
-                                float4 ci = params.point_lights_col_int[pli];
-                                gi_pl_direct += ci.rgb * (ci.w * att * (r_ndl * inv_d) * 1.35);
-                            }
-                            gi_pl_direct = min(gi_pl_direct, float3(1.6, 1.6, 1.6));
-                        }
-                        float3 off_in = b_chroma * (
-                            params.sun_colour.xyz * (b_ndl * b_shadow * 1.15)
-                            + gi_pl_direct
-                            + params.ambient.xyz * (params.tuning.z * 0.20));
-                        float3 incoming = off_in;
-                        // Opt #12: Only reproject on-screen radiance on close, lit bounce-0 hits.
-                        if (bounce == 0u && bhit.t < 28.0 && b_ndl > 0.04) {
-                            float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
-                            float b_w = saturate(b_screen.a);
-                            float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 0.85 * sun_strength + 0.10 * day_gi_scale);
-                            incoming = lerp(off_in, on_in, b_w);
-                        }
-                        if (cached.w >= 3.0) {
-                            float cache_blend = (bounce == 0u) ? 0.25 : 0.45;
-                            incoming = lerp(incoming, cached.rgb, cache_blend);
-                        }
-                        // Opt #12: Skip global UAV radiance-cache writes on dim hits (< 0.02 luma).
-                        if (bounce == 0u && g == 0u && luma(incoming) > 0.02 && ((id.x + id.y + uint(params.frame.x)) & 3u) == 0u) {
-                            rc_update(bhit_world, bhit.normal, dist + bhit.t, incoming);
-                        }
-                        incoming = min(incoming, float3(1.10, 1.10, 1.10));
-                        gi_sum += throughput * incoming * (params.tuning.w * 0.58 * (1.0 - fog_t));
-                        if (bounce + 1u < tap_bounces) {
-                            throughput *= clamp(b_chroma * 1.02, float3(0.08, 0.08, 0.08), float3(0.84, 0.84, 0.84));
-                            if (bounce >= 2u) {
-                                float rr = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.30, 0.88);
-                                if (rand01(state) > rr) {
-                                    break;
-                                }
-                                throughput /= rr;
-                            }
-                            b_origin = bhit_world + bhit.normal * b_bias;
-                            b_n = bhit.normal;
-                            float3 bup = abs(b_n.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
-                            b_t = normalize(cross(bup, b_n));
-                            b_b = cross(b_n, b_t);
-                            b_step_bias = b_bias;
-                        }
-                    } else {
-                        gi_total_rays += 1.0;
-                        gi_sky_hits += 1.0;
-                        // Calibrated directional sky-dome GI + Enhancement #15 (Golden-hour sunset/dawn color grading).
-                        float3 raw_sky = min(sample_sky_env(d), float3(0.85, 0.85, 0.85));
-                        float3 vivid_sky = raw_sky;
-                        if (params.sun_dir.y > 0.01 && params.sun_dir.y < 0.42 && sun_strength > 0.05) {
-                            float golden_w = 1.0 - smoothstep(0.10, 0.42, params.sun_dir.y);
-                            float sun_align = dot(normalize(float3(d.x, 0.0, d.z) + float3(1e-5, 0.0, 0.0)),
-                                                  normalize(float3(params.sun_dir.x, 0.0, params.sun_dir.z) + float3(1e-5, 0.0, 0.0)));
-                            float3 warm_cool = lerp(float3(0.76, 0.84, 1.22), float3(1.26, 0.94, 0.68), sun_align * 0.5 + 0.5);
-                            vivid_sky *= lerp(float3(1.0, 1.0, 1.0), warm_cool, golden_w * 0.55);
-                        }
-                        float sky_w = (bounce == 0u) ? 0.075 : 0.045;
-                        gi_sum += throughput * vivid_sky * (params.tuning.w * sky_w * day_gi_scale * (1.0 - fog_t));
-                        break;
+            float bounce_max_t = min(params.lens.y, 65.0);
+            float gi_shadow_max_t = min(params.lens.y, 200.0);
+            float day_gi_scale = 0.04 + 0.96 * sun_strength;
+            float u1 = rand01(state);
+            float phi = rot_angle + 1.0471975 + float(s) * 2.39996323 + rand01(state) * 0.65;
+            float r = sqrt(u1);
+            float s_phi, c_phi;
+            sincos(phi, s_phi, c_phi);
+            float z = sqrt(max(0.0, 1.0 - u1));
+            float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + normal * z;
+            Hit bhit = closest_hit_fast(ray_origin, d, bias, bounce_max_t, opaque_offset, tri_count);
+            float3 gi_sample = float3(0.0, 0.0, 0.0);
+            gi_total_rays += 1.0;
+            if (bhit.index != 0xffffffffu) {
+                float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
+                float3 bhit_world = ray_origin + d * bhit.t;
+                float b_bias = max(bias, (dist + bhit.t) * 0.004);
+                float b_shadow = 1.0;
+                if (bits_shadows && b_ndl > 0.06) {
+                    float3 bhit_pos = bhit_world + bhit.normal * b_bias;
+                    if (occluded_fast(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, gi_shadow_max_t)) {
+                        b_shadow = 0.0;
                     }
                 }
+                Material bmat = material_of(bhit.index);
+                float bkind = tris[bhit.index].a.w;
+                float3 b_base_albedo = (bkind > 1.5 && bkind < 2.5)
+                    ? sample_terrain_albedo_fast(bhit_world, bmat.albedo.rgb)
+                    : detail_offscreen_albedo(bhit_world, bhit.normal, bmat.albedo.rgb, bmat.surface.w);
+                float b_avg = dot(b_base_albedo, float3(0.3333, 0.3333, 0.3333));
+                float3 b_chroma = clamp(
+                    float3(b_avg, b_avg, b_avg) + (b_base_albedo - b_avg) * 1.35,
+                    float3(0.04, 0.04, 0.04),
+                    float3(0.92, 0.92, 0.92));
+                // Direct bounce from up to 8 nearest active lights/lanterns/effects.
+                float3 gi_pl_direct = float3(0.0, 0.0, 0.0);
+                if (bits_lighting && pl_count > 0u) {
+                    uint pl_cap = min(pl_count, 8u);
+                    for (uint pli = 0u; pli < pl_cap; pli = pli + 1u) {
+                        float4 pr = params.point_lights_pos_rad[pli];
+                        float3 to_pl = pr.xyz - bhit_world;
+                        if (abs(to_pl.x) >= pr.w || abs(to_pl.z) >= pr.w || abs(to_pl.y) >= pr.w) {
+                            continue;
+                        }
+                        float r_ndl = dot(bhit.normal, to_pl);
+                        if (r_ndl <= 0.0) {
+                            continue;
+                        }
+                        float d2 = dot(to_pl, to_pl);
+                        if (d2 <= 1e-4 || d2 >= pr.w * pr.w) {
+                            continue;
+                        }
+                        float inv_d = rsqrt(d2);
+                        float d_l = d2 * inv_d;
+                        float att = point_light_falloff(d_l, pr.w);
+                        float4 ci = params.point_lights_col_int[pli];
+                        gi_pl_direct += ci.rgb * (ci.w * att * (r_ndl * inv_d) * 1.45);
+                    }
+                    gi_pl_direct = min(gi_pl_direct, float3(2.2, 2.2, 2.2));
+                }
+                float3 off_in = b_chroma * (
+                    params.sun_colour.xyz * (b_ndl * b_shadow * 1.65)
+                    + gi_pl_direct
+                    + params.ambient.xyz * (params.tuning.z * 0.24));
+                float3 incoming = off_in;
+                if (bhit.t < 28.0 && b_ndl > 0.04) {
+                    float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
+                    float b_w = saturate(b_screen.a);
+                    float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 1.15 * sun_strength + 0.14 * day_gi_scale);
+                    incoming = lerp(off_in, on_in, b_w);
+                }
+                // Infinite multi-bounce via 3D World-Space Radiance Cache at 1-bounce cost.
+                float4 cached = rc_query(bhit_world, bhit.normal, dist + bhit.t);
+                if (max_bounces >= 2u && cached.w >= 2.0) {
+                    incoming += b_chroma * min(cached.rgb, float3(1.8, 1.8, 1.8)) * 0.55;
+                }
+                if (luma(incoming) > 0.02 && ((id.x + id.y + uint(params.frame.x)) & 3u) == 0u) {
+                    rc_update(bhit_world, bhit.normal, dist + bhit.t, incoming);
+                }
+                incoming = min(incoming, float3(2.2, 2.2, 2.2));
+                gi_sample = incoming * (params.tuning.w * 0.85 * (1.0 - fog_t));
+            } else {
+                gi_sky_hits += 1.0;
+                // True directional sky-dome hemisphere irradiance + golden-hour color grading.
+                float3 raw_sky = min(sample_sky_env(d), float3(1.15, 1.15, 1.15));
+                float3 vivid_sky = raw_sky;
+                if (params.sun_dir.y > 0.01 && params.sun_dir.y < 0.42 && sun_strength > 0.05) {
+                    float golden_w = 1.0 - smoothstep(0.10, 0.42, params.sun_dir.y);
+                    float sun_align = dot(normalize(float3(d.x, 0.0, d.z) + float3(1e-5, 0.0, 0.0)),
+                                          normalize(float3(params.sun_dir.x, 0.0, params.sun_dir.z) + float3(1e-5, 0.0, 0.0)));
+                    float3 warm_cool = lerp(float3(0.76, 0.84, 1.22), float3(1.26, 0.94, 0.68), sun_align * 0.5 + 0.5);
+                    vivid_sky *= lerp(float3(1.0, 1.0, 1.0), warm_cool, golden_w * 0.55);
+                }
+                gi_sample = vivid_sky * (params.tuning.w * 0.28 * day_gi_scale * (1.0 - fog_t));
             }
-            accum_gi += min(gi_sum * (gi_fade / float(gi_taps)), float3(1.15, 1.15, 1.15));
+            accum_gi += min(gi_sample * gi_fade, float3(2.2, 2.2, 2.2));
         }
     }
 
@@ -1587,7 +1546,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float bent_sky = lerp(0.92, 1.0, saturate(bent_normal.y * 0.5 + 0.5));
         float v_ao = bits_ao ? (avg_open * bent_sky * sky_portal_vis) : 1.0;
         bool gi_active = bits_gi && !is_water && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01;
-        float amb_keep = gi_active ? lerp(1.0, 0.92, gi_fade) : 1.0;
+        float amb_keep = gi_active ? lerp(1.0, 0.44, gi_fade) : 1.0;
         float night_dark_scale = lerp(0.28, 1.0, smoothstep(0.0, 0.25, sun_strength));
         float separated_lf = (amb_base * v_ao * amb_keep * night_dark_scale + sun_base * v_sun) * point_shadow_mod;
         out_lf = lerp(separated_lf, 1.0, fog_t);
