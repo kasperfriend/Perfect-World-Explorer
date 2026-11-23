@@ -823,13 +823,17 @@ impl Manager {
         // fire, and waterfalls appear quickly when entering an area, while
         // keeping inactive background loads at 1 per frame.
         const ACTIVE_ADMIT_BUDGET: usize = 4;
-        for _ in 0..ACTIVE_ADMIT_BUDGET {
-            if !self.owners.iter().any(|o| matches!(o.state, State::Pending) && o.request.active) {
-                break;
-            }
+        let mut loaded_active = 0usize;
+        while loaded_active < ACTIVE_ADMIT_BUDGET
+            && self
+                .owners
+                .iter()
+                .any(|o| matches!(o.state, State::Pending) && o.request.active)
+        {
             self.load_one();
+            loaded_active += 1;
         }
-        if !self.owners.iter().any(|o| matches!(o.state, State::Pending) && o.request.active) {
+        if loaded_active == 0 {
             self.load_one();
         }
         for _ in 0..ACTIVE_ADMIT_BUDGET {

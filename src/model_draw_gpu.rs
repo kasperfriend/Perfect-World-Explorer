@@ -313,7 +313,7 @@ impl Draw {
             .iter()
             .map(|m| frame.params(m.material, m.color, m.diffuse_alpha_only, m.face_shader))
             .collect::<Result<_, _>>()?;
-        let mut textures: Vec<std::sync::Arc<wgpu::Texture>> = Vec::new();
+        let mut textures: Vec<std::sync::Arc<wgpu::Texture>> = Vec::with_capacity(prepared.len());
         let mut cache: std::collections::HashMap<[String; 2], (usize, bool)> =
             std::collections::HashMap::new();
         let mut loaded: Vec<(usize, bool)> = Vec::with_capacity(prepared.len());
@@ -543,10 +543,11 @@ impl Draw {
             return Err("model pass blending changed; rebuild its pipeline".into());
         }
         let original = asset.descriptor.render_settings().original_color;
-        let mut updates = Vec::with_capacity(self.meshes.len());
+        // Validate every mesh before mutating GPU buffers so partial uploads
+        // never occur, while reusing one scratch vertex buffer across all meshes.
+        let mut max_verts = 0usize;
         for (index, gpu) in self.meshes.iter().enumerate() {
             let Some(gpu) = gpu else {
-                // A hidden queue mesh keeps its buffers untouched.
                 continue;
             };
             let pose = self
@@ -572,29 +573,45 @@ impl Draw {
             } else {
                 asset.mesh_color(pose.skin, pose.mesh, original)
             };
-            let diffuse_alpha_only = gpu.diffuse_alpha_only;
+            let _ = frame.params(
+                material,
+                color,
+                gpu.diffuse_alpha_only,
+                gpu.face_shader.as_ref(),
+            )?;
+            max_verts = max_verts.max(pose.vertices.len());
+        }
+        let mut vertices = Vec::with_capacity(max_verts);
+        for (index, gpu) in self.meshes.iter().enumerate() {
+            let Some(gpu) = gpu else {
+                continue;
+            };
+            let pose = &poses[self.pose_of[index]];
+            let skin = &asset.skins[pose.skin];
+            let source = &skin.data.meshes[pose.mesh];
+            let material = &skin.data.materials[source.material as usize];
+            let color = if gpu.face_shader.is_some() {
+                u32::MAX
+            } else {
+                asset.mesh_color(pose.skin, pose.mesh, original)
+            };
             let params = frame.params(
                 material,
                 color,
-                diffuse_alpha_only,
+                gpu.diffuse_alpha_only,
                 gpu.face_shader.as_ref(),
             )?;
-            let mut vertices = Vec::with_capacity(pose.vertices.len());
-            for (source, posed) in source.vertices.iter().zip(&pose.vertices) {
-                vertices.push(raster::Vertex {
-                    position: posed.position,
-                    normal: posed.normal,
-                    uv: source.uv,
+            vertices.clear();
+            vertices.extend(source.vertices.iter().zip(&pose.vertices).map(|(s, p)| {
+                raster::Vertex {
+                    position: p.position,
+                    normal: p.normal,
+                    uv: s.uv,
                     fog: frame.vertex_fog,
-                });
-            }
-            updates.push((index, vertices, params));
-        }
-        for (index, vertices, params) in updates {
-            if let Some(gpu) = &self.meshes[index] {
-                gpu.mesh.update(queue, &vertices)?;
-                gpu.binding.update(queue, &params)?;
-            }
+                }
+            }));
+            gpu.mesh.update(queue, &vertices)?;
+            gpu.binding.update(queue, &params)?;
         }
         Ok(())
     }
@@ -611,7 +628,6 @@ impl Draw {
             return Err("model pass blending changed; rebuild its pipeline".into());
         }
         let original = asset.descriptor.render_settings().original_color;
-        let mut updates = Vec::with_capacity(self.meshes.len());
         for mesh in self.meshes.iter().flatten() {
             let skin = asset.skins.get(mesh.key.0).ok_or("missing retained skin")?;
             let source = skin
@@ -628,19 +644,29 @@ impl Draw {
             } else {
                 asset.mesh_color(mesh.key.0, mesh.key.1, original)
             };
-            let diffuse_alpha_only = mesh.diffuse_alpha_only;
-            updates.push((
-                &mesh.binding,
-                frame.params(
-                    material,
-                    color,
-                    diffuse_alpha_only,
-                    mesh.face_shader.as_ref(),
-                )?,
-            ));
+            let _ = frame.params(
+                material,
+                color,
+                mesh.diffuse_alpha_only,
+                mesh.face_shader.as_ref(),
+            )?;
         }
-        for (binding, params) in updates {
-            binding.update(queue, &params)?;
+        for mesh in self.meshes.iter().flatten() {
+            let skin = &asset.skins[mesh.key.0];
+            let source = &skin.data.meshes[mesh.key.1];
+            let material = &skin.data.materials[source.material as usize];
+            let color = if mesh.face_shader.is_some() {
+                u32::MAX
+            } else {
+                asset.mesh_color(mesh.key.0, mesh.key.1, original)
+            };
+            let params = frame.params(
+                material,
+                color,
+                mesh.diffuse_alpha_only,
+                mesh.face_shader.as_ref(),
+            )?;
+            mesh.binding.update(queue, &params)?;
         }
         Ok(())
     }

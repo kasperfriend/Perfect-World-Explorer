@@ -3228,7 +3228,9 @@ impl Renderer {
         } else {
             self.water_start
         };
-        p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
+        if local_end > self.terrain_end {
+            p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
+        }
         if !self.world_done {
             for page in &self.local_pages {
                 page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, false);
@@ -3237,14 +3239,14 @@ impl Renderer {
         // Do not submit world pages on top of the same locally streamed
         // ornaments while preload is in progress: the coplanar duplicates
         // caused depth flicker. Switch atomically only after all pages arrive.
+        let world_slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
         if self.world_done {
             // The view's commands were folded once when the world finished
             // loading: its placements are frozen, so nothing here is per-frame
             // work beyond the page binds and the draws themselves.
-            let slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
             crate::world_objects::GpuPage::draw_world_culled(
                 &self.world_pages,
-                &self.world_draw_cmds[slot],
+                &self.world_draw_cmds[world_slot],
                 &mut p,
                 reflected,
                 frustum,
@@ -3252,32 +3254,37 @@ impl Renderer {
             );
         }
         // The `.sdr.` water/lava curtains draw in their own blended pass over
-        // the finished scene: `fs_sdr` keeps only kind 2.02/2.12 and drops
-        // every other fragment, so replaying the same ranges is free, and the
-        // `fs` entry dropped those kinds in the pass above so the sheet is
-        // never drawn twice. Order is terrain/streamed, then pages, exactly as
-        // the unblended pass above — the sheet blends over the whole world
-        // once, the client's visible result for a curtain.
-        p.set_pipeline(&self.sdr_blend_pipeline);
-        p.set_bind_group(0, bind, &[]);
-        p.set_vertex_buffer(0, self.vertex.slice(..));
-        p.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
-        p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
-        if !self.world_done {
-            for page in &self.local_pages {
-                page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, true);
+        // the finished scene: skip the entire pipeline bind & traversal when
+        // neither local geometry nor any world/local page carries SDR sheets.
+        let has_sdr = local_end > self.terrain_end
+            || if self.world_done {
+                self.world_draw_cmds[world_slot].chunks.iter().any(|c| c.has_sdr)
+            } else {
+                !self.local_pages.is_empty()
+            };
+        if has_sdr {
+            p.set_pipeline(&self.sdr_blend_pipeline);
+            if local_end > self.terrain_end {
+                p.set_bind_group(0, bind, &[]);
+                p.set_vertex_buffer(0, self.vertex.slice(..));
+                p.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
+                p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
             }
-        }
-        if self.world_done {
-            let slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
-            crate::world_objects::GpuPage::draw_world_culled(
-                &self.world_pages,
-                &self.world_draw_cmds[slot],
-                &mut p,
-                reflected,
-                frustum,
-                true,
-            );
+            if !self.world_done {
+                for page in &self.local_pages {
+                    page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, true);
+                }
+            }
+            if self.world_done {
+                crate::world_objects::GpuPage::draw_world_culled(
+                    &self.world_pages,
+                    &self.world_draw_cmds[world_slot],
+                    &mut p,
+                    reflected,
+                    frustum,
+                    true,
+                );
+            }
         }
     }
     fn draw_models(
@@ -3945,10 +3952,12 @@ impl Renderer {
                 .filter(|b| b.visible(matrix))
                 .cloned(),
         );
-        visible.sort_unstable_by(|a, b| {
-            b.distance_squared(camera.pos)
-                .total_cmp(&a.distance_squared(camera.pos))
-        });
+        if visible.len() > 1 {
+            visible.sort_unstable_by(|a, b| {
+                b.distance_squared(camera.pos)
+                    .total_cmp(&a.distance_squared(camera.pos))
+            });
+        }
         if water_debug() {
             static LOG_ONCE: std::sync::Once = std::sync::Once::new();
             LOG_ONCE.call_once(|| {

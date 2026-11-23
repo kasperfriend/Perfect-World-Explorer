@@ -180,6 +180,24 @@ pub fn aabb_in_frustum(planes: &[[f32; 4]; 6], min: [f32; 3], max: [f32; 3]) -> 
     true
 }
 
+/// True when the entire AABB lies strictly inside all six frustum planes,
+/// allowing callers to skip per-child frustum tests inside a chunk/page.
+#[inline]
+pub fn aabb_inside_frustum(planes: &[[f32; 4]; 6], min: [f32; 3], max: [f32; 3]) -> bool {
+    if min[0] > max[0] {
+        return false;
+    }
+    for p in planes {
+        let nx = if p[0] >= 0.0 { min[0] } else { max[0] };
+        let ny = if p[1] >= 0.0 { min[1] } else { max[1] };
+        let nz = if p[2] >= 0.0 { min[2] } else { max[2] };
+        if p[0] * nx + p[1] * ny + p[2] * nz + p[3] < 0.0 {
+            return false;
+        }
+    }
+    true
+}
+
 pub struct Page {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
@@ -1146,11 +1164,12 @@ impl GpuPage {
             if (sdr_only && !chunk.has_sdr) || !aabb_in_frustum(frustum, chunk.min, chunk.max) {
                 continue;
             }
+            let fully_inside = aabb_inside_frustum(frustum, chunk.min, chunk.max);
             for cmd in &list.cmds[chunk.start..chunk.end] {
-                if sdr_only && !cmd.has_sdr {
+                if (sdr_only && !cmd.has_sdr) || cmd.start >= cmd.end {
                     continue;
                 }
-                if !aabb_in_frustum(frustum, cmd.min, cmd.max) {
+                if !fully_inside && !aabb_in_frustum(frustum, cmd.min, cmd.max) {
                     continue;
                 }
                 if let Some((cur_page, cur_start, cur_end)) = pending {
@@ -1217,6 +1236,7 @@ impl GpuPage {
             pass.draw_indexed(0..self.count, 0, 0..1);
             return;
         }
+        let fully_inside = aabb_inside_frustum(frustum, self.page_min, self.page_max);
         let mut cursor = None::<(u32, u32)>;
         for (r, b) in self.placements.iter().zip(&self.bounds) {
             if sdr_only && !b.has_sdr {
@@ -1225,7 +1245,7 @@ impl GpuPage {
             if !allows_with_context(view, r.visibility, RenderContext::default()) {
                 continue;
             }
-            if !aabb_in_frustum(frustum, b.min, b.max) {
+            if !fully_inside && !aabb_in_frustum(frustum, b.min, b.max) {
                 continue;
             }
             let start = r.start.min(self.count);

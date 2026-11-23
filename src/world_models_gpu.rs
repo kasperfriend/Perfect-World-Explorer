@@ -930,7 +930,8 @@ impl World {
             reported,
             ..
         } = self;
-        *effect_quads = quads;
+        effect_quads.clear();
+        effect_quads.extend(quads);
         if effects.is_none() {
             // The same reverse-Z depth buffer the world's models use, so an
             // effect in front of a wall is occluded by nothing and one behind it
@@ -1060,10 +1061,14 @@ impl World {
     fn advance_poses(&mut self, delta_ms: u32) {
         let bounds = self.resident_bounds;
         let len = self.slots.len();
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(16);
+        let threads = if len >= 64 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(16)
+        } else {
+            1
+        };
         if len >= 64 && threads > 1 {
             let assets = &self.assets.assets;
             let chunk_size = (len + threads - 1) / threads;
@@ -1244,6 +1249,9 @@ impl World {
         frame: Frame,
         night: f32,
     ) {
+        if self.slots.is_empty() {
+            return;
+        }
         let bounds = self.resident_bounds;
         let frustum = self.frustum;
         let keep_unbounded = self.keep_unbounded;
@@ -1350,11 +1358,15 @@ impl World {
                 }
             }
         }
-        match model_queue::alpha_order(&self.scratch_candidates) {
-            Ok(order) => self.alpha = order,
-            Err(e) => {
-                self.alpha.clear();
-                self.reported.push(format!("alpha queue: {e}"));
+        if self.scratch_candidates.is_empty() {
+            self.alpha.clear();
+        } else {
+            match model_queue::alpha_order(&self.scratch_candidates) {
+                Ok(order) => self.alpha = order,
+                Err(e) => {
+                    self.alpha.clear();
+                    self.reported.push(format!("alpha queue: {e}"));
+                }
             }
         }
         for (slot, error) in &self.scratch_failures {

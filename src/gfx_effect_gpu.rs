@@ -198,6 +198,7 @@ pub struct Draw {
     scratch_index: HashMap<BucketKey, usize>,
     scratch_pool: Vec<Vec<Vertex>>,
     failed: Vec<String>,
+    failed_set: std::collections::HashSet<String>,
 }
 
 fn blend_factor(code: u32) -> Result<wgpu::BlendFactor, String> {
@@ -444,6 +445,7 @@ impl Draw {
             scratch_index: HashMap::new(),
             scratch_pool: Vec::new(),
             failed: Vec::new(),
+            failed_set: std::collections::HashSet::new(),
         })
     }
 
@@ -511,8 +513,13 @@ impl Draw {
             prev_matrix: matrix,
             mv_size: [0.; 4],
         };
-        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
-        self.last_params = Some(params);
+        let changed = self.last_params.map_or(true, |prev| {
+            bytemuck::bytes_of(&prev) != bytemuck::bytes_of(&params)
+        });
+        if changed {
+            queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
+            self.last_params = Some(params);
+        }
 
         // No sheets this frame — switched off, none admitted yet, nothing
         // visible — means the previous vector has no successor. Dropping it makes
@@ -533,7 +540,7 @@ impl Draw {
                 write_depth: quad.mesh.as_ref().is_some_and(|mesh| mesh.write_depth),
                 motion: false,
             };
-            let position = if groups.last_mut().is_some_and(|(last_key, _)| {
+            let position = if groups.last().is_some_and(|(last_key, _)| {
                 last_key.layer == quad.layer
                     && last_key.pipeline == pipeline
                     && last_key.priority == quad.priority
@@ -541,6 +548,29 @@ impl Draw {
                     && last_key.texture == quad.texture.as_str()
             }) {
                 groups.len() - 1
+            } else if groups.len() <= 8 {
+                if let Some(pos) = groups.iter().position(|(k, _)| {
+                    k.layer == quad.layer
+                        && k.pipeline == pipeline
+                        && k.priority == quad.priority
+                        && k.tile == quad.tile
+                        && k.texture == quad.texture.as_str()
+                }) {
+                    pos
+                } else {
+                    let key = BucketKey {
+                        layer: quad.layer,
+                        pipeline,
+                        priority: quad.priority,
+                        tile: quad.tile,
+                        texture: quad.texture.clone(),
+                    };
+                    let mut verts = self.scratch_pool.pop().unwrap_or_default();
+                    verts.clear();
+                    self.scratch_index.insert(key.clone(), groups.len());
+                    groups.push((key, verts));
+                    groups.len() - 1
+                }
             } else {
                 let key = BucketKey {
                     layer: quad.layer,
@@ -602,26 +632,19 @@ impl Draw {
                 });
             }
         }
-        groups.sort_unstable_by(|(a, _), (b, _)| {
-            a.layer
-                .cmp(&b.layer)
-                // Depth writers establish the buffer the blended sheets are
-                // tested against, so within a layer they go first whatever the
-                // authored `Priority` says: a model drawn after the sheet it
-                // stands in front of would otherwise be painted over.
-                .then_with(|| b.pipeline.write_depth.cmp(&a.pipeline.write_depth))
-                // `Priority` orders the elements inside one `RenderLayer`: the
-                // client authors it 1..5 on every element (7,820 are a 4 and
-                // 5,586 a 2) and nothing read it, so a background dust sheet
-                // and the flash over it landed in whatever order the texture
-                // bucket happened to produce.
-                .then_with(|| a.priority.cmp(&b.priority))
-                .then_with(|| a.pipeline.depth_test.cmp(&b.pipeline.depth_test).reverse())
-                .then_with(|| a.pipeline.source.cmp(&b.pipeline.source))
-                .then_with(|| a.pipeline.destination.cmp(&b.pipeline.destination))
-                .then_with(|| a.texture.cmp(&b.texture))
-                .then_with(|| a.tile.cmp(&b.tile))
-        });
+        if groups.len() > 1 {
+            groups.sort_unstable_by(|(a, _), (b, _)| {
+                a.layer
+                    .cmp(&b.layer)
+                    .then_with(|| b.pipeline.write_depth.cmp(&a.pipeline.write_depth))
+                    .then_with(|| a.priority.cmp(&b.priority))
+                    .then_with(|| a.pipeline.depth_test.cmp(&b.pipeline.depth_test).reverse())
+                    .then_with(|| a.pipeline.source.cmp(&b.pipeline.source))
+                    .then_with(|| a.pipeline.destination.cmp(&b.pipeline.destination))
+                    .then_with(|| a.texture.cmp(&b.texture))
+                    .then_with(|| a.tile.cmp(&b.tile))
+            });
+        }
 
         if self.buckets.len() + groups.len() > BUCKET_CACHE_LIMIT {
             self.buckets.clear();
@@ -731,7 +754,7 @@ impl Draw {
 
     fn note_failure(&mut self, texture: &str, error: &str) {
         let message = format!("{texture}: {error}");
-        if !self.failed.contains(&message) {
+        if self.failed_set.insert(message.clone()) {
             self.failed.push(message);
         }
     }
@@ -789,6 +812,9 @@ impl Draw {
     ) {
         // The frame block written by the main view's `update`, which is the last
         // one written before this pass runs.
+        if self.order.is_empty() {
+            return;
+        }
         let Some(params) = self.last_params else {
             return;
         };

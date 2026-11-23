@@ -911,7 +911,7 @@ impl TerrainGpu {
                     runs,
                 );
             }
-        } else {
+        } else if !self.last_near_runs.is_empty() || self.near_records != 0 {
             self.last_near_runs.clear();
             self.near_records = 0;
         }
