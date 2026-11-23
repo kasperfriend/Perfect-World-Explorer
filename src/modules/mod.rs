@@ -637,7 +637,7 @@ mod tests {
         // Let the default size and panel layout settle before grabbing the edge.
         frame(Vec::new());
         frame(Vec::new());
-        let id = egui::Id::new("MODULES  |  ESC to go back");
+        let id = egui::Id::new("MODULES  |  ◀ ESC / Right-click to go back");
         let before = context
             .memory(|memory| memory.area_rect(id))
             .expect("Modules window area");
@@ -690,7 +690,7 @@ mod tests {
         }
         frame(&context, &mut modules, screen);
         frame(&context, &mut modules, screen);
-        let id = egui::Id::new("MODULES  |  ESC to go back");
+        let id = egui::Id::new("MODULES  |  ◀ ESC / Right-click to go back");
         let before = context
             .memory(|memory| memory.area_rect(id))
             .expect("Modules window area");
