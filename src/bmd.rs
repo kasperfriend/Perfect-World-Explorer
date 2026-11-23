@@ -369,8 +369,14 @@ impl Model {
                 let name_len = u(b, p)? as usize;
                 p += 4;
                 if name_len > 4096 {
+                    let dump_start = p.saturating_sub(6);
+                    let dump_end = b.len().min(dump_start + 48);
+                    let hex: String = b[dump_start..dump_end]
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
                     return Err(format!(
-                        "oversized BMD v300 mesh {mesh_idx} name len={name_len:#x} flags=({},{})",
+                        "oversized BMD v300 mesh {mesh_idx} name len={name_len:#x} flags=({},{}) ver={version:#x} tail={hex}",
                         u8::from(b_support_lm),
                         u8::from(b_use_lm),
                     ));

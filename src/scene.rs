@@ -289,7 +289,7 @@ fn refs(b: &[u8], p: &mut usize, n: usize) -> Result<Vec<Reference>, String> {
 /// `ECWDFILEECMODEL` onward, and the shipped files place the boundary above 12:
 /// 1.8.4 writes version 17, which has the field, and a 1.5.2-era map writes 12,
 /// which does not.
-pub const MODEL_SCALE_VERSION: u32 = 13;
+pub const MODEL_SCALE_VERSION: u32 = 17;
 
 /// Fold one tree asset name to the form both sides of the lookup compare.
 ///
