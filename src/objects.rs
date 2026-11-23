@@ -505,16 +505,13 @@ impl Objects {
             // submit a real batch instead of paying one queue submit/wait
             // per model. Four workers still parse independent BMDs
             // concurrently.
+            // Use all available CPU cores for concurrent BMD decompression and
+            // parsing (DirectStorage still batches 16 entries per worker call).
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4);
-            #[cfg(windows)]
-            let workers = if pck::direct_storage::compiled_in() {
-                workers.min(4)
-            } else {
-                workers
-            };
-            let workers = workers.min(missing_models.len());
+                .unwrap_or(4)
+                .min(16)
+                .min(missing_models.len());
             let chunk_size = (missing_models.len() + workers - 1) / workers;
             let parsed: Vec<Vec<(usize, String, Result<bmd::Model, String>)>> = {
                 let litfile = self
@@ -652,16 +649,13 @@ impl Objects {
                 }
             }
 
+            // Use all available CPU cores for concurrent texture decompression
+            // and DXT/TGA/BMP/PNG/JPEG decoding.
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4);
-            #[cfg(windows)]
-            let workers = if pck::direct_storage::compiled_in() {
-                workers.min(4)
-            } else {
-                workers
-            };
-            let workers = workers.min(jobs.len());
+                .unwrap_or(4)
+                .min(16)
+                .min(jobs.len());
             let chunk_size = (jobs.len() + workers - 1) / workers;
             let decoded: Vec<Vec<(String, Result<Texture, String>)>> = {
                 let litfile = self.litfile.as_ref();

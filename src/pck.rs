@@ -116,8 +116,79 @@ pub struct Entry {
     pub size: u32,
     pub compressed: u32,
 }
+#[derive(Hash, PartialEq, Eq)]
+struct DirCacheKey {
+    size: u64,
+    mtime_secs: u64,
+    mtime_nanos: u32,
+    end: u64,
+    pos: u64,
+    count: usize,
+    header_hash: [u8; 32],
+}
+
+fn dir_cache() -> &'static std::sync::Mutex<std::collections::HashMap<DirCacheKey, std::sync::Arc<Vec<Entry>>>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<DirCacheKey, std::sync::Arc<Vec<Entry>>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn decode_entry_record(
+    raw: &[u8],
+    end: u64,
+    decomp: &mut Decompress,
+    buf: &mut [u8; 276],
+) -> Result<Entry, String> {
+    let data: &[u8] = if raw.len() == 276 {
+        raw
+    } else {
+        decomp.reset(true);
+        decomp
+            .decompress(raw, buf, FlushDecompress::Finish)
+            .map_err(|e| e.to_string())?;
+        if decomp.total_out() != 276 {
+            let n = decomp.total_out();
+            return Err(format!("unexpected entry record size: {n}"));
+        }
+        buf.as_slice()
+    };
+    let zero = data[..260].iter().position(|&x| x == 0).unwrap_or(260);
+    let name_bytes = &data[..zero];
+    let mut name = if name_bytes.is_ascii() {
+        // Fast path: ASCII filenames skip GBK state-machine decoding.
+        String::from_utf8(name_bytes.to_vec()).unwrap_or_default()
+    } else {
+        encoding_rs::GBK.decode(name_bytes).0.into_owned()
+    };
+    if name.as_bytes().contains(&b'\\') {
+        // SAFETY: replacing ASCII '\\' with ASCII '/' preserves UTF-8 validity.
+        unsafe {
+            for b in name.as_bytes_mut() {
+                if *b == b'\\' {
+                    *b = b'/';
+                }
+            }
+        }
+    }
+    let offset = u32le(data, 260)?;
+    let usize_ = u32le(data, 264)?;
+    let compressed = u32le(data, 268)?;
+    if offset as u64 + compressed as u64 > end || usize_ > 512 * 1024 * 1024 || compressed > usize_
+    {
+        return Err(format!("invalid entry bounds: {name}"));
+    }
+    Ok(Entry {
+        name,
+        offset,
+        size: usize_,
+        compressed,
+    })
+}
+
 pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
-    let size = f.metadata().map_err(|e| e.to_string())?.len();
+    let meta = f.metadata().map_err(|e| e.to_string())?;
+    let size = meta.len();
     if size < 292 {
         return Err("archive too small".into());
     }
@@ -149,11 +220,41 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     if pos > table_end {
         return Err("entry table overlaps footer".into());
     }
+    // Check process-wide PCK directory cache before reading/decompressing the
+    // entry table. Avoids re-parsing multi-hundred-thousand-entry archives like
+    // textures.pck (8-10x per world load) and litmodels.pck on world switches
+    // and whole-world toggles.
+    let cache_key = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|dur| {
+            use sha2::Digest as _;
+            let mut h = sha2::Sha256::new();
+            h.update(&safe);
+            h.update(&header);
+            DirCacheKey {
+                size,
+                mtime_secs: dur.as_secs(),
+                mtime_nanos: dur.subsec_nanos(),
+                end,
+                pos,
+                count,
+                header_hash: h.finalize().into(),
+            }
+        });
+    if let Some(ref key) = cache_key {
+        if let Ok(guard) = dir_cache().lock() {
+            if let Some(cached) = guard.get(key) {
+                return Ok((**cached).clone());
+            }
+        }
+    }
     let table = at(f, pos, (table_end - pos) as usize)?;
+    // Fast linear scan of 8-byte record headers to collect record slices,
+    // allowing parallel zlib + GBK decoding across all CPU cores.
+    let mut slices: Vec<(usize, usize)> = Vec::with_capacity(count);
     let mut cursor = 0usize;
-    let mut decomp = Decompress::new(true);
-    let mut buf = [0u8; 276];
-    let mut result = Vec::with_capacity(count);
     for _ in 0..count {
         if cursor + 8 > table.len() {
             return Err("entry table overlaps footer".into());
@@ -167,49 +268,68 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
         {
             return Err("invalid entry table record".into());
         }
-        let raw = &table[cursor + 8..cursor + 8 + len];
-        let data: &[u8] = if len == 276 {
-            raw
-        } else {
-            decomp.reset(true);
-            decomp
-                .decompress(raw, &mut buf, FlushDecompress::Finish)
-                .map_err(|e| e.to_string())?;
-            if decomp.total_out() != 276 {
-                let n = decomp.total_out();
-                return Err(format!("unexpected entry record size: {n}"));
-            }
-            &buf
-        };
-        let zero = data[..260].iter().position(|&x| x == 0).unwrap_or(260);
-        let (decoded, _, _) = encoding_rs::GBK.decode(&data[..zero]);
-        let mut name = decoded.into_owned();
-        if name.as_bytes().contains(&b'\\') {
-            // SAFETY: replacing ASCII '\\' with ASCII '/' preserves UTF-8 validity.
-            unsafe {
-                for b in name.as_bytes_mut() {
-                    if *b == b'\\' {
-                        *b = b'/';
-                    }
-                }
-            }
-        }
-        let offset = u32le(&data, 260)?;
-        let usize_ = u32le(&data, 264)?;
-        let compressed = u32le(&data, 268)?;
-        if offset as u64 + compressed as u64 > end
-            || usize_ > 512 * 1024 * 1024
-            || compressed > usize_
-        {
-            return Err(format!("invalid entry bounds: {name}"));
-        }
-        result.push(Entry {
-            name,
-            offset,
-            size: usize_,
-            compressed,
-        });
+        slices.push((cursor + 8, len));
         cursor += 8 + len;
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(16);
+    let result = if workers > 1 && count >= 512 {
+        let chunk_size = (count + workers - 1) / workers;
+        let table_ref = &table;
+        let chunks: Result<Vec<Vec<Entry>>, String> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(workers);
+            for chunk in slices.chunks(chunk_size) {
+                handles.push(s.spawn(move || -> Result<Vec<Entry>, String> {
+                    let mut decomp = Decompress::new(true);
+                    let mut buf = [0u8; 276];
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for &(start, len) in chunk {
+                        out.push(decode_entry_record(
+                            &table_ref[start..start + len],
+                            end,
+                            &mut decomp,
+                            &mut buf,
+                        )?);
+                    }
+                    Ok(out)
+                }));
+            }
+            let mut all = Vec::with_capacity(handles.len());
+            for h in handles {
+                all.push(h.join().unwrap()?);
+            }
+            Ok(all)
+        });
+        let mut flat = Vec::with_capacity(count);
+        for chunk in chunks? {
+            flat.extend(chunk);
+        }
+        flat
+    } else {
+        let mut decomp = Decompress::new(true);
+        let mut buf = [0u8; 276];
+        let mut out = Vec::with_capacity(count);
+        for &(start, len) in &slices {
+            out.push(decode_entry_record(
+                &table[start..start + len],
+                end,
+                &mut decomp,
+                &mut buf,
+            )?);
+        }
+        out
+    };
+    if let Some(key) = cache_key {
+        if let Ok(mut guard) = dir_cache().lock() {
+            // Cap cache to 32 distinct archives so tests creating temporary PCKs
+            // cannot grow memory unboundedly.
+            if guard.len() >= 32 {
+                guard.clear();
+            }
+            guard.insert(key, std::sync::Arc::new(result.clone()));
+        }
     }
     Ok(result)
 }
