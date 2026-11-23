@@ -119,12 +119,13 @@ impl Request {
 pub fn multiply(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
     let mut out = [0.0f32; 16];
     for column in 0..4 {
+        let c = column * 4;
+        let b0 = b[c];
+        let b1 = b[c + 1];
+        let b2 = b[c + 2];
+        let b3 = b[c + 3];
         for row in 0..4 {
-            let mut sum = 0.0f32;
-            for k in 0..4 {
-                sum += a[k * 4 + row] * b[column * 4 + k];
-            }
-            out[column * 4 + row] = sum;
+            out[c + row] = a[row] * b0 + a[4 + row] * b1 + a[8 + row] * b2 + a[12 + row] * b3;
         }
     }
     out
@@ -751,10 +752,12 @@ impl Manager {
             return false;
         };
         self.unregister(&self.owners[index], publications);
-        self.owners.remove(index);
+        let removed_id = self.owners.swap_remove(index).request.identity;
+        self.index.remove(&removed_id);
+        if let Some(moved) = self.owners.get(index) {
+            self.index.insert(moved.request.identity, index);
+        }
         self.removed += 1;
-        // Every index past the removed one moved down by one.
-        self.reindex();
         true
     }
 
@@ -800,10 +803,12 @@ impl Manager {
         for identity in finished {
             if let Some(index) = self.position_of(identity) {
                 self.unregister(&self.owners[index], publications);
-                self.owners.remove(index);
+                let removed_id = self.owners.swap_remove(index).request.identity;
+                self.index.remove(&removed_id);
+                if let Some(moved) = self.owners.get(index) {
+                    self.index.insert(moved.request.identity, index);
+                }
                 self.removed += 1;
-                // An authored lifetime ended: the indices past it moved down.
-                self.reindex();
             }
         }
         for (identity, error) in failed {
@@ -904,10 +909,10 @@ impl Manager {
         view: &View,
         terrain: Option<crate::gfx_player::GroundHeightQuery<'_>>,
     ) -> Vec<EffectQuad> {
-        let mut out = Vec::new();
         if !self.effects {
-            return out;
+            return Vec::new();
         }
+        let mut out = Vec::with_capacity(self.owners.len().min(64) * 8);
         // Report only when one is due; the rows themselves allocate, so nothing
         // is collected on the frames between reports.
         let mut rows = match self.census.as_mut() {
@@ -1029,25 +1034,25 @@ impl Manager {
                         },
                     })
                 });
-                player
-                    .advance_with_terrain(
-                        delta_ms as f32,
-                        view,
-                        transform,
-                        authored_scale,
-                        alpha,
-                        ground,
-                        terrain,
-                    )
-                    .map(|()| (player.quads().to_vec(), player.clock_ms()))
+                let res = player.advance_with_terrain(
+                    delta_ms as f32,
+                    view,
+                    transform,
+                    authored_scale,
+                    alpha,
+                    ground,
+                    terrain,
+                );
+                res.map(|()| {
+                    let quads = player.quads();
+                    if let Some(rows) = rows.as_mut() {
+                        rows.push(census_row(&owner.request.path, quads, player.clock_ms()));
+                    }
+                    out.extend(quads.iter().cloned());
+                })
             };
             match stepped {
-                Ok((quads, clock)) => {
-                    if let Some(rows) = rows.as_mut() {
-                        rows.push(census_row(&owner.request.path, &quads, clock));
-                    }
-                    out.extend(quads);
-                }
+                Ok(()) => {}
                 Err(error) => {
                     failures.push((owner.request.origin.clone(), error));
                     owner.player = None;

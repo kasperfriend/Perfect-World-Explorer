@@ -523,7 +523,7 @@ impl Draw {
         }
         // Group and order: `RenderLayer` first, then depth-tested quads, then
         // the blend pair and the texture so a group reuses one pipeline.
-        let mut groups: Vec<(BucketKey, Vec<Vertex>)> = Vec::new();
+        let mut groups: Vec<(BucketKey, Vec<Vertex>)> = Vec::with_capacity(self.order.len().max(8));
         self.scratch_index.clear();
         for quad in quads {
             let pipeline = PipelineKey {
@@ -602,7 +602,7 @@ impl Draw {
                 });
             }
         }
-        groups.sort_by(|(a, _), (b, _)| {
+        groups.sort_unstable_by(|(a, _), (b, _)| {
             a.layer
                 .cmp(&b.layer)
                 // Depth writers establish the buffer the blended sheets are

@@ -362,7 +362,7 @@ impl FarTrees {
                 .map(|v| v.pos[2])
                 .chain(tree.lods[0].leaves.iter().map(|l| l.center[2]))
                 .fold(5.0f32, f32::max);
-            let mut slots = Vec::new();
+            let mut slots = Vec::with_capacity(2);
             for (part_index, img) in [&tree.bark, &tree.composite].into_iter().enumerate() {
                 let w = if small {
                     128
@@ -849,7 +849,8 @@ impl FarTrees {
         // Placement table, per-group constants and the indirect args are built
         // once here. Nothing per-frame is uploaded any more: a camera move only
         // dispatches `LOD_COMPUTE` over the placement table.
-        let mut placement_data = Vec::new();
+        let total_placements: usize = groups.iter().map(|g| g.positions.len()).sum();
+        let mut placement_data = Vec::with_capacity(total_placements);
         for (index, group) in groups.iter().enumerate() {
             for &position in &group.positions {
                 placement_data.push(Placement {

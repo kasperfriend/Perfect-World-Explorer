@@ -45,7 +45,7 @@ fn noise() -> (Vec<f32>, Vec<(usize, usize, f32)>) {
             }
         }
     }
-    let mut octave = Vec::new();
+    let mut octave = Vec::with_capacity(5);
     let mut scale = 1.;
     let mut sum = 0.;
     let mut period = 23;
@@ -68,8 +68,9 @@ fn sample_noise(table: &[f32], oct: &[(usize, usize, f32)], x: f32) -> f32 {
     oct.iter()
         .map(|&(period, off, amp)| {
             let x = x / period as f32 + off as f32;
-            let k = x.floor() as usize;
-            let f = x - x.floor();
+            let fl = x.floor();
+            let k = fl as usize;
+            let f = x - fl;
             (table[k % 64] * (1. - f) + table[(k + 1) % 64] * f).abs() * amp
         })
         .sum()

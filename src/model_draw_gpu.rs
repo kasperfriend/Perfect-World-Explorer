@@ -186,6 +186,7 @@ struct Mesh {
     indices: Vec<u16>,
     vertices: usize,
     alpha_texture: bool,
+    diffuse_alpha_only: bool,
     face_shader: Option<crate::model_asset::FaceShader>,
     /// Initial (bind-pose) mesh AABB in model space, used by the retail alpha
     /// sort: 0x7a5460 measures the eight transformed initial-box corners.
@@ -465,6 +466,7 @@ impl Draw {
                 indices: m.indices.to_vec(),
                 vertices: vertices.len(),
                 alpha_texture,
+                diffuse_alpha_only: asset.diffuse_alpha_meshes.contains(&(m.skin, m.mesh)),
                 face_shader: m.face_shader.cloned(),
                 bounds,
                 mesh: raster::Mesh::new(device, &vertices, m.indices.as_ref())?,
@@ -570,7 +572,7 @@ impl Draw {
             } else {
                 asset.mesh_color(pose.skin, pose.mesh, original)
             };
-            let diffuse_alpha_only = asset.diffuse_alpha_meshes.contains(&gpu.key);
+            let diffuse_alpha_only = gpu.diffuse_alpha_only;
             let params = frame.params(
                 material,
                 color,
@@ -609,7 +611,7 @@ impl Draw {
             return Err("model pass blending changed; rebuild its pipeline".into());
         }
         let original = asset.descriptor.render_settings().original_color;
-        let mut updates = Vec::new();
+        let mut updates = Vec::with_capacity(self.meshes.len());
         for mesh in self.meshes.iter().flatten() {
             let skin = asset.skins.get(mesh.key.0).ok_or("missing retained skin")?;
             let source = skin
@@ -626,7 +628,7 @@ impl Draw {
             } else {
                 asset.mesh_color(mesh.key.0, mesh.key.1, original)
             };
-            let diffuse_alpha_only = asset.diffuse_alpha_meshes.contains(&mesh.key);
+            let diffuse_alpha_only = mesh.diffuse_alpha_only;
             updates.push((
                 &mesh.binding,
                 frame.params(
@@ -682,7 +684,7 @@ impl Draw {
             // pipeline owns a different implicit bind-group layout. Submitting
             // them here would be a layout mismatch, so `draw_alpha_mesh` owns
             // them instead.
-            if self.alpha_meshes.contains(&index) || !visible(mesh.key) {
+            if self.alpha_meshes.binary_search(&index).is_ok() || !visible(mesh.key) {
                 continue;
             }
             self.receiver.draw(pass, &mesh.mesh, &mesh.binding);

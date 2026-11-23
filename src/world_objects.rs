@@ -1057,7 +1057,8 @@ impl GpuPage {
     /// Freeze the original submission sequence once loading is complete.
     /// Texture sharing changes storage, never coplanar/depth-tie winners.
     pub fn draw_order(pages: &[Self]) -> Vec<(usize, usize)> {
-        let mut order = Vec::new();
+        let cap: usize = pages.iter().map(|p| p.placements.len().max(1)).sum();
+        let mut order = Vec::with_capacity(cap);
         for (page, p) in pages.iter().enumerate() {
             if p.placements.is_empty() {
                 order.push((u64::MAX, page, usize::MAX));

@@ -1475,9 +1475,9 @@ fn build(
     }
     // Keep opaque indices separate so water can sample reflected/refracted scene passes.
     let water_start = indices.len() as u32;
-    let mut water_batches: Vec<WaterBatch> = Vec::new();
     let mut areas: Vec<_> = t.water.iter().collect();
-    areas.sort_by(|a, b| a.height.total_cmp(&b.height));
+    areas.sort_unstable_by(|a, b| a.height.total_cmp(&b.height));
+    let mut water_batches: Vec<WaterBatch> = Vec::with_capacity(areas.len());
     // The water records had no channel of their own: `SceneWater` and
     // `RenderWater` were declared in the Logging tab and emitted nowhere, so a
     // report could not say whether the map carries a water surface where the
@@ -3945,7 +3945,7 @@ impl Renderer {
                 .filter(|b| b.visible(matrix))
                 .cloned(),
         );
-        visible.sort_by(|a, b| {
+        visible.sort_unstable_by(|a, b| {
             b.distance_squared(camera.pos)
                 .total_cmp(&a.distance_squared(camera.pos))
         });

@@ -698,35 +698,31 @@ impl World {
             return;
         }
         let (x, z, radius) = self.view.unwrap_or((0., 0., -1.));
+        let radius_sq = radius * radius;
+        let resident_bounds = self.resident_bounds;
         let mut census = [0usize; 3];
-        let updates: Vec<(u64, bool)> = self
-            .producers
-            .iter()
-            .map(|producer| {
-                let dx = producer.position[0] - x;
-                let dz = producer.position[2] - z;
-                let near = dx * dx + dz * dz <= radius * radius;
-                let resident = cutoff_residency::contains(self.resident_bounds, producer.position);
-                let visible = match producer.valid_time {
-                    Some(mode) => crate::scene::effect_visible(mode, night),
-                    None => true,
-                };
-                if !near {
-                    census[0] += 1;
-                }
-                if !resident {
-                    census[1] += 1;
-                }
-                if !visible {
-                    census[2] += 1;
-                }
-                (producer.identity, near && resident && visible)
-            })
-            .collect();
-        self.census = census;
-        for (identity, active) in updates {
-            self.owners.set_active(identity, active);
+        let Self { producers, owners, .. } = self;
+        for producer in producers.iter() {
+            let dx = producer.position[0] - x;
+            let dz = producer.position[2] - z;
+            let near = dx * dx + dz * dz <= radius_sq;
+            let resident = cutoff_residency::contains(resident_bounds, producer.position);
+            let visible = match producer.valid_time {
+                Some(mode) => crate::scene::effect_visible(mode, night),
+                None => true,
+            };
+            if !near {
+                census[0] += 1;
+            }
+            if !resident {
+                census[1] += 1;
+            }
+            if !visible {
+                census[2] += 1;
+            }
+            owners.set_active(producer.identity, near && resident && visible);
         }
+        self.census = census;
         self.apply_attenuation(delta_ms, eye);
     }
     /// Ramp every attenuating root's alpha toward "visible inside the retail
@@ -752,22 +748,21 @@ impl World {
     /// stored, and nothing else in the frame writes it back, so returning early
     /// here would hold that root invisible for the rest of the session.
     fn apply_attenuation(&mut self, delta_ms: u32, eye: [f32; 3]) {
-        let off = self.effect_distance <= 0.;
-        let mut updates: Vec<(u64, f32)> = Vec::new();
-        for producer in self.producers.iter_mut().filter(|p| p.attenuation) {
+        let effect_distance = self.effect_distance;
+        let off = effect_distance <= 0.;
+        let Self { producers, owners, .. } = self;
+        for producer in producers.iter_mut().filter(|p| p.attenuation) {
             if off {
                 if producer.fade != 1. {
                     producer.fade = 1.;
-                    updates.push((producer.identity, 1.));
+                    owners.set_attenuation(producer.identity, 1.);
                 }
                 continue;
             }
-            let target = attenuation_target(self.effect_distance, producer.position, eye);
-            producer.fade = attenuation_step(producer.fade, target, delta_ms);
-            updates.push((producer.identity, producer.fade));
-        }
-        for (identity, fade) in updates {
-            self.owners.set_attenuation(identity, fade);
+            let target = attenuation_target(effect_distance, producer.position, eye);
+            let next = attenuation_step(producer.fade, target, delta_ms);
+            producer.fade = next;
+            owners.set_attenuation(producer.identity, next);
         }
     }
     pub fn update(
@@ -1185,30 +1180,30 @@ impl World {
             let Some(binding) = &producer.hook else {
                 continue;
             };
-            let origin = format!("producer {}", producer.identity);
+            let id = producer.identity;
             let outcome = (|| -> Result<Option<[f32; 16]>, String> {
                 let slot = self
                     .slots
                     .get(binding.instance)
-                    .ok_or_else(|| format!("{origin}: parent slot is gone"))?;
+                    .ok_or_else(|| format!("producer {id}: parent slot is gone"))?;
                 let parent = self
                     .assets
                     .instances
                     .get(binding.instance)
-                    .ok_or_else(|| format!("{origin}: parent instance is gone"))?;
+                    .ok_or_else(|| format!("producer {id}: parent instance is gone"))?;
                 if !cutoff_residency::contains(self.resident_bounds, parent.placement.position) {
                     return Ok(None);
                 }
                 let posed = match &slot.posed {
                     Some(Ok(posed)) => posed,
-                    Some(Err(e)) => return Err(format!("{origin}: parent pose failed: {e}")),
+                    Some(Err(e)) => return Err(format!("producer {id}: parent pose failed: {e}")),
                     None => return Ok(None),
                 };
                 let asset = self
                     .assets
                     .assets
                     .get(parent.asset)
-                    .ok_or_else(|| format!("{origin}: parent asset is gone"))?;
+                    .ok_or_else(|| format!("producer {id}: parent asset is gone"))?;
                 let hook = asset.hook_matrix(&posed.pose, &binding.record.hook)?;
                 // Validate hook * local composition without baking `local` into
                 // the attachment parent: `Request::transform` already holds
@@ -1236,7 +1231,9 @@ impl World {
         }
         // A producer whose owner is gone or whose hook cannot be resolved is
         // dropped instead of retrying against a stale parent every frame.
-        self.producers.retain(|p| !detached.contains(&p.identity));
+        if !detached.is_empty() {
+            self.producers.retain(|p| !detached.contains(&p.identity));
+        }
     }
     /// Upload this frame's already-evaluated poses. Runs for every pass without
     /// touching playback, producer clocks or publications.
