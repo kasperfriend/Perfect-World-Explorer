@@ -1033,7 +1033,7 @@ fn extract_rt_triangles(
                 let mut mask_albedo = None;
                 let mut mask_opacity = None;
                 if let Some(ta) = tex_alpha {
-                    if ta < 0.96 || tex_alpha_min < 0.95 {
+                    if ta < 0.99 || tex_alpha_min < 0.98 {
                         let mut m_bits = 0u64;
                         let mut m_rgb = [0.0f32; 3];
                         let mut m_w = 0.0f32;
@@ -1067,7 +1067,9 @@ fn extract_rt_triangles(
                                 }
                             }
                         }
-                        if m_hits == 0 && m_max_a < 0.12 {
+                        if m_hits == 0 && (!is_sdr_blend || m_max_a < 0.12) {
+                            // Raster alpha-test (`tex.a < 0.5`) discards 100% of this triangle;
+                            // drop it instead of emitting an unmasked speckled quad.
                             diag.dropped_transparent_tris += 1;
                             t += 1;
                             continue;
@@ -1083,6 +1085,9 @@ fn extract_rt_triangles(
                                     (m_rgb[2] / m_w).clamp(0.06, 0.95),
                                 ]);
                             }
+                        } else if m_hits == 49 && !is_sdr_blend {
+                            // All 49 samples pass alpha-test: solid opaque leaf interior.
+                            mask_opacity = Some(1.0);
                         }
                     }
                 }

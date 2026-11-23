@@ -326,6 +326,10 @@ pub fn push_alpha_canopy_fallback(pos: glam::Vec3, height: f32, out: &mut Vec<Rt
         let p_l = c_mid - off;
         let p_r = c_mid + off;
         let n = glam::Vec3::new(-az, 0.25, ax).normalize_or_zero();
+        // Organic perforated 49-bit foliage cluster mask so distant budget-fallback
+        // trees still cast leafy dappled shadows instead of solid diamond silhouettes.
+        const CANOPY_FALLBACK_MASK_A: u64 = 0x0001_5B6D_B6AD_556A;
+        const CANOPY_FALLBACK_MASK_B: u64 = 0x0000_B5AD_6B5B_2B54;
         out.push(RtTreeTriangle {
             a: c_bot,
             b: p_r,
@@ -333,8 +337,8 @@ pub fn push_alpha_canopy_fallback(pos: glam::Vec3, height: f32, out: &mut Vec<Rt
             normal: n,
             albedo: [0.16, 0.28, 0.12],
             roughness: 0.85,
-            opacity: 0.58,
-            alpha_mask: 0,
+            opacity: 0.62,
+            alpha_mask: CANOPY_FALLBACK_MASK_A,
         });
         out.push(RtTreeTriangle {
             a: c_bot,
@@ -343,8 +347,8 @@ pub fn push_alpha_canopy_fallback(pos: glam::Vec3, height: f32, out: &mut Vec<Rt
             normal: n,
             albedo: [0.16, 0.28, 0.12],
             roughness: 0.85,
-            opacity: 0.58,
-            alpha_mask: 0,
+            opacity: 0.62,
+            alpha_mask: CANOPY_FALLBACK_MASK_B,
         });
     }
     // Narrow trunk card.
@@ -720,9 +724,9 @@ impl FarTrees {
                                     .unwrap_or(0.46);
                                 let (mut mask, mut albedo, mut hits) =
                                     sample_tri_alpha_mask49(img, v0.uv, v1.uv, v2.uv, frond_cutoff);
-                                if hits == 0 {
+                                if hits == 0 && frond_cutoff > 0.36 {
                                     (mask, albedo, hits) =
-                                        sample_tri_alpha_mask49(img, v0.uv, v1.uv, v2.uv, 0.12);
+                                        sample_tri_alpha_mask49(img, v0.uv, v1.uv, v2.uv, 0.34);
                                 }
                                 if hits == 0 {
                                     ldiag.frond_skipped += 1;
@@ -792,14 +796,14 @@ impl FarTrees {
                                 leaf.uv[0],
                                 leaf.uv[1],
                                 leaf.uv[2],
-                                0.12,
+                                0.34,
                             );
                             (m1, a1, h1) = sample_tri_alpha_mask49(
                                 &tree.composite,
                                 leaf.uv[0],
                                 leaf.uv[2],
                                 leaf.uv[3],
-                                0.12,
+                                0.34,
                             );
                         }
                         if h0 + h1 == 0 {

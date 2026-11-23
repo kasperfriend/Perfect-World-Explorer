@@ -4726,8 +4726,16 @@ impl Renderer {
                 // Dynamic RT Camera Light (Hotkey: L): always placed at slot 0 so it never gets culled.
                 if settings.camera_light_enabled {
                     let cam_int = settings.camera_light_intensity.clamp(0.5, 100.0);
+                    // When Walker is active, place the camera light slightly ahead and above the
+                    // third-person character so it lights the world instead of blasting the
+                    // character's back into a glowing silhouette.
+                    let cam_light_pos = if self.modules.walker_active() {
+                        camera.pos + camera.direction() * 6.2 + glam::Vec3::new(0.0, 1.35, 0.0)
+                    } else {
+                        camera.pos + camera.direction() * 1.2
+                    };
                     let cam_light = crate::modules::raywatcher::frame::PointLight {
-                        position: camera.pos + camera.direction() * 1.2,
+                        position: cam_light_pos,
                         radius: (18.0 + cam_int * 2.4).clamp(22.0, 180.0),
                         colour: crate::modules::raywatcher::plan::camera_light_rgb(
                             settings.camera_light_warmness,

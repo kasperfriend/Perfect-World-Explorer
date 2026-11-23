@@ -1414,20 +1414,25 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
 
         var open = 1.0;
         if (bits_ao && ao_fade > 0.01 && !is_water) {
-            var hits = 0u;
+            var occ_sum = 0.0;
             var bent = vec3<f32>(0.0);
+            let inv_ao_r = 1.0 / max(ao_radius, 0.5);
             for (var i = 0u; i < ao_samples; i = i + 1u) {
                 let u1 = (f32(i) + next_f32(&state)) / f32(ao_samples);
                 let phi = f32(i) * 2.39996323 + rot_angle + f32(s) * 0.7548776;
                 let r = sqrt(u1);
                 let d = onb * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
-                if (occluded(ray_origin, d, ao_t_min, ao_radius, state ^ i)) {
-                    hits = hits + 1u;
+                let ao_hit = closest_hit(ray_origin, d, ao_t_min, ao_radius);
+                if (ao_hit.index != 0xffffffffu) {
+                    let t_norm = clamp(ao_hit.t * inv_ao_r, 0.0, 1.0);
+                    let w_close = 1.0 - t_norm;
+                    let contact_boost = select(1.0, 1.18, ao_hit.t < 1.8);
+                    occ_sum = occ_sum + clamp(w_close * sqrt(w_close) * contact_boost, 0.0, 1.0);
                 } else {
                     bent = bent + d;
                 }
             }
-            open = mix(1.0, 1.0 - f32(hits) / f32(ao_samples), ao_fade);
+            open = mix(1.0, 1.0 - clamp(occ_sum / f32(ao_samples), 0.0, 1.0), ao_fade);
             accum_bent_n = accum_bent_n + select(normal, normalize(bent), dot(bent, bent) > 1e-4);
         } else {
             accum_bent_n = accum_bent_n + normal;
@@ -1497,26 +1502,42 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 refl_col = refl_col + fx_refl * (fresnel * trim_scale * (1.0 - fog_t));
             }
             if (is_water && bits_refraction && fog_t < 0.90) {
-                let wdepth = select(6.0, water_depth, water_depth > 0.01);
-                let refract_dir = refract(view_dir, normal, 1.0 / 1.333);
-                let beer = exp(-wdepth * vec3<f32>(0.24, 0.085, 0.045));
+                var refract_dir = refract(view_dir, refl_base_n, 1.0 / 1.333);
+                if (dot(refract_dir, refract_dir) < 1e-4) {
+                    refract_dir = normalize(view_dir - vec3<f32>(0.0, 0.25, 0.0));
+                }
+                let refr_origin = point - vec3<f32>(0.0, 0.08, 0.0);
+                let refr_max_t = select(18.0, 36.0, dist < 220.0);
+                let refr_hit = closest_hit(refr_origin, refract_dir, 0.08, refr_max_t);
+                let wdepth = select(select(14.0, water_depth, water_depth > 0.01), max(refr_hit.t * max(-refract_dir.y, 0.25), 0.08), refr_hit.index != 0xffffffffu);
+                let refr_path = select(wdepth / max(-refract_dir.y, 0.25), refr_hit.t, refr_hit.index != 0xffffffffu);
+                let beer = exp(-refr_path * vec3<f32>(0.25, 0.085, 0.042));
                 let refract_w = (1.0 - fresnel) * (1.0 - fog_t);
-                let shallow_clear = exp(-wdepth * 0.16);
-                let depth_tint = (beer - vec3<f32>(1.0)) * (raster_rgb * 0.28 * refract_w);
-                refl_col = max(refl_col + depth_tint, vec3<f32>(0.0));
-                // Enhancement #13: Backlit shallow-water shoreline subsurface turquoise glow.
+                let shallow_clear = exp(-wdepth * 0.14);
+                if (refr_hit.index != 0xffffffffu) {
+                    let seabed_pos = refr_origin + refract_dir * refr_hit.t;
+                    let smat = material_of(refr_hit.index);
+                    let skind = tris[refr_hit.index].a.w;
+                    let s_albedo = select(smat.albedo.rgb, sample_terrain_albedo(seabed_pos, smat.albedo.rgb), skind > 1.5 && skind < 2.5);
+                    let s_ndl = max(dot(refr_hit.normal, params.sun_dir.xyz), 0.0);
+                    let seabed_lit = s_albedo * (params.ambient.xyz * params.tuning.z * 0.85 + params.sun_colour.xyz * (s_ndl * shadow));
+                    let deep_scatter = mix(vec3<f32>(0.01, 0.03, 0.06), vec3<f32>(0.03, 0.14, 0.18), sun_strength);
+                    let refr_col = seabed_lit * beer + deep_scatter * (vec3<f32>(1.0) - beer);
+                    refl_col = refl_col + refr_col * (refract_w * 0.42 * shallow_clear);
+                    if (bits_caustics && wdepth < 14.0 && shadow > 0.05 && s_ndl > 0.06 && sun_strength > 0.05) {
+                        let caust_rgb = caustic_pattern_chromatic(seabed_pos.xz, params.frame.x * 0.025, dist, wdepth);
+                        let c_fade = smoothstep(0.10, 0.75, wdepth) * shallow_clear * exp(-dist * 0.014);
+                        refl_col = refl_col + params.sun_colour.xyz * beer * caust_rgb * (shadow * s_ndl * sun_strength * refract_w * c_fade * 0.24);
+                    }
+                } else {
+                    let depth_tint = (beer - vec3<f32>(1.0)) * (raster_rgb * 0.26 * refract_w);
+                    refl_col = max(refl_col + depth_tint, vec3<f32>(0.0));
+                }
                 if (wdepth < 4.5 && shadow > 0.05 && sun_strength > 0.05) {
                     let back_w = clamp(dot(view_dir, params.sun_dir.xyz), 0.0, 1.0);
                     let bw3 = back_w * back_w * back_w;
                     let shore_w = smoothstep(0.05, 0.55, wdepth) * (1.0 - smoothstep(1.2, 4.5, wdepth));
                     refl_col = refl_col + vec3<f32>(0.12, 0.62, 0.58) * params.sun_colour.xyz * (bw3 * shore_w * shadow * sun_strength * refract_w * 0.45);
-                }
-                if (bits_caustics && wdepth < 12.0 && shadow > 0.05 && n_dot_l > 0.08 && sun_strength > 0.05) {
-                    let refr_t = wdepth / max(-refract_dir.y, 0.25);
-                    let seabed_pos = point + refract_dir * refr_t;
-                    let caust_rgb = caustic_pattern_chromatic(seabed_pos.xz, params.frame.x * 0.025, dist, wdepth);
-                    let c_fade = smoothstep(0.15, 0.90, wdepth) * shallow_clear * exp(-dist * 0.015);
-                    refl_col = refl_col + params.sun_colour.xyz * beer * caust_rgb * (shadow * n_dot_l * sun_strength * refract_w * c_fade * 0.16);
                 }
             }
             accum_reflection = accum_reflection + refl_col;
@@ -1673,35 +1694,37 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Feature #1: Sculpted 12-step Ray-Traced Volumetric God Rays (no flat foggy plane)
+    // Feature #1: True World-Space Ray-Marched Volumetric God-Rays & Light Shafts.
     var god_rays = vec3<f32>(0.0);
-    if (bits_shadows && params.sun_dir.y > 0.05 && dist > 14.0 && fog_t < 0.94) {
+    if (bits_shadows && params.sun_dir.y > 0.04 && dist > 10.0 && fog_t < 0.92) {
         let cos_view_sun = dot(view_dir, params.sun_dir.xyz);
-        if (cos_view_sun > 0.30) {
-            let phase = hg_phase(cos_view_sun, 0.86);
-            let march_len = min(dist, 155.0) - 3.0;
-            if (march_len > 8.0 && phase > 0.06) {
+        if (cos_view_sun > 0.08) {
+            let phase = hg_phase(cos_view_sun, 0.84) * 0.72 + hg_phase(cos_view_sun, 0.42) * 0.28;
+            let march_len = min(dist, 210.0) - 2.5;
+            if (march_len > 6.0 && phase > 0.04) {
                 var lit_steps = 0.0;
                 var occ_steps = 0.0;
-                let vol_steps = select(6u, 4u, march_len < 45.0 || dist > 100.0);
+                let vol_steps = select(select(8u, 6u, dist > 140.0), 5u, march_len < 40.0);
                 let inv_steps = 1.0 / f32(vol_steps);
                 for (var vi = 0u; vi < vol_steps; vi = vi + 1u) {
                     let u = (f32(vi) + ign_v) * inv_steps;
-                    let t_vol = 3.0 + (u * sqrt(u)) * march_len;
+                    let t_vol = 2.5 + (u * u * 0.55 + u * 0.45) * march_len;
                     let p_vol = params.eye.xyz + view_dir * t_vol;
+                    let h_density = exp(-max(p_vol.y - params.eye.y + 30.0, 0.0) * 0.0045);
                     if (occluded(p_vol, params.sun_dir.xyz, 0.5, 260.0, state ^ (vi * 53u))) {
                         occ_steps = occ_steps + 1.0;
                     } else {
-                        lit_steps = lit_steps + 1.0;
+                        lit_steps = lit_steps + h_density;
                     }
                 }
                 let shaft_vis = lit_steps * inv_steps;
                 let occ_frac = occ_steps * inv_steps;
-                let shaft_contrast = mix(0.12, 1.0, smoothstep(0.04, 0.38, occ_frac));
-                let dist_w = smoothstep(14.0, 95.0, march_len);
-                let shaft_col = mix(vec3<f32>(0.28, 0.38, 0.58), params.sun_colour.xyz, sun_strength);
-                let shaft_intensity = mix(0.025, 0.065, sun_strength);
-                god_rays = shaft_col * (shaft_vis * shaft_contrast * min(phase, 1.4) * dist_w * shaft_intensity * (1.0 - fog_t * 0.7));
+                let shaft_contrast = mix(0.16, 1.0, smoothstep(0.05, 0.34, occ_frac));
+                let dist_w = smoothstep(8.0, 85.0, march_len);
+                let low_sun_boost = mix(1.38, 1.0, smoothstep(0.12, 0.52, params.sun_dir.y));
+                let shaft_col = mix(vec3<f32>(0.32, 0.46, 0.72), params.sun_colour.xyz * vec3<f32>(1.06, 0.98, 0.86), sun_strength);
+                let shaft_intensity = mix(0.055, 0.145, sun_strength) * low_sun_boost;
+                god_rays = shaft_col * (shaft_vis * shaft_contrast * min(phase, 1.65) * dist_w * shaft_intensity * (1.0 - fog_t * 0.65));
             }
         }
     }
@@ -1821,7 +1844,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     if (bits_lighting && pl_count > 0u && is_water) {
         let w_norm = water_wave_normal(point.xz, params.frame.x * 0.03, dist);
         let view_to_eye = -view_dir;
-        for (var li = 0u; li < pl_count; li = li + 1u) {
+        let pl_loop_end = select(0u, pl_count, any_pl_near);
+        for (var li = 0u; li < pl_loop_end; li = li + 1u) {
             let pl_pr = params.point_lights_pos_rad[li];
             let to_l = pl_pr.xyz - point;
             if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
@@ -1856,33 +1880,70 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         point_lighting = min(point_lighting * (1.0 - fog_t), vec3<f32>(1.6));
     } else if (bits_lighting && pl_count > 0u) {
+        var any_pl_near = false;
+        for (var pre_i = 0u; pre_i < pl_count; pre_i = pre_i + 1u) {
+            let pr = params.point_lights_pos_rad[pre_i];
+            let d_pre = pr.xyz - point;
+            if (abs(d_pre.x) < pr.w && abs(d_pre.z) < pr.w && abs(d_pre.y) < pr.w && dot(d_pre, d_pre) < pr.w * pr.w) {
+                any_pl_near = true;
+                break;
+            }
+        }
         var pl_normal = normal;
-        {
+        if (any_pl_near) {
             let gdim_pl = vec2<i32>(i32(params.extents.x), i32(params.extents.y));
             let cpx = vec2<i32>(id.xy);
-            let d_thresh = max(0.80, dist * 0.026);
-            var offs = array<vec2<i32>, 8>(
-                vec2<i32>(2, 0), vec2<i32>(-2, 0), vec2<i32>(0, 2), vec2<i32>(0, -2),
-                vec2<i32>(4, 4), vec2<i32>(-4, 4), vec2<i32>(4, -4), vec2<i32>(-4, -4)
-            );
-            var n_acc = normal * 1.25;
-            for (var oi = 0u; oi < 8u; oi = oi + 1u) {
-                let npx = clamp(cpx + offs[oi], vec2<i32>(0), gdim_pl - vec2<i32>(1));
-                let nd = textureLoad(src_gbuf_pos, npx, 0).w;
-                if (nd > 0.0 && abs(nd - dist) < d_thresh) {
-                    var nn = textureLoad(src_gbuf_norm, npx, 0).xyz;
-                    let nn_l = length(nn);
-                    if (nn_l > 1e-4) {
-                        nn = nn / nn_l;
-                        if (dot(normal, nn) > 0.56) {
-                            n_acc = n_acc + nn;
+            if (dist < 18.0) {
+                let d_thresh = clamp(dist * 0.024, 0.08, 0.55);
+                var offs12 = array<vec2<i32>, 12>(
+                    vec2<i32>(1, 0), vec2<i32>(-1, 0), vec2<i32>(0, 1), vec2<i32>(0, -1),
+                    vec2<i32>(2, 1), vec2<i32>(-2, 1), vec2<i32>(2, -1), vec2<i32>(-2, -1),
+                    vec2<i32>(1, 2), vec2<i32>(-1, 2), vec2<i32>(1, -2), vec2<i32>(-1, -2)
+                );
+                var n_acc = normal * 0.65;
+                for (var oi = 0u; oi < 12u; oi = oi + 1u) {
+                    let npx = clamp(cpx + offs12[oi], vec2<i32>(0), gdim_pl - vec2<i32>(1));
+                    let nd = textureLoad(src_gbuf_pos, npx, 0).w;
+                    if (nd > 0.0 && abs(nd - dist) < d_thresh) {
+                        var nn = textureLoad(src_gbuf_norm, npx, 0).xyz;
+                        let nn_l = length(nn);
+                        if (nn_l > 1e-4) {
+                            nn = nn / nn_l;
+                            if (dot(normal, nn) > 0.36) {
+                                n_acc = n_acc + nn;
+                            }
                         }
                     }
                 }
-            }
-            let acc_l = length(n_acc);
-            if (acc_l > 1e-4) {
-                pl_normal = n_acc / acc_l;
+                let acc_l = length(n_acc);
+                if (acc_l > 1e-4) {
+                    pl_normal = n_acc / acc_l;
+                }
+            } else {
+                let d_thresh = max(0.80, dist * 0.026);
+                var offs = array<vec2<i32>, 8>(
+                    vec2<i32>(2, 0), vec2<i32>(-2, 0), vec2<i32>(0, 2), vec2<i32>(0, -2),
+                    vec2<i32>(4, 4), vec2<i32>(-4, 4), vec2<i32>(4, -4), vec2<i32>(-4, -4)
+                );
+                var n_acc = normal * 1.25;
+                for (var oi = 0u; oi < 8u; oi = oi + 1u) {
+                    let npx = clamp(cpx + offs[oi], vec2<i32>(0), gdim_pl - vec2<i32>(1));
+                    let nd = textureLoad(src_gbuf_pos, npx, 0).w;
+                    if (nd > 0.0 && abs(nd - dist) < d_thresh) {
+                        var nn = textureLoad(src_gbuf_norm, npx, 0).xyz;
+                        let nn_l = length(nn);
+                        if (nn_l > 1e-4) {
+                            nn = nn / nn_l;
+                            if (dot(normal, nn) > 0.56) {
+                                n_acc = n_acc + nn;
+                            }
+                        }
+                    }
+                }
+                let acc_l = length(n_acc);
+                if (acc_l > 1e-4) {
+                    pl_normal = n_acc / acc_l;
+                }
             }
         }
         let pl_terrain_skip = 2.4 + steepness * 12.0 + dist * 0.020;
@@ -2025,7 +2086,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             point_lighting = point_lighting * (comp / pl_peak);
         }
         point_lighting = min(point_lighting * (1.0 - fog_t), vec3<f32>(2.8));
-        if (bits_gi && luminance(point_lighting) > 0.08 && ((id.x + id.y + u32(params.frame.x)) & 7u) == 0u) {
+        if (bits_gi && dist > 8.5 && luminance(point_lighting) > 0.08 && ((id.x + id.y + u32(params.frame.x)) & 7u) == 0u) {
             rc_update(point, pl_normal, dist, point_lighting * 0.55);
         }
     }
@@ -2253,7 +2314,7 @@ fn reproject(pixel: vec2<i32>, size: vec2<i32>, current_depth: f32) -> Reproject
     if (previous_depth <= 0.0 || expected_prev_depth <= 0.0) {
         return empty;
     }
-    if (abs(previous_depth - expected_prev_depth) / max(expected_prev_depth, 1e-3) > 0.05) {
+    if (abs(previous_depth - expected_prev_depth) / max(expected_prev_depth, 1e-3) > 0.038) {
         return empty;
     }
     let prev_c = textureLoad(history_colour, index, 0);
@@ -2330,6 +2391,27 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let lum = luminance(blended);
         m1 = mix(prev.moments.x, lum, alpha);
         m2 = mix(prev.moments.y, lum * lum, alpha);
+    } else {
+        // SVGF spatial variance fallback on disoccluded pixels (history_len == 1):
+        // estimate luminance moments from 3x3 ray-grid neighborhood so à-trous immediately
+        // filters disocclusion noise cleanly without waiting 4 frames.
+        var l_sum = m1;
+        var l2_sum = m2;
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                let p = clamp(gp + vec2<i32>(dx, dy), vec2<i32>(0), gmax);
+                let raw = textureLoad(src_colour, p, 0);
+                let c = select(raw.rgb, raw.rgb + textureLoad(src_reflection, p, 0).rgb, is_glossy);
+                let l = luminance(c);
+                l_sum = l_sum + l;
+                l2_sum = l2_sum + l * l;
+            }
+        }
+        m1 = l_sum * (1.0 / 9.0);
+        m2 = l2_sum * (1.0 / 9.0);
     }
     textureStore(out_colour, pixel, vec4<f32>(blended, blended_lf));
     textureStore(out_moments, pixel, vec4<f32>(m1, m2, depth, length));
@@ -2417,7 +2499,8 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             let n1 = normal_at_scaled(p, grid_scale, gmax);
             let ndot = dot(centre_normal, n1);
-            if (ndot <= 0.0) {
+            // Zero-visual-cost Perf Boost: reject grazing/corner taps before loading colour & moments.
+            if (ndot <= 0.42) {
                 continue;
             }
             let curved_seam = smoothstep(0.55, 0.88, ndot);
@@ -2454,8 +2537,8 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let inv_w = 1.0 / weight_sum;
     let out_lf = select(centre_raw.a, sum_lf / weight_sum_lf, filter_lf);
     textureStore(out_colour, pixel, vec4<f32>(sum * inv_w, out_lf));
-    let out_m1 = select(centre_moments.x, moment1 * inv_w, step < 4);
-    let out_m2 = select(centre_moments.y, moment2 * inv_w, step < 4);
+    let out_m1 = select(centre_moments.x, moment1 * inv_w, step < 2);
+    let out_m2 = select(centre_moments.y, moment2 * inv_w, step < 2);
     textureStore(out_moments, pixel, vec4<f32>(out_m1, out_m2, centre_moments.z, centre_moments.w));
 }
 "#;
@@ -2652,7 +2735,11 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
         // Uniform per-frame scene-illumination albedo recovery (preserves dark stone/wood
         // albedo by day and reveals crisp textures under night point lights, zero grey veil).
         let scene_gain = clamp(comp_params.x, 1.0, 9.0);
-        let full_albedo = clamp(raster.rgb * scene_gain, vec3<f32>(0.002), vec3<f32>(0.92));
+        // Luminance-preserving albedo recovery: dark stone/terrain gets full night texture
+        // recovery while already-lit Walker character skin/armor never blows out to 0.92 white.
+        let r_lum = dot(raster.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let eff_gain = mix(scene_gain, 1.0, smoothstep(0.10, 0.36, r_lum));
+        let full_albedo = clamp(raster.rgb * eff_gain, vec3<f32>(0.002), vec3<f32>(0.92));
         // Add volumetric god rays (#1) & subtle calibrated glossy trim reflections (#3)
         // directly without multiplying by wall albedo.
         let refl_dim = vec2<i32>(textureDimensions(src_reflection));
