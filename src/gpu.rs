@@ -4336,10 +4336,10 @@ impl Renderer {
                 // slots for active world effects (Archosaur ring beams, wandering lights,
                 // dungeon entry circles, portals, torches, and 3D effect models).
                 point_lights.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-                if point_lights.len() > 24 {
-                    point_lights.truncate(24);
+                if point_lights.len() > 48 {
+                    point_lights.truncate(48);
                 }
-                let eff_slots = 48usize.saturating_sub(point_lights.len());
+                let eff_slots = 128usize.saturating_sub(point_lights.len());
                 if eff_slots > 0 {
                     if let Some(models) = &self.models {
                         // Cluster value: (pos_sum, bmin, bmax, weighted_col_sum, col_w_sum, max_radius, max_lum, count)

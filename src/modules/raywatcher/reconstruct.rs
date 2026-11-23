@@ -129,6 +129,9 @@ pub struct DlssRrInputs<'a> {
     /// Untouched full raster world render (`None` only in opt-in replace mode).
     pub raster: Option<&'a wgpu::TextureView>,
     pub layered: bool,
+    /// Per-frame scene-illumination albedo recovery gain (`1 / max(scene_illum, 0.08)`),
+    /// keeping dark stone/wood dark instead of boosting every dark pixel to 0.75 grey.
+    pub scene_albedo_gain: f32,
     pub motion: &'a wgpu::Texture,
     pub jitter: (f32, f32),
     pub reset: bool,
@@ -271,35 +274,57 @@ struct FOut {
 
 @fragment
 fn fs(i: VOut) -> FOut {
-    let c = textureSampleLevel(src_colour, lin_samp, i.uv, 0.0);
-    let r = textureSampleLevel(src_reflection, lin_samp, i.uv, 0.0);
-    let n = textureSampleLevel(src_normals, lin_samp, i.uv, 0.0);
-    let a = textureSampleLevel(src_albedo, lin_samp, i.uv, 0.0);
-    let raster_rgb = textureSampleLevel(src_raster, lin_samp, i.uv, 0.0).rgb;
     let depth_dim = vec2<f32>(textureDimensions(src_depth));
     let dcoord = vec2<i32>(clamp(i.uv * depth_dim, vec2<f32>(0.0), depth_dim - vec2<f32>(1.0)));
     let d = textureLoad(src_depth, dcoord, 0);
 
+    let rdim = vec2<f32>(textureDimensions(src_raster));
+    let rcoord = vec2<i32>(clamp(i.uv * rdim, vec2<f32>(0.0), rdim - vec2<f32>(1.0)));
+    let raster_rgb = textureLoad(src_raster, rcoord, 0).rgb;
+
+    // Sky pixels pass through 100% untouched so bilinear filtering never bleeds
+    // rooftop GI or shadow edges onto sky/clouds in DLSS Ray Reconstruction.
     var out: FOut;
+    if (d <= 1e-6) {
+        out.color = vec4<f32>(raster_rgb, 1.0);
+        out.depth = d;
+        out.normals = vec4<f32>(0.0, 1.0, 0.0, 1.0);
+        out.diffuse_albedo = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        out.specular_albedo = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        out.hit_distance = 1.0;
+        return out;
+    }
+
+    // Nearest texel fetch on ray-grid buffers prevents GI irradiance, shadow
+    // light-factor, and surface normals from smearing across building silhouettes.
+    let gdim = vec2<f32>(textureDimensions(src_colour));
+    let gcoord = vec2<i32>(clamp(i.uv * gdim, vec2<f32>(0.0), gdim - vec2<f32>(1.0)));
+    let c = textureLoad(src_colour, gcoord, 0);
+    let r = textureLoad(src_reflection, gcoord, 0);
+    let n = textureLoad(src_normals, gcoord, 0);
+    let a = textureLoad(src_albedo, gcoord, 0);
+
     let layered = prep_flags.x > 0.5;
-    let r_max = max(raster_rgb.r, max(raster_rgb.g, raster_rgb.b));
-    // Recover crisp per-pixel textured albedo directly from `raster_rgb` at all
-    // brightnesses (day & night), never substituting a flat grey constant on dark walls.
-    let albedo_gain = clamp(0.75 / max(r_max, 0.002), 1.0, 40.0);
-    let full_albedo = clamp(raster_rgb * albedo_gain, vec3<f32>(0.0), vec3<f32>(0.95));
-    // Modulate demodulated GI/point-light irradiance (`c.rgb`) by crisp full-res
-    // raster albedo on opaque surfaces so DLSS RR never stamps a grey tint over buildings.
-    let modulated_gi = select(full_albedo * c.rgb, c.rgb, n.w <= 0.12);
-    let base_rgb = select(c.rgb, max(raster_rgb * c.a + modulated_gi, vec3<f32>(0.0)), layered);
-    out.color = vec4<f32>(base_rgb + r.rgb, 1.0);
+    // Scale raster colour by the uniform per-frame scene-illumination gain (NOT
+    // per-pixel `0.75 / r_max`), preserving true dark stone/wood albedo so DLSS RR
+    // demodulation/remodulation never creates a noisy chalky grey/white veil.
+    let scene_gain = clamp(prep_flags.y, 1.0, 9.0);
+    let full_albedo = clamp(raster_rgb * scene_gain, vec3<f32>(0.015), vec3<f32>(0.92));
+    let is_water = n.w <= 0.12;
+    let modulated_gi = select(full_albedo * c.rgb, c.rgb, is_water);
+    let base_rgb = select(c.rgb, max(raster_rgb * clamp(c.a, 0.0, 1.0) + modulated_gi, vec3<f32>(0.0)), layered);
+    out.color = vec4<f32>(max(base_rgb + r.rgb, vec3<f32>(0.0)), 1.0);
     let n_len = length(n.xyz);
     let unit_n = select(vec3<f32>(0.0, 1.0, 0.0), n.xyz / n_len, n_len > 1e-4);
+    let rough = clamp(n.w, 0.02, 1.0);
     out.depth = d;
-    out.normals = vec4<f32>(unit_n, clamp(n.w, 0.02, 1.0));
-    // Feed crisp full-resolution raster albedo to DLSS RR instead of low-res grid albedo.
-    out.diffuse_albedo = vec4<f32>(select(a.rgb, full_albedo, d > 1e-6), 1.0);
-    out.specular_albedo = vec4<f32>(a.a, a.a, a.a, 1.0);
+    out.normals = vec4<f32>(unit_n, rough);
+    out.diffuse_albedo = vec4<f32>(full_albedo, 1.0);
+    let spec_f0 = select(select(0.02, 0.06, rough <= 0.36), 0.18, is_water);
+    out.specular_albedo = vec4<f32>(spec_f0, spec_f0, spec_f0, 1.0);
     out.hit_distance = r.a;
+    let _keep_samp = textureSampleLevel(src_albedo, lin_samp, i.uv, 0.0).a * 0.0;
+    out.specular_albedo.w = 1.0 + _keep_samp;
     return out;
 }
 "#;
@@ -667,7 +692,12 @@ fn fs(i: VOut) -> FOut {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("raywatcher dlss-rr prep"),
             });
-            let flags = [if inputs.layered { 1.0f32 } else { 0.0 }, 0.0, 0.0, 0.0];
+            let flags = [
+                if inputs.layered { 1.0f32 } else { 0.0 },
+                inputs.scene_albedo_gain.clamp(1.0, 9.0),
+                0.0,
+                0.0,
+            ];
             queue.write_buffer(&self.prep.flags_buf, 0, bytemuck::bytes_of(&flags));
             let raster_view = inputs.raster.unwrap_or(inputs.grid_colour);
             let bg = self.prep_bg.get_or_insert_with(|| {

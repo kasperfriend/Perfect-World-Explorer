@@ -694,6 +694,9 @@ mod imp {
         /// Deferred retirement lists freed once `ring.completed_fence() >= fence`.
         retired_scenes: Vec<(u64, DxrScene)>,
         retired_buffers: Vec<(u64, Vec<RawBuffer>)>,
+        /// Persistent 65,536-cell 3D world-space radiance cache (`u5`, 1 MB VRAM)
+        /// updated and queried by hardware RT cores for low-noise multi-bounce GI.
+        radiance_cache: RawBuffer,
         targets: DxrTargets,
     }
 
@@ -709,7 +712,8 @@ mod imp {
     // 8: u2 out_reflection UAV
     // 9: u3 out_normals UAV
     // 10: u4 out_albedo UAV
-    const HEAP_SLOTS: u32 = 13;
+    const RADIANCE_CACHE_CELLS: u32 = 65_536;
+    const HEAP_SLOTS: u32 = 14;
 
     impl Drop for DxrTracer {
         fn drop(&mut self) {
@@ -760,6 +764,15 @@ mod imp {
             let cbvs = [mk_cbv()?, mk_cbv()?, mk_cbv()?];
             let (dxr_scene, staging, build_fence) =
                 Self::build_scene(dev_ptr, device5_guard.0, &mut ring, &raw_queue, scene)?;
+            let radiance_cache = unsafe {
+                RawBuffer::create(
+                    dev_ptr,
+                    (RADIANCE_CACHE_CELLS as u64) * 16,
+                    d12::D3D12_HEAP_TYPE_DEFAULT,
+                    d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )?
+            };
             let targets = DxrTargets::new(device, &raw_device, grid_extent)?;
 
             let tracer = Self {
@@ -775,6 +788,7 @@ mod imp {
                 scene: dxr_scene,
                 retired_scenes: Vec::new(),
                 retired_buffers: vec![(build_fence, staging)],
+                radiance_cache,
                 targets,
             };
             tracer.write_scene_descriptors();
@@ -805,7 +819,7 @@ mod imp {
             };
             let uav_range = d12::D3D12_DESCRIPTOR_RANGE {
                 RangeType: d12::D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-                NumDescriptors: 5,
+                NumDescriptors: 6,
                 BaseShaderRegister: 0,
                 RegisterSpace: 0,
                 OffsetInDescriptorsFromTableStart: 0,
@@ -1370,6 +1384,24 @@ mod imp {
                         self.cpu_handle(8 + i as u32),
                     );
                 }
+
+                // Slot 13: u5 persistent 3D world-space radiance cache (`RWStructuredBuffer<float4>`).
+                let mut rc_uav: d12::D3D12_UNORDERED_ACCESS_VIEW_DESC = zeroed();
+                rc_uav.Format = DXGI_FORMAT_UNKNOWN;
+                rc_uav.ViewDimension = d12::D3D12_UAV_DIMENSION_BUFFER;
+                *rc_uav.u.Buffer_mut() = d12::D3D12_BUFFER_UAV {
+                    FirstElement: 0,
+                    NumElements: RADIANCE_CACHE_CELLS,
+                    StructureByteStride: 16,
+                    CounterOffsetInBytes: 0,
+                    Flags: d12::D3D12_BUFFER_UAV_FLAG_NONE,
+                };
+                (*dev).CreateUnorderedAccessView(
+                    self.radiance_cache.resource,
+                    null_mut(),
+                    &rc_uav,
+                    self.cpu_handle(13),
+                );
             }
         }
 
