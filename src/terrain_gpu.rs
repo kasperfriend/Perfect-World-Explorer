@@ -462,11 +462,10 @@ impl TerrainGpu {
                 native_n[group] += 1;
                 tex_map.push(index | ((group as u32 + 3) << 28));
                 crate::terrain_upload::upload(queue, &native_textures[group], &img.source, index)?;
-                // A submit bounds upload staging; a wait every eight sources
-                // also caps in-flight allocations on shared-memory adapters.
-                if image_number % 8 == 7 || image_number + 1 == m.textures.len() {
+                // Flush staging periodically without stalling the GPU pipeline.
+                if image_number % 32 == 31 || image_number + 1 == m.textures.len() {
                     queue.submit(std::iter::empty());
-                    device.poll(wgpu::Maintain::Wait);
+                    device.poll(wgpu::Maintain::Poll);
                 }
                 continue;
             }
@@ -539,9 +538,9 @@ impl TerrainGpu {
             }
             // wgpu keeps write_texture staging alive until submission. Bound
             // peak memory even when maximum-quality terrain uses 1024px images.
-            if image_number % 8 == 7 || image_number + 1 == m.textures.len() {
+            if image_number % 32 == 31 || image_number + 1 == m.textures.len() {
                 queue.submit(std::iter::empty());
-                device.poll(wgpu::Maintain::Wait);
+                device.poll(wgpu::Maintain::Poll);
             }
         }
         let masks = upload_masks(device, queue, m, &tex_map)?;
@@ -1083,36 +1082,10 @@ fn upload_masks(
             },
         view_formats: &[],
     });
-    let mut areas = Vec::with_capacity(masks_count);
-    let mut layers = Vec::with_capacity(masks_count);
-    let mut page = vec![0u8; MASK_PAGE * MASK_PAGE];
+    let mut areas = Vec::with_capacity(m.areas.len());
+    let mut layers = Vec::with_capacity(masks_count + m.areas.len());
+    let mut page_jobs: Vec<Vec<(usize, &crate::material::Layer)>> = vec![Vec::new(); pages];
     let mut layer_id = 0usize;
-    let mut page_id = 0usize;
-    let upload_page = |page: &[u8], id: usize| {
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &masktex,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: id as u32,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            page,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(MASK_PAGE as u32),
-                rows_per_image: Some(MASK_PAGE as u32),
-            },
-            wgpu::Extent3d {
-                width: MASK_PAGE as u32,
-                height: MASK_PAGE as u32,
-                depth_or_array_layers: 1,
-            },
-        )
-    };
     for a in &m.areas {
         areas.push(Area {
             start: layers.len() as u32,
@@ -1123,28 +1096,9 @@ fn upload_masks(
             let id = if j == 0 {
                 u32::MAX
             } else {
-                if layer_id / per_page != page_id {
-                    upload_page(&page, page_id);
-                    // Prevent queued 16 MiB mask pages from accumulating
-                    // alongside decoded terrain images and lightmaps.
-                    if page_id % 2 == 1 {
-                        queue.submit(std::iter::empty());
-                        device.poll(wgpu::Maintain::Wait);
-                    }
-                    page.fill(0);
-                    page_id += 1;
-                }
+                let p_id = layer_id / per_page;
                 let slot = layer_id % per_page;
-                let ox = slot % per_row * mask_side;
-                let oy = slot / per_row * mask_side;
-                let decoded_mask = l.mask.decode(l.mask_size)?;
-                for y in 0..mask_side {
-                    for x in 0..mask_side {
-                        let sx = x * l.mask_size / mask_side;
-                        let sy = y * l.mask_size / mask_side;
-                        page[(oy + y) * MASK_PAGE + ox + x] = decoded_mask[sy * l.mask_size + sx];
-                    }
-                }
+                page_jobs[p_id].push((slot, l));
                 let id = layer_id as u32;
                 layer_id += 1;
                 id
@@ -1159,9 +1113,96 @@ fn upload_masks(
             });
         }
     }
-    upload_page(&page, page_id);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8);
+    let mut page = vec![0u8; MASK_PAGE * MASK_PAGE];
+    for (page_id, jobs) in page_jobs.iter().enumerate() {
+        page.fill(0);
+        if !jobs.is_empty() {
+            let decoded: Vec<(usize, usize, std::borrow::Cow<'_, [u8]>)> =
+                if workers > 1 && jobs.len() >= 8 {
+                    let chunk_size = (jobs.len() + workers - 1) / workers;
+                    std::thread::scope(|s| -> Result<Vec<_>, String> {
+                        let handles: Vec<_> = jobs
+                            .chunks(chunk_size)
+                            .map(|chunk| {
+                                s.spawn(move || -> Result<Vec<_>, String> {
+                                    let mut out = Vec::with_capacity(chunk.len());
+                                    for &(slot, l) in chunk {
+                                        out.push((slot, l.mask_size, l.mask.decode(l.mask_size)?));
+                                    }
+                                    Ok(out)
+                                })
+                            })
+                            .collect();
+                        let mut all = Vec::with_capacity(jobs.len());
+                        for h in handles {
+                            all.extend(h.join().unwrap()?);
+                        }
+                        Ok(all)
+                    })?
+                } else {
+                    let mut out = Vec::with_capacity(jobs.len());
+                    for &(slot, l) in jobs {
+                        out.push((slot, l.mask_size, l.mask.decode(l.mask_size)?));
+                    }
+                    out
+                };
+            for (slot, src_size, decoded_mask) in decoded {
+                let ox = (slot % per_row) * mask_side;
+                let oy = (slot / per_row) * mask_side;
+                if src_size == mask_side {
+                    for y in 0..mask_side {
+                        let dst = (oy + y) * MASK_PAGE + ox;
+                        let src = y * mask_side;
+                        page[dst..dst + mask_side]
+                            .copy_from_slice(&decoded_mask[src..src + mask_side]);
+                    }
+                } else {
+                    for y in 0..mask_side {
+                        let sy = y * src_size / mask_side;
+                        let dst_row = (oy + y) * MASK_PAGE + ox;
+                        let src_row = sy * src_size;
+                        for x in 0..mask_side {
+                            let sx = x * src_size / mask_side;
+                            page[dst_row + x] = decoded_mask[src_row + sx];
+                        }
+                    }
+                }
+            }
+        }
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &masktex,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: page_id as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &page,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(MASK_PAGE as u32),
+                rows_per_image: Some(MASK_PAGE as u32),
+            },
+            wgpu::Extent3d {
+                width: MASK_PAGE as u32,
+                height: MASK_PAGE as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+        if page_id % 4 == 3 {
+            queue.submit(std::iter::empty());
+            device.poll(wgpu::Maintain::Poll);
+        }
+    }
     queue.submit(std::iter::empty());
-    device.poll(wgpu::Maintain::Wait);
+    device.poll(wgpu::Maintain::Poll);
     drop(page);
     let area_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("terrain areas"),
@@ -1318,96 +1359,136 @@ fn load_lightmaps(
     // as the day/night fallback the night slot uses.
     let mut availability = vec![crate::terrain_lightmaps::Availability::Unbound; m.areas.len()];
     let mut unbound = Vec::new();
-    for (si, name) in t.subterrain_names.iter().enumerate() {
-        let base = t.element.join("maps/world");
-        let pair = match crate::terrain_lightmaps::Pair::read_optional(
-            &base.join(format!("{name}.t2lm")),
-            &base.join(format!("{name}.t2lm1")),
-        )? {
-            Some(pair) => pair,
-            None => {
+    let base = t.element.join("maps/world");
+    let lm_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8);
+    // Read and parse .t2lm/.t2lm1 pairs in parallel batches of 16 subtiles so
+    // disk I/O and DDS parsing overlap across CPU cores while bounding RAM.
+    for batch_start in (0..t.subterrain_names.len()).step_by(16) {
+        let batch_end = (batch_start + 16).min(t.subterrain_names.len());
+        let batch_names = &t.subterrain_names[batch_start..batch_end];
+        let loaded_pairs: Vec<(usize, Option<crate::terrain_lightmaps::Pair>)> =
+            if lm_workers > 1 && batch_names.len() >= 2 {
+                let chunk_size = (batch_names.len() + lm_workers - 1) / lm_workers;
+                let base_ref = &base;
+                std::thread::scope(|s| -> Result<Vec<_>, String> {
+                    let handles: Vec<_> = batch_names
+                        .chunks(chunk_size)
+                        .enumerate()
+                        .map(|(ci, chunk)| {
+                            let offset = batch_start + ci * chunk_size;
+                            s.spawn(move || -> Result<Vec<_>, String> {
+                                let mut out = Vec::with_capacity(chunk.len());
+                                for (k, name) in chunk.iter().enumerate() {
+                                    let pair = crate::terrain_lightmaps::Pair::read_optional(
+                                        &base_ref.join(format!("{name}.t2lm")),
+                                        &base_ref.join(format!("{name}.t2lm1")),
+                                    )?;
+                                    out.push((offset + k, pair));
+                                }
+                                Ok(out)
+                            })
+                        })
+                        .collect();
+                    let mut all = Vec::with_capacity(batch_names.len());
+                    for h in handles {
+                        all.extend(h.join().unwrap()?);
+                    }
+                    Ok(all)
+                })?
+            } else {
+                let mut out = Vec::with_capacity(batch_names.len());
+                for (k, name) in batch_names.iter().enumerate() {
+                    let pair = crate::terrain_lightmaps::Pair::read_optional(
+                        &base.join(format!("{name}.t2lm")),
+                        &base.join(format!("{name}.t2lm1")),
+                    )?;
+                    out.push((batch_start + k, pair));
+                }
+                out
+            };
+        for (si, pair) in loaded_pairs {
+            let name = &t.subterrain_names[si];
+            let Some(pair) = pair else {
                 for j in 0..crate::terrain_lightmaps::TILES {
                     unbound.push(layout.area(si, j).unwrap());
                 }
                 continue;
-            }
-        };
-        for (which, ext) in ["t2lm", "t2lm1"].iter().enumerate() {
-            let path = t.element.join("maps/world").join(format!("{name}.{ext}"));
-            let tiles = crate::terrain_lightmaps::Tiles::parse(pair.bytes(which == 1))
-                .map_err(|e| format!("lightmap {}: {e}", path.display()))?;
-            for j in 0..crate::terrain_lightmaps::TILES {
-                let raw = tiles.tile(j).unwrap();
-                let id = layout.area(si, j).unwrap();
-                availability[id] = pair.availability();
-                let slot = id % per_page;
-                let page = id / per_page + which * pages;
-                let x = (slot % per_row) * side;
-                let y = (slot / per_row) * side;
-                let write_tile = |data: &[u8], bytes_per_row: u32, rows_per_image: u32| {
-                    queue.write_texture(
-                        wgpu::ImageCopyTexture {
-                            texture: &texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d {
-                                x: x as u32,
-                                y: y as u32,
-                                z: page as u32,
-                            },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        data,
-                        wgpu::ImageDataLayout {
-                            offset: 0,
-                            bytes_per_row: Some(bytes_per_row),
-                            rows_per_image: Some(rows_per_image),
-                        },
-                        wgpu::Extent3d {
-                            width: side as u32,
-                            height: side as u32,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                };
-                let dds = crate::model_dds::Dds::parse(raw)
+            };
+            for (which, ext) in ["t2lm", "t2lm1"].iter().enumerate() {
+                let path = base.join(format!("{name}.{ext}"));
+                let tiles = crate::terrain_lightmaps::Tiles::parse(pair.bytes(which == 1))
                     .map_err(|e| format!("lightmap {}: {e}", path.display()))?;
-                if dds.format != crate::model_dds::Format::Dxt1
-                    || dds.mips.len() != 1
-                    || dds.mips[0].width != 256
-                    || dds.mips[0].height != 256
-                {
-                    return Err(format!("Unsupported lightmap DDS in {}", path.display()));
-                }
-                // Both upload backends must accept exactly the same records.
-                if bc {
-                    write_tile(dds.mips[0].bytes, (side / 4 * 8) as u32, (side / 4) as u32);
-                } else {
-                    let img = image::load_from_memory_with_format(raw, image::ImageFormat::Dds)
-                        .map_err(|e| format!("lightmap {}: {e}", path.display()))?
-                        .to_rgba8();
-                    if img.width() != 256 || img.height() != 256 {
-                        return Err("unexpected lightmap dimensions".into());
-                    }
-                    let img = if side == 256 {
-                        img
-                    } else {
-                        image::imageops::resize(
-                            &img,
-                            side as u32,
-                            side as u32,
-                            image::imageops::FilterType::Triangle,
-                        )
+                for j in 0..crate::terrain_lightmaps::TILES {
+                    let raw = tiles.tile(j).unwrap();
+                    let id = layout.area(si, j).unwrap();
+                    availability[id] = pair.availability();
+                    let slot = id % per_page;
+                    let page = id / per_page + which * pages;
+                    let x = (slot % per_row) * side;
+                    let y = (slot / per_row) * side;
+                    let write_tile = |data: &[u8], bytes_per_row: u32, rows_per_image: u32| {
+                        queue.write_texture(
+                            wgpu::ImageCopyTexture {
+                                texture: &texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d {
+                                    x: x as u32,
+                                    y: y as u32,
+                                    z: page as u32,
+                                },
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            data,
+                            wgpu::ImageDataLayout {
+                                offset: 0,
+                                bytes_per_row: Some(bytes_per_row),
+                                rows_per_image: Some(rows_per_image),
+                            },
+                            wgpu::Extent3d {
+                                width: side as u32,
+                                height: side as u32,
+                                depth_or_array_layers: 1,
+                            },
+                        );
                     };
-                    write_tile(img.as_raw(), (side * 4) as u32, side as u32);
+                    let dds = crate::model_dds::Dds::parse(raw)
+                        .map_err(|e| format!("lightmap {}: {e}", path.display()))?;
+                    if dds.format != crate::model_dds::Format::Dxt1
+                        || dds.mips.len() != 1
+                        || dds.mips[0].width != 256
+                        || dds.mips[0].height != 256
+                    {
+                        return Err(format!("Unsupported lightmap DDS in {}", path.display()));
+                    }
+                    if bc {
+                        write_tile(dds.mips[0].bytes, (side / 4 * 8) as u32, (side / 4) as u32);
+                    } else {
+                        let img = image::load_from_memory_with_format(raw, image::ImageFormat::Dds)
+                            .map_err(|e| format!("lightmap {}: {e}", path.display()))?
+                            .to_rgba8();
+                        if img.width() != 256 || img.height() != 256 {
+                            return Err("unexpected lightmap dimensions".into());
+                        }
+                        let img = if side == 256 {
+                            img
+                        } else {
+                            image::imageops::resize(
+                                &img,
+                                side as u32,
+                                side as u32,
+                                image::imageops::FilterType::Triangle,
+                            )
+                        };
+                        write_tile(img.as_raw(), (side * 4) as u32, side as u32);
+                    }
                 }
             }
         }
-        // write_texture staging belongs to wgpu until the next submission.
-        // Wait periodically to cap temporary upload memory on slower GPUs.
-        if si % 4 == 3 || si + 1 == t.subterrain_names.len() {
-            queue.submit(std::iter::empty());
-            device.poll(wgpu::Maintain::Wait);
-        }
+        queue.submit(std::iter::empty());
+        device.poll(wgpu::Maintain::Poll);
     }
     // An unbound area still owns an atlas slot, so fill it with a neutral tile
     // rather than the texture's zero-initialised contents. The shader keeps
@@ -1449,7 +1530,7 @@ fn load_lightmaps(
             }
         }
         queue.submit(std::iter::empty());
-        device.poll(wgpu::Maintain::Wait);
+        device.poll(wgpu::Maintain::Poll);
     }
     eprintln!(
         "Loaded {} terrain lightmap areas ({} with authored night maps, {} day-only, {} unbound) at {}px ({})",

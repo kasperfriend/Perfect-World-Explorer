@@ -372,7 +372,7 @@ pub struct DoneStats {
     pub cache_hit: bool,
 }
 pub enum Message {
-    Page(Page),
+    Page(Arc<Page>),
     /// A cache page failed validation; discard prior cache pages and use the
     /// cold-build pages that follow.
     CacheInvalid,
@@ -525,26 +525,98 @@ fn allocate_slot(
     page.slots.insert(key, s);
     Ok((s, turned))
 }
+enum CacheJob {
+    Write(Arc<Page>),
+    Finish {
+        processed: usize,
+        skipped: usize,
+        atlas_pages: usize,
+        atlas_bytes: usize,
+    },
+}
+
+struct AsyncCacheWriter {
+    tx: Option<SyncSender<CacheJob>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AsyncCacheWriter {
+    fn start(writer: crate::world_page_cache::Writer) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CacheJob>(2);
+        let handle = std::thread::Builder::new()
+            .name("whole-world-cache-writer".into())
+            .spawn(move || {
+                let mut writer = Some(writer);
+                while let Ok(job) = rx.recv() {
+                    match job {
+                        CacheJob::Write(page) => {
+                            if let Some(w) = writer.as_mut() {
+                                if let Err(error) = w.write_page(&page) {
+                                    eprintln!("Whole-world cache write disabled: {error}");
+                                    writer = None;
+                                }
+                            }
+                        }
+                        CacheJob::Finish {
+                            processed,
+                            skipped,
+                            atlas_pages,
+                            atlas_bytes,
+                        } => {
+                            if let Some(w) = writer.take() {
+                                if let Err(error) =
+                                    w.finish(processed, skipped, atlas_pages, atlas_bytes)
+                                {
+                                    eprintln!("Whole-world cache publish failed: {error}");
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            })
+            .expect("whole-world cache writer thread");
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        }
+    }
+
+    fn write(&mut self, page: Arc<Page>) {
+        if let Some(tx) = &self.tx {
+            if tx.send(CacheJob::Write(page)).is_err() {
+                self.tx = None;
+            }
+        }
+    }
+
+    fn finish(mut self, processed: usize, skipped: usize, atlas_pages: usize, atlas_bytes: usize) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(CacheJob::Finish {
+                processed,
+                skipped,
+                atlas_pages,
+                atlas_bytes,
+            });
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn emit_page(
     tx: &SyncSender<Message>,
-    cache: &mut Option<crate::world_page_cache::Writer>,
+    cache: &mut Option<AsyncCacheWriter>,
     metadata: &mut Vec<WorldPageMeta>,
-    mut page: Page,
+    page: Page,
 ) -> bool {
-    let write_error = cache
-        .as_mut()
-        .and_then(|writer| writer.write_page(&page).err());
-    if let Some(error) = write_error {
-        eprintln!("Whole-world cache write disabled: {error}");
-        *cache = None;
-    }
     metadata.push(WorldPageMeta::from_page(&page));
-    // The worker has frozen all world draw/cull commands from this metadata.
-    // Whole-world GPU pages need only the buffers afterward; avoid retaining a
-    // second copy of every placement and bound until the Done message arrives.
-    page.placements = Vec::new();
-    page.bounds = Vec::new();
-    tx.send(Message::Page(page)).is_ok()
+    let shared = Arc::new(page);
+    if let Some(writer) = cache.as_mut() {
+        writer.write(Arc::clone(&shared));
+    }
+    tx.send(Message::Page(shared)).is_ok()
 }
 
 pub fn build<O: Into<Arc<[Ornament]>>>(
@@ -591,7 +663,7 @@ fn run(
                         let mut page = page;
                         page.placements = Vec::new();
                         page.bounds = Vec::new();
-                        if tx.send(Message::Page(page)).is_err() {
+                        if tx.send(Message::Page(Arc::new(page))).is_err() {
                             return Ok(());
                         }
                     }
@@ -635,7 +707,7 @@ fn run(
         }
     }
     let mut cache = cache_key.and_then(|key| match crate::world_page_cache::Writer::new(key) {
-        Ok(writer) => Some(writer),
+        Ok(writer) => Some(AsyncCacheWriter::start(writer)),
         Err(error) => {
             eprintln!("Whole-world cache unavailable: {error}");
             None
@@ -861,9 +933,7 @@ fn run(
     }
     let world_draw_cmds = world_culled_commands_from_meta(&world_metadata);
     if let Some(writer) = cache.take() {
-        if let Err(error) = writer.finish(limit, skipped, atlas_pages, atlas_bytes) {
-            eprintln!("Whole-world cache publish failed: {error}");
-        }
+        writer.finish(limit, skipped, atlas_pages, atlas_bytes);
     }
     let _ = tx.send(Message::Done {
         processed: limit,
@@ -1043,6 +1113,116 @@ impl GpuPage {
             )
         } else {
             Self::upload(device, queue, layout, sampler, normal, reflected, page)
+        }
+    }
+
+    /// Borrowed zero-copy variant used when `Arc<Page>` is shared with the
+    /// asynchronous background disk-cache writer thread.
+    pub fn upload_world_ref(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        normal: &wgpu::Buffer,
+        reflected: &wgpu::Buffer,
+        existing: &[Self],
+        page: &Page,
+    ) -> Self {
+        let (normal_bg, reflected_bg) = if let Some(source) = page.shared_atlas {
+            let source = existing
+                .get(source)
+                .expect("shared atlas must precede its geometry");
+            (Arc::clone(&source.normal), Arc::clone(&source.reflected))
+        } else {
+            let image = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("whole-world object atlas"),
+                size: wgpu::Extent3d {
+                    width: SIDE as u32,
+                    height: page.used_height as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 8,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let mut width = SIDE;
+            let mut height = page.used_height;
+            for mip in 0..8u32 {
+                let level = if mip == 0 {
+                    &page.atlas
+                } else {
+                    &page.mips[(mip - 1) as usize]
+                };
+                queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &image,
+                        mip_level: mip,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    level,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some((width * 4) as u32),
+                        rows_per_image: Some(height as u32),
+                    },
+                    wgpu::Extent3d {
+                        width: width as u32,
+                        height: height as u32,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                width /= 2;
+                height /= 2;
+            }
+            let view = image.create_view(&Default::default());
+            let make = |buf: &wgpu::Buffer| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("whole-world object material"),
+                    layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                })
+            };
+            (Arc::new(make(normal)), Arc::new(make(reflected)))
+        };
+        use wgpu::util::DeviceExt;
+        let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("whole-world object vertices"),
+            contents: bytemuck::cast_slice(&page.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("whole-world object indices"),
+            contents: bytemuck::cast_slice(&page.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        Self {
+            vertex,
+            index,
+            count: page.indices.len() as u32,
+            normal: normal_bg,
+            reflected: reflected_bg,
+            placements: Vec::new(),
+            bounds: Vec::new(),
+            page_min: page.page_min,
+            page_max: page.page_max,
+            page_has_sdr: page.page_has_sdr,
         }
     }
     fn geometry(

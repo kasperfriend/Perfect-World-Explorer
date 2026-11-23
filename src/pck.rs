@@ -127,7 +127,8 @@ struct DirCacheKey {
     header_hash: [u8; 32],
 }
 
-fn dir_cache() -> &'static std::sync::Mutex<std::collections::HashMap<DirCacheKey, std::sync::Arc<Vec<Entry>>>> {
+fn dir_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<DirCacheKey, std::sync::Arc<Vec<Entry>>>> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<DirCacheKey, std::sync::Arc<Vec<Entry>>>>,
     > = std::sync::OnceLock::new();

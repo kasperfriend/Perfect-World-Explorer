@@ -2130,46 +2130,121 @@ impl Renderer {
             ],
         });
         let depth_tex = depth(&device, w, h);
-        let sky = crate::sky_gpu::SkyGpu::new(&device, &queue, format, &t.element)?;
-        let weather =
-            crate::weather_gpu::WeatherGpu::new(&device, &queue, &t.element, format, &t.water);
-        let cloud = t.cloud_surface.as_deref().and_then(|surface| {
-            match crate::cloud_gpu::CloudGpu::new(&device, &queue, format, &t.element, surface) {
-                Ok(cloud) => {
-                    eprintln!("Initialized indexed world cloud billboards from world.cld");
-                    Some(cloud)
-                }
-                Err(error) => {
-                    eprintln!("World cloud renderer unavailable: {error}");
-                    None
-                }
-            }
-        });
-        let water =
-            crate::water_gpu::WaterGpu::new(&device, &queue, format, w, h, &t.water_normals);
-        let simple_water = crate::simple_water_gpu::SimpleWaterGpu::new(
-            &device,
-            &queue,
-            format,
-            &t.water_simple_frames,
-        );
-        let shore =
-            match crate::shore_gpu::ShoreGpu::new(&device, &queue, format, &t.element, &t.water) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Shoreline waves unavailable: {e}");
-                    None
-                }
-            };
-        let far_trees = crate::far_trees_gpu::FarTrees::new(
-            &device,
-            &queue,
-            format,
-            &t.trees,
-            &uniform,
-            &reflected_uniform,
-            vegetation_authored_mips,
-        );
+        let terrain_upload = m
+            .terrain_upload
+            .take()
+            .ok_or("initial terrain upload missing")?;
+        // Initialize all independent GPU subsystems concurrently across CPU
+        // cores (`wgpu::Device` and `wgpu::Queue` are Send + Sync), overlapping
+        // sky/weather/cloud/water/shore/tree/terrain texture decoding, mip
+        // generation, shader compilation, and staging uploads.
+        let (sky, weather, cloud, water, simple_water, shore, far_trees, terrain_gpu) =
+            std::thread::scope(|s| -> Result<_, String> {
+                let device_ref = &device;
+                let queue_ref = &queue;
+                let uniform_ref = &uniform;
+                let reflected_ref = &reflected_uniform;
+                let t_ref = &*t;
+                let upload_ref = &terrain_upload;
+
+                let sky_task = s.spawn(move || {
+                    crate::sky_gpu::SkyGpu::new(device_ref, queue_ref, format, &t_ref.element)
+                });
+                let weather_cloud_task = s.spawn(move || {
+                    let weather = crate::weather_gpu::WeatherGpu::new(
+                        device_ref,
+                        queue_ref,
+                        &t_ref.element,
+                        format,
+                        &t_ref.water,
+                    );
+                    let cloud = t_ref.cloud_surface.as_deref().and_then(|surface| {
+                        match crate::cloud_gpu::CloudGpu::new(
+                            device_ref,
+                            queue_ref,
+                            format,
+                            &t_ref.element,
+                            surface,
+                        ) {
+                            Ok(cloud) => {
+                                eprintln!(
+                                    "Initialized indexed world cloud billboards from world.cld"
+                                );
+                                Some(cloud)
+                            }
+                            Err(error) => {
+                                eprintln!("World cloud renderer unavailable: {error}");
+                                None
+                            }
+                        }
+                    });
+                    (weather, cloud)
+                });
+                let water_task = s.spawn(move || {
+                    let water = crate::water_gpu::WaterGpu::new(
+                        device_ref,
+                        queue_ref,
+                        format,
+                        w,
+                        h,
+                        &t_ref.water_normals,
+                    );
+                    let simple_water = crate::simple_water_gpu::SimpleWaterGpu::new(
+                        device_ref,
+                        queue_ref,
+                        format,
+                        &t_ref.water_simple_frames,
+                    );
+                    let shore = match crate::shore_gpu::ShoreGpu::new(
+                        device_ref,
+                        queue_ref,
+                        format,
+                        &t_ref.element,
+                        &t_ref.water,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("Shoreline waves unavailable: {e}");
+                            None
+                        }
+                    };
+                    (water, simple_water, shore)
+                });
+                let trees_task = s.spawn(move || {
+                    crate::far_trees_gpu::FarTrees::new(
+                        device_ref,
+                        queue_ref,
+                        format,
+                        &t_ref.trees,
+                        uniform_ref,
+                        reflected_ref,
+                        vegetation_authored_mips,
+                    )
+                });
+                let terrain_gpu = crate::terrain_gpu::TerrainGpu::new(
+                    device_ref,
+                    queue_ref,
+                    format,
+                    t_ref,
+                    upload_ref,
+                    uniform_ref,
+                    reflected_ref,
+                )?;
+                let sky = sky_task.join().unwrap()?;
+                let (weather, cloud) = weather_cloud_task.join().unwrap();
+                let (water, simple_water, shore) = water_task.join().unwrap();
+                let far_trees = trees_task.join().unwrap();
+                Ok((
+                    sky,
+                    weather,
+                    cloud,
+                    water,
+                    simple_water,
+                    shore,
+                    far_trees,
+                    terrain_gpu,
+                ))
+            })?;
         // Immutable tree meshes/motion samples and water frames now live on
         // the GPU. The streaming worker never reads these sources again.
         t.trees.types.clear();
@@ -2178,26 +2253,11 @@ impl Renderer {
         t.trees.placements.shrink_to_fit();
         t.water_normals.clear();
         t.water_simple_frames.clear();
-        let terrain_upload = m
-            .terrain_upload
-            .take()
-            .ok_or("initial terrain upload missing")?;
-        let terrain_gpu = crate::terrain_gpu::TerrainGpu::new(
-            &device,
-            &queue,
-            format,
-            t,
-            &terrain_upload,
-            &uniform,
-            &reflected_uniform,
-        )?;
         // Material masks and DDS buffers are no longer needed once uploaded.
-        // Flush staging before adding native-size scenery pages to cap peak memory.
         drop(terrain_upload);
         t.materials.release_gpu_source();
         t.heights.trim();
         queue.submit(std::iter::empty());
-        device.poll(wgpu::Maintain::Wait);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("world WGSL"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -5703,7 +5763,7 @@ pub fn run(
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(|value| value.clamp(1, 250))
-        .unwrap_or(64);
+        .unwrap_or(100);
     // The expensive atlas and scene rebuild runs off the UI thread. At most one
     // request is in flight; once it completes, the latest camera position is used.
     let (width, height, spacing) = (t.width, t.height, t.grid_spacing);
@@ -6694,7 +6754,7 @@ pub fn run(
                             Ok(crate::world_objects::Message::Page(page)) => {
                                 let processed = page.processed;
                                 let upload_started = std::time::Instant::now();
-                                let uploaded = crate::world_objects::GpuPage::upload_world(
+                                let uploaded = crate::world_objects::GpuPage::upload_world_ref(
                                     &renderer.device,
                                     &renderer.queue,
                                     &renderer.layout,
@@ -6702,7 +6762,7 @@ pub fn run(
                                     &renderer.uniform,
                                     &renderer.reflected_uniform,
                                     &renderer.world_pages,
-                                    page,
+                                    &page,
                                 );
                                 let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
                                 renderer.world_pages.push(uploaded);
@@ -8217,7 +8277,7 @@ pub fn preview(
                         "Preview uploaded world chunk: {} vertices",
                         page.vertices.len()
                     );
-                    let uploaded = crate::world_objects::GpuPage::upload_world(
+                    let uploaded = crate::world_objects::GpuPage::upload_world_ref(
                         &renderer.device,
                         &renderer.queue,
                         &renderer.layout,
@@ -8225,7 +8285,7 @@ pub fn preview(
                         &renderer.uniform,
                         &renderer.reflected_uniform,
                         &renderer.world_pages,
-                        page,
+                        &page,
                     );
                     renderer.world_pages.push(uploaded);
                 }

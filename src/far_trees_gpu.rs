@@ -574,7 +574,7 @@ impl FarTrees {
         // Generate each rectangle separately so lower mip levels cannot blend
         // neighboring trees. Keep unadjusted alpha for the next reduction;
         // preserve approximate cutout coverage only in the uploaded copy.
-        for (ox, oy, w, h, cutout, authored) in mip_slots {
+        for &(ox, oy, w, h, cutout, ref authored) in &mip_slots {
             if let Some(chain) = authored {
                 for (index, img) in chain.iter().enumerate() {
                     let level = index as u32 + 1;
@@ -604,45 +604,112 @@ impl FarTrees {
                 }
                 continue;
             }
-            let mut raw = vec![0u8; w * h * 4];
-            for y in 0..h {
-                let src = ((oy + y) * side + ox) * 4;
-                raw[y * w * 4..(y + 1) * w * 4].copy_from_slice(&atlas[src..src + w * 4]);
-            }
-            let source_coverage = crate::foliage_mips::coverage(&raw);
-            let (mut mw, mut mh) = (w, h);
-            for level in 1..8 {
-                raw = crate::foliage_mips::downsample(&raw, mw, mh, cutout);
-                mw /= 2;
-                mh /= 2;
-                let corrected = if cutout {
-                    crate::foliage_mips::preserve_coverage(&raw, source_coverage)
+            // Generated in parallel below.
+            let _ = (ox, oy, w, h, cutout);
+        }
+        // Generate all non-authored foliage mip chains concurrently across CPU
+        // cores before submitting write_texture calls.
+        let gen_slots: Vec<(usize, usize, usize, usize, bool)> = mip_slots
+            .iter()
+            .filter_map(|(ox, oy, w, h, cutout, authored)| {
+                if authored.is_none() {
+                    Some((*ox, *oy, *w, *h, *cutout))
                 } else {
-                    raw.clone()
-                };
-                queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: &image,
-                        mip_level: level,
-                        origin: wgpu::Origin3d {
-                            x: (ox >> level) as u32,
-                            y: (oy >> level) as u32,
-                            z: 0,
+                    None
+                }
+            })
+            .collect();
+        if !gen_slots.is_empty() {
+            let mip_workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(8)
+                .min(gen_slots.len());
+            let build_slot = |ox: usize,
+                              oy: usize,
+                              w: usize,
+                              h: usize,
+                              cutout: bool,
+                              atlas_ref: &[u8]|
+             -> Vec<(u32, u32, u32, u32, u32, Vec<u8>)> {
+                let mut raw = vec![0u8; w * h * 4];
+                for y in 0..h {
+                    let src = ((oy + y) * side + ox) * 4;
+                    raw[y * w * 4..(y + 1) * w * 4].copy_from_slice(&atlas_ref[src..src + w * 4]);
+                }
+                let source_coverage = crate::foliage_mips::coverage(&raw);
+                let (mut mw, mut mh) = (w, h);
+                let mut levels = Vec::with_capacity(7);
+                for level in 1..8u32 {
+                    raw = crate::foliage_mips::downsample(&raw, mw, mh, cutout);
+                    mw /= 2;
+                    mh /= 2;
+                    let corrected = if cutout {
+                        crate::foliage_mips::preserve_coverage(&raw, source_coverage)
+                    } else {
+                        raw.clone()
+                    };
+                    levels.push((
+                        level,
+                        (ox >> level) as u32,
+                        (oy >> level) as u32,
+                        mw as u32,
+                        mh as u32,
+                        corrected,
+                    ));
+                }
+                levels
+            };
+            let generated: Vec<Vec<(u32, u32, u32, u32, u32, Vec<u8>)>> = if mip_workers > 1 {
+                let chunk_size = (gen_slots.len() + mip_workers - 1) / mip_workers;
+                let atlas_ref = &atlas;
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = gen_slots
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            s.spawn(move || {
+                                chunk
+                                    .iter()
+                                    .map(|&(ox, oy, w, h, cutout)| {
+                                        build_slot(ox, oy, w, h, cutout, atlas_ref)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .flat_map(|h| h.join().unwrap())
+                        .collect()
+                })
+            } else {
+                gen_slots
+                    .iter()
+                    .map(|&(ox, oy, w, h, cutout)| build_slot(ox, oy, w, h, cutout, &atlas))
+                    .collect()
+            };
+            for levels in generated {
+                for (level, dx, dy, mw, mh, corrected) in levels {
+                    queue.write_texture(
+                        wgpu::ImageCopyTexture {
+                            texture: &image,
+                            mip_level: level,
+                            origin: wgpu::Origin3d { x: dx, y: dy, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
                         },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &corrected,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some((mw * 4) as u32),
-                        rows_per_image: Some(mh as u32),
-                    },
-                    wgpu::Extent3d {
-                        width: mw as u32,
-                        height: mh as u32,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                        &corrected,
+                        wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(mw * 4),
+                            rows_per_image: Some(mh),
+                        },
+                        wgpu::Extent3d {
+                            width: mw,
+                            height: mh,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
         }
         drop(atlas);
