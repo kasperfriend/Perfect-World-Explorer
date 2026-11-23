@@ -300,9 +300,15 @@ impl FarTrees {
         let mut rocking_samples: Vec<[f32; 4]> = Vec::new();
         let mut leaf_normals: Vec<[f32; 4]> = Vec::new();
         let mut indices = Vec::new();
-        let mut instances = Vec::new();
-        let mut batches = Vec::new();
-        let mut groups = Vec::new();
+        let mut instances = Vec::with_capacity(trees.placements.len() * 3);
+        let mut batches = Vec::with_capacity(trees.types.len() * 3);
+        let mut groups = Vec::with_capacity(trees.types.len());
+        let mut placements_by_type: Vec<Vec<[f32; 3]>> = vec![Vec::new(); trees.types.len()];
+        for placement in &trees.placements {
+            if let Some(bucket) = placements_by_type.get_mut(placement.tree_type as usize) {
+                bucket.push(placement.position);
+            }
+        }
         let mut packed_count = 0usize;
         let mut mip_slots: Vec<(
             usize,
@@ -345,12 +351,7 @@ impl FarTrees {
         }
         for (id, maybe) in trees.types.iter().enumerate() {
             let Some(tree) = maybe else { continue };
-            let positions: Vec<_> = trees
-                .placements
-                .iter()
-                .filter(|p| p.tree_type as usize == id)
-                .map(|p| p.position)
-                .collect();
+            let positions = std::mem::take(&mut placements_by_type[id]);
             if positions.is_empty() {
                 continue;
             }
@@ -1077,8 +1078,13 @@ impl FarTrees {
             return;
         }
         let key = (camera, scale, bounds);
-        if self.last_resident_update == Some(key) {
-            return;
+        if let Some((prev_cam, prev_scale, prev_bounds)) = self.last_resident_update {
+            let dx = camera[0] - prev_cam[0];
+            let dy = camera[1] - prev_cam[1];
+            let dz = camera[2] - prev_cam[2];
+            if dx * dx + dy * dy + dz * dz < 1e-4 && prev_scale == scale && prev_bounds == bounds {
+                return;
+            }
         }
         let params = LodParams {
             camera: [camera[0], camera[1], camera[2], scale],
@@ -1239,7 +1245,7 @@ impl FarTrees {
         bytes
     }
     pub fn draw<'a>(&'a self, p: &mut wgpu::RenderPass<'a>, reflected: bool) {
-        if self.batches.is_empty() {
+        if self.placements == 0 || self.batches.is_empty() {
             return;
         }
         p.set_pipeline(&self.pipeline);

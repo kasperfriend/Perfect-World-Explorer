@@ -799,15 +799,15 @@ impl SkyGpu {
         let mut day_set = 0usize;
         let mut night_set = 1usize;
         let mut load_layer = |key: &str, fallback: &str| -> Result<image::RgbaImage, String> {
-            let key = if entries.contains_key(key) {
-                key.to_string()
+            let resolved = if entries.contains_key(key) {
+                key
             } else {
                 eprintln!("configured sky texture {key} absent; using {fallback}");
-                fallback.to_string()
+                fallback
             };
             let entry = entries
-                .get(&key)
-                .ok_or_else(|| format!("missing client sky texture {key}"))?;
+                .get(resolved)
+                .ok_or_else(|| format!("missing client sky texture {resolved}"))?;
             let bytes = pck::read_entry(&mut file, entry)?;
             let img = image::load_from_memory(&bytes)
                 .map_err(|e| format!("{key}: {e}"))?
@@ -1188,21 +1188,19 @@ impl SkyGpu {
         sets: (i32, i32, f32),
         reflected: bool,
     ) {
+        let inv_h = 1.0 / h.max(1) as f32;
+        let aspect = w as f32 * inv_h;
+        let sun_half = sun_ndc_half(FOV_DEGREES);
         let view = Mat4::look_to_rh(Vec3::ZERO, direction, Vec3::Y);
         let projection = Mat4::from_scale(Vec3::new(-1., 1., 1.))
-            * Mat4::perspective_rh(
-                FOV_DEGREES.to_radians(),
-                w as f32 / h.max(1) as f32,
-                1.,
-                16000.,
-            );
+            * Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 1., 16000.);
         // Reflect every world-space camera ray about the water plane. Mirroring
         // only the forward vector loses the inverted vertical screen basis.
         let inv = sky_inverse(projection, view, reflected);
         let (flare_ndc, flare_weight) = flare_lanes(projection, view, frame.sun, reflected);
         // The chain hangs on the painted disc's centre, which is one half-extent
         // below the point the quad is emitted from (two halves at full night).
-        let flare_ndc = flare_anchor(flare_ndc, sun_ndc_half(FOV_DEGREES), frame.night_weight);
+        let flare_ndc = flare_anchor(flare_ndc, sun_half, frame.night_weight);
         let uniform = Uniform {
             inv: inv.to_cols_array_2d(),
             time: [
@@ -1219,7 +1217,7 @@ impl SkyGpu {
                 frame.background[0],
                 frame.background[1],
                 frame.background[2],
-                sun_ndc_half(FOV_DEGREES),
+                sun_half,
             ],
             tint: [
                 frame.tint[0],
@@ -1227,7 +1225,7 @@ impl SkyGpu {
                 frame.tint[2],
                 // The screen aspect the flare chain needs to keep its sprites
                 // round in NDC, where x and y span different angles.
-                w as f32 / h.max(1) as f32,
+                aspect,
             ],
             // `sets.w` carries the night strength into `celestial` (the sun's
             // `1 + 2 * n` swell and the recovered shine ramp).

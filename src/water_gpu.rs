@@ -887,6 +887,10 @@ impl WaterGpu {
         far: Option<(&wgpu::Buffer, &wgpu::Buffer, u32)>,
         near: (&wgpu::Buffer, &wgpu::Buffer, u32),
     ) {
+        let far = far.filter(|f| f.2 > 0);
+        if far.is_none() && near.2 == 0 {
+            return;
+        }
         let params = EdgeUniform {
             matrix: matrix.to_cols_array_2d(),
             bounds,
@@ -924,10 +928,12 @@ impl WaterGpu {
                 pass.set_index_buffer(far.1.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..far.2, 0, 0..1);
             }
-            pass.set_pipeline(&self.edge_near);
-            pass.set_vertex_buffer(0, near.0.slice(..));
-            pass.set_index_buffer(near.1.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..near.2, 0, 0..1);
+            if near.2 > 0 {
+                pass.set_pipeline(&self.edge_near);
+                pass.set_vertex_buffer(0, near.0.slice(..));
+                pass.set_index_buffer(near.1.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..near.2, 0, 0..1);
+            }
         }
         queue.submit(Some(e.finish()));
     }
@@ -941,6 +947,9 @@ impl WaterGpu {
         start: u32,
         end: u32,
     ) {
+        if start >= end {
+            return;
+        }
         {
             let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("water surface"),

@@ -472,9 +472,9 @@ impl PostGpu {
             format: Some(self.format.remove_srgb_suffix()),
             ..Default::default()
         });
-        let fogged = self.fogged.create_view(&Default::default());
-        let warped = self.warped.create_view(&Default::default());
-        let downsample = self.downsample.create_view(&Default::default());
+        let fogged = plan.fog.then(|| self.fogged.create_view(&Default::default()));
+        let warped = plan.warp.then(|| self.warped.create_view(&Default::default()));
+        let downsample = plan.glow.then(|| self.downsample.create_view(&Default::default()));
         let blur = self.blur.create_view(&Default::default());
         // Separate horizontal and composite bind groups avoid binding the blur texture
         // as both render target and shader resource in the same pass.
@@ -509,13 +509,12 @@ impl PostGpu {
         let mut encoder = device.create_command_encoder(&Default::default());
         // Diagnostic depth fog only. Production shading is fogged per material,
         // so this stage is never part of the shipped chain (`post_plan`).
-        let apply_fog = plan.fog;
-        if apply_fog {
+        if let Some(ref fogged_view) = fogged {
             let group = bind(&scene, &scene);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene fog before glow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &fogged,
+                    view: fogged_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -530,14 +529,14 @@ impl PostGpu {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let before_warp = if apply_fog { &fogged } else { &scene };
+        let before_warp = fogged.as_ref().unwrap_or(&scene);
         // 0x40fd33: spacewarp consumes the quantized capture, before glow.
-        if plan.warp {
+        if let Some(ref warped_view) = warped {
             let group = bind(before_warp, before_warp);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("underwater distortion before glow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &warped,
+                    view: warped_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -552,16 +551,16 @@ impl PostGpu {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let input = if plan.warp { &warped } else { before_warp };
+        let input = warped.as_ref().unwrap_or(before_warp);
         // 0x40fdb0/0x40f053: quarter-size copy, horizontal blur, then the
         // vertical blur + composite in the finish pass.
-        if plan.glow {
+        if let Some(ref downsample_view) = downsample {
             {
                 let group = bind(input, input);
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("glow quarter-size stretch copy"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &downsample,
+                        view: downsample_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -576,7 +575,7 @@ impl PostGpu {
                 pass.set_bind_group(0, &group, &[]);
                 pass.draw(0..3, 0..1);
             }
-            let group = bind(input, &downsample);
+            let group = bind(input, downsample_view);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("glow horizontal"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -595,17 +594,15 @@ impl PostGpu {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let composite_target = self.composite_target.create_view(&Default::default());
+        let composite_target = plan
+            .sharpen
+            .then(|| self.composite_target.create_view(&Default::default()));
         {
             let group = bind(input, &blur);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("underwater and glow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: if plan.sharpen {
-                        &composite_target
-                    } else {
-                        target
-                    },
+                    view: composite_target.as_ref().unwrap_or(target),
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -625,8 +622,8 @@ impl PostGpu {
             pass.draw(0..3, 0..1);
         }
         // 0x40fd64..0x40fd9c: authored fullsharpen_14 after the encoded glow.
-        if plan.sharpen {
-            let group = bind(&composite_target, &blur);
+        if let Some(ref composite_view) = composite_target {
+            let group = bind(composite_view, &blur);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("client fullscreen sharpen after encoded glow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {

@@ -868,8 +868,8 @@ impl Walker {
                 self.camera_position = Some(eye);
                 return Some(eye);
             }
-            let cp = pitch.cos();
-            let look = Vec3::new(s * cp, pitch.sin(), -c * cp);
+            let (sp, cp) = pitch.sin_cos();
+            let look = Vec3::new(s * cp, sp, -c * cp);
             let mut camera = eye - look * self.settings.camera_distance;
             let clearance = physics::ground(map, camera.x, camera.z).height + 0.25;
             camera.y = camera.y.max(clearance);
