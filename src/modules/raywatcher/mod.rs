@@ -455,8 +455,14 @@ impl Raywatcher {
             "Diagnostics log (trees & broken models -> raywatcher-diag.log)",
         )
         .on_hover_text(
-            "Writes detailed SpeedTree species/LOD leaf mask stats, BMD model alpha-mask & degenerate triangle stats, and active effect-light stats to pwe-logs/raywatcher-diag.log whenever the RT scene harvests.",
+            "Writes SpeedTree species/LOD leaf mask stats, BMD model alpha-mask & degenerate triangle stats, and active light counts to pwe-logs/raywatcher-diag.log immediately when enabled and every few seconds.",
         );
+        if settings.diagnostics_log {
+            let log_path = crate::diagnostics::dir()
+                .unwrap_or_else(crate::diagnostics::default_log_dir)
+                .join("raywatcher-diag.log");
+            ui.small(format!("Writes to: {}", log_path.display()));
+        }
         ui.separator();
         ui.heading("Quality");
         ui.add(

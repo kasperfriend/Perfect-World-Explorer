@@ -864,16 +864,34 @@ fn material_of(index: u32) -> Material {
     return materials[mat_idx];
 }
 
+fn occluded_point_light(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32, terrain_skip: f32, seed: u32) -> bool {
+    let h = closest_hit(origin, dir, t_min, t_max);
+    if (h.index == 0xffffffffu) {
+        return false;
+    }
+    if (terrain_skip > 0.0 && h.t < terrain_skip) {
+        let k = tris[h.index].a.w;
+        if (k > 1.5 && k < 2.5) {
+            let next_t = h.t + 0.85;
+            if (next_t < t_max) {
+                return occluded(origin, dir, next_t, t_max, seed);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 fn point_light_falloff(dist: f32, radius: f32) -> f32 {
     if (radius <= 1e-4 || dist >= radius) {
         return 0.0;
     }
     let ratio = dist / radius;
-    let r2 = ratio * ratio;
-    let r4 = r2 * r2;
-    let w = max(1.0 - r4, 0.0);
-    let norm_d = dist / max(radius * 0.22, 2.5);
-    return (w * w) / (1.0 + norm_d * norm_d);
+    let s = max(1.0 - ratio, 0.0);
+    let sw = s * s * (3.0 - 2.0 * s);
+    let fade = sw * sw;
+    let norm_d = dist / max(radius * 0.28, 3.0);
+    return fade / (1.0 + norm_d * norm_d);
 }
 
 // Phase 4: Reproject a world-space hit point into the current frame's 1:1
@@ -1800,7 +1818,72 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var pl_debug_shadow = 0.0;
     var pl_w_total = 0.0;
     var pl_w_lit = 0.0;
-    if (bits_lighting && pl_count > 0u) {
+    if (bits_lighting && pl_count > 0u && is_water) {
+        let w_norm = water_wave_normal(point.xz, params.frame.x * 0.03, dist);
+        let view_to_eye = -view_dir;
+        for (var li = 0u; li < pl_count; li = li + 1u) {
+            let pl_pr = params.point_lights_pos_rad[li];
+            let to_l = pl_pr.xyz - point;
+            if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
+                continue;
+            }
+            if (to_l.y < -2.0) {
+                continue;
+            }
+            let pl_d2 = dot(to_l, to_l);
+            if (pl_d2 <= 1e-6 || pl_d2 >= pl_pr.w * pl_pr.w) {
+                continue;
+            }
+            let pl_dist = sqrt(pl_d2);
+            let atten = point_light_falloff(pl_dist, pl_pr.w);
+            if (atten <= 1e-5) {
+                continue;
+            }
+            let l_dir = to_l / pl_dist;
+            let h_vec = normalize(l_dir + view_to_eye);
+            let ndh = clamp(dot(w_norm, h_vec), 0.0, 1.0);
+            let ndh2 = ndh * ndh;
+            let ndh4 = ndh2 * ndh2;
+            let ndh8 = ndh4 * ndh4;
+            let spec = ndh8 * ndh8 * ndh8 * 0.85 + ndh4 * 0.04;
+            let pl_ci = params.point_lights_col_int[li];
+            point_lighting = point_lighting + pl_ci.rgb * (pl_ci.w * atten * spec);
+        }
+        let wp = max(point_lighting.r, max(point_lighting.g, point_lighting.b));
+        if (wp > 0.9) {
+            let wc = 0.9 + (wp - 0.9) / (1.0 + (wp - 0.9) * 0.85);
+            point_lighting = point_lighting * (wc / wp);
+        }
+        point_lighting = min(point_lighting * (1.0 - fog_t), vec3<f32>(1.6));
+    } else if (bits_lighting && pl_count > 0u) {
+        var pl_normal = normal;
+        {
+            let gdim_pl = vec2<i32>(i32(params.extents.x), i32(params.extents.y));
+            let cpx = vec2<i32>(id.xy);
+            let d_thresh = max(0.45, dist * 0.018);
+            var offs = array<vec2<i32>, 4>(vec2<i32>(2, 0), vec2<i32>(-2, 0), vec2<i32>(0, 2), vec2<i32>(0, -2));
+            var n_acc = normal * 1.5;
+            for (var oi = 0u; oi < 4u; oi = oi + 1u) {
+                let npx = clamp(cpx + offs[oi], vec2<i32>(0), gdim_pl - vec2<i32>(1));
+                let nd = textureLoad(src_gbuf_pos, npx, 0).w;
+                if (nd > 0.0 && abs(nd - dist) < d_thresh) {
+                    var nn = textureLoad(src_gbuf_norm, npx, 0).xyz;
+                    let nn_l = length(nn);
+                    if (nn_l > 1e-4) {
+                        nn = nn / nn_l;
+                        if (dot(normal, nn) > 0.65) {
+                            n_acc = n_acc + nn;
+                        }
+                    }
+                }
+            }
+            let acc_l = length(n_acc);
+            if (acc_l > 1e-4) {
+                pl_normal = n_acc / acc_l;
+            }
+        }
+        let pl_terrain_skip = 1.8 + steepness * 10.0 + dist * 0.015;
+
         var res0_idx = 0xffffffffu;
         var res0_wsum = 0.0;
         var res0_phat = 0.0;
@@ -1814,12 +1897,9 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         var res1_w = 0.0;
 
         var cand_count = 0u;
-        var first_idx = 0xffffffffu;
-        var second_idx = 0xffffffffu;
-        var first_w = 0.0;
-        var second_w = 0.0;
-        var first_col = vec3<f32>(0.0);
-        var second_col = vec3<f32>(0.0);
+        var exact_idxs = array<u32, 4>(0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+        var exact_ws = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+        var exact_cols = array<vec3<f32>, 4>(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
 
         for (var li = 0u; li < pl_count; li = li + 1u) {
             let pl_pr = params.point_lights_pos_rad[li];
@@ -1833,7 +1913,11 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             let pl_dist = sqrt(pl_d2);
             let l_dir = to_l / pl_dist;
-            let pl_ndl = max(dot(normal, l_dir), 0.0);
+            let raw_cos = dot(pl_normal, l_dir);
+            if (raw_cos <= -0.22) {
+                continue;
+            }
+            let pl_ndl = clamp((raw_cos + 0.25) / 1.25, 0.0, 1.0);
             if (pl_ndl <= 0.001) {
                 continue;
             }
@@ -1847,16 +1931,12 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             if (p_hat <= 1e-6) {
                 continue;
             }
-            cand_count = cand_count + 1u;
-            if (cand_count == 1u) {
-                first_idx = li;
-                first_w = w;
-                first_col = pl_ci.rgb;
-            } else if (cand_count == 2u) {
-                second_idx = li;
-                second_w = w;
-                second_col = pl_ci.rgb;
+            if (cand_count < 4u) {
+                exact_idxs[cand_count] = li;
+                exact_ws[cand_count] = w;
+                exact_cols[cand_count] = pl_ci.rgb;
             }
+            cand_count = cand_count + 1u;
             res0_wsum = res0_wsum + p_hat;
             if (next_f32(&state) * res0_wsum <= p_hat) {
                 res0_idx = li;
@@ -1873,18 +1953,15 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         }
 
-        if (cand_count > 0u && cand_count <= 2u) {
-            var idxs = array<u32, 2>(first_idx, second_idx);
-            var ws = array<f32, 2>(first_w, second_w);
-            var cols = array<vec3<f32>, 2>(first_col, second_col);
+        if (cand_count > 0u && cand_count <= 4u) {
             for (var ci = 0u; ci < cand_count; ci = ci + 1u) {
-                let idx = idxs[ci];
+                let idx = exact_idxs[ci];
                 let pl_pr = params.point_lights_pos_rad[idx];
                 let to_l = pl_pr.xyz - point;
                 let pl_dist = length(to_l);
                 let l_dir = to_l / max(pl_dist, 1e-5);
                 var pl_vis = 1.0;
-                if (bits_shadows && pl_dist > 1.5 && ws[ci] > 0.015) {
+                if (bits_shadows && pl_dist > 1.8 && exact_ws[ci] > 0.025) {
                     let r_emit = clamp(pl_pr.w * 0.032, 0.16, 1.35);
                     let l_onb = orthonormal_basis(l_dir);
                     let ang = rot_angle + f32(ci) * 2.39996323;
@@ -1892,17 +1969,17 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                     let j_vec = jitter_pt - ray_origin;
                     let j_dist = length(j_vec);
                     let self_clear = clamp(pl_pr.w * 0.08, 1.4, 3.2);
-                    if (j_dist > self_clear + bias && occluded(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear, state ^ (idx * 131u + 17u))) {
+                    if (j_dist > self_clear + bias && occluded_point_light(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear, pl_terrain_skip, state ^ (idx * 131u + 17u))) {
                         pl_vis = 0.0;
                     }
                 }
-                pl_w_total = pl_w_total + ws[ci];
-                pl_w_lit = pl_w_lit + ws[ci] * pl_vis;
-                pl_debug_lit = pl_debug_lit + cols[ci] * (ws[ci] * pl_vis);
-                pl_debug_shadow = pl_debug_shadow + ws[ci] * (1.0 - pl_vis);
-                point_lighting = point_lighting + cols[ci] * (ws[ci] * pl_vis * 2.6);
+                pl_w_total = pl_w_total + exact_ws[ci];
+                pl_w_lit = pl_w_lit + exact_ws[ci] * pl_vis;
+                pl_debug_lit = pl_debug_lit + exact_cols[ci] * (exact_ws[ci] * pl_vis);
+                pl_debug_shadow = pl_debug_shadow + exact_ws[ci] * (1.0 - pl_vis);
+                point_lighting = point_lighting + exact_cols[ci] * (exact_ws[ci] * pl_vis * 2.4);
             }
-        } else if (cand_count > 2u) {
+        } else if (cand_count > 4u) {
             var r_idxs = array<u32, 2>(res0_idx, res1_idx);
             var r_wsums = array<f32, 2>(res0_wsum, res1_wsum);
             var r_phats = array<f32, 2>(res0_phat, res1_phat);
@@ -1918,7 +1995,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let pl_dist = length(to_l);
                 let l_dir = to_l / max(pl_dist, 1e-5);
                 var pl_vis = 1.0;
-                if (bits_shadows && pl_dist > 1.5) {
+                if (bits_shadows && pl_dist > 1.8) {
                     let r_emit = clamp(pl_pr.w * 0.032, 0.16, 1.35);
                     let l_onb = orthonormal_basis(l_dir);
                     let ang = rot_angle + f32(ri) * 2.39996323 + 1.1;
@@ -1926,7 +2003,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                     let j_vec = jitter_pt - ray_origin;
                     let j_dist = length(j_vec);
                     let self_clear = clamp(pl_pr.w * 0.08, 1.4, 3.2);
-                    if (j_dist > self_clear + bias && occluded(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear, state ^ (idx * 131u + 29u))) {
+                    if (j_dist > self_clear + bias && occluded_point_light(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear, pl_terrain_skip, state ^ (idx * 131u + 29u))) {
                         pl_vis = 0.0;
                     }
                 }
@@ -1936,12 +2013,17 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 pl_w_lit = pl_w_lit + eff_w * pl_vis;
                 pl_debug_lit = pl_debug_lit + r_cols[ri] * (eff_w * pl_vis);
                 pl_debug_shadow = pl_debug_shadow + eff_w * (1.0 - pl_vis);
-                point_lighting = point_lighting + r_cols[ri] * (eff_w * pl_vis * 2.6);
+                point_lighting = point_lighting + r_cols[ri] * (eff_w * pl_vis * 2.4);
             }
         }
-        point_lighting = min(point_lighting * (1.0 - fog_t), vec3<f32>(8.0));
+        let pl_peak = max(point_lighting.r, max(point_lighting.g, point_lighting.b));
+        if (pl_peak > 1.35) {
+            let comp = 1.35 + (pl_peak - 1.35) / (1.0 + (pl_peak - 1.35) * 0.65);
+            point_lighting = point_lighting * (comp / pl_peak);
+        }
+        point_lighting = min(point_lighting * (1.0 - fog_t), vec3<f32>(2.8));
         if (bits_gi && luminance(point_lighting) > 0.08 && ((id.x + id.y + u32(params.frame.x)) & 7u) == 0u) {
-            rc_update(point, normal, dist, point_lighting * 0.55);
+            rc_update(point, pl_normal, dist, point_lighting * 0.55);
         }
     }
     let point_vis = select(1.0, pl_w_lit / max(pl_w_total, 1e-5), pl_w_total > 1e-4);

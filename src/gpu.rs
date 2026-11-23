@@ -67,6 +67,15 @@ pub(crate) struct Uniform {
 /// exactly once; reflection, refraction, minimap and full-map views reuse this
 /// snapshot instead of advancing time or consuming a second publication.
 #[derive(Clone, Copy)]
+struct CachedEffectLight {
+    pos: glam::Vec3,
+    colour: glam::Vec3,
+    radius: f32,
+    intensity: f32,
+    miss_frames: u32,
+}
+
+#[derive(Clone, Copy)]
 struct FrameSnapshot {
     elapsed: f32,
     elapsed64: f64,
@@ -1764,6 +1773,10 @@ struct Renderer {
     raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester,
     /// Worst Raywatcher CPU frame time observed (ms), logged under `PWE_RT_DEBUG=1`.
     raywatcher_worst_frame_ms: f64,
+    /// Last timestamp `raywatcher-diag.log` was written (reset when checkbox is turned off).
+    raywatcher_diag_last_write: Option<std::time::Instant>,
+    /// Temporally smoothed world-effect point lights keyed by 8u world cells to stop particle flicker.
+    raywatcher_eff_light_cache: std::collections::HashMap<(i32, i32, i32), CachedEffectLight>,
     /// Last frame's sky parameters and blend sets, reused by Raywatcher to
     /// render the real `SkyGpu` + `CloudGpu` reflection environment atlas.
     last_sky_frame: Option<(crate::sky_gpu::SkyFrame, (i32, i32, f32))>,
@@ -2544,6 +2557,8 @@ impl Renderer {
             raywatcher_scene: None,
             raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester::new(),
             raywatcher_worst_frame_ms: 0.0,
+            raywatcher_diag_last_write: None,
+            raywatcher_eff_light_cache: std::collections::HashMap::new(),
             last_sky_frame: None,
             raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan::OFF,
             raywatcher_hw_probe: None,
@@ -3852,6 +3867,109 @@ impl Renderer {
         let t_rw_frame = std::time::Instant::now();
         // Poll any completed background BVH build without blocking the frame.
         let _ = self.raywatcher_harvest.poll_background_build();
+        if !settings.diagnostics_log {
+            self.raywatcher_diag_last_write = None;
+        } else if self
+            .raywatcher_diag_last_write
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(4))
+        {
+            self.raywatcher_diag_last_write = Some(std::time::Instant::now());
+            use std::fmt::Write as _;
+            let detail_radius = view_distance.clamp(512.0, 1024.0);
+            let pages_slice = if self.world_done {
+                &self.world_pages[..]
+            } else {
+                &self.local_pages[..]
+            };
+            let mut report = String::with_capacity(4096);
+            let _ = writeln!(
+                report,
+                "=== Raywatcher RT Diagnostics ===\ncamera=({:.1}, {:.1}, {:.1}) detail_radius={:.0} world_done={} static_model_lights={} cached_effect_lights={}",
+                camera.pos.x,
+                camera.pos.y,
+                camera.pos.z,
+                detail_radius,
+                self.world_done,
+                self.model_lights.lights.len(),
+                self.raywatcher_eff_light_cache.len(),
+            );
+            let mut sum_pages = 0usize;
+            let mut thumb_pages = 0usize;
+            let mut sum_tris = 0usize;
+            let mut sum_opaque = 0usize;
+            let mut sum_masked = 0usize;
+            let mut sum_semi = 0usize;
+            let mut sum_drop = 0usize;
+            let mut sum_degen = 0usize;
+            let mut sum_untex = 0usize;
+            let mut suspect_lines = Vec::new();
+            for (pi, page) in pages_slice.iter().enumerate() {
+                let d = page.rt_diag();
+                sum_pages += 1;
+                if d.used_thumb_atlas {
+                    thumb_pages += 1;
+                }
+                sum_tris += d.total_tris;
+                sum_opaque += d.opaque_tris;
+                sum_masked += d.masked_tris;
+                sum_semi += d.semi_unmasked_tris;
+                sum_drop += d.dropped_transparent_tris;
+                sum_degen += d.degenerate_tris;
+                sum_untex += d.untextured_tris;
+                if suspect_lines.len() < 32
+                    && (d.semi_unmasked_tris > 0
+                        || d.untextured_tris > 0
+                        || d.degenerate_tris > 32
+                        || (d.used_thumb_atlas && d.total_tris > 0 && d.masked_tris == 0))
+                {
+                    let (bmin, bmax) = page.page_bounds();
+                    suspect_lines.push(format!(
+                        "  page#{pi}: thumb={} tris={} opaque={} masked={} semi_unmasked={} dropped_alpha={} degen={} untex={} bounds=({:.0},{:.0},{:.0})..({:.0},{:.0},{:.0})",
+                        d.used_thumb_atlas,
+                        d.total_tris,
+                        d.opaque_tris,
+                        d.masked_tris,
+                        d.semi_unmasked_tris,
+                        d.dropped_transparent_tris,
+                        d.degenerate_tris,
+                        d.untextured_tris,
+                        bmin[0], bmin[1], bmin[2],
+                        bmax[0], bmax[1], bmax[2],
+                    ));
+                }
+            }
+            let _ = writeln!(
+                report,
+                "\n[BMD / World Objects] pages={} (thumb_atlas={}) tris={} opaque={} masked={} semi_unmasked={} dropped_alpha={} degenerate={} untextured={}",
+                sum_pages,
+                thumb_pages,
+                sum_tris,
+                sum_opaque,
+                sum_masked,
+                sum_semi,
+                sum_drop,
+                sum_degen,
+                sum_untex,
+            );
+            if suspect_lines.is_empty() {
+                let _ = writeln!(report, "  (no suspect BMD pages)");
+            } else {
+                let _ = writeln!(report, "  suspect pages (first {}):", suspect_lines.len());
+                for line in suspect_lines {
+                    let _ = writeln!(report, "{line}");
+                }
+            }
+            let _ = writeln!(report, "\n[SpeedTree / FarTrees]");
+            report.push_str(
+                &self
+                    .far_trees
+                    .diagnostics_report(camera.pos, detail_radius.min(640.0)),
+            );
+            let log_dir =
+                crate::diagnostics::dir().unwrap_or_else(crate::diagnostics::default_log_dir);
+            let _ = std::fs::create_dir_all(&log_dir);
+            let _ = std::fs::write(log_dir.join("raywatcher-diag.log"), report);
+        }
         if self.raywatcher_harvest.needs_frustum_rebuild(
             config,
             camera.pos,
@@ -3954,104 +4072,7 @@ impl Renderer {
                     detail_radius,
                 );
             }
-            if settings.diagnostics_log {
-                use std::fmt::Write as _;
-                let mut report = String::with_capacity(4096);
-                let _ = writeln!(
-                    report,
-                    "=== Raywatcher RT Diagnostics ===\ncamera=({:.1}, {:.1}, {:.1}) detail_radius={:.0} world_done={} real_mesh_pages={} tree_tris={} tree_inst={} tree_canopy_fallbacks={}",
-                    camera.pos.x,
-                    camera.pos.y,
-                    camera.pos.z,
-                    detail_radius,
-                    self.world_done,
-                    real_mesh_pages,
-                    real_tree_tris,
-                    real_tree_instances,
-                    tree_canopy_fallbacks,
-                );
-                let _ = writeln!(
-                    report,
-                    "lights: static_model_lights={}",
-                    self.model_lights.lights.len(),
-                );
-                let mut sum_pages = 0usize;
-                let mut thumb_pages = 0usize;
-                let mut sum_tris = 0usize;
-                let mut sum_opaque = 0usize;
-                let mut sum_masked = 0usize;
-                let mut sum_semi = 0usize;
-                let mut sum_drop = 0usize;
-                let mut sum_degen = 0usize;
-                let mut sum_untex = 0usize;
-                let mut suspect_lines = Vec::new();
-                for (pi, page) in pages_slice.iter().enumerate() {
-                    let d = page.rt_diag();
-                    sum_pages += 1;
-                    if d.used_thumb_atlas {
-                        thumb_pages += 1;
-                    }
-                    sum_tris += d.total_tris;
-                    sum_opaque += d.opaque_tris;
-                    sum_masked += d.masked_tris;
-                    sum_semi += d.semi_unmasked_tris;
-                    sum_drop += d.dropped_transparent_tris;
-                    sum_degen += d.degenerate_tris;
-                    sum_untex += d.untextured_tris;
-                    if suspect_lines.len() < 32
-                        && (d.semi_unmasked_tris > 0
-                            || d.untextured_tris > 0
-                            || d.degenerate_tris > 32
-                            || (d.used_thumb_atlas && d.total_tris > 0 && d.masked_tris == 0))
-                    {
-                        let (bmin, bmax) = page.page_bounds();
-                        suspect_lines.push(format!(
-                            "  page#{pi}: thumb={} tris={} opaque={} masked={} semi_unmasked={} dropped_alpha={} degen={} untex={} bounds=({:.0},{:.0},{:.0})..({:.0},{:.0},{:.0})",
-                            d.used_thumb_atlas,
-                            d.total_tris,
-                            d.opaque_tris,
-                            d.masked_tris,
-                            d.semi_unmasked_tris,
-                            d.dropped_transparent_tris,
-                            d.degenerate_tris,
-                            d.untextured_tris,
-                            bmin[0], bmin[1], bmin[2],
-                            bmax[0], bmax[1], bmax[2],
-                        ));
-                    }
-                }
-                let _ = writeln!(
-                    report,
-                    "\n[BMD / World Objects] pages={} (thumb_atlas={}) tris={} opaque={} masked={} semi_unmasked={} dropped_alpha={} degenerate={} untextured={}",
-                    sum_pages,
-                    thumb_pages,
-                    sum_tris,
-                    sum_opaque,
-                    sum_masked,
-                    sum_semi,
-                    sum_drop,
-                    sum_degen,
-                    sum_untex,
-                );
-                if suspect_lines.is_empty() {
-                    let _ = writeln!(report, "  (no suspect BMD pages)");
-                } else {
-                    let _ = writeln!(report, "  suspect pages (first {}):", suspect_lines.len());
-                    for line in suspect_lines {
-                        let _ = writeln!(report, "{line}");
-                    }
-                }
-                let _ = writeln!(report, "\n[SpeedTree / FarTrees]");
-                report.push_str(
-                    &self
-                        .far_trees
-                        .diagnostics_report(camera.pos, detail_radius.min(640.0)),
-                );
-                let log_dir =
-                    crate::diagnostics::dir().unwrap_or_else(crate::diagnostics::default_log_dir);
-                let _ = std::fs::create_dir_all(&log_dir);
-                let _ = std::fs::write(log_dir.join("raywatcher-diag.log"), report);
-            }
+            // Diagnostics log is written immediately on toggle-on and every 4s above.
 
             // Reflective water surfaces across the visible frustum.
             let water: Vec<WaterSurface> = self
@@ -4577,9 +4598,9 @@ impl Renderer {
                             let lum = peak;
                             let radius = (extent * 4.2).clamp(18.0, 60.0);
                             let cell = (
-                                (center.x / 6.0).floor() as i32,
-                                (center.y / 6.0).floor() as i32,
-                                (center.z / 6.0).floor() as i32,
+                                (center.x / 8.0).floor() as i32,
+                                (center.y / 8.0).floor() as i32,
+                                (center.z / 8.0).floor() as i32,
                             );
                             let entry = grid.entry(cell).or_insert((
                                 glam::Vec3::ZERO,
@@ -4601,57 +4622,86 @@ impl Renderer {
                             entry.6 = entry.6.max(lum);
                             entry.7 += 1;
                         }
+                        // Temporally smooth & holdover effect lights so particle spawn/despawn
+                        // gaps and animated flame pulses never cause strobing or flickering.
+                        let mut seen_cells = std::collections::HashSet::with_capacity(grid.len());
+                        let night_boost =
+                            if crate::environment::night_factor(camera.time_of_day) > 0.4 {
+                                1.30
+                            } else {
+                                1.0
+                            };
+                        for (cell, (pos_sum, bmin, bmax, col_sum, col_w, max_rad, max_lum, cnt)) in
+                            grid
+                        {
+                            if cnt == 0 || col_w <= 1e-5 {
+                                continue;
+                            }
+                            let pos = pos_sum / cnt as f32;
+                            let span = (bmax - bmin).length();
+                            let radius = (max_rad + span * 0.85).clamp(18.0, 68.0);
+                            let mut colour = col_sum / col_w;
+                            let peak = colour.x.max(colour.y).max(colour.z).max(1e-4);
+                            if peak > 1.0 {
+                                colour /= peak;
+                            } else if peak < 0.75 {
+                                colour *= (0.75 / peak).min(2.2);
+                            }
+                            let size_boost = (1.0 + span * 0.03).min(1.45);
+                            let intensity = ((1.60 + max_lum * 2.00) * size_boost * night_boost)
+                                .clamp(1.60, 5.0);
+                            seen_cells.insert(cell);
+                            self.raywatcher_eff_light_cache
+                                .entry(cell)
+                                .and_modify(|c| {
+                                    c.pos = c.pos.lerp(pos, 0.18);
+                                    c.colour = c.colour.lerp(colour, 0.18);
+                                    c.radius = c.radius + (radius - c.radius) * 0.18;
+                                    c.intensity = c.intensity + (intensity - c.intensity) * 0.18;
+                                    c.miss_frames = 0;
+                                })
+                                .or_insert(CachedEffectLight {
+                                    pos,
+                                    colour,
+                                    radius,
+                                    intensity: intensity * 0.40,
+                                    miss_frames: 0,
+                                });
+                        }
+                        let prune_d = params.far + 128.0;
+                        let prune_d_sq = prune_d * prune_d;
+                        self.raywatcher_eff_light_cache.retain(|cell, c| {
+                            if !seen_cells.contains(cell) {
+                                c.miss_frames += 1;
+                                c.intensity *= 0.86;
+                            }
+                            c.miss_frames < 10
+                                && c.intensity >= 0.08
+                                && c.pos.distance_squared(camera.pos) <= prune_d_sq
+                        });
                         let mut eff_lights: Vec<(
                             f32,
                             crate::modules::raywatcher::frame::PointLight,
-                        )> = grid
-                            .into_values()
-                            .filter_map(
-                                |(pos_sum, bmin, bmax, col_sum, col_w, max_rad, max_lum, cnt)| {
-                                    if cnt == 0 || col_w <= 1e-5 {
-                                        return None;
-                                    }
-                                    let pos = pos_sum / cnt as f32;
-                                    let span = (bmax - bmin).length();
-                                    let radius = (max_rad + span * 0.85).clamp(16.0, 64.0);
-                                    let dist_sq = pos.distance_squared(camera.pos);
-                                    let max_d = params.far + radius;
-                                    if dist_sq > max_d * max_d {
-                                        return None;
-                                    }
-                                    // Luminance-weighted true colour preserves vivid beam/portal/wisp hues
-                                    // instead of washing to white via per-channel `.max()`.
-                                    let mut colour = col_sum / col_w;
-                                    let peak = colour.x.max(colour.y).max(colour.z).max(1e-4);
-                                    if peak > 1.0 {
-                                        colour /= peak;
-                                    } else if peak < 0.75 {
-                                        colour *= (0.75 / peak).min(2.2);
-                                    }
-                                    let size_boost = (1.0 + span * 0.03).min(1.55);
-                                    let night_boost =
-                                        if crate::environment::night_factor(camera.time_of_day)
-                                            > 0.4
-                                        {
-                                            1.35
-                                        } else {
-                                            1.0
-                                        };
-                                    let intensity =
-                                        ((1.80 + max_lum * 2.40) * size_boost * night_boost)
-                                            .clamp(1.80, 6.5);
-                                    Some((
-                                        dist_sq,
-                                        crate::modules::raywatcher::frame::PointLight {
-                                            position: pos,
-                                            radius,
-                                            colour,
-                                            intensity,
-                                            casts_shadow: true,
-                                        },
-                                    ))
-                                },
-                            )
+                        )> = self
+                            .raywatcher_eff_light_cache
+                            .values()
+                            .filter_map(|c| {
+                                let dist_sq = c.pos.distance_squared(camera.pos);
+                                let max_d = params.far + c.radius;
+                                if dist_sq > max_d * max_d {
+                                    return None;
+                                }
+                                Some((
+                                    dist_sq,
+                                    crate::modules::raywatcher::frame::PointLight {
+                                        position: c.pos,
+                                        radius: c.radius,
+                                        colour: c.colour,
+                                        intensity: c.intensity,
+                                        casts_shadow: true,
+                                    },
+                                ))
+                            })
                             .collect();
                         eff_lights.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
                         eff_lights.truncate(eff_slots);

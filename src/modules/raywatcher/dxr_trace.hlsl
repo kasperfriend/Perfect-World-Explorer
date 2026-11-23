@@ -357,18 +357,49 @@ bool occluded_fast(float3 origin, float3 dir, float t_min, float t_max) {
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
+bool occluded_point_light(float3 origin, float3 dir, float t_min, float t_max, float terrain_skip, uint opaque_offset, uint tri_count) {
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = dir;
+    ray.TMin = t_min;
+    ray.TMax = t_max;
+
+    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(scene_tlas, RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
+    q.Proceed();
+    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
+        return false;
+    }
+    if (terrain_skip > 0.0 && q.CommittedRayT() < terrain_skip) {
+        uint tri_idx = (q.CommittedInstanceID() == 0u)
+            ? q.CommittedPrimitiveIndex()
+            : (opaque_offset + q.CommittedPrimitiveIndex());
+        if (tri_idx < tri_count) {
+            float k = tris[tri_idx].a.w;
+            if (k > 1.5 && k < 2.5) {
+                float next_t = q.CommittedRayT() + 0.85;
+                if (next_t < t_max) {
+                    return occluded_fast(origin, dir, next_t, t_max);
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 float point_light_falloff(float dist, float radius) {
     if (radius <= 1e-4 || dist >= radius) {
         return 0.0;
     }
     float ratio = dist / radius;
-    float r2 = ratio * ratio;
-    float r4 = r2 * r2;
-    float w = max(1.0 - r4, 0.0);
-    // Soft architectural area-emitter falloff so elevated flames/orbs on 8-14m
-    // pillars illuminate the stone plaza below while still fading cleanly to 0 at `radius`.
-    float norm_d = dist / max(radius * 0.22, 2.5);
-    return (w * w) / (1.0 + norm_d * norm_d);
+    // Ultra-smooth C2-like cubic smoothstep squared tail: reaches 0 with zero slope
+    // and zero curvature at `dist == radius` so there is never a visible hard circle edge.
+    float s = max(1.0 - ratio, 0.0);
+    float sw = s * s * (3.0 - 2.0 * s);
+    float fade = sw * sw;
+    float norm_d = dist / max(radius * 0.28, 3.0);
+    return fade / (1.0 + norm_d * norm_d);
 }
 
 // Reproject world-space hit into current frame's 1:1 raster G-buffer.
@@ -1361,7 +1392,78 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float pl_w_total = 0.0;
     float pl_w_lit = 0.0;
 
-    if (bits_lighting && pl_count > 0u) {
+    if (bits_lighting && pl_count > 0u && is_water) {
+        // Water is a glossy dielectric, NEVER a flat matte diffuse sheet: evaluate
+        // rippled specular glints from point/effect lights so night water stays reflective
+        // and textured instead of turning flat grey.
+        float3 w_norm = water_wave_normal(world_pos.xz, params.frame.x * 0.03, dist);
+        float3 view_to_eye = -view_dir;
+        for (uint li = 0u; li < pl_count; li = li + 1u) {
+            float4 pl_pr = params.point_lights_pos_rad[li];
+            float3 to_l = pl_pr.xyz - world_pos;
+            if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
+                continue;
+            }
+            if (to_l.y < -2.0) {
+                continue;
+            }
+            float pl_d2 = dot(to_l, to_l);
+            if (pl_d2 <= 1e-6 || pl_d2 >= pl_pr.w * pl_pr.w) {
+                continue;
+            }
+            float inv_pl_dist = rsqrt(pl_d2);
+            float pl_dist = pl_d2 * inv_pl_dist;
+            float atten = point_light_falloff(pl_dist, pl_pr.w);
+            if (atten <= 1e-5) {
+                continue;
+            }
+            float3 l_dir = to_l * inv_pl_dist;
+            float3 h_vec = normalize(l_dir + view_to_eye);
+            float ndh = saturate(dot(w_norm, h_vec));
+            float ndh2 = ndh * ndh;
+            float ndh4 = ndh2 * ndh2;
+            float ndh8 = ndh4 * ndh4;
+            float spec = ndh8 * ndh8 * ndh8 * 0.85 + ndh4 * 0.04;
+            float4 pl_ci = params.point_lights_col_int[li];
+            point_lighting += pl_ci.rgb * (pl_ci.w * atten * spec);
+        }
+        float wp = max(point_lighting.r, max(point_lighting.g, point_lighting.b));
+        if (wp > 0.9) {
+            float wc = 0.9 + (wp - 0.9) / (1.0 + (wp - 0.9) * 0.85);
+            point_lighting *= (wc / wp);
+        }
+        point_lighting = min(point_lighting * (1.0 - fog_t), float3(1.6, 1.6, 1.6));
+    } else if (bits_lighting && pl_count > 0u) {
+        // Depth- and angle-aware 5-tap normal smoothing removes low-poly terrain/rock
+        // triangle faceting under point/effect lights while keeping 90-degree building corners crisp.
+        float3 pl_normal = normal;
+        {
+            int2 gdim_pl = int2(int(params.extents.x), int(params.extents.y));
+            int2 cpx = int2(id.xy);
+            float d_thresh = max(0.45, dist * 0.018);
+            int2 offs[4] = { int2(2, 0), int2(-2, 0), int2(0, 2), int2(0, -2) };
+            float3 n_acc = normal * 1.5;
+            for (uint oi = 0u; oi < 4u; oi = oi + 1u) {
+                int2 npx = clamp(cpx + offs[oi], int2(0, 0), gdim_pl - int2(1, 1));
+                float nd = src_gbuf_pos.Load(int3(npx, 0)).w;
+                if (nd > 0.0 && abs(nd - dist) < d_thresh) {
+                    float3 nn = src_gbuf_norm.Load(int3(npx, 0)).xyz;
+                    float nn_l = length(nn);
+                    if (nn_l > 1e-4) {
+                        nn /= nn_l;
+                        if (dot(normal, nn) > 0.65) {
+                            n_acc += nn;
+                        }
+                    }
+                }
+            }
+            float acc_l = length(n_acc);
+            if (acc_l > 1e-4) {
+                pl_normal = n_acc / acc_l;
+            }
+        }
+        float pl_terrain_skip = 1.8 + steepness * 10.0 + dist * 0.015;
+
         uint res0_idx = 0xffffffffu;
         float res0_wsum = 0.0;
         float res0_phat = 0.0;
@@ -1375,22 +1477,14 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float res1_w = 0.0;
 
         uint cand_count = 0u;
-        uint first_idx = 0xffffffffu;
-        uint second_idx = 0xffffffffu;
-        float first_w = 0.0;
-        float second_w = 0.0;
-        float3 first_col = float3(0.0, 0.0, 0.0);
-        float3 second_col = float3(0.0, 0.0, 0.0);
+        uint exact_idxs[4] = { 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu };
+        float exact_ws[4] = { 0.0, 0.0, 0.0, 0.0 };
+        float3 exact_cols[4] = { float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0) };
 
         for (uint li = 0u; li < pl_count; li = li + 1u) {
             float4 pl_pr = params.point_lights_pos_rad[li];
             float3 to_l = pl_pr.xyz - world_pos;
             if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
-                continue;
-            }
-            // Opt #11: Reject back-facing lights before sqrt/div in 128-light ReSTIR DI loop (~50% fewer sqrts).
-            float raw_ndl = dot(normal, to_l);
-            if (raw_ndl <= 0.0) {
                 continue;
             }
             float pl_d2 = dot(to_l, to_l);
@@ -1399,7 +1493,13 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             }
             float inv_pl_dist = rsqrt(pl_d2);
             float pl_dist = pl_d2 * inv_pl_dist;
-            float pl_ndl = raw_ndl * inv_pl_dist;
+            float raw_cos = dot(pl_normal, to_l) * inv_pl_dist;
+            // Gentle wrap-Lambert prevents harsh triangle-edge jumps on low-poly terrain slopes
+            // while still rejecting genuinely back-facing building walls.
+            if (raw_cos <= -0.22) {
+                continue;
+            }
+            float pl_ndl = saturate((raw_cos + 0.25) / 1.25);
             if (pl_ndl <= 0.001) {
                 continue;
             }
@@ -1413,18 +1513,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             if (p_hat <= 1e-6) {
                 continue;
             }
-            cand_count = cand_count + 1u;
-            if (cand_count == 1u) {
-                first_idx = li;
-                first_w = w;
-                first_col = pl_ci.rgb;
-            } else if (cand_count == 2u) {
-                second_idx = li;
-                second_w = w;
-                second_col = pl_ci.rgb;
+            if (cand_count < 4u) {
+                exact_idxs[cand_count] = li;
+                exact_ws[cand_count] = w;
+                exact_cols[cand_count] = pl_ci.rgb;
             }
-
-            // Reservoir 0 update
+            cand_count = cand_count + 1u;
             res0_wsum += p_hat;
             if (rand01(state) * res0_wsum <= p_hat) {
                 res0_idx = li;
@@ -1432,7 +1526,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 res0_col = pl_ci.rgb;
                 res0_w = w;
             }
-            // Reservoir 1 update
             res1_wsum += p_hat;
             if (rand01(state) * res1_wsum <= p_hat) {
                 res1_idx = li;
@@ -1442,20 +1535,16 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             }
         }
 
-        if (cand_count > 0u && cand_count <= 2u) {
-            // Exact evaluation when 1..=2 lights touch this pixel (zero resampling variance).
-            uint idxs[2] = { first_idx, second_idx };
-            float ws[2] = { first_w, second_w };
-            float3 cols[2] = { first_col, second_col };
+        if (cand_count > 0u && cand_count <= 4u) {
+            // Exact evaluation when 1..=4 lights touch this pixel (zero resampling flicker).
             for (uint ci = 0u; ci < cand_count; ci = ci + 1u) {
-                uint idx = idxs[ci];
+                uint idx = exact_idxs[ci];
                 float4 pl_pr = params.point_lights_pos_rad[idx];
                 float3 to_l = pl_pr.xyz - world_pos;
                 float pl_dist = length(to_l);
                 float3 l_dir = to_l / max(pl_dist, 1e-5);
                 float pl_vis = 1.0;
-                if (bits_shadows && pl_dist > 1.5 && ws[ci] > 0.015) {
-                    // Enhancement #6: Soft area-light penumbra jitter across physical light sphere radius.
+                if (bits_shadows && pl_dist > 1.8 && exact_ws[ci] > 0.025) {
                     float r_emit = clamp(pl_pr.w * 0.032, 0.16, 1.35);
                     float3 l_up = abs(l_dir.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
                     float3 l_t = normalize(cross(l_up, l_dir));
@@ -1466,20 +1555,19 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float3 jitter_pt = pl_pr.xyz + (l_t * ca + l_b * sa) * (r_emit * sqrt(rand01(state)));
                     float3 j_vec = jitter_pt - ray_origin;
                     float j_dist = length(j_vec);
-                    // Pull shadow ray back from emitter housing (brazier/lamp/crystal) to prevent self-occlusion.
                     float self_clear = clamp(pl_pr.w * 0.08, 1.4, 3.2);
-                    if (j_dist > self_clear + bias && occluded_fast(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear)) {
+                    if (j_dist > self_clear + bias && occluded_point_light(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear, pl_terrain_skip, opaque_offset, tri_count)) {
                         pl_vis = 0.0;
                     }
                 }
-                pl_w_total += ws[ci];
-                pl_w_lit += ws[ci] * pl_vis;
-                pl_debug_lit += cols[ci] * (ws[ci] * pl_vis);
-                pl_debug_shadow += ws[ci] * (1.0 - pl_vis);
-                point_lighting += cols[ci] * (ws[ci] * pl_vis * 2.6);
+                pl_w_total += exact_ws[ci];
+                pl_w_lit += exact_ws[ci] * pl_vis;
+                pl_debug_lit += exact_cols[ci] * (exact_ws[ci] * pl_vis);
+                pl_debug_shadow += exact_ws[ci] * (1.0 - pl_vis);
+                point_lighting += exact_cols[ci] * (exact_ws[ci] * pl_vis * 2.4);
             }
-        } else if (cand_count > 2u) {
-            // ReSTIR DI unbiased 2-reservoir RIS evaluation (2 shadow rays total for 3..128 lights).
+        } else if (cand_count > 4u) {
+            // ReSTIR DI unbiased 2-reservoir RIS evaluation (2 shadow rays total for 5..128 lights).
             uint r_idxs[2] = { res0_idx, res1_idx };
             float r_wsums[2] = { res0_wsum, res1_wsum };
             float r_phats[2] = { res0_phat, res1_phat };
@@ -1495,8 +1583,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float pl_dist = length(to_l);
                 float3 l_dir = to_l / max(pl_dist, 1e-5);
                 float pl_vis = 1.0;
-                if (bits_shadows && pl_dist > 1.5) {
-                    // Enhancement #6: Soft area-light penumbra jitter across physical light sphere radius.
+                if (bits_shadows && pl_dist > 1.8) {
                     float r_emit = clamp(pl_pr.w * 0.032, 0.16, 1.35);
                     float3 l_up = abs(l_dir.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
                     float3 l_t = normalize(cross(l_up, l_dir));
@@ -1507,9 +1594,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float3 jitter_pt = pl_pr.xyz + (l_t * ca + l_b * sa) * (r_emit * sqrt(rand01(state)));
                     float3 j_vec = jitter_pt - ray_origin;
                     float j_dist = length(j_vec);
-                    // Pull shadow ray back from emitter housing (brazier/lamp/crystal) to prevent self-occlusion.
                     float self_clear = clamp(pl_pr.w * 0.08, 1.4, 3.2);
-                    if (j_dist > self_clear + bias && occluded_fast(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear)) {
+                    if (j_dist > self_clear + bias && occluded_point_light(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear, pl_terrain_skip, opaque_offset, tri_count)) {
                         pl_vis = 0.0;
                     }
                 }
@@ -1519,14 +1605,21 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 pl_w_lit += eff_w * pl_vis;
                 pl_debug_lit += r_cols[ri] * (eff_w * pl_vis);
                 pl_debug_shadow += eff_w * (1.0 - pl_vis);
-                point_lighting += r_cols[ri] * (eff_w * pl_vis * 2.6);
+                point_lighting += r_cols[ri] * (eff_w * pl_vis * 2.4);
             }
         }
-        point_lighting = min(point_lighting * (1.0 - fog_t), float3(8.0, 8.0, 8.0));
+        // Hue-preserving soft-shoulder highlight rolloff: keeps normal lights vivid while
+        // preventing stacked/close-range effects from clipping to solid white.
+        float pl_peak = max(point_lighting.r, max(point_lighting.g, point_lighting.b));
+        if (pl_peak > 1.35) {
+            float comp = 1.35 + (pl_peak - 1.35) / (1.0 + (pl_peak - 1.35) * 0.65);
+            point_lighting *= (comp / pl_peak);
+        }
+        point_lighting = min(point_lighting * (1.0 - fog_t), float3(2.8, 2.8, 2.8));
         // Feed bright nearby point/effect lighting into the 3D World-Space Radiance Cache
         // so lanterns and beams bounce coloured light onto surrounding walls and ceilings!
         if (bits_gi && luma(point_lighting) > 0.08 && ((id.x + id.y + uint(params.frame.x)) & 7u) == 0u) {
-            rc_update(world_pos, normal, dist, point_lighting * 0.55);
+            rc_update(world_pos, pl_normal, dist, point_lighting * 0.55);
         }
     }
 
