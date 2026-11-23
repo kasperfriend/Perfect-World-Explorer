@@ -92,9 +92,15 @@ impl IconSheet {
         {
             return None;
         }
-        let mut by_name = HashMap::new();
-        for (index, name) in lines.take(rows.checked_mul(cols)? as usize).enumerate() {
-            by_name.entry(name.to_lowercase()).or_insert(index as u32);
+        let count = rows.checked_mul(cols)? as usize;
+        let mut by_name = HashMap::with_capacity(count);
+        for (index, name) in lines.take(count).enumerate() {
+            let lower = if name.is_ascii() {
+                name.to_ascii_lowercase()
+            } else {
+                name.to_lowercase()
+            };
+            by_name.entry(lower).or_insert(index as u32);
         }
         Some(Self {
             cell_width,
