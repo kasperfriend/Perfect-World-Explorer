@@ -1470,7 +1470,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // and textured instead of turning flat grey.
         float3 w_norm = water_wave_normal(world_pos.xz, params.frame.x * 0.03, dist);
         float3 view_to_eye = -view_dir;
-        if (any_pl_near) for (uint li = 0u; li < pl_count; li = li + 1u) {
+        for (uint li = 0u; li < pl_count; li = li + 1u) {
             float4 pl_pr = params.point_lights_pos_rad[li];
             float3 to_l = pl_pr.xyz - world_pos;
             if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
@@ -1596,7 +1596,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float exact_ws[4] = { 0.0, 0.0, 0.0, 0.0 };
         float3 exact_cols[4] = { float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0) };
 
-        for (uint li = 0u; li < pl_count; li = li + 1u) {
+        if (any_pl_near) for (uint li = 0u; li < pl_count; li = li + 1u) {
             float4 pl_pr = params.point_lights_pos_rad[li];
             float3 to_l = pl_pr.xyz - world_pos;
             if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
