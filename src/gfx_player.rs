@@ -2851,7 +2851,12 @@ fn apply_controls(state: &mut CtrlState, key: &KeyPoint, sampled: &Sampled, dt: 
                 }
             }
             ControlData::ScaleChange { rate, min, max } => {
-                let total = (sampled.scale + state.scale_extra + rate * dt).clamp(*min, *max);
+                let (lo, hi) = if min <= max {
+                    (*min, *max)
+                } else {
+                    (*max, *min)
+                };
+                let total = (sampled.scale + state.scale_extra + rate * dt).clamp(lo, hi);
                 state.scale_extra = total - sampled.scale;
             }
             ControlData::Fractal {
@@ -5700,10 +5705,13 @@ fn emit_particles(
             continue;
         }
         let scale = if state.scale.is_finite() && state.scale > 0. {
-            state.scale + state.scale_noise
+            (state.scale + state.scale_noise).max(0.)
         } else {
             1.
         };
+        if scale <= 0. {
+            continue;
+        }
         let (right, up, forward) = if billboard {
             (context.view.right, context.view.up, context.view.forward)
         } else {
@@ -6705,7 +6713,12 @@ fn integrate(
                 state.color = packed;
             }
             ControlData::ScaleChange { rate, min, max } => {
-                state.scale = (state.scale + rate * dt).clamp(*min, *max);
+                let (lo, hi) = if min <= max {
+                    (*min, *max)
+                } else {
+                    (*max, *min)
+                };
+                state.scale = (state.scale + rate * dt).clamp(lo, hi);
             }
             ControlData::Fractal {
                 kind,
@@ -6784,16 +6797,28 @@ fn integrate(
             ControlData::ScaleRamp { first, stops } => {
                 state.scale = sample_ramp(*first, stops, state.age);
             }
-            ControlData::Path { points, .. } => {
+            ControlData::Path { points, calc_dir } => {
                 if points.len() > 1 {
                     let total = path_length(points);
                     if total > 0. {
-                        let distance = if state.ttl > 0. {
-                            (state.age / state.ttl).clamp(0., 1.) * total
+                        let span_ms = if control.end > control.start {
+                            control.end - control.start
                         } else {
-                            total
+                            state.ttl * 1000.
                         };
-                        state.position = sample_path(points, distance).0;
+                        let fraction = if span_ms > 0. {
+                            ((age_ms - control.start) / span_ms).clamp(0., 1.)
+                        } else {
+                            1.
+                        };
+                        let (pos, tangent) = sample_path(points, fraction * total);
+                        state.position = pos;
+                        if *calc_dir {
+                            let dir = tangent.normalize_or_zero();
+                            if dir.length_squared() > 1e-6 {
+                                state.direction = dir;
+                            }
+                        }
                     }
                 }
             }
@@ -6937,9 +6962,16 @@ fn emit_ribbon(
         {
             positions[slot] = point.to_array();
         }
-        let u = (a0.age / life).clamp(0., 1.);
-        let v = (b0.age / life).clamp(0., 1.);
-        let strip = [[uv[0][0], u], [uv[1][0], u], [uv[2][0], v], [uv[3][0], v]];
+        let v_start = uv[0][1];
+        let v_span = uv[2][1] - uv[0][1];
+        let v_a = v_start + v_span * (a0.age / life).clamp(0., 1.);
+        let v_b = v_start + v_span * (b0.age / life).clamp(0., 1.);
+        let strip = [
+            [uv[0][0], v_a],
+            [uv[1][0], v_a],
+            [uv[2][0], v_b],
+            [uv[3][0], v_b],
+        ];
         push_quad(
             out,
             context,
