@@ -22,20 +22,36 @@ struct Emitter {
 }
 
 fn asset_key(path: &str) -> Option<String> {
-    let path = path.replace('\\', "/");
-    if path.starts_with('/')
-        || path
+    let mut normalized = if path.is_ascii() {
+        let mut s = String::with_capacity(path.len());
+        for b in path.bytes() {
+            s.push(if b == b'\\' { '/' } else { (b as char).to_ascii_lowercase() });
+        }
+        s
+    } else {
+        let mut s = path.to_lowercase();
+        if s.as_bytes().contains(&b'\\') {
+            unsafe {
+                for b in s.as_bytes_mut() {
+                    if *b == b'\\' {
+                        *b = b'/';
+                    }
+                }
+            }
+        }
+        s
+    };
+    if normalized.starts_with('/')
+        || normalized
             .split('/')
             .any(|p| p.is_empty() || p == "." || p == ".." || p.contains(':'))
     {
         return None;
     }
-    let path = path.to_lowercase();
-    Some(if path.starts_with("sfx/") {
-        path
-    } else {
-        format!("sfx/{path}")
-    })
+    if !normalized.starts_with("sfx/") {
+        normalized.insert_str(0, "sfx/");
+    }
+    Some(normalized)
 }
 
 #[derive(Clone, Debug)]
@@ -52,7 +68,7 @@ fn select(emitters: &[Emitter], pos: [f32; 3], yaw: f32, night_factor: f32) -> V
         return Vec::new();
     }
     let (sin, cos) = yaw.sin_cos();
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(MAX_VOICES.min(emitters.len()));
     for (index, e) in emitters.iter().enumerate() {
         let s = &e.sound;
         if e.asset.is_none()
@@ -66,17 +82,19 @@ fn select(emitters: &[Emitter], pos: [f32; 3], yaw: f32, night_factor: f32) -> V
         let dx = s.position[0] - pos[0];
         let dy = s.position[1] - pos[1];
         let dz = s.position[2] - pos[2];
-        let distance = dx.hypot(dy).hypot(dz);
-        if !distance.is_finite() || distance >= s.max_distance {
+        let horiz_sq = dx * dx + dz * dz;
+        let dist_sq = horiz_sq + dy * dy;
+        if !dist_sq.is_finite() || dist_sq >= s.max_distance * s.max_distance {
             continue;
         }
+        let distance = dist_sq.sqrt();
         let gain = if distance <= s.min_distance {
             1.
         } else {
             (s.max_distance - distance) / (s.max_distance - s.min_distance)
         };
         // Match the viewer's mirrored camera and D-key strafe direction.
-        let horizontal = dx.hypot(dz);
+        let horizontal = horiz_sq.sqrt();
         let pan = if horizontal > 0.0001 {
             ((-cos * dx - sin * dz) / horizontal).clamp(-1., 1.)
         } else {
@@ -84,7 +102,7 @@ fn select(emitters: &[Emitter], pos: [f32; 3], yaw: f32, night_factor: f32) -> V
         };
         result.push(Voice { index, gain, pan });
     }
-    result.sort_by(|a, b| {
+    result.sort_unstable_by(|a, b| {
         b.gain
             .total_cmp(&a.gain)
             .then_with(|| a.index.cmp(&b.index))

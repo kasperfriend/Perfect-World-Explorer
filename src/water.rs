@@ -77,7 +77,16 @@ pub(crate) fn path_string(b: &[u8], p: &mut usize) -> Result<String, String> {
     if bad {
         return Err("bad BSData name".into());
     }
-    let path = s.replace('\\', "/");
+    let mut path = s.into_owned();
+    if path.as_bytes().contains(&b'\\') {
+        unsafe {
+            for b in path.as_bytes_mut() {
+                if *b == b'\\' {
+                    *b = b'/';
+                }
+            }
+        }
+    }
     if path.contains("..") || path.starts_with('/') || path.contains(':') {
         return Err("unsafe BSData path".into());
     }
@@ -280,9 +289,10 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
     }
     let mut loaded_index = None;
     let mut loaded = Vec::new();
-    let mut records = Vec::new();
-    let mut seen = HashMap::<u32, u32>::new();
-    let mut areas = Vec::new();
+    let est: usize = scene.blocks.iter().map(|bl| bl.water.len()).sum();
+    let mut records = Vec::with_capacity(est);
+    let mut seen = HashMap::<u32, u32>::with_capacity(est);
+    let mut areas = Vec::with_capacity(est);
     for block in &scene.blocks {
         for r in &block.water {
             if let Some(previous) = seen.insert(r.export_id, r.offset) {
@@ -294,7 +304,7 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
             records.push((u(&b, r.offset as usize)? as usize, records.len(), r));
         }
     }
-    records.sort_by_key(|r| r.0);
+    records.sort_unstable_by_key(|r| r.0);
     for (index, order, r) in records {
         let off = r.offset as usize;
         let record = u(&b, off + 4)? as usize;

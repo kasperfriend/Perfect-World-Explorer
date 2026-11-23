@@ -105,9 +105,17 @@ impl Builder {
     }
     pub fn finish(self) -> Data {
         let mut data = Data::default();
+        let (vcap, icap, ncap) = self
+            .groups
+            .values()
+            .filter(|g| !g.instances.is_empty())
+            .fold((0usize, 0usize, 0usize), |(v, i, n), g| {
+                (v + g.vertices.len(), i + g.indices.len(), n + g.instances.len())
+            });
         data.batches.reserve(self.groups.len());
-        data.instances
-            .reserve(self.groups.values().map(|g| g.instances.len()).sum());
+        data.vertices.reserve(vcap);
+        data.indices.reserve(icap);
+        data.instances.reserve(ncap);
         for (_, g) in self.groups {
             if g.instances.is_empty() {
                 continue;

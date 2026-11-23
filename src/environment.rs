@@ -194,7 +194,8 @@ impl RegionalLight {
     /// (`0x4b2d0c`/`0x4b3b80`), not directional material light.
     pub fn material_direction(&self) -> MaterialDirection {
         let v = self.toward_sun;
-        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        let len_sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+        let len = if len_sq > 0. { len_sq.sqrt() } else { 0. };
         let rcp = 1. / len;
         MaterialDirection(if rcp.is_finite() && rcp > 0. {
             [-v[0] * rcp, -v[1] * rcp, -v[2] * rcp]

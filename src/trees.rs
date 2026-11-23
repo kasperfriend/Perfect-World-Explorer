@@ -266,11 +266,23 @@ impl Trees {
                 .and_then(|s| s.to_str())
                 .ok_or("missing bark name")?;
             let parent = ty.tree.rsplit_once('/').map(|x| x.0).unwrap_or("trees");
-            let bark_path = format!("{parent}/{stem}.dds").to_lowercase();
-            let fallback = format!("trees/{stem}.dds").to_lowercase();
+            let mut bark_path = format!("{parent}/{stem}.dds");
+            if bark_path.is_ascii() {
+                bark_path.make_ascii_lowercase();
+            } else {
+                bark_path = bark_path.to_lowercase();
+            }
             let bark_entry = entries
                 .get(&bark_path)
-                .or_else(|| entries.get(&fallback))
+                .or_else(|| {
+                    let mut fallback = format!("trees/{stem}.dds");
+                    if fallback.is_ascii() {
+                        fallback.make_ascii_lowercase();
+                    } else {
+                        fallback = fallback.to_lowercase();
+                    }
+                    entries.get(&fallback)
+                })
                 .ok_or_else(|| format!("branch material: missing bark texture {bark_path}"))?;
             let tex_entry = entries.get(&ty.composite.to_lowercase()).ok_or_else(|| {
                 format!(

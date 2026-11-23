@@ -134,11 +134,12 @@ fn f(b: &[u8], p: usize) -> Result<f32, String> {
 /// child name for the caller to resolve inside the same pack and directory.
 pub fn mox_wrapper_child(b: &[u8]) -> Result<String, String> {
     let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-    let text = encoding_rs::GBK
-        .decode(&b[..end])
-        .0
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    let decoded = encoding_rs::GBK.decode(&b[..end]).0;
+    let text = if decoded.contains('\r') {
+        decoded.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        decoded.into_owned()
+    };
     if !text.starts_with("MOXTMODEL: ") {
         return Err("unsupported MOXTMODEL header".into());
     }
@@ -217,7 +218,7 @@ fn parse_model(b: &[u8], name: &str) -> Result<Model, String> {
         return Err("unsupported MOXB hierarchy".into());
     }
     let dir = name.rsplit_once('/').map(|x| x.0).unwrap_or("");
-    let mut meshes = Vec::new();
+    let mut meshes = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let st = find(b, q, b"MESH: ")?;
         let (_, p) = cstr(b, st)?;
@@ -265,7 +266,25 @@ fn parse_model(b: &[u8], name: &str) -> Result<Model, String> {
         if bad {
             return Err("invalid MOXB texture path".into());
         }
-        let t = decoded.replace('\\', "/").to_lowercase();
+        let t = if decoded.is_ascii() {
+            let mut s = String::with_capacity(decoded.len());
+            for b in decoded.bytes() {
+                s.push(if b == b'\\' { '/' } else { (b as char).to_ascii_lowercase() });
+            }
+            s
+        } else {
+            let mut s = decoded.to_lowercase();
+            if s.as_bytes().contains(&b'\\') {
+                unsafe {
+                    for b in s.as_bytes_mut() {
+                        if *b == b'\\' {
+                            *b = b'/';
+                        }
+                    }
+                }
+            }
+            s
+        };
         if t.contains("..") || t.starts_with('/') || t.contains(':') {
             return Err("unsafe MOXB texture path".into());
         }
