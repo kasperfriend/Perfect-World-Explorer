@@ -486,7 +486,12 @@ impl Catalog {
     pub fn census(&self) -> Vec<(Group, usize)> {
         Group::all()
             .iter()
-            .map(|group| (*group, self.entries.iter().filter(|e| e.group == *group).count()))
+            .map(|group| {
+                (
+                    *group,
+                    self.entries.iter().filter(|e| e.group == *group).count(),
+                )
+            })
             .collect()
     }
 
@@ -494,7 +499,10 @@ impl Catalog {
     /// differences an authored reference carries.
     pub fn find(&self, path: &str) -> Option<&Entry> {
         let wanted = normalize(path);
-        if let Ok(idx) = self.entries.binary_search_by(|entry| entry.path.as_str().cmp(wanted.as_str())) {
+        if let Ok(idx) = self
+            .entries
+            .binary_search_by(|entry| entry.path.as_str().cmp(wanted.as_str()))
+        {
             return Some(&self.entries[idx]);
         }
         let lower = wanted.to_lowercase();

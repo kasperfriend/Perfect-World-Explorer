@@ -296,9 +296,7 @@ impl Population {
                 (distance2 <= radius2).then_some((index, distance2))
             })
             .collect();
-        let cmp = |a: &(usize, f32), b: &(usize, f32)| {
-            a.1.total_cmp(&b.1).then(a.0.cmp(&b.0))
-        };
+        let cmp = |a: &(usize, f32), b: &(usize, f32)| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0));
         if limit == 0 {
             candidates.clear();
         } else if candidates.len() > limit {

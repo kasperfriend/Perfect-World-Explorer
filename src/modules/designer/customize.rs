@@ -830,7 +830,11 @@ impl Ini {
             }
             if line.starts_with('[') && line.ends_with(']') {
                 let s = line[1..line.len() - 1].trim();
-                section = if s.is_ascii() { s.to_ascii_lowercase() } else { s.to_lowercase() };
+                section = if s.is_ascii() {
+                    s.to_ascii_lowercase()
+                } else {
+                    s.to_lowercase()
+                };
                 continue;
             }
             if let Some((key, value)) = line.split_once('=') {

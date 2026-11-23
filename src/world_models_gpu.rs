@@ -701,7 +701,9 @@ impl World {
         let radius_sq = radius * radius;
         let resident_bounds = self.resident_bounds;
         let mut census = [0usize; 3];
-        let Self { producers, owners, .. } = self;
+        let Self {
+            producers, owners, ..
+        } = self;
         for producer in producers.iter() {
             let dx = producer.position[0] - x;
             let dz = producer.position[2] - z;
@@ -750,7 +752,9 @@ impl World {
     fn apply_attenuation(&mut self, delta_ms: u32, eye: [f32; 3]) {
         let effect_distance = self.effect_distance;
         let off = effect_distance <= 0.;
-        let Self { producers, owners, .. } = self;
+        let Self {
+            producers, owners, ..
+        } = self;
         for producer in producers.iter_mut().filter(|p| p.attenuation) {
             if off {
                 if producer.fade != 1. {

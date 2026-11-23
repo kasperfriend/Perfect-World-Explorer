@@ -166,9 +166,16 @@ fn atlas_uv(tag: u32) -> [f32; 4] {
 /// atlas-cell selection is recovered from native code; billboard dimensions
 /// and the group scale are still provisional visual approximations.
 fn triangle_mesh(surface: &CloudSurface) -> (Vec<TriVertex>, Vec<u32>) {
-    let (vcap, icap) = surface.cells.iter().flatten().fold((0usize, 0usize), |(v, i), c| {
-        (v + c.vertices.len(), i + c.groups.iter().map(|g| g.indices.len()).sum::<usize>())
-    });
+    let (vcap, icap) = surface
+        .cells
+        .iter()
+        .flatten()
+        .fold((0usize, 0usize), |(v, i), c| {
+            (
+                v + c.vertices.len(),
+                i + c.groups.iter().map(|g| g.indices.len()).sum::<usize>(),
+            )
+        });
     let mut verts = Vec::with_capacity(vcap);
     let mut idx = Vec::with_capacity(icap);
     for cell in surface.cells.iter().flatten() {

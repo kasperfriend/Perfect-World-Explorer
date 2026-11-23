@@ -110,7 +110,11 @@ impl Builder {
             .values()
             .filter(|g| !g.instances.is_empty())
             .fold((0usize, 0usize, 0usize), |(v, i, n), g| {
-                (v + g.vertices.len(), i + g.indices.len(), n + g.instances.len())
+                (
+                    v + g.vertices.len(),
+                    i + g.indices.len(),
+                    n + g.instances.len(),
+                )
             });
         data.batches.reserve(self.groups.len());
         data.vertices.reserve(vcap);

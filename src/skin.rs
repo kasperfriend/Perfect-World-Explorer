@@ -105,19 +105,19 @@ impl<'a> Reader<'a> {
             return Err("invalid skin string".into());
         }
         let trimmed = s.trim_end_matches('\0');
-    let mut out = String::with_capacity(trimmed.len());
-    out.push_str(trimmed);
-    if out.as_bytes().contains(&b'\\') {
-        // SAFETY: replacing ASCII '\\' with ASCII '/' preserves UTF-8 validity.
-        unsafe {
-            for b in out.as_bytes_mut() {
-                if *b == b'\\' {
-                    *b = b'/';
+        let mut out = String::with_capacity(trimmed.len());
+        out.push_str(trimmed);
+        if out.as_bytes().contains(&b'\\') {
+            // SAFETY: replacing ASCII '\\' with ASCII '/' preserves UTF-8 validity.
+            unsafe {
+                for b in out.as_bytes_mut() {
+                    if *b == b'\\' {
+                        *b = b'/';
+                    }
                 }
             }
         }
-    }
-    Ok(out)
+        Ok(out)
     }
     fn cstring(&mut self) -> Result<String, String> {
         let rest = &self.data[self.pos..];

@@ -25,7 +25,11 @@ fn asset_key(path: &str) -> Option<String> {
     let mut normalized = if path.is_ascii() {
         let mut s = String::with_capacity(path.len());
         for b in path.bytes() {
-            s.push(if b == b'\\' { '/' } else { (b as char).to_ascii_lowercase() });
+            s.push(if b == b'\\' {
+                '/'
+            } else {
+                (b as char).to_ascii_lowercase()
+            });
         }
         s
     } else {
