@@ -1502,7 +1502,7 @@ mod tests {
         for (a, b) in quads {
             for triangle in [a, b] {
                 for point in triangle {
-                    indices.push(vertices.len() as u16);
+                    indices.push(vertices.len() as u32);
                     vertices.push(crate::bmd::Vertex {
                         position: *point,
                         uv: [0., 0.],

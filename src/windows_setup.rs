@@ -1702,10 +1702,11 @@ pub fn start_window() -> Result<Option<PathBuf>, String> {
                 2 => {
                     if let Some(client) = selected {
                         if crate::launcher_ui::run_diagnostics() {
-                            let report_hint = client
-                                .element
-                                .parent()
-                                .unwrap_or(&client.element)
+                            let report_hint = std::env::current_exe()
+                                .ok()
+                                .and_then(|p| p.parent().map(Path::to_path_buf))
+                                .or_else(|| std::env::current_dir().ok())
+                                .unwrap_or_else(|| client.element.clone())
                                 .join("pw-explorer-diagnostics.txt");
                             let prompt: Vec<u16> = format!(
                                 "Full client diagnostics will scan every map (ECWLD, EC-BSD, terrain textures, water, and all referenced BMDs) and write all errors with explanations to:\n\n{}\n\nThis can take a minute. Continue?",

@@ -65,7 +65,7 @@ pub struct Mesh {
     pub material: Option<Material>,
     pub texture: String,
     pub vertices: Vec<Vertex>,
-    pub indices: Vec<u16>,
+    pub indices: Vec<u32>,
     /// Flag-selected colour branch for v300+ meshes (`None` for legacy v2..=v6).
     pub color_branch: Option<V300ColorBranch>,
     /// `bSupportLightMap` flag read from v300+ mesh header (false for legacy).
@@ -261,6 +261,42 @@ fn count_opaque_words(vertices: &[Vertex]) -> (usize, usize) {
     }
     (day, night)
 }
+fn looks_like_v300_mesh_header(b: &[u8], q: usize, require_nonempty_name: bool) -> bool {
+    let check = || -> Option<bool> {
+        if *b.get(q)? > 1 || *b.get(q + 1)? > 1 {
+            return Some(false);
+        }
+        let name_len = u(b, q + 2).ok()? as usize;
+        if (require_nonempty_name && name_len == 0) || name_len > 256 {
+            return Some(false);
+        }
+        let name_end = q.checked_add(6)?.checked_add(name_len)?;
+        if b.get(q + 6..name_end)?.contains(&0) {
+            return Some(false);
+        }
+        let tex_len = u(b, name_end).ok()? as usize;
+        if tex_len > 512 {
+            return Some(false);
+        }
+        let tex_end = name_end.checked_add(4)?.checked_add(tex_len)?;
+        if b.get(name_end + 4..tex_end)?.contains(&0) {
+            return Some(false);
+        }
+        let n = u(b, tex_end).ok()? as usize;
+        let faces = u(b, tex_end + 4).ok()? as usize;
+        if n > 1_000_000 || faces > 2_000_000 {
+            return Some(false);
+        }
+        let min_body = n
+            .checked_mul(24)?
+            .checked_add(faces.checked_mul(6)?)?
+            .checked_add(n.checked_mul(12)?)?
+            .checked_add(n.checked_mul(8)?)?;
+        let end = tex_end.checked_add(8)?.checked_add(min_body)?;
+        Some(end <= b.len())
+    };
+    check().unwrap_or(false)
+}
 impl Model {
     /// Mirrors the retail loaders exactly:
     /// - file magic "MOXB" (u32 0x42584f4d) is the AFileImage binary marker,
@@ -316,9 +352,9 @@ impl Model {
         let up = v3(b, p + 24)?;
         let position = v3(b, p + 36)?;
         p += 48;
-        let v305_header_word = if version >= 0x10000304 {
-            // 0x10000305 models (e.g. world/47, login, a111) carry a 4-byte
-            // model-level field (often 0xFFFFFFFF) immediately before nNumMeshes.
+        let v305_header_word = if version >= 0x10000303 {
+            // 0x10000303..=0x10000305 models carry a 4-byte model-level field
+            // (often 0xFFFFFFFF) immediately before nNumMeshes.
             let word = u(b, p)?;
             p += 4;
             Some(word)
@@ -403,13 +439,13 @@ impl Model {
                 if n > 1_000_000 || faces > 2_000_000 {
                     return Err("invalid BMD mesh size".into());
                 }
-                let needed = n
+                let min_needed = n
                     .checked_mul(24)
-                    .and_then(|v| v.checked_add(faces.checked_mul(12)?))
+                    .and_then(|v| v.checked_add(faces.checked_mul(6)?))
                     .and_then(|v| v.checked_add(n.checked_mul(12)?))
                     .and_then(|v| v.checked_add(n.checked_mul(8)?))
                     .ok_or("BMD size overflow")?;
-                if p.checked_add(needed).is_none_or(|e| e > b.len()) {
+                if p.checked_add(min_needed).is_none_or(|e| e > b.len()) {
                     return Err("truncated BMD mesh data".into());
                 }
                 let mut vertices = Vec::with_capacity(n);
@@ -425,15 +461,44 @@ impl Model {
                     });
                 }
                 p += n * 24;
-                let mut indices = Vec::with_capacity(faces * 3);
-                for _ in 0..faces * 3 {
-                    let idx = u(b, p)?;
-                    if idx as usize >= n {
-                        return Err("BMD vertex index out of range".into());
+                let idx_count = faces.checked_mul(3).ok_or("BMD size overflow")?;
+                let bytes_32 = idx_count.checked_mul(4).ok_or("BMD size overflow")?;
+                let bytes_16 = idx_count.checked_mul(2).ok_or("BMD size overflow")?;
+                let post_idx_min = n.checked_mul(20).ok_or("BMD size overflow")?;
+                let can_try_32 = p
+                    .checked_add(bytes_32)
+                    .and_then(|v| v.checked_add(post_idx_min))
+                    .is_some_and(|e| e <= b.len());
+                let mut indices = Vec::with_capacity(idx_count);
+                let mut parsed_32 = false;
+                if can_try_32 {
+                    let mut all_ok = true;
+                    for i in 0..idx_count {
+                        let idx = u(b, p + i * 4)?;
+                        if idx as usize >= n {
+                            all_ok = false;
+                            break;
+                        }
+                        indices.push(idx);
                     }
-                    let idx16 = u16::try_from(idx).map_err(|_| "BMD vertex index exceeds u16")?;
-                    indices.push(idx16);
-                    p += 4;
+                    if all_ok {
+                        p += bytes_32;
+                        parsed_32 = true;
+                    } else {
+                        indices.clear();
+                    }
+                }
+                if !parsed_32 {
+                    for i in 0..idx_count {
+                        let q = p + i * 2;
+                        let s = b.get(q..q + 2).ok_or("truncated BMD indices")?;
+                        let idx = u16::from_le_bytes([s[0], s[1]]) as u32;
+                        if idx as usize >= n {
+                            return Err("BMD vertex index out of range".into());
+                        }
+                        indices.push(idx);
+                    }
+                    p += bytes_16;
                 }
                 for v in &mut vertices {
                     v.normal = v3(b, p)?;
@@ -580,6 +645,18 @@ impl Model {
                 } else {
                     p = b.len();
                 }
+                if mesh_idx + 1 < count && !looks_like_v300_mesh_header(b, p, false) {
+                    if p.checked_add(18)
+                        .is_some_and(|q| looks_like_v300_mesh_header(b, q, false))
+                    {
+                        p += 18;
+                    } else if let Some(delta) = (1..=256usize).find(|&d| {
+                        p.checked_add(d)
+                            .is_some_and(|q| looks_like_v300_mesh_header(b, q, true))
+                    }) {
+                        p += delta;
+                    }
+                }
                 meshes.push(Mesh {
                     name,
                     version,
@@ -687,7 +764,7 @@ impl Model {
                     if i as usize >= n {
                         return Err("BMD vertex index out of range".into());
                     }
-                    indices.push(i);
+                    indices.push(u32::from(i));
                     p += 2;
                 }
                 // The normal array is present in every version (n*12 bytes);
@@ -1203,6 +1280,142 @@ mod tests {
         b[4..8].copy_from_slice(&0x10000304u32.to_le_bytes());
         let model304 = Model::parse(&b).expect("v304 with -1 sentinel + count=2 should parse");
         assert_eq!(model304.meshes.len(), 2);
+
+        // 0x10000303 carries the same 4-byte header word before nNumMeshes.
+        b[4..8].copy_from_slice(&0x10000303u32.to_le_bytes());
+        let model303 = Model::parse(&b).expect("v303 with -1 sentinel + count=2 should parse");
+        assert_eq!(model303.meshes.len(), 2);
+    }
+
+    #[test]
+    fn parses_v300_mesh_with_16bit_indices_and_tight_length() {
+        let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+        let mut b = Vec::new();
+        put(&mut b, 0x42584f4d);
+        put(&mut b, 0x10000302);
+        b.extend_from_slice(&[0; 48]);
+        put(&mut b, 1);
+        b.extend_from_slice(&[0, 0]);
+        b.extend_from_slice(&[0, 0]);
+        put(&mut b, 2);
+        b.extend_from_slice(b"m0");
+        put(&mut b, 5);
+        b.extend_from_slice(b"a.dds");
+        put(&mut b, 3);
+        put(&mut b, 2);
+        for i in 0..3u32 {
+            put(&mut b, (i as f32).to_bits());
+            put(&mut b, 0.0f32.to_bits());
+            put(&mut b, 1.0f32.to_bits());
+            put(&mut b, 0xffffffff);
+            put(&mut b, 0.0f32.to_bits());
+            put(&mut b, 1.0f32.to_bits());
+        }
+        // 2 faces * 3 = 6 u16 indices (12 bytes instead of 24).
+        for idx in [0u16, 1, 2, 2, 1, 0] {
+            b.extend_from_slice(&idx.to_le_bytes());
+        }
+        b.extend_from_slice(&[0; 36]); // 3 normals
+        for _ in 0..6 {
+            put(&mut b, 0xff808080); // day + night colours
+        }
+        let model = Model::parse(&b).expect("v300 mesh with 16-bit indices should parse");
+        assert_eq!(model.meshes.len(), 1);
+        assert_eq!(model.meshes[0].indices, vec![0, 1, 2, 2, 1, 0]);
+    }
+
+    #[test]
+    fn parses_v300_mesh_with_u32_indices_above_u16_max() {
+        let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+        let n: u32 = 65_537;
+        let mut b = Vec::new();
+        put(&mut b, 0x42584f4d);
+        put(&mut b, 0x10000305);
+        b.extend_from_slice(&[0; 48]);
+        put(&mut b, u32::MAX);
+        put(&mut b, 1);
+        b.extend_from_slice(&[0, 0]);
+        b.extend_from_slice(&[0, 0]);
+        put(&mut b, 2);
+        b.extend_from_slice(b"hi");
+        put(&mut b, 5);
+        b.extend_from_slice(b"a.dds");
+        put(&mut b, n);
+        put(&mut b, 1);
+        b.resize(b.len() + (n as usize) * 24, 0);
+        put(&mut b, 0);
+        put(&mut b, 65_535);
+        put(&mut b, 65_536);
+        b.resize(b.len() + (n as usize) * 12, 0); // normals
+        b.resize(b.len() + (n as usize) * 8, 0xff); // day + night colours
+        let model = Model::parse(&b).expect("v300 mesh with >65535 vertices should parse");
+        assert_eq!(model.meshes[0].indices, vec![0, 65_535, 65_536]);
+    }
+
+    #[test]
+    fn parses_v305_mesh_with_40_byte_extra_tail_before_next_mesh() {
+        let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+        let mut b = Vec::new();
+        put(&mut b, 0x42584f4d);
+        put(&mut b, 0x10000305);
+        b.extend_from_slice(&[0; 48]);
+        put(&mut b, u32::MAX);
+        put(&mut b, 2);
+        b.extend_from_slice(&[0, 0]);
+
+        // Mesh 0 with 40-byte extra block after MATERIAL (dwExtraSize=0, 5.0f, 1.0f, 0, 0, 0).
+        b.extend_from_slice(&[0, 0]);
+        put(&mut b, 2);
+        b.extend_from_slice(b"m0");
+        put(&mut b, 5);
+        b.extend_from_slice(b"a.dds");
+        put(&mut b, 3);
+        put(&mut b, 1);
+        for i in 0..3u32 {
+            put(&mut b, (i as f32).to_bits());
+            put(&mut b, 0.0f32.to_bits());
+            put(&mut b, 1.0f32.to_bits());
+            put(&mut b, 0xffffffff);
+            put(&mut b, 0.0f32.to_bits());
+            put(&mut b, 1.0f32.to_bits());
+        }
+        put(&mut b, 0);
+        put(&mut b, 1);
+        put(&mut b, 2);
+        b.extend_from_slice(&[0; 36]);
+        for _ in 0..6 {
+            put(&mut b, 0xff808080);
+        }
+        b.extend_from_slice(&[0; 48]); // AABB
+        b.extend_from_slice(b"MATERIAL:  ");
+        b.extend_from_slice(&[0; 69]); // material body
+                                       // 40-byte extra block: 5 zero dwords + 5.0f + 1.0f + 3 zero dwords
+        for _ in 0..5 {
+            put(&mut b, 0);
+        }
+        put(&mut b, 5.0f32.to_bits());
+        put(&mut b, 1.0f32.to_bits());
+        for _ in 0..3 {
+            put(&mut b, 0);
+        }
+
+        // Mesh 1 immediately after the 40-byte extra block.
+        push_v300_mesh(
+            &mut b,
+            false,
+            false,
+            b"m1",
+            b"b.dds",
+            [0xff808080; 3],
+            [0xff808080; 3],
+            22,
+        );
+
+        let model =
+            Model::parse(&b).expect("v305 with 40-byte extra tail should parse both meshes");
+        assert_eq!(model.meshes.len(), 2);
+        assert_eq!(model.meshes[0].name, "m0");
+        assert_eq!(model.meshes[1].name, "m1");
     }
 
     #[test]

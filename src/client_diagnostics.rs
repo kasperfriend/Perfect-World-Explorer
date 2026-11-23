@@ -49,21 +49,33 @@ fn explain_error(category: &str, err: &str) -> &'static str {
 }
 
 fn report_output_path(element: &Path) -> PathBuf {
-    let preferred = element
-        .parent()
-        .unwrap_or(element)
-        .join("pw-explorer-diagnostics.txt");
-    if fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&preferred)
-        .is_ok()
-    {
-        preferred
-    } else {
-        element.join("pw-explorer-diagnostics.txt")
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("pw-explorer-diagnostics.txt"));
+        }
     }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("pw-explorer-diagnostics.txt"));
+    }
+    candidates.push(
+        element
+            .parent()
+            .unwrap_or(element)
+            .join("pw-explorer-diagnostics.txt"),
+    );
+    for path in candidates {
+        if fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .is_ok()
+        {
+            return path;
+        }
+    }
+    element.join("pw-explorer-diagnostics.txt")
 }
 
 fn check_terrain_and_materials(dir: &Path) -> Result<(), String> {
@@ -311,6 +323,12 @@ mod tests {
         let text = fs::read_to_string(&summary.report_path).unwrap();
         assert!(text.contains("map=a999 stage=ECWLD"));
         assert!(text.contains("Explanation:"));
+        assert!(
+            !summary.report_path.starts_with(&dir),
+            "report should be written in Explorer's root dir, not inside client folder: {}",
+            summary.report_path.display()
+        );
+        let _ = fs::remove_file(&summary.report_path);
         let _ = fs::remove_dir_all(&dir);
     }
 }

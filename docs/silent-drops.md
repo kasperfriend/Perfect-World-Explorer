@@ -13,6 +13,10 @@ Every place a loader can lose a value without saying so, classified. Generated b
 
 | file | line | pattern | category | code |
 |---|---|---|---|---|
+| `src/bmd.rs` | 269 | `ok-question` | **probe** | `let name_len = u(b, q + 2).ok()? as usize;` |
+| `src/bmd.rs` | 277 | `ok-question` | **probe** | `let tex_len = u(b, name_end).ok()? as usize;` |
+| `src/bmd.rs` | 285 | `ok-question` | **probe** | `let n = u(b, tex_end).ok()? as usize;` |
+| `src/bmd.rs` | 286 | `ok-question` | **probe** | `let faces = u(b, tex_end + 4).ok()? as usize;` |
 | `src/client_detect.rs` | 181 | `ok-question` | **probe** | `let word = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 182 | `ok-question` | **probe** | `let timestamp = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 184 | `ok-question` | **probe** | `short: u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?),` |
