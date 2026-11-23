@@ -3837,6 +3837,30 @@ fn main() {
                 std::process::exit(2);
             }
         }
+        if flag == "--diagnose-all-worlds" {
+            let Some(path) = args.get(2) else {
+                eprintln!("usage: perfect-world-explorer --diagnose-all-worlds <element folder>");
+                std::process::exit(2);
+            };
+            match client_diagnostics::run_all_worlds(Path::new(path)) {
+                Ok(summary) => {
+                    println!(
+                        "Maps scanned: {} ({} with errors)\nUnique BMDs scanned: {} ({} failed)\nTotal errors: {}\n\nReport saved to:\n{}",
+                        summary.maps_scanned,
+                        summary.maps_failed,
+                        summary.unique_bmds_scanned,
+                        summary.bmds_failed,
+                        summary.total_errors,
+                        summary.report_path.display()
+                    );
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         if flag == "--diagnose-upscale" || flag == "--diagnose-framegen" {
             let rest: Vec<String> = args[2..]
                 .iter()

@@ -1721,20 +1721,35 @@ pub fn start_window() -> Result<Option<PathBuf>, String> {
                             // MB_OKCANCEL (0x1) | MB_ICONWARNING (0x30); IDOK == 1
                             let choice = MessageBoxW(hwnd, prompt.as_ptr(), cap.as_ptr(), 0x31);
                             if choice == 1 {
-                                match crate::client_diagnostics::run_all_worlds(&client.element) {
-                                    Ok(summary) => {
-                                        let done: Vec<u16> = format!(
-                                            "Diagnostics complete.\n\nMaps scanned: {} ({} with errors)\nUnique BMDs scanned: {} ({} failed)\nTotal errors: {}\n\nReport saved to:\n{}",
-                                            summary.maps_scanned,
-                                            summary.maps_failed,
-                                            summary.unique_bmds_scanned,
-                                            summary.bmds_failed,
-                                            summary.total_errors,
-                                            summary.report_path.display()
-                                        )
-                                        .encode_utf16()
-                                        .chain(Some(0))
-                                        .collect();
+                                use std::os::windows::process::CommandExt;
+                                let diag_res = std::env::current_exe()
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|exe| {
+                                        std::process::Command::new(exe)
+                                            .arg("--diagnose-all-worlds")
+                                            .arg(&client.element)
+                                            .creation_flags(0x08000000)
+                                            .output()
+                                            .map_err(|e| e.to_string())
+                                    })
+                                    .and_then(|out| {
+                                        if out.status.success() {
+                                            Ok(String::from_utf8_lossy(&out.stdout)
+                                                .trim()
+                                                .to_string())
+                                        } else {
+                                            Err(String::from_utf8_lossy(&out.stderr)
+                                                .trim()
+                                                .to_string())
+                                        }
+                                    });
+                                match diag_res {
+                                    Ok(summary_text) => {
+                                        let done: Vec<u16> =
+                                            format!("Diagnostics complete.\n\n{summary_text}")
+                                                .encode_utf16()
+                                                .chain(Some(0))
+                                                .collect();
                                         let done_cap: Vec<u16> = "Diagnostics Complete"
                                             .encode_utf16()
                                             .chain(Some(0))
