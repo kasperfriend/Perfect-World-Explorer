@@ -148,7 +148,7 @@ impl Modules {
     /// Returns true when the user asks to go back to the main Escape menu.
     pub fn menu_ui(&mut self, ctx: &egui::Context, spawn: Vec3, yaw: f32) -> bool {
         let mut back = false;
-        egui::Window::new("MODULES  |  ESC to go back")
+        egui::Window::new("MODULES  |  ◀ ESC / Right-click to go back")
             .default_pos(egui::pos2(16., 16.))
             .default_size(egui::vec2(780., 650.))
             .min_size(egui::vec2(560., 480.))
@@ -177,7 +177,7 @@ impl Modules {
                     .frame(egui::Frame::default())
                     .show_inside(ui, |ui| {
                         ui.separator();
-                        if ui.button("Back to menu").clicked() {
+                        if ui.button("◀ Back to menu (RMB)").clicked() {
                             back = true;
                         }
                     });

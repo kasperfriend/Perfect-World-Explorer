@@ -665,7 +665,7 @@ impl FarTrees {
                                     let (c2, a2) = sample_rgba_uv(img, uv_2);
                                     let a_avg = (a0 + a1 + a2) / 3.0;
                                     let a_max = a0.max(a1).max(a2);
-                                    if a_avg < 0.24 && a_max < 0.42 {
+                                    if a_avg < 0.34 && a_max < 0.52 {
                                         continue;
                                     }
                                     let wsum = (a0 + a1 + a2).max(1e-4);
@@ -677,15 +677,45 @@ impl FarTrees {
                                         ((c0[2] * a0 + c1[2] * a1 + c2[2] * a2) / wsum)
                                             .clamp(0.05, 0.92),
                                     ];
+                                    // Give SpeedTree frond sub-triangles organic 3D displacement + a
+                                    // perpendicular micro-fin so fronds never appear as flat 2D planes
+                                    // in water reflections or shadows.
+                                    let sub_c = (sa + sb + sc) / 3.0;
+                                    let edge_len = (sb - sa).length().clamp(0.08, 1.4);
+                                    let lift =
+                                        ((sub_c.x * 4.3 + sub_c.z * 5.7).sin()) * edge_len * 0.16;
+                                    let pa = sa + norm * lift;
+                                    let pb = sb - norm * (lift * 0.6);
+                                    let pc = sc + norm * (lift * 0.4);
+                                    let f_op = a_avg.max(a_max * 0.72).clamp(0.42, 0.78);
                                     lod_tris.push(RtTreeTriangle {
-                                        a: sa,
-                                        b: sb,
-                                        c: sc,
+                                        a: pa,
+                                        b: pb,
+                                        c: pc,
                                         normal: norm,
                                         albedo,
                                         roughness: 0.85,
-                                        opacity: a_avg.max(a_max * 0.8).clamp(0.60, 0.96),
+                                        opacity: f_op,
                                     });
+                                    if a_avg >= 0.48 {
+                                        let tangent = (sb - sa).normalize_or_zero();
+                                        let fin_r = (edge_len * 0.32).clamp(0.08, 0.55);
+                                        let fa = sub_c - tangent * fin_r;
+                                        let fb = sub_c + tangent * fin_r;
+                                        let fc = sub_c + norm * (fin_r * 1.15);
+                                        let fin_n = (fb - fa).cross(fc - fa).normalize_or_zero();
+                                        if fin_n.length_squared() > 0.25 {
+                                            lod_tris.push(RtTreeTriangle {
+                                                a: fa,
+                                                b: fb,
+                                                c: fc,
+                                                normal: fin_n,
+                                                albedo,
+                                                roughness: 0.85,
+                                                opacity: (f_op * 0.88).clamp(0.38, 0.72),
+                                            });
+                                        }
+                                    }
                                 }
                             } else {
                                 let uv_mid = [
@@ -765,9 +795,9 @@ impl FarTrees {
                             avg_r += (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
                         }
                         let base_r = (avg_r * 0.25).clamp(0.18, 2.2);
-                        let r_h = base_r * (0.60 + 0.20 * coverage.sqrt()).clamp(0.62, 0.82);
-                        let r_v = r_h * 0.90;
-                        let opacity = (0.48 + 0.38 * coverage).clamp(0.50, 0.84);
+                        let r_h = base_r * (0.48 + 0.18 * coverage.sqrt()).clamp(0.48, 0.68);
+                        let r_v = r_h * 0.86;
+                        let opacity = (0.40 + 0.34 * coverage).clamp(0.42, 0.72);
                         // Tilt axes per leaf cluster so neighbouring leaves never align into flat sheets.
                         let phase = (center.x * 3.17 + center.y * 5.41 + center.z * 2.73).sin();
                         let (s_a, c_a) = (phase * 1.1).sin_cos();

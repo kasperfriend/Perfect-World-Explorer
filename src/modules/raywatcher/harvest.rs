@@ -1554,7 +1554,7 @@ fn push_terrain_frustum(
                         (hc, hm_n, hm_s, hm_w, hm_e, err_c, edge_err)
                     };
 
-                    if edge_err > 0.08 {
+                    if edge_err > 0.04 {
                         // Watertight 8-triangle star pinning both the cell
                         // centre AND all 4 edge midpoints to exact `ground()`
                         // heights: eliminates elevated bridges over valley
@@ -1583,7 +1583,7 @@ fn push_terrain_frustum(
                             ));
                         }
                         lod_tris[lod_band] += 8;
-                    } else if err_c > 0.08 {
+                    } else if err_c > 0.04 {
                         // Watertight 4-triangle fan through the exact centre
                         // height when all 4 perimeter edges are linear.
                         let p0 = Vec3::new(wx0, h0, wz0);

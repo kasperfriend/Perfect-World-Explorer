@@ -8144,6 +8144,13 @@ pub fn run(
                                                 }
                                             });
                                     }
+                                    if menu_page.is_open()
+                                        && !ctx.wants_keyboard_input()
+                                        && ctx.input(|i| i.pointer.secondary_clicked())
+                                    {
+                                        menu_page = menu_page.escape();
+                                        keys.clear();
+                                    }
                                     if menu_page==MenuPage::Main {
                                         egui::Window::new("PERFECT WORLD EXPLORER  |  ESC MENU")
                                             .default_pos(egui::pos2(16.,16.)).default_size(egui::vec2(380.,330.)).min_size(egui::vec2(280.,260.)).collapsible(false).resizable(true).vscroll(true)
@@ -8163,7 +8170,7 @@ pub fn run(
                                                     ui.add_space(8.);
                                                     if ui.add_sized([button_width,40.],egui::Button::new(egui::RichText::new("WORLD MAP  [M]").size(17.))).clicked(){menu_page=MenuPage::WorldMap;map_refresh=Instant::now()-std::time::Duration::from_secs(10);}
                                                     ui.add_space(8.);
-                                                    if ui.add_sized([button_width,36.],egui::Button::new("Exit Explorer")).clicked(){if let Err(e)=settings.save(){eprintln!("Settings save: {e}");}target.exit();}
+                                                    if ui.add_sized([button_width,36.],egui::Button::new("Exit Explorer")).clicked(){if let Err(e)=settings.save(){eprintln!("Settings save: {e}");}target.exit();}ui.add_space(6.);ui.label(egui::RichText::new("◀ ESC or Right-click to resume").small().weak());
                                                 });
                                             });
                                     }
@@ -8171,7 +8178,7 @@ pub fn run(
                                         if renderer.modules.menu_ui(ctx,camera.pos,camera.yaw){menu_page=MenuPage::Main;}
                                     }
                                     if menu_page==MenuPage::Settings {
-                                        egui::Window::new("SETTINGS  |  ESC to go back")
+                                        egui::Window::new("SETTINGS  |  ◀ ESC / Right-click to go back")
                                             .default_pos(egui::pos2(16.,16.)).collapsible(false).resizable(true)
                                             .default_size(egui::vec2(490.,460.)).min_size(egui::vec2(310.,250.)).max_height(config.height as f32 / window.scale_factor() as f32-35.).vscroll(true)
                                             .show(ctx,|ui| {
@@ -8191,11 +8198,11 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                     3=>{ui.heading("Interface");ui.checkbox(&mut settings.show_zone_entry,"Show entering zone notification");ui.checkbox(&mut settings.show_minimap,"Show minimap");marked_slider(ui,egui::Slider::new(&mut settings.minimap_range,100.0..=600.0),"Minimap half-width (world units)",defaults.minimap_range,100.,600.,false,settings.show_minimap);ui.separator();egui::ComboBox::from_label("Minimap style").selected_text(settings.minimap_style.label()).show_ui(ui,|ui|{ui.selectable_value(&mut settings.minimap_style,MapStyle::Realistic,"Realistic");ui.selectable_value(&mut settings.minimap_style,MapStyle::Original,"Original");});ui.label(egui::RichText::new("Realistic renders the world from above each frame; Original shows the client's own minimap tiles (surfaces/minimaps/world) at their native resolution.").small().weak());egui::ComboBox::from_label("Minimap shape").selected_text(settings.minimap_shape.label()).show_ui(ui,|ui|{ui.selectable_value(&mut settings.minimap_shape,MinimapShape::Square,"Square");ui.selectable_value(&mut settings.minimap_shape,MinimapShape::Circular,"Circular");});egui::ComboBox::from_label("World map style").selected_text(settings.world_map_style.label()).show_ui(ui,|ui|{ui.selectable_value(&mut settings.world_map_style,MapStyle::Realistic,"Realistic");ui.selectable_value(&mut settings.world_map_style,MapStyle::Original,"Original");});ui.label(egui::RichText::new("Realistic renders the whole world from above; Original shows the client's map tiles (surfaces/maps).").small().weak());ui.separator();ui.heading("Camera controls");marked_slider(ui,egui::Slider::new(&mut settings.camera_speed,10.0..=3000.0).logarithmic(true),"Flight speed",defaults.camera_speed,10.,3000.,true,true);marked_slider(ui,egui::Slider::new(&mut settings.boost,1.0..=10.0),"Shift multiplier",defaults.boost,1.,10.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.sensitivity,0.0005..=0.01).logarithmic(true),"Mouse sensitivity",defaults.sensitivity,0.0005,0.01,true,true);}
                                                     _=>{ui.heading("Logging");ui.label(egui::RichText::new("Tick a channel, or click the capture for a report that is already filed, and the viewer writes the files below while you look at the artefact. F8 drops a marker with the camera pose into the log, so a report can name the spot instead of describing it.").small().weak());let mut mask=settings.logging_mask;let mut directory=settings.logging_dir.clone();let changed=crate::diagnostics::ui(ui,&mut mask,&mut directory);if mask!=settings.logging_mask{settings.logging_mask=mask;crate::diagnostics::set_mask(mask);}if directory!=settings.logging_dir{settings.logging_dir=directory;crate::diagnostics::apply_dir(&settings.logging_dir);}}
                                                 }
-                                                ui.separator();ui.horizontal(|ui|{if ui.add_sized([135.,32.],egui::Button::new("Back to menu")).clicked(){menu_page=MenuPage::Main;}if ui.button("Restore defaults").clicked(){settings=ViewSettings::default();}});
+                                                ui.separator();ui.horizontal(|ui|{if ui.add_sized([165.,32.],egui::Button::new("◀ Back to menu (RMB)")).clicked(){menu_page=MenuPage::Main;}if ui.button("Restore defaults").clicked(){settings=ViewSettings::default();}});
                                             });
                                     }
                                     if menu_page==MenuPage::Teleports {
-                                        egui::Window::new("TELEPORT LIST  |  ESC to go back").default_pos(egui::pos2(16.,16.)).default_size(egui::vec2(540.,570.)).min_size(egui::vec2(340.,280.)).max_height(config.height as f32/window.scale_factor() as f32-35.).collapsible(false).resizable(true).show(ctx,|ui|{
+                                        egui::Window::new("TELEPORT LIST  |  ◀ ESC / Right-click to go back").default_pos(egui::pos2(16.,16.)).default_size(egui::vec2(540.,570.)).min_size(egui::vec2(340.,280.)).max_height(config.height as f32/window.scale_factor() as f32-35.).collapsible(false).resizable(true).show(ctx,|ui|{
                                             ui.heading("Explore destinations");ui.label(egui::RichText::new("Locations and coordinates from the selected map").small().weak());ui.add_space(6.);
                                             ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new("Current world").strong());
@@ -8280,12 +8287,12 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                     if ui.button("Teleport").clicked(){camera.pos=Vec3::from_array(place.position)+Vec3::Y*3.;menu_page=MenuPage::Closed;keys.clear();}});ui.separator();
                                                 }});
                                             },Err(e)=>{ui.colored_label(egui::Color32::LIGHT_RED,format!("Could not load destinations: {e}"));}}
-                                            if ui.button("Back to menu").clicked(){menu_page=MenuPage::Main;}
+                                            if ui.button("◀ Back to menu (RMB)").clicked(){menu_page=MenuPage::Main;}
                                         });
                                     }
                                     if menu_page==MenuPage::WorldMap {
                                         let scale=window.scale_factor() as f32;let screen_w=config.width as f32/scale;let screen_h=config.height as f32/scale;
-                                        egui::Window::new("WORLD MAP  |  M or ESC to close").default_pos(egui::pos2(16.,16.)).default_size(egui::vec2((screen_w-32.).min(760.),(screen_h-32.).min(900.))).min_size(egui::vec2(330.,300.)).max_height(screen_h-35.).collapsible(false).resizable(true).show(ctx,|ui|{
+                                        egui::Window::new("WORLD MAP  |  ◀ M / ESC / Right-click to close").default_pos(egui::pos2(16.,16.)).default_size(egui::vec2((screen_w-32.).min(760.),(screen_h-32.).min(900.))).min_size(egui::vec2(330.,300.)).max_height(screen_h-35.).collapsible(false).resizable(true).show(ctx,|ui|{
                                             ui.label(egui::RichText::new("North: up  |  East: right  |  Mouse wheel: zoom").small().strong());
                                             if settings.world_map_style==MapStyle::Realistic && !renderer.world_done {ui.horizontal_wrapped(|ui|{ui.label(egui::RichText::new("Distant scenery: ").small().weak());if settings.detail.terrain_cutoff {ui.label("Scenery follows the resident window");}else if settings.whole_world {ui.label(egui::RichText::new(&world_status).small().weak());}else if ui.button("Load whole world scenery").clicked(){settings.whole_world=true;}});}
                                             let remaining=(ui.available_height()-78.).max(100.);let visible_width=ui.available_width();let base_width=visible_width.min(remaining*map_aspect).max(120.);let image_size=egui::vec2(base_width*map_zoom,base_width*map_zoom/map_aspect);
@@ -8299,7 +8306,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                 }else {if let Some(e)=&original_map_error{ui.colored_label(egui::Color32::LIGHT_RED,format!("Original map unavailable: {e}"));}else{ui.label("Loading original client map tiles...");}ui.allocate_space(egui::vec2(80.,80.));}
                                             });
                                             if let Some((pointer,rect,ratio))=zoom_anchor {let mut state=scroll.state;let local=pointer-rect.min;state.offset=anchored_zoom_offset(state.offset,local,ratio);state.store(ctx,scroll.id);ctx.request_repaint();}
-                                            ui.separator();ui.horizontal_wrapped(|ui|{ui.checkbox(&mut map_click_teleport,"Click to teleport");marked_slider(ui,egui::Slider::new(&mut map_zoom,1.0..=4.0),"Zoom",1.,1.,4.,false,true);ui.label(egui::RichText::new(format!("{} style — change in Settings ▸ Interface",settings.world_map_style.label())).small().weak());});
+                                            ui.separator();ui.horizontal_wrapped(|ui|{if ui.button("◀ Back (RMB)").clicked(){menu_page=MenuPage::Closed;}ui.checkbox(&mut map_click_teleport,"Click to teleport");marked_slider(ui,egui::Slider::new(&mut map_zoom,1.0..=4.0),"Zoom",1.,1.,4.,false,true);ui.label(egui::RichText::new(format!("{} style — change in Settings ▸ Interface",settings.world_map_style.label())).small().weak());});
                                         });
                                     }
                                     if settings.show_minimap {egui::Area::new(egui::Id::new("minimap-hud")).anchor(egui::Align2::RIGHT_TOP,egui::vec2(-16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.).rounding(match settings.minimap_shape { MinimapShape::Circular => 256.*0.5+5., MinimapShape::Square => 0.0 }).show(ui,|ui|{

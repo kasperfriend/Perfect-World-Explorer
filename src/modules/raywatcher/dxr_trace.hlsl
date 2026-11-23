@@ -162,12 +162,16 @@ bool accept_opacity(uint prim, float2 bary, uint seed, uint tri_count) {
     }
     uint _unused = seed;
     float clump = 1.0;
-    if (opacity < 0.90) {
-        uint cx = uint(bary.x * 7.0);
-        uint cy = uint(bary.y * 7.0);
+    if (opacity < 0.96) {
+        // Organic leaf-edge feathering + multi-scale breakup removes flat polygonal leaf edges.
+        float bw = max(0.0, 1.0 - bary.x - bary.y);
+        float edge_d = min(bary.x, min(bary.y, bw));
+        float edge_fade = smoothstep(0.0, 0.24, edge_d);
+        uint cx = uint(bary.x * 11.0);
+        uint cy = uint(bary.y * 11.0);
         uint ch = prim * 2654435761u ^ cx * 2246822519u ^ cy * 3266489917u;
         ch ^= ch >> 15u;
-        clump = 0.42 + 0.86 * (float(ch & 0xffu) / 255.0);
+        clump = (0.35 + 0.95 * (float(ch & 0xffu) / 255.0)) * edge_fade;
     }
     float eff_opacity = saturate(opacity * clump);
     uint h = prim * 747796405u ^ uint(bary.x * 64.0) * 2891336453u ^ uint(bary.y * 64.0) * 1664525u;
@@ -247,7 +251,7 @@ Hit closest_hit_fast(float3 origin, float3 dir, float t_min, float t_max, uint o
 
 // Feature #4 & #7: Shadow ray returning blocker distance (for PCSS contact-hardening)
 // and colored translucent transmission when passing through foliage/banners.
-ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_max, uint seed, uint opaque_offset, uint tri_count, bool fast_mode) {
+ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_max, uint seed, uint opaque_offset, uint tri_count, bool fast_mode, float terrain_self_skip) {
     ShadowResult res;
     res.occluded = false;
     res.t_blocker = -1.0;
@@ -287,9 +291,37 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
     }
 
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-        res.occluded = true;
-        res.t_blocker = q.CommittedRayT();
         uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
+        float hit_t = q.CommittedRayT();
+        // Skip local coarse KIND_TERRAIN_LOD self-intersections on curved slopes (fixes triangular black holes).
+        if (prim < tri_count && terrain_self_skip > 0.0 && hit_t < terrain_self_skip) {
+            float hkind = tris[prim].a.w;
+            if (hkind > 1.5 && hkind < 2.5 && hit_t + 0.65 < t_max) {
+                RayDesc ray2;
+                ray2.Origin = origin;
+                ray2.Direction = dir;
+                ray2.TMin = hit_t + 0.65;
+                ray2.TMax = t_max;
+                RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q2;
+                q2.TraceRayInline(scene_tlas, RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray2);
+                while (q2.Proceed()) {
+                    if (q2.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
+                        uint cp2 = q2.CandidatePrimitiveIndex() + (q2.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
+                        foliage_layers = min(foliage_layers + 1u, 6u);
+                        if (accept_opacity(cp2, q2.CandidateTriangleBarycentrics(), seed ^ 19u, tri_count)) {
+                            q2.CommitNonOpaqueTriangleHit();
+                        }
+                    }
+                }
+                if (q2.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
+                    return res;
+                }
+                prim = q2.CommittedPrimitiveIndex() + (q2.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
+                hit_t = q2.CommittedRayT();
+            }
+        }
+        res.occluded = true;
+        res.t_blocker = hit_t;
         if (prim < tri_count) {
             Material m = material_of(prim);
             if (m.surface.w < 0.96) {
@@ -505,8 +537,8 @@ float voronoi_ridge(float2 uv, float t) {
     }
     // Opt #8: Fast cubic multiply replaces transcendental pow() in Voronoi ridge.
     float edge = sqrt(d2) - sqrt(d1);
-    float v = saturate(1.0 - edge * 2.3);
-    return v * v * v;
+    float v = smoothstep(0.58, 0.0, edge);
+    return v * v * (0.45 + 0.55 * v);
 }
 
 float caustic_pattern(float2 xz, float t, float cam_dist) {
@@ -556,24 +588,29 @@ float3 trace_effect_light_reflections(float3 origin, float3 dir, float max_t, ui
         if (pr.w <= 0.1) {
             continue;
         }
-        float3 to_l = pr.xyz - origin;
-        float t_proj = dot(to_l, dir);
-        if (t_proj <= 0.4 || t_proj >= max_reach) {
+        float3 d_eye = pr.xyz - params.eye.xyz;
+        if (dot(d_eye, d_eye) < 12.25) {
             continue;
         }
-        float r_core = clamp(pr.w * 0.13, 0.60, 4.2);
-        float r2 = r_core * r_core;
+        float3 to_l = pr.xyz - origin;
+        float t_proj = dot(to_l, dir);
+        if (t_proj <= 0.8 || t_proj >= max_reach) {
+            continue;
+        }
+        float r_core = clamp(pr.w * 0.11, 0.50, 3.2);
+        float r2_out = r_core * r_core * 6.0;
         float d2 = dot(to_l, to_l) - t_proj * t_proj;
-        if (d2 >= r2 * 6.5) {
+        if (d2 >= r2_out) {
             continue;
         }
         float4 ci = params.point_lights_col_int[li];
         if (ci.w < 0.05) {
             continue;
         }
-        float x = d2 / max(r2, 0.1);
-        float orb = (1.0 / (1.0 + x + 0.5 * x * x)) / (1.0 + t_proj * 0.011);
-        glow_sum += ci.rgb * (ci.w * orb * 0.36);
+        float u = saturate(d2 / max(r2_out, 0.1));
+        float win = 1.0 - u;
+        float orb = (win * win * win) * exp(-u * 3.5) / (1.0 + t_proj * 0.014);
+        glow_sum += ci.rgb * (ci.w * orb * 0.28);
     }
     return min(glow_sum, float3(2.2, 2.2, 2.2));
 }
@@ -664,7 +701,7 @@ float3 caustic_pattern_chromatic(float2 xz, float t, float cam_dist, float depth
     if (cam_dist > 34.0 || depth_w > 5.5) {
         return float3(c_g, c_g, c_g);
     }
-    float disp = 0.055 * (1.0 - saturate(depth_w / 5.5));
+    float disp = 0.032 * (1.0 - saturate(depth_w / 5.5));
     float c_r = caustic_pattern(xz + float2(disp, disp * 0.6), t, cam_dist + 24.0);
     float c_b = caustic_pattern(xz - float2(disp, disp * 0.6), t, cam_dist + 24.0);
     return float3(lerp(c_g, c_r, 0.65), c_g, lerp(c_g, c_b, 0.65));
@@ -745,8 +782,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         fog_t = saturate((dist - fog_start) / (fog_end - fog_start));
     }
 
+    float water_y = params.eye.w;
+    bool is_submerged = (water_y > -1e5) && (params.eye.y < water_y - 0.05);
     uint debug_mode_early = uint(round(params.counts.w));
-    if (fog_t >= 0.99 && layered && debug_mode_early == 0u) {
+    if (fog_t >= 0.99 && layered && debug_mode_early == 0u && !is_submerged) {
         out_colour[id.xy] = float4(0.0, 0.0, 0.0, 1.0);
         if (params.point_light_meta.w > 0.5) {
             out_guide[id.xy] = float4(1.0, 1.0, dist, 1.0);
@@ -793,7 +832,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float spread_tan = (params.lens.z > 1e-4) ? tan(params.lens.z) : 0.0;
     float sun_luma = luma(params.sun_colour.xyz);
     float sun_strength = smoothstep(0.28, 0.48, sun_luma);
-    float gi_fade = 1.0 - saturate((dist - 150.0) / 70.0);
+    float gi_fade = 1.0 - saturate((dist - 220.0) / 180.0);
 
     for (uint s = 0u; s < samples; s = s + 1u) {
         // Feature #7 (Contact-Hardening Soft Shadows / PCSS) + Feature #4 (Foliage Transmission):
@@ -804,10 +843,11 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         if (bits_shadows && n_dot_l > 0.02 && fog_t < 0.96) {
             // Opt #6: Clamp primary shadow ray t_max to 480u to prune far BVH nodes.
             float shadow_max_t = min(params.lens.y, 480.0);
-            bool fast_shadow = dist > 180.0;
+            bool fast_shadow = dist > 320.0;
+            float terrain_self_skip = is_water ? 0.0 : (2.5 + steepness * 14.0 + dist * 0.025);
             ShadowResult sr0 = trace_sun_shadow(
                 ray_origin, params.sun_dir.xyz, shadow_t_min, shadow_max_t,
-                state, opaque_offset, tri_count, fast_shadow);
+                state, opaque_offset, tri_count, fast_shadow, terrain_self_skip);
             float vis_sum = sr0.occluded ? 0.0 : 1.0;
             if (sr0.occluded) {
                 trans_tint += sr0.transmittance;
@@ -828,7 +868,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float3 shadow_dir1 = normalize(params.sun_dir.xyz + (sun_t * c_th + sun_b * s_th) * r);
                 ShadowResult sr1 = trace_sun_shadow(
                     ray_origin, shadow_dir1, shadow_t_min, shadow_max_t,
-                    state ^ 1u, opaque_offset, tri_count, fast_shadow);
+                    state ^ 1u, opaque_offset, tri_count, fast_shadow, terrain_self_skip);
                 if (!sr1.occluded) {
                     vis_sum += 1.0;
                 } else {
@@ -909,7 +949,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             // Opt #9: Use fast opaque RT traversal for blurry glossy trims & distant water (> 140u).
             float refl_max_t = is_water ? min(params.lens.y, 750.0) : min(params.lens.y, 140.0);
             Hit rhit;
-            if (!is_water || dist > 140.0) {
+            if (!is_water || dist > 420.0) {
                 rhit = closest_hit_fast(ray_origin, reflect_dir, bias, refl_max_t, opaque_offset, tri_count);
             } else {
                 rhit = closest_hit(ray_origin, reflect_dir, bias, refl_max_t, opaque_offset, tri_count);
@@ -1038,7 +1078,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         // converged cache cells terminate deep paths immediately without extra rays.
                         float4 cached = rc_query(bhit_world, bhit.normal, dist + bhit.t);
                         if (bounce >= 1u && cached.w >= 6.0) {
-                            gi_sum += throughput * min(cached.rgb, float3(1.10, 1.10, 1.10)) * (params.tuning.w * 0.85 * (1.0 - fog_t));
+                            gi_sum += throughput * min(cached.rgb, float3(1.10, 1.10, 1.10)) * (params.tuning.w * 0.42 * (1.0 - fog_t));
                             break;
                         }
                         if (bits_shadows && bounce < 2u && b_ndl > 0.08) {
@@ -1105,7 +1145,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                             rc_update(bhit_world, bhit.normal, dist + bhit.t, incoming);
                         }
                         incoming = min(incoming, float3(1.10, 1.10, 1.10));
-                        gi_sum += throughput * incoming * (params.tuning.w * 0.85 * (1.0 - fog_t));
+                        gi_sum += throughput * incoming * (params.tuning.w * 0.42 * (1.0 - fog_t));
                         if (bounce + 1u < tap_bounces) {
                             throughput *= clamp(b_chroma * 1.02, float3(0.08, 0.08, 0.08), float3(0.84, 0.84, 0.84));
                             if (bounce >= 2u) {
@@ -1126,9 +1166,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         gi_total_rays += 1.0;
                         gi_sky_hits += 1.0;
                         // Calibrated directional sky-dome GI + Enhancement #15 (Golden-hour sunset/dawn color grading).
-                        float3 raw_sky = min(sample_sky_env(d), float3(1.10, 1.10, 1.10));
-                        float sky_l = luma(raw_sky);
-                        float3 vivid_sky = max(float3(sky_l, sky_l, sky_l) + (raw_sky - sky_l) * 1.25, float3(0.0, 0.0, 0.0));
+                        float3 raw_sky = min(sample_sky_env(d), float3(0.85, 0.85, 0.85));
+                        float3 vivid_sky = raw_sky;
                         if (params.sun_dir.y > 0.01 && params.sun_dir.y < 0.42 && sun_strength > 0.05) {
                             float golden_w = 1.0 - smoothstep(0.10, 0.42, params.sun_dir.y);
                             float sun_align = dot(normalize(float3(d.x, 0.0, d.z) + float3(1e-5, 0.0, 0.0)),
@@ -1136,7 +1175,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                             float3 warm_cool = lerp(float3(0.76, 0.84, 1.22), float3(1.26, 0.94, 0.68), sun_align * 0.5 + 0.5);
                             vivid_sky *= lerp(float3(1.0, 1.0, 1.0), warm_cool, golden_w * 0.55);
                         }
-                        float sky_w = (bounce == 0u) ? 0.24 : 0.14;
+                        float sky_w = (bounce == 0u) ? 0.075 : 0.045;
                         gi_sum += throughput * vivid_sky * (params.tuning.w * sky_w * day_gi_scale * (1.0 - fog_t));
                         break;
                     }
@@ -1165,7 +1204,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     // Feature #2 (Underwater Caustics): Project organic Voronoi sun caustics onto
     // submerged terrain, rocks, and ruins when beneath the active water plane.
     float3 underwater_caustics = float3(0.0, 0.0, 0.0);
-    float water_y = params.eye.w;
     if (bits_caustics && !is_water && water_y > -1e5 && world_pos.y < water_y - 0.05 && fog_t < 0.95 && sun_strength > 0.05) {
         float sub_depth = water_y - world_pos.y;
         if (sub_depth < 28.0 && n_dot_l > 0.05) {
@@ -1217,17 +1255,18 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
     }
 
-    // Enhancement #2: Ray-Traced Underwater Volumetric Sun Shafts when submerged.
-    if (bits_shadows && water_y > -1e5 && params.sun_dir.y > 0.08 && sun_strength > 0.05
-        && (params.eye.y < water_y - 0.10 || world_pos.y < water_y - 0.15) && dist > 3.0)
+    // Enhancement #2: Ray-Traced Underwater Volumetric Sun/Moon Shafts & Scatter when submerged.
+    if (bits_shadows && water_y > -1e5 && params.sun_dir.y > 0.03
+        && (is_submerged || world_pos.y < water_y - 0.15) && dist > 1.5)
     {
-        float uw_march = min(dist, 65.0) - 1.0;
-        if (uw_march > 2.0) {
+        float uw_march = min(dist, 60.0) - 0.5;
+        if (uw_march > 1.0) {
             float uw_lit = 0.0;
             float uw_occ = 0.0;
-            for (uint ui = 0u; ui < 5u; ui = ui + 1u) {
-                float u = (float(ui) + ign_v) * 0.2;
-                float t_u = 1.0 + u * uw_march;
+            float t_anim = params.frame.x * 0.032;
+            for (uint ui = 0u; ui < 6u; ui = ui + 1u) {
+                float u = (float(ui) + ign_v) / 6.0;
+                float t_u = 0.5 + u * uw_march;
                 float3 p_u = params.eye.xyz + view_dir * t_u;
                 if (p_u.y >= water_y) {
                     continue;
@@ -1235,14 +1274,21 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 if (occluded_fast(p_u, params.sun_dir.xyz, 0.4, 220.0)) {
                     uw_occ += 1.0;
                 } else {
-                    float d_sub = max(water_y - p_u.y, 0.1);
-                    float wave_focus = 0.65 + 0.35 * sin(p_u.x * 0.45 + p_u.z * 0.38 + params.frame.x * 0.04);
-                    uw_lit += exp(-d_sub * 0.065) * wave_focus;
+                    float d_sub = max(water_y - p_u.y, 0.05);
+                    float w1 = sin(p_u.x * 0.42 + p_u.z * 0.36 + t_anim);
+                    float w2 = cos(p_u.x * 0.29 - p_u.z * 0.51 - t_anim * 0.8);
+                    float wave_focus = 0.45 + 0.55 * saturate(0.5 + 0.5 * w1 * w2);
+                    uw_lit += exp(-d_sub * 0.045) * wave_focus;
                 }
             }
-            float uw_contrast = lerp(0.35, 1.0, smoothstep(0.05, 0.40, uw_occ * 0.2));
-            float3 uw_tint = float3(0.16, 0.66, 0.78) * params.sun_colour.xyz;
-            god_rays += uw_tint * ((uw_lit * 0.2) * uw_contrast * sun_strength * 0.16 * (1.0 - fog_t * 0.6));
+            float uw_vis = uw_lit / 6.0;
+            float uw_phase = 0.55 + 0.45 * saturate(dot(view_dir, params.sun_dir.xyz));
+            float uw_contrast = lerp(0.55, 1.0, smoothstep(0.05, 0.35, uw_occ / 6.0));
+            float3 day_uw = float3(0.22, 0.78, 0.86) * max(params.sun_colour.xyz, float3(0.4, 0.4, 0.4));
+            float3 night_uw = float3(0.06, 0.16, 0.28);
+            float3 uw_tint = lerp(night_uw, day_uw, sun_strength);
+            float uw_gain = is_submerged ? 0.34 : 0.18;
+            god_rays += uw_tint * (uw_vis * uw_phase * uw_contrast * uw_gain * (1.0 - fog_t * 0.25));
         }
     }
 
@@ -1280,11 +1326,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
     }
 
-    // Enhancement #3: Local Volumetric Light Halos around bright lanterns, portals & beams in darkness/fog.
-    if (bits_lighting && pl_count > 0u && dist > 2.5 && fog_t < 0.95) {
-        float dark_fog_w = max(1.0 - 0.72 * sun_strength, fog_t * 0.65);
-        if (dark_fog_w > 0.15) {
-            float max_h_t = min(dist, 95.0);
+    // Enhancement #3: Subtle, smooth edge-free Volumetric Light Halos around world lanterns/portals
+    // (excludes camera light < 3.5u from eye and uses strictly zero-at-boundary cubic falloff).
+    if (bits_lighting && pl_count > 0u && dist > 3.0 && fog_t < 0.95) {
+        float dark_fog_w = max(0.45 * (1.0 - sun_strength), fog_t * 0.65);
+        if (dark_fog_w > 0.12) {
+            float max_h_t = min(dist, 85.0);
             uint halo_cap = min(pl_count, 32u);
             float3 halo_sum = float3(0.0, 0.0, 0.0);
             float best_h_score = 0.0;
@@ -1296,27 +1343,33 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     continue;
                 }
                 float3 to_l = pr.xyz - params.eye.xyz;
-                float t_p = dot(to_l, view_dir);
-                if (t_p <= 1.2 || t_p >= max_h_t) {
+                float l_dist2 = dot(to_l, to_l);
+                // Exclude camera light attached near the camera eye.
+                if (l_dist2 < 12.25) {
                     continue;
                 }
-                float d2 = dot(to_l, to_l) - t_p * t_p;
-                float r_h = clamp(pr.w * 0.24, 1.8, 9.0);
-                float r2 = r_h * r_h;
-                if (d2 >= r2 * 4.5) {
+                float t_p = dot(to_l, view_dir);
+                if (t_p <= 2.5 || t_p >= max_h_t) {
+                    continue;
+                }
+                float d2 = max(l_dist2 - t_p * t_p, 0.0);
+                float r_h = clamp(pr.w * 0.10, 0.7, 3.2);
+                float r2_out = r_h * r_h * 4.0;
+                if (d2 >= r2_out) {
                     continue;
                 }
                 float4 ci = params.point_lights_col_int[hi];
-                float x = d2 / max(r2, 0.25);
-                float scatter = (1.0 / (1.0 + x * 1.4 + 0.6 * x * x)) * (1.0 / (1.0 + t_p * 0.025));
-                float3 contrib = ci.rgb * (ci.w * scatter * 0.048);
+                float u = saturate(d2 / max(r2_out, 0.25));
+                float w_edge = 1.0 - u;
+                float scatter = (w_edge * w_edge * w_edge) * exp(-u * 3.5) / (1.0 + t_p * 0.04);
+                float3 contrib = ci.rgb * (ci.w * scatter * 0.014);
                 float sc = luma(contrib);
                 if (sc > best_h_score) {
                     best_h_score = sc;
                     best_h_pos = params.eye.xyz + view_dir * t_p;
                     best_h_col = contrib;
                 } else {
-                    halo_sum += contrib * 0.65;
+                    halo_sum += contrib * 0.55;
                 }
             }
             if (best_h_score > 1e-4) {
@@ -1326,7 +1379,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 }
                 halo_sum += best_h_col * vis_h;
             }
-            god_rays += min(halo_sum * dark_fog_w, float3(0.38, 0.38, 0.38));
+            god_rays += min(halo_sum * dark_fog_w, float3(0.12, 0.12, 0.12));
         }
     }
 
@@ -1554,7 +1607,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float bent_sky = lerp(0.82, 1.0, saturate(bent_normal.y * 0.5 + 0.5));
         float v_ao = bits_ao ? (avg_open * bent_sky * sky_portal_vis) : 1.0;
         bool gi_active = bits_gi && !is_water && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01;
-        float amb_keep = gi_active ? lerp(1.0, 0.18, gi_fade) : 1.0;
+        float amb_keep = gi_active ? lerp(1.0, 0.82, gi_fade) : 1.0;
         float night_dark_scale = lerp(0.085, 1.0, smoothstep(0.0, 0.25, sun_strength));
         float separated_lf = (amb_f * v_ao * amb_keep * night_dark_scale + sun_f * v_sun) * point_shadow_mod;
         out_lf = lerp(separated_lf, 1.0, fog_t);
