@@ -665,7 +665,7 @@ impl FarTrees {
                                     let (c2, a2) = sample_rgba_uv(img, uv_2);
                                     let a_avg = (a0 + a1 + a2) / 3.0;
                                     let a_max = a0.max(a1).max(a2);
-                                    if a_avg < 0.16 && a_max < 0.30 {
+                                    if a_avg < 0.24 && a_max < 0.42 {
                                         continue;
                                     }
                                     let wsum = (a0 + a1 + a2).max(1e-4);
@@ -756,47 +756,41 @@ impl FarTrees {
                         };
                         let right = up.cross(n).normalize_or_zero();
                         let bitan = n.cross(right).normalize_or_zero();
-                        // Preserve full lush bush volume (~86% scale) while chamfering
-                        // the 4 sharp 90-degree corners into a rounded 6-vertex organic
-                        // leaf cluster (4 tris) so trees reflect as full bushes without boxes.
-                        let hull_scale = (0.72 + 0.20 * coverage.sqrt()).clamp(0.74, 0.92);
-                        let corner = |j: usize| {
+                        // Emit 2 orthogonal crossed 3D organic leaf-cluster diamonds (4 tris)
+                        // instead of a single flat 2D card plane, so tree canopies have true 3D
+                        // bush volume from every reflection and sun-shadow angle with zero flat planes.
+                        let mut avg_r = 0.0f32;
+                        for j in 0..4 {
                             let c = leaf.corners[j];
-                            center + (right * c[0] + bitan * c[1] + n * c[2]) * hull_scale
-                        };
-                        let (c0, c1, c2, c3) = (corner(0), corner(1), corner(2), corner(3));
-                        // Chamfer each corner inward by 22% along both adjacent edges.
-                        let v0 = c0.lerp(c1, 0.22);
-                        let v1 = c1.lerp(c0, 0.22);
-                        let v2 = c1.lerp(c2, 0.22);
-                        let v3 = c2.lerp(c1, 0.22);
-                        let v4 = c2.lerp(c3, 0.22);
-                        let v5 = c3.lerp(c2, 0.22);
-                        let v6 = c3.lerp(c0, 0.22);
-                        let v7 = c0.lerp(c3, 0.22);
-                        let ring = [v0, v1, v2, v3, v4, v5, v6, v7];
-                        let opacity = (0.52 + 0.42 * coverage).clamp(0.56, 0.90);
-                        // 4-triangle organic hexagon/octagon fan (every 2nd edge for low tri count + full silhouette).
-                        let poly = [
-                            ring[0].lerp(ring[7], 0.5),
-                            ring[1].lerp(ring[2], 0.5),
-                            ring[3].lerp(ring[4], 0.5),
-                            ring[5].lerp(ring[6], 0.5),
-                            (c0 + c1) * 0.5,
-                            (c2 + c3) * 0.5,
-                        ];
-                        for &(ia, ib, ic) in &[(0, 4, 1), (0, 1, 2), (0, 2, 5), (0, 5, 3)] {
-                            let (pa, pb, pc) = (poly[ia], poly[ib], poly[ic]);
-                            if (pb - pa).cross(pc - pa).length_squared() > 1e-8 {
-                                lod_tris.push(RtTreeTriangle {
-                                    a: pa,
-                                    b: pb,
-                                    c: pc,
-                                    normal: n,
-                                    albedo,
-                                    roughness: 0.84,
-                                    opacity,
-                                });
+                            avg_r += (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+                        }
+                        let base_r = (avg_r * 0.25).clamp(0.18, 2.2);
+                        let r_h = base_r * (0.60 + 0.20 * coverage.sqrt()).clamp(0.62, 0.82);
+                        let r_v = r_h * 0.90;
+                        let opacity = (0.48 + 0.38 * coverage).clamp(0.50, 0.84);
+                        // Tilt axes per leaf cluster so neighbouring leaves never align into flat sheets.
+                        let phase = (center.x * 3.17 + center.y * 5.41 + center.z * 2.73).sin();
+                        let (s_a, c_a) = (phase * 1.1).sin_cos();
+                        let ax1 = (right * c_a + n * s_a).normalize_or_zero();
+                        let ax2 = (n * c_a - right * s_a).normalize_or_zero();
+                        let up_axis = (bitan * 0.88 + glam::Vec3::Y * 0.12).normalize_or_zero();
+                        for &(horiz, norm_dir) in &[(ax1, ax2), (ax2, ax1)] {
+                            let top = center + up_axis * r_v;
+                            let bot = center - up_axis * r_v;
+                            let left = center - horiz * r_h;
+                            let rgt = center + horiz * r_h;
+                            for &(pa, pb, pc) in &[(bot, rgt, top), (bot, top, left)] {
+                                if (pb - pa).cross(pc - pa).length_squared() > 1e-8 {
+                                    lod_tris.push(RtTreeTriangle {
+                                        a: pa,
+                                        b: pb,
+                                        c: pc,
+                                        normal: norm_dir,
+                                        albedo,
+                                        roughness: 0.84,
+                                        opacity,
+                                    });
+                                }
                             }
                         }
                     }

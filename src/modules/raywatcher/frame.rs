@@ -690,6 +690,7 @@ mod tests {
                 ambient_occlusion: false,
                 global_illumination: false,
                 refraction: false,
+                caustics: false,
             };
             f(&mut e);
             RasterOverrides::for_effects(e, true)

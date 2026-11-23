@@ -109,6 +109,9 @@ impl RayParams {
         if effects.refraction {
             bits |= 32;
         }
+        if effects.caustics {
+            bits |= 64;
+        }
         bits
     }
 
@@ -132,7 +135,7 @@ impl RayParams {
         Self {
             inv_view_projection: params.inv_view_projection.to_cols_array_2d(),
             view_projection: params.view_projection.to_cols_array_2d(),
-            eye: params.eye.extend(1.).to_array(),
+            eye: params.eye.extend(-1.0e6).to_array(),
             sun_direction: params.sun.direction.extend(0.).to_array(),
             sun_colour: (params.sun.colour * params.sun.intensity)
                 .extend(0.)
@@ -214,10 +217,12 @@ impl DenoiseParams {
         iteration: u32,
         config: &DenoiseConfig,
         params: &FrameParams,
+        unjittered_vp: glam::Mat4,
         prev_view_projection: Option<glam::Mat4>,
     ) -> Self {
         let history_valid = params.history_valid > 0 && prev_view_projection.is_some();
-        let prev_vp = prev_view_projection.unwrap_or(params.view_projection);
+        let prev_vp = prev_view_projection.unwrap_or(unjittered_vp);
+        let unjittered_inv = unjittered_vp.inverse();
         Self {
             extent: [
                 extent.0 as f32,
@@ -238,9 +243,8 @@ impl DenoiseParams {
                 if history_valid { 1. } else { 0. },
             ],
             frame: [params.jitter.0, params.jitter.1, params.frame as f32, 0.],
-            inv_view_projection: params.inv_view_projection.to_cols_array_2d(),
-            // Pre-multiplied `prev_vp * inv_vp` saves one full mat4x4*vec4 + div per pixel in temporal_pass.
-            prev_view_projection: (prev_vp * params.inv_view_projection).to_cols_array_2d(),
+            inv_view_projection: unjittered_inv.to_cols_array_2d(),
+            prev_view_projection: (prev_vp * unjittered_inv).to_cols_array_2d(),
         }
     }
 }
@@ -1006,14 +1010,41 @@ fn detail_offscreen_albedo(hit_pos: vec3<f32>, hit_normal: vec3<f32>, base_albed
     return clamp(base_albedo * slab, vec3<f32>(0.02), vec3<f32>(0.95));
 }
 
+fn hash22(p: vec2<f32>) -> vec2<f32> {
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * vec3<f32>(0.1031, 0.1030, 0.0973));
+    p3 = p3 + dot(p3, p3.yzx + vec3<f32>(33.33));
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+fn voronoi_ridge(uv: vec2<f32>, t: f32) -> f32 {
+    let n = floor(uv);
+    let f = fract(uv);
+    var d1 = 8.0;
+    var d2 = 8.0;
+    for (var j = -1; j <= 1; j = j + 1) {
+        for (var i = -1; i <= 1; i = i + 1) {
+            let g = vec2<f32>(f32(i), f32(j));
+            var o = hash22(n + g);
+            o = vec2<f32>(0.5) + 0.42 * sin(vec2<f32>(t) + 6.28318 * o);
+            let r = g + o - f;
+            let d = dot(r, r);
+            if (d < d1) {
+                d2 = d1;
+                d1 = d;
+            } else if (d < d2) {
+                d2 = d;
+            }
+        }
+    }
+    let edge = sqrt(d2) - sqrt(d1);
+    return pow(clamp(1.0 - edge * 2.3, 0.0, 1.0), 3.0);
+}
+
 fn caustic_pattern(xz: vec2<f32>, t: f32) -> f32 {
-    let p1 = xz * 0.55 + vec2<f32>(t * 0.65, -t * 0.42);
-    let p2 = xz * 0.82 + vec2<f32>(-t * 0.48, t * 0.58);
-    let w1 = sin(p1.x * 2.3 + sin(p1.y * 1.9 + t)) * cos(p1.y * 2.1 - cos(p1.x * 1.7));
-    let w2 = sin(p2.x * 2.7 - cos(p2.y * 2.4 - t * 1.1)) * cos(p2.y * 2.5 + sin(p2.x * 2.2));
-    let c = clamp((1.0 - abs(w1)) * (1.0 - abs(w2)), 0.0, 1.0);
-    let c2 = c * c;
-    return c2 * c2;
+    let warp = vec2<f32>(sin(xz.y * 0.27 + t * 0.7), cos(xz.x * 0.23 - t * 0.6)) * 0.45;
+    let c1 = voronoi_ridge((xz + warp) * 0.36 + vec2<f32>(t * 0.22, -t * 0.17), t * 1.15);
+    let c2 = voronoi_ridge((xz - warp * 0.7) * 0.58 + vec2<f32>(-t * 0.19, t * 0.24), t * 0.85);
+    return clamp(c1 * 0.65 + c2 * 0.55, 0.0, 1.0);
 }
 
 fn hg_phase(cos_theta: f32, g: f32) -> f32 {
@@ -1093,6 +1124,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let bits_ao = (effects & 8u) != 0u;
     let bits_gi = (effects & 16u) != 0u;
     let bits_refraction = (effects & 32u) != 0u;
+    let bits_caustics = (effects & 64u) != 0u;
 
     let steepness = 1.0 - clamp(normal.y, 0.0, 1.0);
     let slope_bias = steepness * (0.75 + dist * 0.0065);
@@ -1250,12 +1282,12 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let shallow_clear = exp(-wdepth * 0.16);
                 let depth_tint = (beer - vec3<f32>(1.0)) * (raster_rgb * 0.28 * refract_w);
                 refl_col = max(refl_col + depth_tint, vec3<f32>(0.0));
-                if (wdepth < 14.0 && shadow > 0.05 && n_dot_l > 0.08 && sun_strength > 0.05) {
+                if (bits_caustics && wdepth < 12.0 && shadow > 0.05 && n_dot_l > 0.08 && sun_strength > 0.05) {
                     let refr_t = wdepth / max(-refract_dir.y, 0.25);
                     let seabed_pos = point + refract_dir * refr_t;
-                    let caust = caustic_pattern(seabed_pos.xz, params.frame.x * 0.035);
-                    let c_fade = smoothstep(0.03, 0.45, wdepth) * shallow_clear * exp(-dist * 0.008);
-                    refl_col = refl_col + params.sun_colour.xyz * beer * (caust * shadow * n_dot_l * sun_strength * refract_w * c_fade * 0.55);
+                    let caust = caustic_pattern(seabed_pos.xz, params.frame.x * 0.025);
+                    let c_fade = smoothstep(0.15, 0.90, wdepth) * shallow_clear * exp(-dist * 0.015);
+                    refl_col = refl_col + params.sun_colour.xyz * beer * (caust * shadow * n_dot_l * sun_strength * refract_w * c_fade * 0.16);
                 }
             }
             accum_reflection = accum_reflection + refl_col;
@@ -1367,27 +1399,50 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Feature #1: Ray-Traced Volumetric God Rays (sun & moon shafts)
-    var god_rays = vec3<f32>(0.0);
-    if (bits_shadows && params.sun_dir.y > 0.04 && dist > 10.0 && fog_t < 0.96) {
-        let cos_view_sun = dot(view_dir, params.sun_dir.xyz);
-        let phase = hg_phase(cos_view_sun, 0.72);
-        let march_len = min(dist, 175.0) - 4.0;
-        if (march_len > 4.0 && phase > 0.03) {
-            let step_len = march_len * 0.25;
-            var lit_steps = 0.0;
-            for (var vi = 0u; vi < 4u; vi = vi + 1u) {
-                let t_vol = 4.0 + (f32(vi) + ign_v) * step_len;
-                let p_vol = params.eye.xyz + view_dir * t_vol;
-                if (!occluded(p_vol, params.sun_dir.xyz, 0.5, 420.0, state ^ (vi * 53u))) {
-                    lit_steps = lit_steps + 1.0;
-                }
+    // Feature #2 (Underwater Caustics): organic Voronoi sun caustics on submerged geometry
+    var underwater_caustics = vec3<f32>(0.0);
+    let water_y = params.eye.w;
+    if (bits_caustics && !is_water && water_y > -1e5 && point.y < water_y - 0.05 && fog_t < 0.95 && sun_strength > 0.05) {
+        let sub_depth = water_y - point.y;
+        if (sub_depth < 28.0 && n_dot_l > 0.05) {
+            let uw_vis = select(1.0, accum_shadow / f32(samples), bits_shadows);
+            if (uw_vis > 0.05) {
+                let caust = caustic_pattern(point.xz, params.frame.x * 0.025);
+                let beer = exp(-sub_depth * vec3<f32>(0.18, 0.07, 0.04));
+                let fade = smoothstep(0.05, 0.50, sub_depth) * exp(-sub_depth * 0.065) * exp(-dist * 0.008);
+                underwater_caustics = params.sun_colour.xyz * beer * (caust * uw_vis * n_dot_l * sun_strength * fade * 0.85);
             }
-            let shaft_vis = lit_steps * 0.25;
-            let dist_w = smoothstep(10.0, 110.0, march_len);
-            let shaft_col = mix(vec3<f32>(0.28, 0.38, 0.58), params.sun_colour.xyz, sun_strength);
-            let shaft_intensity = mix(0.055, 0.11, sun_strength);
-            god_rays = shaft_col * (shaft_vis * min(phase, 1.35) * dist_w * shaft_intensity * (1.0 - fog_t * 0.6));
+        }
+    }
+
+    // Feature #1: Sculpted 12-step Ray-Traced Volumetric God Rays (no flat foggy plane)
+    var god_rays = vec3<f32>(0.0);
+    if (bits_shadows && params.sun_dir.y > 0.05 && dist > 14.0 && fog_t < 0.94) {
+        let cos_view_sun = dot(view_dir, params.sun_dir.xyz);
+        if (cos_view_sun > 0.30) {
+            let phase = hg_phase(cos_view_sun, 0.86);
+            let march_len = min(dist, 155.0) - 3.0;
+            if (march_len > 8.0 && phase > 0.06) {
+                var lit_steps = 0.0;
+                var occ_steps = 0.0;
+                for (var vi = 0u; vi < 12u; vi = vi + 1u) {
+                    let u = (f32(vi) + ign_v) / 12.0;
+                    let t_vol = 3.0 + (u * sqrt(u)) * march_len;
+                    let p_vol = params.eye.xyz + view_dir * t_vol;
+                    if (occluded(p_vol, params.sun_dir.xyz, 0.5, 420.0, state ^ (vi * 53u))) {
+                        occ_steps = occ_steps + 1.0;
+                    } else {
+                        lit_steps = lit_steps + 1.0;
+                    }
+                }
+                let shaft_vis = lit_steps / 12.0;
+                let occ_frac = occ_steps / 12.0;
+                let shaft_contrast = mix(0.12, 1.0, smoothstep(0.04, 0.38, occ_frac));
+                let dist_w = smoothstep(14.0, 95.0, march_len);
+                let shaft_col = mix(vec3<f32>(0.28, 0.38, 0.58), params.sun_colour.xyz, sun_strength);
+                let shaft_intensity = mix(0.025, 0.065, sun_strength);
+                god_rays = shaft_col * (shaft_vis * shaft_contrast * min(phase, 1.4) * dist_w * shaft_intensity * (1.0 - fog_t * 0.7));
+            }
         }
     }
 
@@ -1537,7 +1592,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let avg_open = accum_open * inv;
     let avg_refl = accum_reflection * inv + god_rays;
     let avg_refl_dist = accum_refl_dist * inv;
-    let avg_gi = accum_gi * inv + sss_light;
+    let avg_gi = accum_gi * inv + sss_light + underwater_caustics;
 
     var out_rgb = vec3<f32>(0.0);
     var out_lf = 1.0;
@@ -1550,7 +1605,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let v_ao = select(1.0, avg_open, bits_ao);
         let gi_active = bits_gi && !is_water && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01;
         let amb_keep = select(1.0, mix(1.0, 0.18, gi_fade), gi_active);
-        let separated_lf = (amb_f * v_ao * amb_keep + sun_f * v_sun) * point_shadow_mod;
+        let night_dark_scale = mix(0.085, 1.0, smoothstep(0.0, 0.25, sun_strength));
+        let separated_lf = (amb_f * v_ao * amb_keep * night_dark_scale + sun_f * v_sun) * point_shadow_mod;
         out_lf = mix(separated_lf, 1.0, fog_t);
         out_rgb = avg_gi + point_lighting;
     } else {
@@ -2120,7 +2176,7 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
         // Uniform per-frame scene-illumination albedo recovery (preserves dark stone/wood
         // albedo by day and reveals crisp textures under night point lights, zero grey veil).
         let scene_gain = clamp(comp_params.x, 1.0, 9.0);
-        let full_albedo = clamp(raster.rgb * scene_gain, vec3<f32>(0.015), vec3<f32>(0.92));
+        let full_albedo = clamp(raster.rgb * scene_gain, vec3<f32>(0.002), vec3<f32>(0.92));
         // Add volumetric god rays (#1) & subtle calibrated glossy trim reflections (#3)
         // directly without multiplying by wall albedo.
         let refl_dim = vec2<i32>(textureDimensions(src_reflection));
@@ -3660,6 +3716,7 @@ impl RaywatcherGpu {
         pre_water_depth: &wgpu::Texture,
         water: &[super::harvest::WaterSurface],
         point_lights: &[super::frame::PointLight],
+        unjittered_vp: glam::Mat4,
     ) {
         if !plan.trace {
             self.traced_last_frame = false;
@@ -3798,6 +3855,20 @@ impl RaywatcherGpu {
             point_lights,
         );
         packed.terrain_map_bounds = self.terrain_map_bounds();
+        if let Some(ws) = water.iter().min_by(|a, b| {
+            let ca = glam::Vec2::new(
+                (a.bounds[0] + a.bounds[1]) * 0.5,
+                (a.bounds[2] + a.bounds[3]) * 0.5,
+            );
+            let cb = glam::Vec2::new(
+                (b.bounds[0] + b.bounds[1]) * 0.5,
+                (b.bounds[2] + b.bounds[3]) * 0.5,
+            );
+            let e = glam::Vec2::new(params.eye.x, params.eye.z);
+            ca.distance_squared(e).total_cmp(&cb.distance_squared(e))
+        }) {
+            packed.eye[3] = ws.height;
+        }
         let scene_albedo_gain = compute_scene_albedo_gain(
             params.sun.colour,
             params.sun.intensity,
@@ -3891,7 +3962,7 @@ impl RaywatcherGpu {
         }
 
         if !skip_inhouse {
-            self.record_denoise(queue, encoder, params, config, motion);
+            self.record_denoise(queue, encoder, params, config, motion, unjittered_vp);
         }
         self.frames = self.frames.saturating_add(1);
         self.traced_last_frame = true;
@@ -3905,6 +3976,7 @@ impl RaywatcherGpu {
         params: &FrameParams,
         config: &DenoiseConfig,
         motion: &wgpu::Texture,
+        unjittered_vp: glam::Mat4,
     ) {
         let (rw, rh) = self.render_extent;
         encoder.copy_texture_to_texture(
@@ -3935,6 +4007,7 @@ impl RaywatcherGpu {
                 0,
                 config,
                 params,
+                unjittered_vp,
                 prev_vp,
             )),
         );
@@ -3957,6 +4030,7 @@ impl RaywatcherGpu {
                     iteration,
                     config,
                     params,
+                    unjittered_vp,
                     prev_vp,
                 )),
             );
@@ -3989,7 +4063,7 @@ impl RaywatcherGpu {
             pass.set_bind_group(0, &self.compose_bind_groups[final_plane], &[]);
             pass.dispatch_workgroups(rw.div_ceil(8), rh.div_ceil(8), 1);
         }
-        self.prev_view_projection = Some(params.view_projection);
+        self.prev_view_projection = Some(unjittered_vp);
     }
 
     /// Run NVIDIA DLSS Ray Reconstruction (`nvngx_dlssd.dll`) over the freshly
@@ -4002,6 +4076,7 @@ impl RaywatcherGpu {
         self.dlss_rr_error.as_deref()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn reconstruct_dlss_rr(
         &mut self,
         device: &wgpu::Device,
@@ -4009,9 +4084,10 @@ impl RaywatcherGpu {
         post_encoder: &mut wgpu::CommandEncoder,
         sdk_dir: &std::path::Path,
         params: &FrameParams,
-        motion: &wgpu::Texture,
+        motion: &wgpu::TextureView,
         reset: bool,
         layered: bool,
+        unjittered_vp: glam::Mat4,
         world_to_view: [[f32; 4]; 4],
         view_to_clip: [[f32; 4]; 4],
     ) -> bool {
@@ -4039,6 +4115,9 @@ impl RaywatcherGpu {
         let Some(rr) = self.dlss_rr.as_mut() else {
             return false;
         };
+        let history_valid = !reset && self.prev_view_projection.is_some();
+        let prev_vp = self.prev_view_projection.unwrap_or(unjittered_vp);
+        let prev_vp_inv_vp = (prev_vp * unjittered_vp.inverse()).to_cols_array_2d();
         let inputs = super::reconstruct::DlssRrInputs {
             grid_colour: &self.grid.colour_view,
             grid_reflection: &self.grid.reflection_view,
@@ -4049,6 +4128,8 @@ impl RaywatcherGpu {
             layered,
             scene_albedo_gain: self.last_scene_albedo_gain,
             motion,
+            prev_vp_inv_vp,
+            history_valid,
             jitter: params.jitter,
             reset,
             world_to_view,
@@ -4056,6 +4137,7 @@ impl RaywatcherGpu {
         };
         match rr.evaluate(device, queue, post_encoder, &inputs, &self.output) {
             Ok(()) => {
+                self.prev_view_projection = Some(unjittered_vp);
                 self.dlss_rr_error = None;
                 true
             }

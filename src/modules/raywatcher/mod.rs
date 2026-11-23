@@ -247,6 +247,12 @@ impl Raywatcher {
     }
 
     /// Advance the frame counter. Called once per rendered frame.
+    /// Toggle the dynamic RT Camera Light on/off (bound to the `L` hotkey).
+    pub fn toggle_camera_light(&mut self) -> bool {
+        self.settings.camera_light_enabled = !self.settings.camera_light_enabled;
+        self.settings.camera_light_enabled
+    }
+
     pub fn next_frame(&mut self) {
         self.frame = self.frame.wrapping_add(1);
     }
@@ -400,12 +406,45 @@ impl Raywatcher {
             ("Ambient occlusion", &mut effects.ambient_occlusion),
             ("Global illumination", &mut effects.global_illumination),
             ("Water refraction", &mut effects.refraction),
+            ("Water caustics", &mut effects.caustics),
         ] {
             changed_effects |= ui.checkbox(slot, label).changed();
         }
         if changed_effects {
             settings.effects = effects;
         }
+        ui.separator();
+        // Mini-tab / collapsible section for the dynamic RT Camera Light (Hotkey: L).
+        egui::CollapsingHeader::new("Camera light [Hotkey: L]")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.checkbox(
+                    &mut settings.camera_light_enabled,
+                    "Enable camera light (L)",
+                )
+                .on_hover_text(
+                    "Attaches a real ray-traced shadow-casting point light to the camera for exploring dark interiors and night scenes.",
+                );
+                ui.add(
+                    egui::Slider::new(&mut settings.camera_light_intensity, 0.5..=20.0)
+                        .text("intensity"),
+                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Slider::new(&mut settings.camera_light_warmness, -1.0..=1.0)
+                            .text("warmness (red -> blue)"),
+                    );
+                    let rgb = plan::camera_light_rgb(settings.camera_light_warmness);
+                    let swatch = egui::Color32::from_rgb(
+                        (rgb.x.clamp(0.0, 1.0) * 255.0) as u8,
+                        (rgb.y.clamp(0.0, 1.0) * 255.0) as u8,
+                        (rgb.z.clamp(0.0, 1.0) * 255.0) as u8,
+                    );
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 14.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, swatch);
+                });
+            });
         ui.separator();
         ui.heading("Quality");
         ui.add(
@@ -593,9 +632,25 @@ impl Raywatcher {
             ("ambient_occlusion", effects.ambient_occlusion),
             ("global_illumination", effects.global_illumination),
             ("refraction", effects.refraction),
+            ("caustics", effects.caustics),
         ] {
             let _ = writeln!(out, "{name}={}", u8::from(on));
         }
+        let _ = writeln!(
+            out,
+            "camera_light_enabled={}",
+            u8::from(self.settings.camera_light_enabled)
+        );
+        let _ = writeln!(
+            out,
+            "camera_light_intensity={}",
+            self.settings.camera_light_intensity
+        );
+        let _ = writeln!(
+            out,
+            "camera_light_warmness={}",
+            self.settings.camera_light_warmness
+        );
         if !self.settings.sdk_dir.is_empty() {
             let _ = writeln!(out, "sdk_dir={}", self.settings.sdk_dir);
         }
@@ -655,12 +710,22 @@ impl Raywatcher {
             ("ambient_occlusion", &mut effects.ambient_occlusion),
             ("global_illumination", &mut effects.global_illumination),
             ("refraction", &mut effects.refraction),
+            ("caustics", &mut effects.caustics),
         ] {
             if let Some(v) = get(name).and_then(parse_flag) {
                 *slot = v;
             }
         }
         s.effects = effects;
+        if let Some(v) = get("camera_light_enabled").and_then(parse_flag) {
+            s.camera_light_enabled = v;
+        }
+        if let Some(v) = get("camera_light_intensity").and_then(|v| v.parse().ok()) {
+            s.camera_light_intensity = v;
+        }
+        if let Some(v) = get("camera_light_warmness").and_then(|v| v.parse().ok()) {
+            s.camera_light_warmness = v;
+        }
         if let Some(dir) = get("sdk_dir") {
             s.sdk_dir = dir.trim().to_string();
         }
@@ -965,6 +1030,7 @@ mod tests {
             ambient_occlusion: false,
             global_illumination: false,
             refraction: false,
+            caustics: false,
         };
         m.set_settings(s);
         let none = m.status((640, 360), false);
@@ -1115,5 +1181,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn camera_light_warmness_and_toggle_work() {
+        let mut m = module();
+        assert!(!m.settings().camera_light_enabled);
+        assert!(m.toggle_camera_light());
+        assert!(m.settings().camera_light_enabled);
+        assert!(!m.toggle_camera_light());
+        assert!(!m.settings().camera_light_enabled);
+
+        let mut s = m.settings().clone();
+        s.camera_light_warmness = -1.0;
+        let hot = plan::camera_light_rgb(s.camera_light_warmness);
+        assert!(
+            hot[0] > hot[2] * 3.0,
+            "warmness=-1 should be hot red: {hot:?}"
+        );
+
+        s.camera_light_warmness = 0.0;
+        let neutral = plan::camera_light_rgb(s.camera_light_warmness);
+        assert!(
+            (neutral[0] - 1.0).abs() < 1e-4
+                && (neutral[1] - 0.97).abs() < 1e-4
+                && (neutral[2] - 0.94).abs() < 1e-4
+        );
+
+        s.camera_light_warmness = 1.0;
+        let cold = plan::camera_light_rgb(s.camera_light_warmness);
+        assert!(
+            cold[2] > cold[0] * 3.0,
+            "warmness=+1 should be cold blue: {cold:?}"
+        );
     }
 }

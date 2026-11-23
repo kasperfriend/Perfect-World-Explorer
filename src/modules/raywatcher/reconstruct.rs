@@ -132,7 +132,11 @@ pub struct DlssRrInputs<'a> {
     /// Per-frame scene-illumination albedo recovery gain (`1 / max(scene_illum, 0.08)`),
     /// keeping dark stone/wood dark instead of boosting every dark pixel to 0.75 grey.
     pub scene_albedo_gain: f32,
-    pub motion: &'a wgpu::Texture,
+    pub motion: &'a wgpu::TextureView,
+    /// Pre-multiplied `prev_unjittered_vp * current_unjittered_vp.inverse()` for
+    /// exact full-screen camera motion vectors in DLSS RR.
+    pub prev_vp_inv_vp: [[f32; 4]; 4],
+    pub history_valid: bool,
     pub jitter: (f32, f32),
     pub reset: bool,
     pub world_to_view: [[f32; 4]; 4],
@@ -242,7 +246,12 @@ mod dlss_rr {
 @group(0) @binding(4) var src_depth: texture_depth_2d;
 @group(0) @binding(5) var lin_samp: sampler;
 @group(0) @binding(6) var src_raster: texture_2d<f32>;
-@group(0) @binding(7) var<uniform> prep_flags: vec4<f32>;
+struct PrepUniform {
+    flags: vec4<f32>,
+    prev_vp_inv_vp: mat4x4<f32>,
+};
+@group(0) @binding(7) var<uniform> prep_u: PrepUniform;
+@group(0) @binding(8) var src_object_mv: texture_2d<f32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -270,6 +279,7 @@ struct FOut {
     @location(3) diffuse_albedo: vec4<f32>,
     @location(4) specular_albedo: vec4<f32>,
     @location(5) hit_distance: f32,
+    @location(6) motion: vec4<f32>,
 };
 
 @fragment
@@ -292,6 +302,7 @@ fn fs(i: VOut) -> FOut {
         out.diffuse_albedo = vec4<f32>(0.0, 0.0, 0.0, 1.0);
         out.specular_albedo = vec4<f32>(0.0, 0.0, 0.0, 1.0);
         out.hit_distance = 1.0;
+        out.motion = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         return out;
     }
 
@@ -304,12 +315,9 @@ fn fs(i: VOut) -> FOut {
     let n = textureLoad(src_normals, gcoord, 0);
     let a = textureLoad(src_albedo, gcoord, 0);
 
-    let layered = prep_flags.x > 0.5;
-    // Scale raster colour by the uniform per-frame scene-illumination gain (NOT
-    // per-pixel `0.75 / r_max`), preserving true dark stone/wood albedo so DLSS RR
-    // demodulation/remodulation never creates a noisy chalky grey/white veil.
-    let scene_gain = clamp(prep_flags.y, 1.0, 9.0);
-    let full_albedo = clamp(raster_rgb * scene_gain, vec3<f32>(0.015), vec3<f32>(0.92));
+    let layered = prep_u.flags.x > 0.5;
+    let scene_gain = clamp(prep_u.flags.y, 1.0, 9.0);
+    let full_albedo = clamp(raster_rgb * scene_gain, vec3<f32>(0.002), vec3<f32>(0.92));
     let is_water = n.w <= 0.12;
     let modulated_gi = select(full_albedo * c.rgb, c.rgb, is_water);
     let base_rgb = select(c.rgb, max(raster_rgb * clamp(c.a, 0.0, 1.0) + modulated_gi, vec3<f32>(0.0)), layered);
@@ -325,6 +333,23 @@ fn fs(i: VOut) -> FOut {
     out.hit_distance = r.a;
     let _keep_samp = textureSampleLevel(src_albedo, lin_samp, i.uv, 0.0).a * 0.0;
     out.specular_albedo.w = 1.0 + _keep_samp;
+    // Full-screen camera + object motion vectors (`(prev_uv - uv) * size`) so DLSS RR
+    // never smears buildings during camera motion or upscaler jitter.
+    var mv_px = vec2<f32>(0.0);
+    let obj_mv = textureLoad(src_object_mv, dcoord, 0);
+    if (obj_mv.z > 0.5) {
+        mv_px = obj_mv.xy;
+    } else if (prep_u.flags.z > 0.5) {
+        let uv_c = (vec2<f32>(dcoord) + vec2<f32>(0.5)) / depth_dim;
+        let ndc = vec2<f32>(uv_c.x * 2.0 - 1.0, 1.0 - uv_c.y * 2.0);
+        let prev_clip = prep_u.prev_vp_inv_vp * vec4<f32>(ndc, d, 1.0);
+        if (abs(prev_clip.w) > 1e-5) {
+            let prev_ndc = prev_clip.xyz / prev_clip.w;
+            let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+            mv_px = (prev_uv - uv_c) * depth_dim;
+        }
+    }
+    out.motion = vec4<f32>(mv_px, 0.0, 0.0);
     return out;
 }
 "#;
@@ -386,6 +411,7 @@ fn fs(i: VOut) -> FOut {
                         },
                         count: None,
                     },
+                    tex(8),
                 ],
             });
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -418,6 +444,7 @@ fn fs(i: VOut) -> FOut {
                         target(wgpu::TextureFormat::Rgba16Float),
                         target(wgpu::TextureFormat::Rgba16Float),
                         target(wgpu::TextureFormat::R32Float),
+                        target(wgpu::TextureFormat::Rgba16Float),
                     ],
                 }),
                 primitive: wgpu::PrimitiveState::default(),
@@ -432,8 +459,8 @@ fn fs(i: VOut) -> FOut {
                 ..Default::default()
             });
             let flags_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("raywatcher dlss-rr prep flags"),
-                size: 16,
+                label: Some("raywatcher dlss-rr prep uniform"),
+                size: 80,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -461,6 +488,7 @@ fn fs(i: VOut) -> FOut {
         diffuse_view: wgpu::TextureView,
         specular_view: wgpu::TextureView,
         hit_view: wgpu::TextureView,
+        mv_view: wgpu::TextureView,
     }
 
     impl RrNatives {
@@ -497,20 +525,11 @@ fn fs(i: VOut) -> FOut {
                 wgpu::TextureFormat::R32Float,
                 DXGI_FORMAT_R32_FLOAT,
             )?;
-            let mv = unsafe {
-                NativeTexture2D::create(
-                    device,
-                    raw_device,
-                    "dlss-rr mv",
-                    wgpu::TextureFormat::Rgba16Float,
-                    DXGI_FORMAT_R16G16B16A16_FLOAT,
-                    extent,
-                    d12::D3D12_RESOURCE_FLAG_NONE,
-                    wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-                    d12::D3D12_RESOURCE_STATE_COMMON,
-                    false,
-                )?
-            };
+            let mv = mk_rt(
+                "dlss-rr mv",
+                wgpu::TextureFormat::Rgba16Float,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+            )?;
             let normals = mk_rt(
                 "dlss-rr normals",
                 wgpu::TextureFormat::Rgba16Float,
@@ -553,6 +572,7 @@ fn fs(i: VOut) -> FOut {
             let diffuse_view = diffuse_albedo.texture.create_view(&Default::default());
             let specular_view = specular_albedo.texture.create_view(&Default::default());
             let hit_view = hit_distance.texture.create_view(&Default::default());
+            let mv_view = mv.texture.create_view(&Default::default());
             Ok(Self {
                 color,
                 depth,
@@ -568,6 +588,7 @@ fn fs(i: VOut) -> FOut {
                 diffuse_view,
                 specular_view,
                 hit_view,
+                mv_view,
             })
         }
     }
@@ -692,13 +713,26 @@ fn fs(i: VOut) -> FOut {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("raywatcher dlss-rr prep"),
             });
-            let flags = [
-                if inputs.layered { 1.0f32 } else { 0.0 },
-                inputs.scene_albedo_gain.clamp(1.0, 9.0),
-                0.0,
-                0.0,
-            ];
-            queue.write_buffer(&self.prep.flags_buf, 0, bytemuck::bytes_of(&flags));
+            #[repr(C)]
+            #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+            struct PrepUniformData {
+                flags: [f32; 4],
+                prev_vp_inv_vp: [[f32; 4]; 4],
+            }
+            let uniform_data = PrepUniformData {
+                flags: [
+                    if inputs.layered { 1.0f32 } else { 0.0 },
+                    inputs.scene_albedo_gain.clamp(1.0, 9.0),
+                    if inputs.history_valid && !inputs.reset {
+                        1.0f32
+                    } else {
+                        0.0
+                    },
+                    0.0,
+                ],
+                prev_vp_inv_vp: inputs.prev_vp_inv_vp,
+            };
+            queue.write_buffer(&self.prep.flags_buf, 0, bytemuck::bytes_of(&uniform_data));
             let raster_view = inputs.raster.unwrap_or(inputs.grid_colour);
             let bg = self.prep_bg.get_or_insert_with(|| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -737,6 +771,10 @@ fn fs(i: VOut) -> FOut {
                             binding: 7,
                             resource: self.prep.flags_buf.as_entire_binding(),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::TextureView(inputs.motion),
+                        },
                     ],
                 })
             });
@@ -760,6 +798,7 @@ fn fs(i: VOut) -> FOut {
                         attach(&self.natives.diffuse_view),
                         attach(&self.natives.specular_view),
                         attach(&self.natives.hit_view),
+                        attach(&self.natives.mv_view),
                     ],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
@@ -769,25 +808,7 @@ fn fs(i: VOut) -> FOut {
                 rp.set_bind_group(0, bg, &[]);
                 rp.draw(0..3, 0..1);
             }
-            encoder.copy_texture_to_texture(
-                wgpu::ImageCopyTexture {
-                    texture: inputs.motion,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::ImageCopyTexture {
-                    texture: &self.natives.mv.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: w.min(inputs.motion.width()),
-                    height: h.min(inputs.motion.height()),
-                    depth_or_array_layers: 1,
-                },
-            );
+
             queue.submit(Some(encoder.finish()));
 
             // 2. Run NVSDK_NGX_D3D12_EvaluateFeature(RayReconstruction) on DX12.
@@ -828,7 +849,7 @@ fn fs(i: VOut) -> FOut {
                 *before[6].u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
                     pResource: mv_res,
                     Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    StateBefore: d12::D3D12_RESOURCE_STATE_COPY_DEST,
+                    StateBefore: d12::D3D12_RESOURCE_STATE_RENDER_TARGET,
                     StateAfter: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 };
                 let out_wgpu_state = if self.frame_index == 0 {
@@ -938,7 +959,7 @@ fn fs(i: VOut) -> FOut {
                     pResource: mv_res,
                     Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                     StateBefore: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                    StateAfter: d12::D3D12_RESOURCE_STATE_COPY_DEST,
+                    StateAfter: d12::D3D12_RESOURCE_STATE_RENDER_TARGET,
                 };
                 let out_wgpu_state = if self.frame_index == 0 {
                     d12::D3D12_RESOURCE_STATE_COMMON

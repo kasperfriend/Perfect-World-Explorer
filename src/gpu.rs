@@ -2795,9 +2795,10 @@ impl Renderer {
         };
         let light = if self.raywatcher_overrides.suppress_baked_shadows {
             if tracked_is_moon {
-                // Real-life night: pitch black ambient in unlit/shadowed areas,
-                // cool directional moonlight where the moon actually hits.
-                [0.008, 0.03 + 0.18 * tracked_int, 1., 1.]
+                // Keep a quantization-safe 0.095 ambient carrier in the 8-bit raster target
+                // so night building textures are never crushed to 0/255 under point lights;
+                // Raywatcher's `night_dark_scale` darkens unlit areas back to pitch black.
+                [0.095, 0.03 + 0.18 * tracked_int, 1., 1.]
             } else {
                 // Strong solar elevation curve across the day: low dim golden
                 // dawn/sunset -> crisp bright high noon.
@@ -3805,6 +3806,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         render_extent: (u32, u32),
         matrix: Mat4,
+        unjittered_vp: Mat4,
         jitter: (f32, f32),
         reset_history: bool,
         map_space: Option<&crate::navigation::MapSpace>,
@@ -4359,15 +4361,12 @@ impl Renderer {
                         let max_eff_d = params.far + 64.0;
                         let max_eff_d_sq = max_eff_d * max_eff_d;
                         for q in models.effect_quads() {
-                            // Additive (dest=ONE=2, src=ONE=2, or screen dest=INVSRCCOLOR=4)
-                            // OR bright emissive alpha-blended (dest=INVSRCALPHA=6) effects.
+                            // Accept additive (dest=2/4, src=2), alpha-blended glowing orbs/flares (dest=6),
+                            // and opaque/self-lit lamp effects (dest=1/3/7/9, e.g. City of Raging Tides lamps).
                             let is_additive = q.destination_blend == 2
                                 || q.source_blend == 2
                                 || q.destination_blend == 4;
-                            let is_alpha_emissive = q.destination_blend == 6;
-                            if !is_additive && !is_alpha_emissive {
-                                continue;
-                            }
+                            let is_alpha_emissive = !is_additive;
 
                             let (center, extent, vert_rgba, tex_name, mat_emissive) =
                                 if let Some(ref mesh) = q.mesh {
@@ -4432,7 +4431,7 @@ impl Renderer {
                                 continue;
                             }
                             let a = vert_rgba[3].clamp(0.0, 1.0);
-                            if a < (if is_additive { 0.08 } else { 0.20 }) {
+                            if a < (if is_additive { 0.04 } else { 0.08 }) {
                                 continue;
                             }
                             let tex_rgb =
@@ -4442,22 +4441,23 @@ impl Renderer {
                                 vert_rgba[1].max(0.0),
                                 vert_rgba[2].max(0.0),
                             );
-                            let mut col = v_rgb * tex_rgb * a + mat_emissive * tex_rgb;
-                            let lum = col.x * 0.2126 + col.y * 0.7152 + col.z * 0.0722;
-                            // Filter out dark smoke/dust/waterfalls while keeping all glowing
-                            // additive & emissive alpha effects (beams, circles, wandering lights).
-                            let min_lum = if is_additive { 0.07 } else { 0.24 };
-                            if lum < min_lum {
+                            let mut col = v_rgb * tex_rgb * a.max(0.25) + mat_emissive * tex_rgb;
+                            // Use peak chromatic channel (not Rec.709 luma) so vivid blue/cyan/violet/red
+                            // lamps (e.g. City of Raging Tides Tideborn coral lamps) are never filtered out!
+                            let peak = col.x.max(col.y).max(col.z);
+                            let min_peak = if is_additive { 0.04 } else { 0.12 };
+                            if peak < min_peak {
                                 continue;
                             }
                             if is_alpha_emissive {
-                                col *= 0.75;
+                                col *= 0.85;
                             }
-                            let radius = (extent * 3.8).clamp(16.0, 56.0);
+                            let lum = peak;
+                            let radius = (extent * 4.2).clamp(18.0, 60.0);
                             let cell = (
-                                (center.x / 10.0).floor() as i32,
-                                (center.y / 10.0).floor() as i32,
-                                (center.z / 10.0).floor() as i32,
+                                (center.x / 6.0).floor() as i32,
+                                (center.y / 6.0).floor() as i32,
+                                (center.z / 6.0).floor() as i32,
                             );
                             let entry = grid.entry(cell).or_insert((
                                 glam::Vec3::ZERO,
@@ -4507,8 +4507,17 @@ impl Renderer {
                                         colour *= (0.75 / peak).min(2.2);
                                     }
                                     let size_boost = (1.0 + span * 0.03).min(1.55);
+                                    let night_boost =
+                                        if crate::environment::night_factor(camera.time_of_day)
+                                            > 0.4
+                                        {
+                                            1.35
+                                        } else {
+                                            1.0
+                                        };
                                     let intensity =
-                                        ((0.85 + max_lum * 0.95) * size_boost).clamp(0.85, 2.35);
+                                        ((0.95 + max_lum * 1.15) * size_boost * night_boost)
+                                            .clamp(0.95, 3.2);
                                     Some((
                                         dist_sq,
                                         crate::modules::raywatcher::frame::PointLight {
@@ -4527,7 +4536,23 @@ impl Renderer {
                         point_lights.extend(eff_lights);
                     }
                 }
-                point_lights.into_iter().map(|(_, l)| l).collect()
+                let mut final_lights: Vec<crate::modules::raywatcher::frame::PointLight> =
+                    point_lights.into_iter().map(|(_, l)| l).collect();
+                // Dynamic RT Camera Light (Hotkey: L): always placed at slot 0 so it never gets culled.
+                if settings.camera_light_enabled {
+                    let cam_int = settings.camera_light_intensity.clamp(0.5, 20.0);
+                    let cam_light = crate::modules::raywatcher::frame::PointLight {
+                        position: camera.pos + camera.direction() * 1.2,
+                        radius: (18.0 + cam_int * 3.5).clamp(22.0, 85.0),
+                        colour: crate::modules::raywatcher::plan::camera_light_rgb(
+                            settings.camera_light_warmness,
+                        ),
+                        intensity: cam_int,
+                        casts_shadow: true,
+                    };
+                    final_lights.insert(0, cam_light);
+                }
+                final_lights
             } else {
                 Vec::new()
             };
@@ -4545,6 +4570,7 @@ impl Renderer {
             self.water.sample_depth_texture(),
             &active_water,
             &active_point_lights,
+            unjittered_vp,
         );
         let mut dlss_rr_ran = false;
         if plan.reconstruction
@@ -4563,7 +4589,8 @@ impl Renderer {
             self.queue.submit(Some(pending.finish()));
             let sdk_dir = self.modules.raywatcher().sdk_dir().to_path_buf();
             let view = camera.view_matrix();
-            let proj = matrix * view.inverse();
+            // Pass UNJITTERED projection to DLSS RR (jitter is already supplied via P_JITTER_X/Y).
+            let proj = unjittered_vp * view.inverse();
             if let Some(gpu) = self.raywatcher_gpu.as_mut() {
                 dlss_rr_ran = gpu.reconstruct_dlss_rr(
                     &self.device,
@@ -4571,14 +4598,22 @@ impl Renderer {
                     encoder,
                     &sdk_dir,
                     &params,
-                    &self.object_mv,
+                    &self.object_mv_view,
                     reset_history,
                     layered,
+                    unjittered_vp,
                     view.to_cols_array_2d(),
                     proj.to_cols_array_2d(),
                 );
                 if !dlss_rr_ran {
-                    gpu.record_denoise(&self.queue, encoder, &params, &denoise, &self.object_mv);
+                    gpu.record_denoise(
+                        &self.queue,
+                        encoder,
+                        &params,
+                        &denoise,
+                        &self.object_mv,
+                        unjittered_vp,
+                    );
                 }
                 let rr_err = gpu.dlss_rr_error().map(str::to_string);
                 self.modules.raywatcher_mut().set_dlss_rr_error(rr_err);
@@ -6526,6 +6561,9 @@ pub fn run(
                     }
                 }
                 if let WindowEvent::KeyboardInput {ref event,..}=event {
+                    if event.physical_key == PhysicalKey::Code(KeyCode::KeyL) && event.state == ElementState::Pressed && !event.repeat && !world_loading_active && !menu_page.is_open() {
+                        renderer.modules.raywatcher_mut().toggle_camera_light();
+                    }
                     if event.physical_key==PhysicalKey::Code(KeyCode::KeyM) && event.state==ElementState::Pressed && !event.repeat && !world_loading_active && (menu_page!=MenuPage::Teleports) {
                         menu_page=if menu_page==MenuPage::WorldMap {MenuPage::Closed} else {MenuPage::WorldMap};
                         keys.clear(); map_refresh=Instant::now()-std::time::Duration::from_secs(10);
@@ -7684,6 +7722,7 @@ pub fn run(
                                     &mut ray_encoder,
                                     world_extent,
                                     world_matrix,
+                                    unjittered_vp,
                                     frame_jitter,
                                     camera_jumped,
                                     Some(&map_space),

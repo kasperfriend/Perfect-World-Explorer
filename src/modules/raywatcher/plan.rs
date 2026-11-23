@@ -266,6 +266,8 @@ pub struct Effects {
     pub global_illumination: bool,
     /// Water refraction/absorption on submerged pixels (Beer-Lambert).
     pub refraction: bool,
+    /// Animated ray-traced Voronoi water caustics (subtle from above, vivid underwater).
+    pub caustics: bool,
 }
 
 impl Default for Effects {
@@ -280,6 +282,7 @@ impl Default for Effects {
             ambient_occlusion: true,
             global_illumination: true,
             refraction: true,
+            caustics: true,
         }
     }
 }
@@ -294,6 +297,7 @@ impl Effects {
             self.ambient_occlusion,
             self.global_illumination,
             self.refraction,
+            self.caustics,
         ]
         .iter()
         .filter(|on| **on)
@@ -342,9 +346,35 @@ pub struct Settings {
     pub point_light_shadows: bool,
     /// Single-term debug view (Phase 0); `DebugView::None` in normal play.
     pub debug_view: DebugView,
+    /// Enable a dynamic ray-traced light attached to the camera (toggled via `L` or UI).
+    pub camera_light_enabled: bool,
+    /// Camera light intensity (0.5..=20.0).
+    pub camera_light_intensity: f32,
+    /// Camera light colour warmness: -1.0 (hot red) -> 0.0 (white) -> +1.0 (cold blue).
+    pub camera_light_warmness: f32,
     /// Folder the reconstruction SDKs are loaded from. Empty means
     /// `PW_UPSCALER_SDK_DIR`, then `<exe>/sdk`, the same rule the upscalers use.
     pub sdk_dir: String,
+}
+
+/// Convert a camera-light warmness slider value (`-1.0` hot red .. `0.0` white .. `+1.0` cold blue)
+/// into a smooth linear RGB colour.
+pub fn camera_light_rgb(warmness: f32) -> glam::Vec3 {
+    let w = warmness.clamp(-1.0, 1.0);
+    let hot_red = glam::Vec3::new(1.0, 0.18, 0.05);
+    let warm_amber = glam::Vec3::new(1.0, 0.62, 0.24);
+    let neutral = glam::Vec3::new(1.0, 0.97, 0.94);
+    let cool_sky = glam::Vec3::new(0.62, 0.82, 1.0);
+    let cold_blue = glam::Vec3::new(0.24, 0.54, 1.0);
+    if w < -0.5 {
+        hot_red.lerp(warm_amber, (w + 1.0) * 2.0)
+    } else if w < 0.0 {
+        warm_amber.lerp(neutral, (w + 0.5) * 2.0)
+    } else if w < 0.5 {
+        neutral.lerp(cool_sky, w * 2.0)
+    } else {
+        cool_sky.lerp(cold_blue, (w - 0.5) * 2.0)
+    }
 }
 
 impl Default for Settings {
@@ -365,6 +395,9 @@ impl Default for Settings {
             replace_raster: false,
             point_light_shadows: false,
             debug_view: DebugView::None,
+            camera_light_enabled: false,
+            camera_light_intensity: 5.0,
+            camera_light_warmness: 0.0,
             sdk_dir: String::new(),
         }
     }
@@ -398,6 +431,8 @@ impl Settings {
         self.bounce_strength = finite_or(self.bounce_strength, 1.).clamp(0., 2.);
         self.reflection_roughness_cutoff =
             finite_or(self.reflection_roughness_cutoff, 0.4).clamp(0., 1.);
+        self.camera_light_intensity = finite_or(self.camera_light_intensity, 5.0).clamp(0.5, 20.0);
+        self.camera_light_warmness = finite_or(self.camera_light_warmness, 0.0).clamp(-1.0, 1.0);
     }
 
     /// True when this configuration replaces at least one original effect, i.e.
@@ -466,6 +501,7 @@ impl Plan {
             ambient_occlusion: false,
             global_illumination: false,
             refraction: false,
+            caustics: false,
         },
         reconstruction: RayReconstruction::Off,
         grid: (0, 0),
@@ -652,6 +688,7 @@ mod tests {
             ambient_occlusion: false,
             global_illumination: false,
             refraction: false,
+            caustics: false,
         };
         assert!(!s.replaces_effects());
         assert_eq!(
@@ -667,6 +704,7 @@ mod tests {
                 ambient_occlusion: false,
                 global_illumination: false,
                 refraction: false,
+                caustics: false,
             };
             match enable {
                 0 => e.shadows = true,

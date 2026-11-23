@@ -163,11 +163,11 @@ bool accept_opacity(uint prim, float2 bary, uint seed, uint tri_count) {
     uint _unused = seed;
     float clump = 1.0;
     if (opacity < 0.90) {
-        uint cx = uint(bary.x * 10.0);
-        uint cy = uint(bary.y * 10.0);
+        uint cx = uint(bary.x * 7.0);
+        uint cy = uint(bary.y * 7.0);
         uint ch = prim * 2654435761u ^ cx * 2246822519u ^ cy * 3266489917u;
         ch ^= ch >> 15u;
-        clump = 0.84 + 0.28 * (float(ch & 0xffu) / 255.0);
+        clump = 0.42 + 0.86 * (float(ch & 0xffu) / 255.0);
     }
     float eff_opacity = saturate(opacity * clump);
     uint h = prim * 747796405u ^ uint(bary.x * 64.0) * 2891336453u ^ uint(bary.y * 64.0) * 1664525u;
@@ -471,17 +471,42 @@ float3 detail_offscreen_albedo(float3 hit_pos, float3 hit_normal, float3 base_al
     return clamp(base_albedo * slab, float3(0.02, 0.02, 0.02), float3(0.95, 0.95, 0.95));
 }
 
-// Feature #2: Dual-octave animated underwater sun caustics interference pattern.
+float2 hash22(float2 p) {
+    float3 p3 = frac(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.xx + p3.yz) * p3.zy);
+}
+
+// Organic Voronoi cellular ridge (non-repeating natural water caustics, zero grid wallpaper).
+float voronoi_ridge(float2 uv, float t) {
+    float2 n = floor(uv);
+    float2 f = frac(uv);
+    float d1 = 8.0;
+    float d2 = 8.0;
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            float2 g = float2(float(i), float(j));
+            float2 o = hash22(n + g);
+            o = 0.5 + 0.42 * sin(t + 6.28318 * o);
+            float2 r = g + o - f;
+            float d = dot(r, r);
+            if (d < d1) {
+                d2 = d1;
+                d1 = d;
+            } else if (d < d2) {
+                d2 = d;
+            }
+        }
+    }
+    float edge = sqrt(d2) - sqrt(d1);
+    return pow(saturate(1.0 - edge * 2.3), 3.0);
+}
+
 float caustic_pattern(float2 xz, float t) {
-    float2 p1 = xz * 0.55 + float2(t * 0.65, -t * 0.42);
-    float2 p2 = xz * 0.82 + float2(-t * 0.48, t * 0.58);
-    float w1 = sin(p1.x * 2.3 + sin(p1.y * 1.9 + t)) * cos(p1.y * 2.1 - cos(p1.x * 1.7));
-    float w2 = sin(p2.x * 2.7 - cos(p2.y * 2.4 - t * 1.1)) * cos(p2.y * 2.5 + sin(p2.x * 2.2));
-    float ridge1 = 1.0 - abs(w1);
-    float ridge2 = 1.0 - abs(w2);
-    float c = saturate(ridge1 * ridge2);
-    float c2 = c * c;
-    return c2 * c2;
+    float2 warp = float2(sin(xz.y * 0.27 + t * 0.7), cos(xz.x * 0.23 - t * 0.6)) * 0.45;
+    float c1 = voronoi_ridge((xz + warp) * 0.36 + float2(t * 0.22, -t * 0.17), t * 1.15);
+    float c2 = voronoi_ridge((xz - warp * 0.7) * 0.58 + float2(-t * 0.19, t * 0.24), t * 0.85);
+    return saturate(c1 * 0.65 + c2 * 0.55);
 }
 
 // Feature #1: Henyey-Greenstein forward-scattering phase for volumetric god rays.
@@ -588,6 +613,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     bool bits_ao = (effects & 8u) != 0u;
     bool bits_gi = (effects & 16u) != 0u;
     bool bits_refraction = (effects & 32u) != 0u;
+    bool bits_caustics = (effects & 64u) != 0u;
 
     float steepness = 1.0 - saturate(normal.y);
     float slope_bias = steepness * (0.75 + dist * 0.0065);
@@ -780,12 +806,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float shallow_clear = exp(-wdepth * 0.16);
                 float3 depth_tint = (beer - float3(1.0, 1.0, 1.0)) * (raster_rgb * 0.28 * refract_w);
                 refl_col = max(refl_col + depth_tint, float3(0.0, 0.0, 0.0));
-                if (wdepth < 14.0 && shadow > 0.05 && n_dot_l > 0.08 && sun_strength > 0.05) {
+                if (bits_caustics && wdepth < 12.0 && shadow > 0.05 && n_dot_l > 0.08 && sun_strength > 0.05) {
                     float refr_t = wdepth / max(-refract_dir.y, 0.25);
                     float3 seabed_pos = world_pos + refract_dir * refr_t;
-                    float caust = caustic_pattern(seabed_pos.xz, params.frame.x * 0.035);
-                    float c_fade = smoothstep(0.03, 0.45, wdepth) * shallow_clear * exp(-dist * 0.008);
-                    refl_col += params.sun_colour.xyz * beer * (caust * shadow * n_dot_l * sun_strength * refract_w * c_fade * 0.55);
+                    float caust = caustic_pattern(seabed_pos.xz, params.frame.x * 0.025);
+                    float c_fade = smoothstep(0.15, 0.90, wdepth) * shallow_clear * exp(-dist * 0.015);
+                    refl_col += params.sun_colour.xyz * beer * (caust * shadow * n_dot_l * sun_strength * refract_w * c_fade * 0.16);
                 }
             }
             accum_reflection += refl_col;
@@ -913,29 +939,55 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
     }
 
-    // Feature #1: Ray-Traced Volumetric God Rays (sun & moon light shafts).
-    // 4 IGN-jittered shadow-ray steps along view ray toward sun/moon with HG forward phase.
-    float3 god_rays = float3(0.0, 0.0, 0.0);
-    if (bits_shadows && params.sun_dir.y > 0.04 && dist > 10.0 && fog_t < 0.96) {
-        float cos_view_sun = dot(view_dir, params.sun_dir.xyz);
-        float phase = hg_phase(cos_view_sun, 0.72);
-        float march_len = min(dist, 175.0) - 4.0;
-        if (march_len > 4.0 && phase > 0.03) {
-            float step_len = march_len * 0.25;
-            float lit_steps = 0.0;
-            for (uint vi = 0u; vi < 4u; vi = vi + 1u) {
-                float t_vol = 4.0 + (float(vi) + ign_v) * step_len;
-                float3 p_vol = params.eye.xyz + view_dir * t_vol;
-                if (!occluded_fast(p_vol, params.sun_dir.xyz, 0.5, 420.0)) {
-                    lit_steps += 1.0;
-                }
+    // Feature #2 (Underwater Caustics): Project organic Voronoi sun caustics onto
+    // submerged terrain, rocks, and ruins when beneath the active water plane.
+    float3 underwater_caustics = float3(0.0, 0.0, 0.0);
+    float water_y = params.eye.w;
+    if (bits_caustics && !is_water && water_y > -1e5 && world_pos.y < water_y - 0.05 && fog_t < 0.95 && sun_strength > 0.05) {
+        float sub_depth = water_y - world_pos.y;
+        if (sub_depth < 28.0 && n_dot_l > 0.05) {
+            float uw_vis = bits_shadows ? (accum_shadow / float(samples)) : 1.0;
+            if (uw_vis > 0.05) {
+                float caust = caustic_pattern(world_pos.xz, params.frame.x * 0.025);
+                float3 beer = exp(-sub_depth * float3(0.18, 0.07, 0.04));
+                float fade = smoothstep(0.05, 0.50, sub_depth) * exp(-sub_depth * 0.065) * exp(-dist * 0.008);
+                underwater_caustics = params.sun_colour.xyz * beer * (caust * uw_vis * n_dot_l * sun_strength * fade * 0.85);
             }
-            float shaft_vis = lit_steps * 0.25;
-            float dist_w = smoothstep(10.0, 110.0, march_len);
-            // Warm sun shafts by day, cool subtle moonlight shafts at night.
-            float3 shaft_col = lerp(float3(0.28, 0.38, 0.58), params.sun_colour.xyz, sun_strength);
-            float shaft_intensity = lerp(0.055, 0.11, sun_strength);
-            god_rays = shaft_col * (shaft_vis * min(phase, 1.35) * dist_w * shaft_intensity * (1.0 - fog_t * 0.6));
+        }
+    }
+
+    // Feature #1: Sculpted 12-step Ray-Traced Volumetric God Rays.
+    // Depth-stratified steps + occlusion-contrast weighting produce real sunbeams
+    // carved by canopies, arches, and cliffs without a flat foggy plane over open sky.
+    float3 god_rays = float3(0.0, 0.0, 0.0);
+    if (bits_shadows && params.sun_dir.y > 0.05 && dist > 14.0 && fog_t < 0.94) {
+        float cos_view_sun = dot(view_dir, params.sun_dir.xyz);
+        if (cos_view_sun > 0.30) {
+            float phase = hg_phase(cos_view_sun, 0.86);
+            float march_len = min(dist, 155.0) - 3.0;
+            if (march_len > 8.0 && phase > 0.06) {
+                float lit_steps = 0.0;
+                float occ_steps = 0.0;
+                for (uint vi = 0u; vi < 12u; vi = vi + 1u) {
+                    float u = (float(vi) + ign_v) / 12.0;
+                    float t_vol = 3.0 + (u * sqrt(u)) * march_len;
+                    float3 p_vol = params.eye.xyz + view_dir * t_vol;
+                    if (occluded_fast(p_vol, params.sun_dir.xyz, 0.5, 420.0)) {
+                        occ_steps += 1.0;
+                    } else {
+                        lit_steps += 1.0;
+                    }
+                }
+                float shaft_vis = lit_steps / 12.0;
+                float occ_frac = occ_steps / 12.0;
+                // Only boost into visible shafts when geometry actually slices the sunbeam;
+                // open unoccluded terrain stays clean instead of a flat foggy plane.
+                float shaft_contrast = lerp(0.12, 1.0, smoothstep(0.04, 0.38, occ_frac));
+                float dist_w = smoothstep(14.0, 95.0, march_len);
+                float3 shaft_col = lerp(float3(0.28, 0.38, 0.58), params.sun_colour.xyz, sun_strength);
+                float shaft_intensity = lerp(0.025, 0.065, sun_strength);
+                god_rays = shaft_col * (shaft_vis * shaft_contrast * min(phase, 1.4) * dist_w * shaft_intensity * (1.0 - fog_t * 0.7));
+            }
         }
     }
 
@@ -1098,7 +1150,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float avg_open = accum_open * inv;
     float3 avg_refl = accum_reflection * inv + god_rays;
     float avg_refl_dist = accum_refl_dist * inv;
-    float3 avg_gi = accum_gi * inv + sss_light;
+    float3 avg_gi = accum_gi * inv + sss_light + underwater_caustics;
 
     float3 out_rgb;
     float out_lf;
@@ -1110,9 +1162,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float v_sun = bits_shadows ? avg_shadow : 1.0;
         float v_ao = bits_ao ? avg_open : 1.0;
         bool gi_active = bits_gi && !is_water && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01;
-        // Keep 18% of raster ambient grounded under GI so dark crevices never collapse or rely on noisy sky taps.
+        // Keep 18% of raster ambient grounded under GI by day, and darken the
+        // quantization-safe night raster carrier (0.095) back to pitch black where unlit
+        // so night buildings keep 100% crisp textures under point lights!
         float amb_keep = gi_active ? lerp(1.0, 0.18, gi_fade) : 1.0;
-        float separated_lf = (amb_f * v_ao * amb_keep + sun_f * v_sun) * point_shadow_mod;
+        float night_dark_scale = lerp(0.085, 1.0, smoothstep(0.0, 0.25, sun_strength));
+        float separated_lf = (amb_f * v_ao * amb_keep * night_dark_scale + sun_f * v_sun) * point_shadow_mod;
         out_lf = lerp(separated_lf, 1.0, fog_t);
         out_rgb = avg_gi + point_lighting;
     } else {
