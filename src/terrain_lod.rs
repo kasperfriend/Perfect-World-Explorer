@@ -100,7 +100,21 @@ impl LodConfig {
     /// Level for a block centred at `centre` in world XZ. Block availability
     /// (`block+0x74`) is the caller's business; see `window_lod`.
     pub fn level_at(&self, cam: [f32; 2], centre: [f32; 2]) -> u8 {
-        self.level(self.block_distance(cam, centre))
+        let dx = centre[0] - cam[0];
+        let dz = centre[1] - cam[1];
+        let dist_sq = dx * dx + dz * dz;
+        let offset = self.block_size * HALF_DIAGONAL;
+        let near_lim = self.near * self.block_scale + offset;
+        if near_lim > 0.0 && dist_sq < near_lim * near_lim {
+            3
+        } else {
+            let far_lim = self.far * self.block_scale + offset;
+            if far_lim > 0.0 && dist_sq < far_lim * far_lim {
+                2
+            } else {
+                1
+            }
+        }
     }
 }
 
@@ -222,9 +236,9 @@ pub fn block_surface(level: u8, cases: [u8; 4]) -> BlockSurface {
     let u = CELLS / s; // block edge in step units
     let mut b = SurfaceBuilder {
         s,
-        grid: Vec::new(),
+        grid: Vec::with_capacity((u + 1) * (u + 1)),
         index_of: Default::default(),
-        indices: Vec::new(),
+        indices: Vec::with_capacity(u * u * 6),
     };
     // Interior: `q x q` cells at `step`, spanning 1 ..= u-1 in step units.
     let q = interior_cells(level);

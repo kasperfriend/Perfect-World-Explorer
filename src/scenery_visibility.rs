@@ -398,22 +398,27 @@ impl RegionResidency {
         margin: f32,
     ) -> Vec<usize> {
         let q = (quality as usize).min(5);
-        let mut selected = Vec::new();
+        let mut selected = Vec::with_capacity(self.resident.len());
         for p in placements {
             // 0x424020 uses `0x951158 + 4*class` for each of the ten classes.
             let threshold = PRESETS[q][p.class.index()];
-            let d = distance(eye, p.center);
+            let dx = eye[0] - p.center[0];
+            let dz = eye[1] - p.center[1];
+            let d_sq = dx * dx + dz * dz;
             let was = self.resident.contains(&p.index);
-            if !was && d <= threshold {
+            let mut is_resident = was;
+            if !was && d_sq <= threshold * threshold {
                 self.resident.insert(p.index);
                 self.loads += 1;
-            } else if was && d > threshold + margin {
+                is_resident = true;
+            } else if was && d_sq > (threshold + margin) * (threshold + margin) {
                 self.resident.remove(&p.index);
                 self.evictions += 1;
+                is_resident = false;
             } else if !was {
                 self.distance_culls += 1;
             }
-            if self.resident.contains(&p.index) {
+            if is_resident {
                 selected.push(p.index);
             }
         }

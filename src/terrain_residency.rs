@@ -232,7 +232,7 @@ fn intersects(planes: &[[f32; 4]; 6], bounds: [f32; 6]) -> bool {
 /// Merge the visible blocks of one view into contiguous index ranges, so a
 /// frame is submitted as a handful of draw calls instead of one per block.
 pub fn visible_runs(spans: &[Span], matrix: Mat4) -> Vec<(u32, u32)> {
-    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut runs: Vec<(u32, u32)> = Vec::with_capacity(spans.len().min(64));
     visible_runs_into(spans, matrix, &mut runs);
     runs
 }

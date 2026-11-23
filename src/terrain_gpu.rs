@@ -1075,8 +1075,8 @@ fn upload_masks(
             },
         view_formats: &[],
     });
-    let mut areas = Vec::new();
-    let mut layers = Vec::new();
+    let mut areas = Vec::with_capacity(masks_count);
+    let mut layers = Vec::with_capacity(masks_count);
     let mut page = vec![0u8; MASK_PAGE * MASK_PAGE];
     let mut layer_id = 0usize;
     let mut page_id = 0usize;
@@ -1515,7 +1515,9 @@ fn far_indices(
     let mut indices = Vec::with_capacity((cols - 1) * (rows - 1) * 6);
     // Preserve every original triangle, but group index ranges into bounded
     // patches so the main view never transforms the entire off-screen world.
-    let mut spans = Vec::new();
+    let patch_x = (cols - 1 + 31) / 32;
+    let patch_y = (rows - 1 + 31) / 32;
+    let mut spans = Vec::with_capacity(patch_x * patch_y);
     for py in (0..rows - 1).step_by(32) {
         for px in (0..cols - 1).step_by(32) {
             let end_x = (px + 32).min(cols - 1);

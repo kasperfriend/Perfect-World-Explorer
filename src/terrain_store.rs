@@ -393,10 +393,11 @@ impl Builder {
             .create_new(true)
             .open(&path)
             .map_err(|e| e.to_string())?;
-        let mut header = b"PWTGRID1".to_vec();
-        for v in [width, height, side] {
-            header.extend_from_slice(&(v as u64).to_le_bytes());
-        }
+        let mut header = [0u8; 32];
+        header[..8].copy_from_slice(b"PWTGRID1");
+        header[8..16].copy_from_slice(&(width as u64).to_le_bytes());
+        header[16..24].copy_from_slice(&(height as u64).to_le_bytes());
+        header[24..32].copy_from_slice(&(side as u64).to_le_bytes());
         file.write_all(&header).map_err(|e| e.to_string())?;
         let mut hash = Sha256::new();
         hash.update(&header);
@@ -775,7 +776,10 @@ fn write_manifest(
     if !safe_name(identity) || !safe_name(pages_name) || !pages_name.ends_with(".pages") {
         return Err("invalid terrain cache names".into());
     }
-    let mut out = MANIFEST_MAGIC.to_vec();
+    let mut out = Vec::with_capacity(
+        MANIFEST_MAGIC.len() + 44 + pages_name.len() + pages_digest.len() + records.len() * 48,
+    );
+    out.extend_from_slice(MANIFEST_MAGIC);
     out.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
     for value in [
         width as u64,

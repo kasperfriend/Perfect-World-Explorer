@@ -40,44 +40,53 @@ fn parse_destinations(text: &str, world_ids: &[u32]) -> Result<Vec<Destination>,
         if line.trim().is_empty() {
             continue;
         }
-        let fields = line.split('\t').map(str::trim).collect::<Vec<_>>();
-        if fields.len() < 5 {
+        let mut fields = line.split('\t').map(str::trim);
+        let (Some(f0), Some(f1), Some(f2), Some(f3), Some(_f4)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
             return Err(format!("invalid destination line {}", number + 1));
-        }
-        let id = fields[0]
+        };
+        let id = f0
             .parse()
             .map_err(|_| format!("invalid destination ID on {}", number + 1))?;
-        let name = fields[1]
+        let name = f1
             .strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
             .ok_or("invalid destination name")?
             .to_string();
-        let coords = fields[3]
-            .trim_matches('"')
-            .split(',')
-            .map(str::parse::<f32>)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| "invalid destination coordinates")?;
-        if name.is_empty() || coords.len() != 3 || coords.iter().any(|v| !v.is_finite()) {
+        let mut coord_it = f3.trim_matches('"').split(',');
+        let parse_coord = |s: Option<&str>| -> Result<f32, String> {
+            s.ok_or_else(|| format!("invalid destination at {}", number + 1))?
+                .parse::<f32>()
+                .map_err(|_| "invalid destination coordinates".to_string())
+        };
+        let c0 = parse_coord(coord_it.next())?;
+        let c1 = parse_coord(coord_it.next())?;
+        let c2 = parse_coord(coord_it.next())?;
+        if name.is_empty()
+            || coord_it.next().is_some()
+            || !c0.is_finite()
+            || !c1.is_finite()
+            || !c2.is_finite()
+        {
             return Err(format!("invalid destination at {}", number + 1));
         }
         // Teleport only within the loaded world/instance: do not silently send
         // the camera to coordinates authored for a different coordinate space.
-        let world_id = fields[2].parse::<u32>().unwrap_or(0);
+        let world_id = f2.parse::<u32>().unwrap_or(0);
         if world_ids.is_empty() || world_ids.contains(&world_id) {
             result.push(Destination {
                 id,
                 name,
-                position: [coords[0], coords[1], coords[2]],
+                position: [c0, c1, c2],
             });
         }
     }
-    result.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then(a.id.cmp(&b.id))
-    });
+    result.sort_by_cached_key(|a| (a.name.to_lowercase(), a.id));
     Ok(result)
 }
 #[derive(Clone)]

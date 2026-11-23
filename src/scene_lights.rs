@@ -196,10 +196,11 @@ impl StaticGrid {
             {
                 continue;
             }
-            let x0 = index((l.bounds_min[0] - min_x) / 12.);
-            let x1 = index((l.bounds_max[0] - min_x) / 12.);
-            let z0 = index((max_z - l.bounds_max[2]) / 12.);
-            let z1 = index((max_z - l.bounds_min[2]) / 12.);
+            const INV_CELL: f32 = 1. / 12.;
+            let x0 = index((l.bounds_min[0] - min_x) * INV_CELL);
+            let x1 = index((l.bounds_max[0] - min_x) * INV_CELL);
+            let z0 = index((max_z - l.bounds_max[2]) * INV_CELL);
+            let z1 = index((max_z - l.bounds_min[2]) * INV_CELL);
             for z in z0..=z1 {
                 for x in x0..=x1 {
                     self.cells[z * 10 + x].push(id);
@@ -238,10 +239,11 @@ impl StaticGrid {
             if x - r > max_x || x + r < min_x || z - r > max_z || z + r < min_z {
                 continue;
             }
-            let x0 = index((x - r - min_x) / 12.);
-            let x1 = index((x + r - min_x) / 12.);
-            let z0 = index((max_z - z - r) / 12.);
-            let z1 = index((max_z - z + r) / 12.);
+            const INV_CELL: f32 = 1. / 12.;
+            let x0 = index((x - r - min_x) * INV_CELL);
+            let x1 = index((x + r - min_x) * INV_CELL);
+            let z0 = index((max_z - z - r) * INV_CELL);
+            let z1 = index((max_z - z + r) * INV_CELL);
             for cz in z0..=z1 {
                 for cx in x0..=x1 {
                     let cell = &mut self.dynamic_cells[cz * 10 + cx];
@@ -273,18 +275,19 @@ impl StaticGrid {
         {
             return None;
         }
-        let x = (((point[0] - min_x) / 12.) as usize).min(9);
-        let z = (((max_z - point[2]) / 12.) as usize).min(9);
+        const INV_CELL: f32 = 1. / 12.;
+        let x = (((point[0] - min_x) * INV_CELL) as usize).min(9);
+        let z = (((max_z - point[2]) * INV_CELL) as usize).min(9);
         let mut best = None;
-        let mut best_d = 99999.8984375_f32;
+        let mut best_d_sq = 99999.8984375_f32 * 99999.8984375_f32;
         for &id in &self.cells[z * 10 + x] {
             let l = &self.static_records[id];
-            let d = ((l.position[0] - point[0]).powi(2)
-                + (l.position[1] - point[1]).powi(2)
-                + (l.position[2] - point[2]).powi(2))
-            .sqrt();
-            if d < best_d {
-                best_d = d;
+            let dx = l.position[0] - point[0];
+            let dy = l.position[1] - point[1];
+            let dz = l.position[2] - point[2];
+            let d_sq = dx * dx + dy * dy + dz * dz;
+            if d_sq < best_d_sq {
+                best_d_sq = d_sq;
                 best = Some(l);
             }
         }
@@ -302,12 +305,12 @@ impl StaticGrid {
         }
         for &id in &self.dynamic_cells[z * 10 + x] {
             let d = &self.dynamic[id];
-            let distance = ((d.position[0] - point[0]).powi(2)
-                + (d.position[1] - point[1]).powi(2)
-                + (d.position[2] - point[2]).powi(2))
-            .sqrt();
-            if distance < best_d {
-                best_d = distance;
+            let dx = d.position[0] - point[0];
+            let dy = d.position[1] - point[1];
+            let dz = d.position[2] - point[2];
+            let dist_sq = dx * dx + dy * dy + dz * dz;
+            if dist_sq < best_d_sq {
+                best_d_sq = dist_sq;
                 let scale = d.color[3];
                 let diff = [
                     2. * d.color[0] * scale,
