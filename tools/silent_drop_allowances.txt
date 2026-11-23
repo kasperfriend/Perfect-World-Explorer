@@ -17,11 +17,11 @@ src/latency.rs:309 unreachable an end-of-frame latency marker's return code is a
 src/objects.rs:273 unreachable OnceLock::set: a second logger would be a programming error, and the first is the one used
 src/gfx_file.rs:1395 unreachable `accurate_aabb` is intentionally unread: the flag describes a bound this build derives instead
 src/gfx_player.rs:1748 unreachable `root_path` is intentionally unread at this call site; the path is carried by the element
-src/gpu.rs:7814 unreachable `&mut pass` reborrow to end a borrow; no value is produced
+src/gpu.rs:7823 unreachable `&mut pass` reborrow to end a borrow; no value is produced
 src/gpu.rs:2542 unreachable `author()` writes into the recorder it is given; the return value carries nothing
 src/gpu.rs:3843 unreachable begin_render_pass returns the encoder-owned pass, which is then used through the handle
 src/gpu.rs:5957 unreachable cursor grab can legitimately fail in windowed mode and is retried; not content
-src/gpu.rs:7659 unreachable cursor grab can legitimately fail in windowed mode and is retried; not content
+src/gpu.rs:7668 unreachable cursor grab can legitimately fail in windowed mode and is retried; not content
 src/gfx_player.rs:3349 unreachable let-else on a control that is not a Fractal: this loop asks for the Fractal, so another kind is not a loss
 src/model_draw_gpu.rs:693 unreachable let-else on a mesh that is absent by construction: draw_alpha_mesh is only called for indices alpha_meshes lists
 src/xess/imp.rs:323 unreachable `queue` is kept alive past the call; no result
@@ -45,13 +45,14 @@ src/world_handoff.rs:238 unreachable mpsc failure to the UI: a closed receiver m
 src/world_handoff.rs:247 unreachable child.kill on a process we are abandoning
 src/world_handoff.rs:248 unreachable child.wait after kill; the exit status of an abandoned child carries nothing
 src/world_objects.rs:653 unreachable mpsc error to the UI: a closed receiver means the window is gone
-src/world_objects.rs:681 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
-src/world_objects.rs:696 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
-src/world_objects.rs:706 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
+src/world_objects.rs:678 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
+src/world_objects.rs:687 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
+src/world_objects.rs:702 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
+src/world_objects.rs:718 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
 src/world_objects.rs:712 unreachable mpsc done to the UI: a closed receiver means the window is gone
-src/world_objects.rs:958 unreachable mpsc done to the UI: a closed receiver means the window is gone
-src/gpu.rs:8105 unreachable mpsc send of a worker result whose receiver is the caller that already returned
-src/gpu.rs:8440 unreachable mpsc send of a worker result whose receiver is the caller that already returned
+src/world_objects.rs:966 unreachable mpsc done to the UI: a closed receiver means the window is gone
+src/gpu.rs:8114 unreachable mpsc send of a worker result whose receiver is the caller that already returned
+src/gpu.rs:8449 unreachable mpsc send of a worker result whose receiver is the caller that already returned
 src/dlss/fg.rs:200 unreachable an SDK destroy call's status: the context is being torn down
 src/dlss/fg.rs:305 unreachable an SDK destroy call's status: the context is being torn down
 src/dlss/imp.rs:415 unreachable an SDK destroy call's status: the context is being torn down
@@ -121,8 +122,8 @@ src/pck.rs unreachable caller already range-checked n; the stem exists because P
 
 src/windows_setup.rs:1330 unreachable mpsc ready signal: a closed receiver means the caller stopped waiting
 src/world_handoff.rs:205 unreachable mpsc window-shown signal to the UI: a closed receiver means the window is gone
-src/gpu.rs:8371 unreachable an absent frame option is the documented default value
-src/gpu.rs:8374 unreachable an absent frame option is the documented default value
+src/gpu.rs:8380 unreachable an absent frame option is the documented default value
+src/gpu.rs:8383 unreachable an absent frame option is the documented default value
 src/loading_screen.rs:714 unreachable pre-epoch system clock falls back to zero duration for random seed
 src/windows_setup.rs:445 unreachable mpsc progress send to the UI: a closed receiver means the window is gone
 src/world_handoff.rs:117 unreachable an absent optional field is the documented default of the handoff request

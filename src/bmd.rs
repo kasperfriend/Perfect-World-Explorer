@@ -328,9 +328,10 @@ impl Model {
         let count = u(b, p)? as usize;
         p += 4;
         if count > 65_536 {
-            let extra = v305_header_word
-                .map(|w| format!(", hdr={w:#010x}"))
-                .unwrap_or_default();
+            let extra = match v305_header_word {
+                Some(w) => format!(", hdr={w:#010x}"),
+                None => String::new(),
+            };
             return Err(format!(
                 "too many meshes ({count}, version={version:#x}{extra})"
             ));
