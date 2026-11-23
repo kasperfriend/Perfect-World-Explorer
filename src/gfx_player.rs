@@ -2473,6 +2473,7 @@ fn advance_element(
                 element.generation_sequence.as_deref(),
                 &context,
                 dt_s,
+                drape,
                 stats,
                 out,
             );
@@ -2493,10 +2494,29 @@ fn advance_element(
                 color_scale
             };
             let child_dt = dt_s * 1000. * child.play_speed;
+            if child.loop_flag && child.player.finished() {
+                child.player.reset();
+            }
             if child.loop_flag || !child.player.finished() {
-                child
-                    .player
-                    .advance(child_dt, view, placement, context.scale, child_alpha)?;
+                // `A3DGFXContainer.cpp:300` hands the child `GetTranMatrix(kp) * GetParentTM()`,
+                // which includes `Rad_2D` spin, and preserves the parent's accumulated scale
+                // (since `advance_with_terrain` normalizes `transform`'s basis columns).
+                let child_transform = context.element_matrix(Vec3::Z);
+                let parent_scale = placement.x_axis.truncate().length();
+                let child_scale = if parent_scale.is_finite() && parent_scale > 1e-6 {
+                    parent_scale * context.scale
+                } else {
+                    context.scale
+                };
+                child.player.advance_with_terrain(
+                    child_dt,
+                    view,
+                    child_transform,
+                    child_scale,
+                    child_alpha,
+                    None,
+                    drape.map(|s| s.height),
+                )?;
                 out.extend(child.player.quads.iter().cloned());
                 stats.merge(&child.player.stats);
             }
@@ -2931,16 +2951,20 @@ fn apply_controls(state: &mut CtrlState, key: &KeyPoint, sampled: &Sampled, dt: 
                 // long it is, the ratio clamps at 1 (the last point is held,
                 // no wrap), and `GenPath` builds cubic Bezier segments whose
                 // end tangents are `(P[i+1] - P[i-1]) / 6`.
-                let span = if key.time_span > 0. {
-                    key.time_span
+                // `sampled.offset` and `key.time_span` are both in milliseconds;
+                // dividing `age` (seconds) by `key.time_span` (ms) ran 1,000x too slow.
+                let (elapsed_ms, span_ms) = if key.time_span > 0. {
+                    (sampled.offset, key.time_span)
+                } else if control.end > control.start {
+                    (sampled.offset - control.start, control.end - control.start)
                 } else {
-                    1.
+                    (sampled.offset, 1000.)
                 };
-                let ratio = (age / span).clamp(0., 1.);
+                let ratio = (elapsed_ms / span_ms).clamp(0., 1.);
                 let (position, tangent) = sample_curve_ratio(points, ratio);
                 state.path_override = Some(position);
                 if state.path_direction {
-                    state.rotation = tangent.angle_between(Vec3::X);
+                    state.rotation = tangent.y.atan2(tangent.x);
                 }
             }
         }
@@ -5476,6 +5500,7 @@ fn emit_particles(
     generation: Option<&KeyPoint>,
     context: &ElementContext,
     dt: f32,
+    drape: Option<GroundSampler<'_>>,
     stats: &mut Stats,
     out: &mut Vec<EffectQuad>,
 ) {
@@ -5511,8 +5536,26 @@ fn emit_particles(
                 _ => None,
             })
         });
+        let inv_placement = if particle.start_on_ground && drape.is_some() {
+            Some(context.placement.inverse())
+        } else {
+            None
+        };
         for _ in 0..count {
-            particles.push(spawn(particle, path, rng, average, context));
+            let mut p = spawn(particle, path, rng, average, context);
+            if let (Some(sampler), Some(inv)) = (drape, inv_placement) {
+                let mut world = context.placement.transform_point3(p.position);
+                if let Some(h) = (sampler.height)(world.x, world.z) {
+                    world.y = h;
+                    let snapped = inv.transform_point3(world);
+                    if snapped.is_finite() {
+                        p.position = snapped;
+                        p.previous = snapped;
+                        p.origin = snapped;
+                    }
+                }
+            }
+            particles.push(p);
         }
     }
     if dt > 0. {

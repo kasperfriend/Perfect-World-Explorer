@@ -819,11 +819,31 @@ impl Manager {
                 self.failures.push(format!("{origin}: {error}"));
             }
         }
-        self.load_one();
-        // One animated root per frame, the same budget the loader has. Only
-        // owners that are visible right now are admitted, so a world with
-        // thousands of installed effects builds the handful inside the radius.
-        self.build_one_player();
+        // Admit up to 4 active visible roots/players per frame so torches,
+        // fire, and waterfalls appear quickly when entering an area, while
+        // keeping inactive background loads at 1 per frame.
+        const ACTIVE_ADMIT_BUDGET: usize = 4;
+        for _ in 0..ACTIVE_ADMIT_BUDGET {
+            if !self.owners.iter().any(|o| matches!(o.state, State::Pending) && o.request.active) {
+                break;
+            }
+            self.load_one();
+        }
+        if !self.owners.iter().any(|o| matches!(o.state, State::Pending) && o.request.active) {
+            self.load_one();
+        }
+        for _ in 0..ACTIVE_ADMIT_BUDGET {
+            if !self.owners.iter().any(|o| {
+                matches!(o.state, State::Live { .. })
+                    && o.player.is_none()
+                    && !o.player_failed
+                    && o.request.active
+                    && o.elapsed >= o.request.start_ms
+            }) {
+                break;
+            }
+            self.build_one_player();
+        }
     }
 
     /// Gate the animated effect graph: the sprites, particles, ribbons, trails
