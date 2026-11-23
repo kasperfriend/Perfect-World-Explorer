@@ -1812,8 +1812,14 @@ fn sprite(lookup: &Lookup, id: u32, version: u32) -> Result<Sprite, String> {
     let no_scale = if version >= 36 {
         let vals = lookup.all("NoScale");
         [
-            vals.first().map(|v| boolean("NoScale", v)).transpose()?.unwrap_or(false),
-            vals.get(1).map(|v| boolean("NoScale", v)).transpose()?.unwrap_or(false),
+            vals.first()
+                .map(|v| boolean("NoScale", v))
+                .transpose()?
+                .unwrap_or(false),
+            vals.get(1)
+                .map(|v| boolean("NoScale", v))
+                .transpose()?
+                .unwrap_or(false),
         ]
     } else {
         [false; 2]
@@ -1821,8 +1827,14 @@ fn sprite(lookup: &Lookup, id: u32, version: u32) -> Result<Sprite, String> {
     let origin = if version >= 36 {
         let vals = lookup.all("OrgPt");
         [
-            vals.first().map(|v| float("OrgPt", v)).transpose()?.unwrap_or(0.5),
-            vals.get(1).map(|v| float("OrgPt", v)).transpose()?.unwrap_or(0.5),
+            vals.first()
+                .map(|v| float("OrgPt", v))
+                .transpose()?
+                .unwrap_or(0.5),
+            vals.get(1)
+                .map(|v| float("OrgPt", v))
+                .transpose()?
+                .unwrap_or(0.5),
         ]
     } else {
         [0.5; 2]
@@ -1884,15 +1896,27 @@ fn particle(lookup: &Lookup, id: u32) -> Result<Particle, String> {
         no_scale: {
             let vals = lookup.all("NoScale");
             [
-                vals.first().map(|v| boolean("NoScale", v)).transpose()?.unwrap_or(false),
-                vals.get(1).map(|v| boolean("NoScale", v)).transpose()?.unwrap_or(false),
+                vals.first()
+                    .map(|v| boolean("NoScale", v))
+                    .transpose()?
+                    .unwrap_or(false),
+                vals.get(1)
+                    .map(|v| boolean("NoScale", v))
+                    .transpose()?
+                    .unwrap_or(false),
             ]
         },
         origin: {
             let vals = lookup.all("OrgPt");
             [
-                vals.first().map(|v| float("OrgPt", v)).transpose()?.unwrap_or(0.5),
-                vals.get(1).map(|v| float("OrgPt", v)).transpose()?.unwrap_or(0.5),
+                vals.first()
+                    .map(|v| float("OrgPt", v))
+                    .transpose()?
+                    .unwrap_or(0.5),
+                vals.get(1)
+                    .map(|v| float("OrgPt", v))
+                    .transpose()?
+                    .unwrap_or(0.5),
             ]
         },
         use_particle_uv: lookup.flag("IsUseParUV", false)?,

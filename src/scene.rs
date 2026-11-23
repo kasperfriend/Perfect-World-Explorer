@@ -457,7 +457,9 @@ impl Scene {
                 let extra = u32at(&b, p + 36)?;
                 let mut pos = p + 40;
                 let path = string(&b, &mut pos)?;
-                if path.len() < 4 || !path.as_bytes()[path.len() - 4..].eq_ignore_ascii_case(b".bmd") {
+                if path.len() < 4
+                    || !path.as_bytes()[path.len() - 4..].eq_ignore_ascii_case(b".bmd")
+                {
                     return Err(format!(
                         "ornament {} has unexpected BMD path {path:?}",
                         r.export_id

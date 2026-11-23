@@ -121,7 +121,11 @@ pub fn normalize(name: &str) -> String {
     if name.is_ascii() {
         let mut out = String::with_capacity(name.len());
         for b in name.bytes() {
-            out.push(if b == b'\\' { '/' } else { (b as char).to_ascii_lowercase() });
+            out.push(if b == b'\\' {
+                '/'
+            } else {
+                (b as char).to_ascii_lowercase()
+            });
         }
         return out;
     }

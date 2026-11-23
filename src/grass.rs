@@ -269,7 +269,11 @@ fn parse_model(b: &[u8], name: &str) -> Result<Model, String> {
         let t = if decoded.is_ascii() {
             let mut s = String::with_capacity(decoded.len());
             for b in decoded.bytes() {
-                s.push(if b == b'\\' { '/' } else { (b as char).to_ascii_lowercase() });
+                s.push(if b == b'\\' {
+                    '/'
+                } else {
+                    (b as char).to_ascii_lowercase()
+                });
             }
             s
         } else {
