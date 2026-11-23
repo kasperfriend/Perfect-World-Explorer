@@ -62,7 +62,7 @@ impl CollisionBrush {
         let extents = v3(b, *p + 12)?;
         let _mins = v3(b, *p + 24)?;
         let _maxs = v3(b, *p + 36)?;
-        if extents.iter().any(|v| *v < 0.0) {
+        if extents[0] < 0.0 || extents[1] < 0.0 || extents[2] < 0.0 {
             return Err("negative collision-brush extent".into());
         }
         *p = p.checked_add(48).ok_or("collision-brush overflow")?;
@@ -77,7 +77,7 @@ impl CollisionBrush {
         for _ in 0..count {
             let normal = v3(b, *p)?;
             let distance = f(b, *p + 12)?;
-            if normal.iter().map(|v| v * v).sum::<f32>() < 1e-12 {
+            if normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] < 1e-12 {
                 return Err("zero collision-plane normal".into());
             }
             let bevel = *b.get(*p + 16).ok_or("truncated collision plane")? != 0;

@@ -231,18 +231,26 @@ fn terrain_pass_fog(linear:vec3<f32>,reciprocal_w:f32,transmittance:f32)->vec3<f
  // matrix `0x7b4b00` writes) is produced. Register row: "terrain day/night
  // factor".
  let lightmapped=camera.sun.w>=0.;
+ let fcoord=fract(coord);
  var color=vec3<f32>(0.);
  var baked=vec3<f32>(1.);
- if lightmapped {let id=ay*settings.areas.x+ax;let slot=id%settings.light.z;let page=id/settings.light.z;let side=f32(settings.light.x);let xy=vec2<f32>(f32(slot%settings.light.y),f32(slot/settings.light.y))*side;let loc=clamp(fract(coord)*side,vec2<f32>(0.5),vec2<f32>(side-0.5));let lmuv=(xy+loc)/vec2<f32>(textureDimensions(lightmaps));let day=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page),0.).rgb;let night=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page+settings.light.w),0.).rgb;
+ if lightmapped {let id=ay*settings.areas.x+ax;let slot=id%settings.light.z;let page=id/settings.light.z;let side=f32(settings.light.x);let xy=vec2<f32>(f32(slot%settings.light.y),f32(slot/settings.light.y))*side;let loc=clamp(fcoord*side,vec2<f32>(0.5),vec2<f32>(side-0.5));let inv_lm=1./vec2<f32>(textureDimensions(lightmaps));let lmuv=(xy+loc)*inv_lm;
   // t2_3layer_batch_14: `lrp_sat r5, c3.a, r5, r4` with t4 = day (r4), t5 = night
   // (r5): factor 0 selects the day map and 1 the night map, then `mul_x2` doubles
   // the encoded result into the 8-bit target.
   let factor=clamp(camera.fog_range.w,0.,1.);
-  baked=mix(day,night,factor)*2.;}
- for(var k=0u;k<a.count;k=k+1u){let l=layers[a.start+k];var v=vec2<f32>(i.world.x,-i.world.z);if l.axis==0u {v=vec2<f32>(i.world.z,-i.world.y);}else if l.axis==2u {v=vec2<f32>(i.world.x,-i.world.y);}
+  if factor<=0.001 {baked=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page),0.).rgb*2.;}
+  else if factor>=0.999 {baked=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page+settings.light.w),0.).rgb*2.;}
+  else {let day=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page),0.).rgb;let night=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page+settings.light.w),0.).rgb;baked=mix(day,night,factor)*2.;}}
+ let mask_side=f32(settings.areas.y);
+ let mask_local=clamp(fcoord*mask_side,vec2<f32>(0.5),vec2<f32>(mask_side-0.5));
+ let inv_mask_atlas=1./4096.;
+ for(var k=0u;k<a.count;k=k+1u){let l=layers[a.start+k];
+ var alpha=1.;if k>0u {let slot=l.mask%settings.areas.w;let page=l.mask/settings.areas.w;let xy=vec2<f32>(f32(slot%settings.areas.z),f32(slot/settings.areas.z))*mask_side;alpha=textureSampleLevel(masks,mask_sampler,(xy+mask_local)*inv_mask_atlas,i32(page),0.).r;if alpha<0.002 {continue;}}
+ var v=vec2<f32>(i.world.x,-i.world.z);if l.axis==0u {v=vec2<f32>(i.world.z,-i.world.y);}else if l.axis==2u {v=vec2<f32>(i.world.x,-i.world.y);}
  var dx=vec2<f32>(wx.x,-wx.z);var dy=vec2<f32>(wy.x,-wy.z);
  if l.axis==0u {dx=vec2<f32>(wx.z,-wx.y);dy=vec2<f32>(wy.z,-wy.y);}else if l.axis==2u {dx=vec2<f32>(wx.x,-wx.y);dy=vec2<f32>(wy.x,-wy.y);}
- dx*=l.uv*camera.lod.y;dy*=l.uv*camera.lod.y;let kind=l.tex>>28u;let index=i32(l.tex & 0x0fffffffu);
+ let uv_scale=l.uv*camera.lod.y;dx*=uv_scale;dy*=uv_scale;let kind=l.tex>>28u;let index=i32(l.tex & 0x0fffffffu);
  // Pass the true screen-space gradient, not a scalar max-footprint LOD.
  // The sampler can then preserve detail along the minor axis at grazing angles.
  var tex:vec3<f32>;
@@ -255,7 +263,6 @@ fn terrain_pass_fog(linear:vec3<f32>,reciprocal_w:f32,transmittance:f32)->vec3<f
  else if kind==2u {tex=textureSampleGrad(terrain_full,terrain_sampler,v*l.uv,index,dx,dy).rgb;}
  else if kind==1u {tex=textureSampleGrad(terrain,terrain_sampler,v*l.uv,index,dx,dy).rgb;}
  else {tex=textureSampleGrad(terrain_small,terrain_sampler,v*l.uv,index,dx,dy).rgb;}
- var alpha=1.;if k>0u {let slot=l.mask%settings.areas.w;let page=l.mask/settings.areas.w;let side=f32(settings.areas.y);let xy=vec2<f32>(f32(slot%settings.areas.z),f32(slot/settings.areas.z))*side;let local=clamp(fract(coord)*side,vec2<f32>(0.5),vec2<f32>(side-0.5));alpha=textureSampleLevel(masks,mask_sampler,(xy+local)/4096.,i32(page),0.).r;}
  if !lightmapped {tex=to_linear(tex);}
  color=mix(color,tex,alpha);}
  // t2_3layer_batch_14 composite: `mul r0, r0, v0` with v0 = c0.x = 1.0 and
