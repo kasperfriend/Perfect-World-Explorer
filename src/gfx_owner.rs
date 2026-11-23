@@ -1008,6 +1008,27 @@ impl Manager {
                 // it is advanced by the *frame* delta. `scaled` above is for the
                 // owner clock, the lifetime window and the light emitters, all of
                 // which are in the record's own time base.
+                let ground = terrain.and_then(|height_at| {
+                    let ox = world[12];
+                    let oz = world[14];
+                    let h = height_at(ox, oz)?;
+                    const STEP: f32 = 0.5;
+                    let hx_p = height_at(ox + STEP, oz).unwrap_or(h);
+                    let hx_m = height_at(ox - STEP, oz).unwrap_or(h);
+                    let hz_p = height_at(ox, oz + STEP).unwrap_or(h);
+                    let hz_m = height_at(ox, oz - STEP).unwrap_or(h);
+                    let dx = (hx_p - hx_m) / (2. * STEP);
+                    let dz = (hz_p - hz_m) / (2. * STEP);
+                    let normal = glam::Vec3::new(-dx, 1., -dz).normalize_or_zero();
+                    Some(crate::gfx_player::GroundHit {
+                        height: h,
+                        normal: if normal == glam::Vec3::ZERO {
+                            glam::Vec3::Y
+                        } else {
+                            normal
+                        },
+                    })
+                });
                 player
                     .advance_with_terrain(
                         delta_ms as f32,
@@ -1015,7 +1036,7 @@ impl Manager {
                         transform,
                         authored_scale,
                         alpha,
-                        None,
+                        ground,
                         terrain,
                     )
                     .map(|()| (player.quads().to_vec(), player.clock_ms()))

@@ -1797,27 +1797,19 @@ fn sprite(lookup: &Lookup, id: u32, version: u32) -> Result<Sprite, String> {
     let rotate_from_view = version >= 9 && lookup.flag("RotFromView", false)?;
     let ground_normal_only = version >= 26 && lookup.flag("GrndNormOnly", false)?;
     let no_scale = if version >= 36 {
+        let vals = lookup.all("NoScale");
         [
-            lookup.all("NoScale").first().is_some_and(|v| *v == "1"),
-            lookup.all("NoScale").get(1).is_some_and(|v| *v == "1"),
+            vals.first().map(|v| boolean("NoScale", v)).transpose()?.unwrap_or(false),
+            vals.get(1).map(|v| boolean("NoScale", v)).transpose()?.unwrap_or(false),
         ]
     } else {
         [false; 2]
     };
     let origin = if version >= 36 {
+        let vals = lookup.all("OrgPt");
         [
-            lookup
-                .all("OrgPt")
-                .first()
-                .map(|v| float("OrgPt", v))
-                .transpose()?
-                .unwrap_or(0.5),
-            lookup
-                .all("OrgPt")
-                .get(1)
-                .map(|v| float("OrgPt", v))
-                .transpose()?
-                .unwrap_or(0.5),
+            vals.first().map(|v| float("OrgPt", v)).transpose()?.unwrap_or(0.5),
+            vals.get(1).map(|v| float("OrgPt", v)).transpose()?.unwrap_or(0.5),
         ]
     } else {
         [0.5; 2]
@@ -1876,24 +1868,20 @@ fn particle(lookup: &Lookup, id: u32) -> Result<Particle, String> {
         is_3d: lookup.flag("3DParticle", false)?,
         facing: clamp_u32(lookup.integer("Facing", 0)?),
         scale_no_offset: lookup.flag("ScaleNoOff", false)?,
-        no_scale: [
-            lookup.all("NoScale").first().is_some_and(|v| *v == "1"),
-            lookup.all("NoScale").get(1).is_some_and(|v| *v == "1"),
-        ],
-        origin: [
-            lookup
-                .all("OrgPt")
-                .first()
-                .map(|v| float("OrgPt", v))
-                .transpose()?
-                .unwrap_or(0.5),
-            lookup
-                .all("OrgPt")
-                .get(1)
-                .map(|v| float("OrgPt", v))
-                .transpose()?
-                .unwrap_or(0.5),
-        ],
+        no_scale: {
+            let vals = lookup.all("NoScale");
+            [
+                vals.first().map(|v| boolean("NoScale", v)).transpose()?.unwrap_or(false),
+                vals.get(1).map(|v| boolean("NoScale", v)).transpose()?.unwrap_or(false),
+            ]
+        },
+        origin: {
+            let vals = lookup.all("OrgPt");
+            [
+                vals.first().map(|v| float("OrgPt", v)).transpose()?.unwrap_or(0.5),
+                vals.get(1).map(|v| float("OrgPt", v)).transpose()?.unwrap_or(0.5),
+            ]
+        },
         use_particle_uv: lookup.flag("IsUseParUV", false)?,
         start_on_ground: lookup.flag("IsStartOnGrnd", false)?,
         emission_rate: lookup.number("EmissionRate", 0.)?,

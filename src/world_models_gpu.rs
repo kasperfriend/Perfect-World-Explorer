@@ -322,17 +322,21 @@ impl World {
             &mut self.read,
             Box::new(move |path: &str| Err(format!("unset reader: {path}"))),
         );
-        self.read = Box::new(move |path: &str| match gfx_entries.get(path) {
-            Some(entry) => crate::pck::read_entry(&mut gfx_pack, entry),
-            None => previous(path),
+        self.read = Box::new(move |path: &str| {
+            let key = crate::ecmodel::normalize(path);
+            match gfx_entries.get(&key) {
+                Some(entry) => crate::pck::read_entry(&mut gfx_pack, entry),
+                None => previous(path),
+            }
         });
         // Root text is a separate handle so a root load and a texture load can
         // never interleave their file positions.
         let root_entries = entries.clone();
         let mut pack = File::open(element.join("gfx.pck")).map_err(|e| format!("gfx.pck: {e}"))?;
         self.owners.set_reader(move |path: &str| {
+            let key = crate::ecmodel::normalize(path);
             let entry = root_entries
-                .get(path)
+                .get(&key)
                 .ok_or_else(|| format!("missing gfx.pck entry: {path}"))?;
             let bytes = crate::pck::read_entry(&mut pack, entry)?;
             if !bytes.starts_with(b"MOXT") {
@@ -526,6 +530,24 @@ impl World {
                         continue;
                     }
                 };
+                let event_scale = event
+                    .fields
+                    .iter()
+                    .find(|(k, _)| k == "GfxScale")
+                    .and_then(|(_, v)| v.trim().parse::<f32>().ok())
+                    .filter(|v| v.is_finite() && *v > 0.)
+                    .unwrap_or(1.);
+                let event_alpha = event
+                    .fields
+                    .iter()
+                    .find(|(k, _)| k == "GfxAlpha")
+                    .and_then(|(_, v)| v.trim().parse::<f32>().ok())
+                    .and_then(gfx_owner::scene_alpha);
+                let scale_mat = if event_scale != 1. {
+                    glam::Mat4::from_scale(glam::Vec3::splat(event_scale))
+                } else {
+                    glam::Mat4::IDENTITY
+                };
                 let identity = MODEL_EVENT_IDENTITY + self.producers.len() as u64;
                 let request = gfx_owner::Request {
                     identity,
@@ -534,13 +556,13 @@ impl World {
                     // parent is installed per frame; a hook-free root is placed
                     // by the model transform the native event inherits.
                     transform: match &record {
-                        Some(_) => local.to_cols_array(),
-                        None => transform.to_cols_array(),
+                        Some(_) => (local * scale_mat).to_cols_array(),
+                        None => (transform * scale_mat).to_cols_array(),
                     },
                     speed: asset.descriptor.render_settings().default_speed,
                     start_ms: start_ms as u32,
                     span_ms,
-                    outer: None,
+                    outer: event_alpha,
                     attachment: None,
                     active: false,
                     origin: described.clone(),
@@ -1174,10 +1196,13 @@ impl World {
                     .instances
                     .get(binding.instance)
                     .ok_or_else(|| format!("{origin}: parent instance is gone"))?;
+                if !cutoff_residency::contains(self.resident_bounds, parent.placement.position) {
+                    return Ok(None);
+                }
                 let posed = match &slot.posed {
                     Some(Ok(posed)) => posed,
                     Some(Err(e)) => return Err(format!("{origin}: parent pose failed: {e}")),
-                    None => return Err(format!("{origin}: parent has no pose")),
+                    None => return Ok(None),
                 };
                 let asset = self
                     .assets
@@ -1185,8 +1210,12 @@ impl World {
                     .get(parent.asset)
                     .ok_or_else(|| format!("{origin}: parent asset is gone"))?;
                 let hook = asset.hook_matrix(&posed.pose, &binding.record.hook)?;
-                let composed = model_attachment::world(hook, binding.local)?;
-                Ok(Some(composed.to_cols_array()))
+                // Validate hook * local composition without baking `local` into
+                // the attachment parent: `Request::transform` already holds
+                // `local`, and `Request::world_transform` computes
+                // `parent * self.transform`.
+                let _ = model_attachment::world(hook, binding.local)?;
+                Ok(Some(hook.to_cols_array()))
             })();
             resolved.push((producer.identity, outcome));
         }
