@@ -3918,7 +3918,7 @@ impl Renderer {
             let tree_lod_scale =
                 self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees);
             let tree_tri_budget = 260_000usize;
-            let mut tree_tris = Vec::new();
+            let mut tree_tris = Vec::with_capacity(65_536);
             let (real_tree_instances, real_tree_tris, tree_canopy_fallbacks) =
                 self.far_trees.harvest_rt_triangles(
                     camera.pos,

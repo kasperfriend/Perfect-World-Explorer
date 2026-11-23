@@ -652,14 +652,31 @@ impl FarTrees {
                                     (ab, bc, ca, uv_ab, uv_bc, uv_ca),
                                 ];
                                 for (sa, sb, sc, u0, u1, u2) in subs {
+                                    // Sample 3 points per frond sub-triangle so solid
+                                    // fronds never get punctured into triangular holes.
                                     let uv_c = [
                                         (u0[0] + u1[0] + u2[0]) / 3.0,
                                         (u0[1] + u1[1] + u2[1]) / 3.0,
                                     ];
-                                    let (albedo, alpha) = sample_rgba_uv(img, uv_c);
-                                    if alpha < 0.18 {
+                                    let uv_1 = [(u0[0] + u1[0]) * 0.5, (u0[1] + u1[1]) * 0.5];
+                                    let uv_2 = [(u1[0] + u2[0]) * 0.5, (u1[1] + u2[1]) * 0.5];
+                                    let (c0, a0) = sample_rgba_uv(img, uv_c);
+                                    let (c1, a1) = sample_rgba_uv(img, uv_1);
+                                    let (c2, a2) = sample_rgba_uv(img, uv_2);
+                                    let a_avg = (a0 + a1 + a2) / 3.0;
+                                    let a_max = a0.max(a1).max(a2);
+                                    if a_avg < 0.16 && a_max < 0.30 {
                                         continue;
                                     }
+                                    let wsum = (a0 + a1 + a2).max(1e-4);
+                                    let albedo = [
+                                        ((c0[0] * a0 + c1[0] * a1 + c2[0] * a2) / wsum)
+                                            .clamp(0.05, 0.92),
+                                        ((c0[1] * a0 + c1[1] * a1 + c2[1] * a2) / wsum)
+                                            .clamp(0.05, 0.92),
+                                        ((c0[2] * a0 + c1[2] * a1 + c2[2] * a2) / wsum)
+                                            .clamp(0.05, 0.92),
+                                    ];
                                     lod_tris.push(RtTreeTriangle {
                                         a: sa,
                                         b: sb,
@@ -667,7 +684,7 @@ impl FarTrees {
                                         normal: norm,
                                         albedo,
                                         roughness: 0.85,
-                                        opacity: alpha.clamp(0.58, 0.95),
+                                        opacity: a_avg.max(a_max * 0.8).clamp(0.60, 0.96),
                                     });
                                 }
                             } else {
@@ -1680,14 +1697,23 @@ pub fn harvest_rt_tree_species(
 ) -> (usize, usize, usize) {
     let max_d2 = max_dist * max_dist;
     let scale = lod_scale.max(0.25);
-    let mut candidates: Vec<(f32, usize, [f32; 3])> = Vec::new();
+    // Boost #20: Fast XZ bounding reject before 3D distance + squared LOD thresholds (zero sqrt).
+    let mut candidates: Vec<(f32, usize, [f32; 3])> = Vec::with_capacity(512);
     for (si, sp) in species_list.iter().enumerate() {
         if sp.lods.is_empty() {
             continue;
         }
         for &pos in &sp.positions {
-            let p = glam::Vec3::from_array(pos);
-            let d2 = p.distance_squared(eye);
+            let dx = pos[0] - eye.x;
+            if dx.abs() > max_dist {
+                continue;
+            }
+            let dz = pos[2] - eye.z;
+            if dz.abs() > max_dist {
+                continue;
+            }
+            let dy = pos[1] - eye.y;
+            let d2 = dx * dx + dy * dy + dz * dz;
             if d2 <= max_d2 {
                 candidates.push((d2, si, pos));
             }
@@ -1699,17 +1725,18 @@ pub fn harvest_rt_tree_species(
     let mut real_tris = 0usize;
     let mut fallback_canopies = 0usize;
     let start_len = out.len();
+    const LOD0_D2: f32 = 32.0 * 32.0;
+    const LOD1_D2: f32 = 120.0 * 120.0;
 
     for (d2, si, pos) in candidates {
         let sp = &species_list[si];
-        let dist = d2.sqrt();
         // Use LOD0 only very close to the camera and medium/coarse real LODs
         // further out so 5x-8x more trees fit inside the real-mesh RT budget
         // with full trunk/branch/leaf silhouettes instead of falling back.
         let _ = scale;
-        let lod_idx = if dist < 32.0 {
+        let lod_idx = if d2 < LOD0_D2 {
             0
-        } else if dist < 120.0 {
+        } else if d2 < LOD1_D2 {
             1.min(sp.lods.len() - 1)
         } else {
             sp.lods.len() - 1

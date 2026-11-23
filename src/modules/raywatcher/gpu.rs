@@ -361,8 +361,10 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let p = reconstruct_pos(px, z, render);
-    let dist = length(p - prep.eye.xyz);
-    let view_dir = normalize(p - prep.eye.xyz);
+    // Boost #17: Reuse `dist` to compute `view_dir` (eliminates 1 sqrt per pixel).
+    let to_p = p - prep.eye.xyz;
+    let dist = length(to_p);
+    let view_dir = to_p / max(dist, 1e-6);
 
     let px_l = clamp(px + vec2<i32>(-1, 0), vec2<i32>(0), rmax);
     let px_r = clamp(px + vec2<i32>(1, 0), vec2<i32>(0), rmax);
@@ -430,9 +432,10 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
     //     reconstructed world point sits on an active water plane (open-sea
     //     horizon where no terrain sits underneath).
     var roughness = 0.92;
-    let z_pre = textureLoad(src_pre_water_depth, px, 0);
     let water_count = u32(round(prep.water_count.x));
-    if (water_count > 0u && z > z_pre + 1e-6) {
+    if (water_count > 0u) {
+      let z_pre = textureLoad(src_pre_water_depth, px, 0);
+      if (z > z_pre + 1e-6) {
         var is_water = z_pre > 1e-6;
         if (!is_water) {
             let n_planes = min(water_count, 16u);
@@ -452,6 +455,7 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
             roughness = 0.06;
             n = vec3<f32>(0.0, 1.0, 0.0);
         }
+      }
     }
 
     textureStore(out_pos, vec2<i32>(id.xy), vec4<f32>(p, dist));
@@ -1325,14 +1329,13 @@ struct ReprojectResult {
 // e.g. weather_gpu), and full-frame `prev_vp * inv_vp` camera reprojection for
 // all static world geometry (terrain, buildings, models, trees, water). Rejects
 // disocclusions with a strict 5% relative depth threshold against `prev_ndc.z`.
-fn reproject(pixel: vec2<i32>, size: vec2<i32>) -> ReprojectResult {
+fn reproject(pixel: vec2<i32>, size: vec2<i32>, current_depth: f32) -> ReprojectResult {
     var empty: ReprojectResult;
     empty.colour = vec3<f32>(0.0);
     empty.light_factor = 1.0;
     empty.moments = vec2<f32>(0.0);
     empty.length = 0.0;
 
-    let current_depth = textureLoad(src_depth, pixel, 0);
     if (current_depth <= 0.0) {
         return empty;
     }
@@ -1389,7 +1392,9 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let gmax = vec2<i32>(i32(gdim.x) - 1, i32(gdim.y) - 1);
     let gp = grid_coord(pixel, size, gdim);
     let cur_raw = textureLoad(src_colour, gp, 0);
-    let current = cur_raw.rgb + textureLoad(src_reflection, gp, 0).rgb;
+    // Boost #15: Skip loading src_reflection on matte land pixels (saves 8 RGBA16F loads/px).
+    let is_glossy = textureLoad(src_normals, gp, 0).w <= 0.12;
+    let current = select(cur_raw.rgb, cur_raw.rgb + textureLoad(src_reflection, gp, 0).rgb, is_glossy);
     let current_lf = cur_raw.a;
     let depth = textureLoad(src_depth, pixel, 0);
     if (depth <= 1e-6) {
@@ -1397,7 +1402,8 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(out_moments, pixel, vec4<f32>(0.0, 0.0, depth, 1.0));
         return;
     }
-    let prev = reproject(pixel, size);
+    // Boost #16: Pass already-loaded depth into reproject (saves 1 full-screen Depth32F fetch).
+    let prev = reproject(pixel, size, depth);
     let n = min(prev.length, params.misc.z);
     let valid = params.misc.w > 0.5 && n > 0.0;
     var blended = current;
@@ -1418,7 +1424,7 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
                 let p = clamp(gp + vec2<i32>(dx, dy), vec2<i32>(0), gmax);
                 let raw = textureLoad(src_colour, p, 0);
-                let c = raw.rgb + textureLoad(src_reflection, p, 0).rgb;
+                let c = select(raw.rgb, raw.rgb + textureLoad(src_reflection, p, 0).rgb, is_glossy);
                 sum = sum + c;
                 sum_sq = sum_sq + c * c;
                 sum_lf = sum_lf + raw.a;
@@ -1490,6 +1496,7 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let disocc = 1.0 - clamp((centre_moments.w - 1.0) / 3.0, 0.0, 1.0);
     let inv_sigma = (1.0 / max(params.weights.x * sqrt(centre_variance), 1e-6)) * mix(0.35, 0.18, disocc);
     let lf_edge_k = mix(4.5, 2.5, disocc);
+    let inv_centre_depth = 1.0 / max(centre_depth, 1e-3);
     let inv_depth_denom = 1.0 / max(params.weights.z * max(abs(centre_depth), 1e-3), 1e-6);
     let centre_raw = textureLoad(history_colour, pixel, 0);
     let centre = centre_raw.rgb;
@@ -1516,7 +1523,7 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 continue;
             }
             let d1 = textureLoad(src_depth, p, 0);
-            if (d1 <= 0.0 || abs(centre_depth - d1) / max(centre_depth, 1e-3) > 0.05) {
+            if (d1 <= 0.0 || abs(centre_depth - d1) * inv_centre_depth > 0.05) {
                 continue;
             }
             let wd = exp(-abs(centre_depth - d1) * inv_depth_denom);
@@ -1531,8 +1538,11 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             // Blend smoothly across gentle curved mesh/terrain triangle seams
             // (ndot >= 0.88) while stopping cleanly at real 90-degree corners (ndot <= 0.55),
             // so extra denoiser passes never turn curved trunks or slopes into low-poly facets.
+            // Boost #14: Fast squaring (ndot^8) replaces transcendental pow() in 3x3 loop.
             let curved_seam = smoothstep(0.55, 0.88, ndot);
-            let wn = curved_seam * curved_seam * pow(ndot, min(params.weights.y, 10.0));
+            let n2 = ndot * ndot;
+            let n4 = n2 * n2;
+            let wn = curved_seam * curved_seam * (n4 * n4);
             if (wn < 1e-4) {
                 continue;
             }
@@ -1689,46 +1699,57 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
     let n_center = select(vec3<f32>(0.0, 1.0, 0.0), norm_raw.xyz / n_len, n_len > 1e-4);
     let center_roughness = norm_raw.w;
 
-    let rt_f = i.uv * vec2<f32>(rt_dim) - vec2<f32>(0.5);
-    let rt_base = vec2<i32>(round(rt_f));
+    // Boost #13: When src_rt is already full-resolution (1:1 with raster), skip the
+    // 9-tap bilateral upsample (saves 27 texture fetches + 18 transcendentals per pixel!).
+    var rt = vec4<f32>(0.0);
+    if (rt_dim.x == rdim.x && rt_dim.y == rdim.y) {
+        rt = textureLoad(src_rt, px, 0);
+    } else {
+        let rt_f = i.uv * vec2<f32>(rt_dim) - vec2<f32>(0.5);
+        let rt_base = vec2<i32>(round(rt_f));
 
-    var rt_sum = vec4<f32>(0.0);
-    var w_sum = 0.0;
-    let inv_rt_dim = vec2<f32>(1.0) / max(vec2<f32>(rt_dim), vec2<f32>(1.0));
-    let depth_scale = max(0.02 * max(z_center, 1e-4), 1e-5);
+        var rt_sum = vec4<f32>(0.0);
+        var w_sum = 0.0;
+        let inv_rt_dim = vec2<f32>(1.0) / max(vec2<f32>(rt_dim), vec2<f32>(1.0));
+        let inv_z_center = 1.0 / max(z_center, 1e-4);
+        let inv_depth_scale = 1.0 / max(0.02 * max(z_center, 1e-4), 1e-5);
 
-    for (var dy = -1; dy <= 1; dy = dy + 1) {
-        for (var dx = -1; dx <= 1; dx = dx + 1) {
-            let tap = clamp(rt_base + vec2<i32>(dx, dy), vec2<i32>(0), rt_dim - vec2<i32>(1));
-            let tap_uv = (vec2<f32>(tap) + vec2<f32>(0.5)) * inv_rt_dim;
-            let tap_dpx = clamp(vec2<i32>(tap_uv * vec2<f32>(ddim)), vec2<i32>(0), ddim - vec2<i32>(1));
-            let z_tap = textureLoad(src_depth, tap_dpx, 0);
-            if (z_tap <= 0.0) {
-                continue;
-            }
-            let rel_dz = abs(z_center - z_tap) / max(z_center, 1e-4);
-            if (rel_dz > 0.05) {
-                continue;
-            }
-            let w_depth = exp(-abs(z_center - z_tap) / depth_scale);
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let tap = clamp(rt_base + vec2<i32>(dx, dy), vec2<i32>(0), rt_dim - vec2<i32>(1));
+                let tap_uv = (vec2<f32>(tap) + vec2<f32>(0.5)) * inv_rt_dim;
+                let tap_dpx = clamp(vec2<i32>(tap_uv * vec2<f32>(ddim)), vec2<i32>(0), ddim - vec2<i32>(1));
+                let z_tap = textureLoad(src_depth, tap_dpx, 0);
+                if (z_tap <= 0.0) {
+                    continue;
+                }
+                let dz = abs(z_center - z_tap);
+                if (dz * inv_z_center > 0.05) {
+                    continue;
+                }
+                let w_depth = exp(-dz * inv_depth_scale);
 
-            let tap_ncoord = clamp(vec2<i32>(tap_uv * vec2<f32>(ndim)), vec2<i32>(0), ndim - vec2<i32>(1));
-            let n_tap = load_unit_normal(tap_ncoord);
-            let ndot = max(dot(n_center, n_tap), 0.0);
-            let w_norm = pow(ndot, 16.0);
+                let tap_ncoord = clamp(vec2<i32>(tap_uv * vec2<f32>(ndim)), vec2<i32>(0), ndim - vec2<i32>(1));
+                let n_tap = load_unit_normal(tap_ncoord);
+                let ndot = max(dot(n_center, n_tap), 0.0);
+                let n2 = ndot * ndot;
+                let n4 = n2 * n2;
+                let n8 = n4 * n4;
+                let w_norm = n8 * n8;
 
-            let delta = vec2<f32>(tap) - rt_f;
-            let w_spatial = exp(-0.5 * dot(delta, delta));
-            let w = w_spatial * w_depth * w_norm;
-            if (w > 1e-5) {
-                rt_sum = rt_sum + textureLoad(src_rt, tap, 0) * w;
-                w_sum = w_sum + w;
+                let delta = vec2<f32>(tap) - rt_f;
+                let w_spatial = exp(-0.5 * dot(delta, delta));
+                let w = w_spatial * w_depth * w_norm;
+                if (w > 1e-5) {
+                    rt_sum = rt_sum + textureLoad(src_rt, tap, 0) * w;
+                    w_sum = w_sum + w;
+                }
             }
         }
-    }
 
-    let rt_fallback = textureLoad(src_rt, clamp(rt_base, vec2<i32>(0), rt_dim - vec2<i32>(1)), 0);
-    let rt = select(rt_fallback, rt_sum / w_sum, w_sum > 1e-5);
+        let rt_fallback = textureLoad(src_rt, clamp(rt_base, vec2<i32>(0), rt_dim - vec2<i32>(1)), 0);
+        rt = select(rt_fallback, rt_sum / w_sum, w_sum > 1e-5);
+    }
     let light_factor = clamp(rt.a, 0.0, 1.0);
     // Water (`roughness <= 0.12`) carries additive mirror reflections in `rt.rgb`.
     // Land, buildings, and trees carry demodulated pure GI + point-light irradiance

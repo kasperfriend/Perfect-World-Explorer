@@ -34,7 +34,7 @@ pub const KIND_REAL_MESH: f32 = 3.0;
 pub const KIND_PROXY: f32 = 4.0;
 /// Hard cap on total BVH/BLAS triangles (~38 MB) so extreme `ray_length` values
 /// can never exceed `wgpu::Limits::max_buffer_size` or `max_storage_buffer_binding_size`.
-pub const MAX_SCENE_TRIANGLES: usize = 600_000;
+pub const MAX_SCENE_TRIANGLES: usize = 1_200_000;
 /// Maximum horizontal terrain harvest radius (world units).
 const MAX_TERRAIN_HARVEST_FAR: f32 = 2048.0;
 
@@ -500,8 +500,9 @@ impl Harvester {
         let _ = std::thread::Builder::new()
             .name("raywatcher-bvh".to_string())
             .spawn(move || {
-                let mut triangles = Vec::new();
-                let mut materials = Vec::new();
+                // Boost #18: Pre-allocate triangle/material storage to avoid multi-MB Vec reallocations.
+                let mut triangles = Vec::with_capacity(512_000);
+                let mut materials = Vec::with_capacity(2048);
                 let mut terrain_lod_tris = [0usize; 4];
                 if let Some(ground_fn) = ground {
                     terrain_lod_tris = push_terrain_frustum(
@@ -518,17 +519,35 @@ impl Harvester {
                 // Unpack O(1)-cloned page Arc slices entirely off the main thread.
                 // Never stride individual triangles (`step > 1` skips every 2nd
                 // triangle of quads, turning sails/walls into checkerboards).
+                // Quad-safe triangle-AABB vs horizontal window test: both triangles
+                // of any quad straddling the boundary share the diagonal and AABB, so
+                // objects near `cull_r` are never sliced into lone half-quad triangles.
                 let cull_r = far.clamp(512.0, 960.0);
+                let min_x = eye.x - cull_r;
+                let max_x = eye.x + cull_r;
+                let min_z = eye.z - cull_r;
+                let max_z = eye.z + cull_r;
+                let remaining_cap = MAX_SCENE_TRIANGLES
+                    .saturating_sub(triangles.len())
+                    .saturating_sub(real_meshes.len());
+                let eff_page_budget = page_tri_budget.min(remaining_cap);
                 let mut page_added = 0usize;
                 for tris in &page_tris {
-                    if tris.is_empty() || page_added >= page_tri_budget {
+                    if tris.is_empty() || page_added >= eff_page_budget {
                         break;
                     }
                     for t in tris.iter() {
-                        if page_added >= page_tri_budget {
+                        if page_added >= eff_page_budget {
                             break;
                         }
-                        if (t.a[0] - eye.x).abs() > cull_r || (t.a[2] - eye.z).abs() > cull_r {
+                        let t_max_x = t.a[0].max(t.b[0]).max(t.c[0]);
+                        let t_min_x = t.a[0].min(t.b[0]).min(t.c[0]);
+                        if t_max_x < min_x || t_min_x > max_x {
+                            continue;
+                        }
+                        let t_max_z = t.a[2].max(t.b[2]).max(t.c[2]);
+                        let t_min_z = t.a[2].min(t.b[2]).min(t.c[2]);
+                        if t_max_z < min_z || t_min_z > max_z {
                             continue;
                         }
                         real_meshes.push(MeshTriangle {
@@ -1062,8 +1081,10 @@ fn push_real_meshes(
     if meshes.is_empty() {
         return;
     }
-    let mut palette: std::collections::HashMap<(u8, u8, u8, u8, u8), u32> =
-        std::collections::HashMap::new();
+    // Boost #19: Packed u32 material key + pre-sized HashMap + length_squared normal check
+    // (eliminates up to 1.8M sqrt calls per 900k-tri scene build).
+    let mut palette: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::with_capacity(2048);
     triangles.reserve(meshes.len());
     let mut dropped = 0usize;
     let before = triangles.len();
@@ -1078,25 +1099,25 @@ fn push_real_meshes(
             dropped += 1;
             continue;
         }
-        let normal = if m.normal.is_finite() && (m.normal.length() - 1.0).abs() <= 1e-3 {
+        let n_len2 = m.normal.length_squared();
+        let normal = if m.normal.is_finite() && (n_len2 - 1.0).abs() <= 2e-3 {
             m.normal
-        } else if m.normal.is_finite() && m.normal.length_squared() > 1e-6 {
-            m.normal.normalize()
+        } else if m.normal.is_finite() && n_len2 > 1e-6 {
+            m.normal * n_len2.sqrt().recip()
         } else {
-            geo / area2_sq.sqrt()
+            geo * area2_sq.sqrt().recip()
         };
-        if !normal.is_finite() || (normal.length() - 1.0).abs() > 1e-3 {
+        if !normal.is_finite() {
             dropped += 1;
             continue;
         }
         let opacity = m.opacity.clamp(0.0, 1.0);
-        let key = (
-            (m.albedo[0].clamp(0.0, 1.0) * 31.0).round() as u8,
-            (m.albedo[1].clamp(0.0, 1.0) * 31.0).round() as u8,
-            (m.albedo[2].clamp(0.0, 1.0) * 31.0).round() as u8,
-            (m.roughness.clamp(0.0, 1.0) * 15.0).round() as u8,
-            (opacity * 15.0).round() as u8,
-        );
+        let r5 = (m.albedo[0].clamp(0.0, 1.0) * 31.0 + 0.5) as u32;
+        let g5 = (m.albedo[1].clamp(0.0, 1.0) * 31.0 + 0.5) as u32;
+        let b5 = (m.albedo[2].clamp(0.0, 1.0) * 31.0 + 0.5) as u32;
+        let ro4 = (m.roughness.clamp(0.0, 1.0) * 15.0 + 0.5) as u32;
+        let op4 = (opacity * 15.0 + 0.5) as u32;
+        let key = (r5 << 18) | (g5 << 13) | (b5 << 8) | (ro4 << 4) | op4;
         let mat_id = *palette.entry(key).or_insert_with(|| {
             let id = materials.len() as u32;
             materials.push(RayMaterial {

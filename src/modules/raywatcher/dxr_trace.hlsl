@@ -110,9 +110,12 @@ struct Hit {
     float3 normal;
 };
 
+static const float SKY_ENV_FACE_F = 128.0;
+static const float TERRAIN_MAP_SIZE_F = 512.0;
+
 Material material_of(uint tri_index) {
     uint mat_count = max(uint(params.counts.z), 1u);
-    uint mat_idx = min(uint(round(tris[tri_index].b.w)), mat_count - 1u);
+    uint mat_idx = min(uint(tris[tri_index].b.w + 0.5), mat_count - 1u);
     return materials[mat_idx];
 }
 
@@ -122,8 +125,7 @@ float ign(uint2 px, uint frame) {
     return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
 }
 
-bool accept_opacity(uint prim, float2 bary, uint seed) {
-    uint tri_count = uint(params.counts.x);
+bool accept_opacity(uint prim, float2 bary, uint seed, uint tri_count) {
     if (prim >= tri_count) {
         return false;
     }
@@ -131,27 +133,25 @@ bool accept_opacity(uint prim, float2 bary, uint seed) {
     if (opacity >= 0.99) {
         return true;
     }
-    // Temporally stable organic leaf-cluster cutout in primitive barycentric space:
-    // tapers opacity smoothly to zero along straight triangle edges so foliage cards
-    // never cast or reflect rectangular/triangular cardbox silhouettes.
+    // Seamless organic foliage opacity test (no barycentric edge_mask so
+    // multi-triangle leaf fans, fronds, sails, and banners never show triangle seams).
     uint _unused = seed;
-    float bw = max(1.0 - bary.x - bary.y, 0.0);
-    float edge_dist = min(bary.x, min(bary.y, bw));
-    float edge_mask = (opacity < 0.94) ? smoothstep(0.0, 0.05, edge_dist) : 1.0;
-    // Subtle organic leaf-clump modulation + fine deterministic micro-dither.
-    uint cx = uint(bary.x * 10.0);
-    uint cy = uint(bary.y * 10.0);
-    uint ch = prim * 2654435761u ^ cx * 2246822519u ^ cy * 3266489917u;
-    ch ^= ch >> 15u;
-    float clump = 0.78 + 0.34 * (float(ch & 0xffu) / 255.0);
-    float eff_opacity = saturate(opacity * edge_mask * clump);
+    float clump = 1.0;
+    if (opacity < 0.90) {
+        uint cx = uint(bary.x * 10.0);
+        uint cy = uint(bary.y * 10.0);
+        uint ch = prim * 2654435761u ^ cx * 2246822519u ^ cy * 3266489917u;
+        ch ^= ch >> 15u;
+        clump = 0.84 + 0.28 * (float(ch & 0xffu) / 255.0);
+    }
+    float eff_opacity = saturate(opacity * clump);
     uint h = prim * 747796405u ^ uint(bary.x * 64.0) * 2891336453u ^ uint(bary.y * 64.0) * 1664525u;
     h ^= h >> 16u;
     float r = float(h & 0xffffu) / 65536.0;
     return r < eff_opacity;
 }
 
-Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
+Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max, uint opaque_offset, uint tri_count) {
     Hit hit;
     hit.index = 0xffffffffu;
     hit.t = t_max;
@@ -165,11 +165,10 @@ Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
 
     RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
     q.TraceRayInline(scene_tlas, RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
-    uint opaque_offset = uint(round(params.fog.w));
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
             uint cand_prim = q.CandidatePrimitiveIndex() + (q.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
-            if (accept_opacity(cand_prim, q.CandidateTriangleBarycentrics(), 0u)) {
+            if (accept_opacity(cand_prim, q.CandidateTriangleBarycentrics(), 0u, tri_count)) {
                 q.CommitNonOpaqueTriangleHit();
             }
         }
@@ -177,7 +176,6 @@ Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
 
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
         uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
-        uint tri_count = uint(params.counts.x);
         if (prim < tri_count) {
             float3 n = normalize(tris[prim].n.xyz);
             if (dot(n, dir) > 0.0) {
@@ -192,8 +190,8 @@ Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max) {
 }
 
 // Pure fixed-function RT-core closest-hit (RAY_FLAG_FORCE_OPAQUE | SKIP_PROCEDURAL_PRIMITIVES):
-// zero shader ejection, single Proceed() call, used for secondary GI bounces.
-Hit closest_hit_fast(float3 origin, float3 dir, float t_min, float t_max) {
+// zero shader ejection, single Proceed() call, used for GI bounces and distant hits.
+Hit closest_hit_fast(float3 origin, float3 dir, float t_min, float t_max, uint opaque_offset, uint tri_count) {
     Hit hit;
     hit.index = 0xffffffffu;
     hit.t = t_max;
@@ -210,9 +208,7 @@ Hit closest_hit_fast(float3 origin, float3 dir, float t_min, float t_max) {
     q.Proceed();
 
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-        uint opaque_offset = uint(round(params.fog.w));
         uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
-        uint tri_count = uint(params.counts.x);
         if (prim < tri_count) {
             float3 n = normalize(tris[prim].n.xyz);
             if (dot(n, dir) > 0.0) {
@@ -281,18 +277,17 @@ float3 sample_sky_env(float3 dir) {
         else            { face = 5u; uc = -d.x; vc = -d.y; }
     }
     float2 fuv = clamp(0.5 * (float2(uc, vc) / max(ma, 1e-5) + 1.0), 0.002, 0.998);
-    uint w, h;
-    src_sky_env.GetDimensions(w, h);
-    float fw = float(w) / 3.0;
-    float fh = float(h) / 2.0;
+    // Boost #6: Fixed 3x2 128px sky cubemap dimensions avoid per-ray GetDimensions().
+    float fw = SKY_ENV_FACE_F;
+    float fh = SKY_ENV_FACE_F;
     uint col = face % 3u;
     uint row = face / 3u;
     float fx = float(col) * fw + fuv.x * (fw - 1.0);
     float fy = float(row) * fh + fuv.y * (fh - 1.0);
     int x0 = int(floor(fx));
     int y0 = int(floor(fy));
-    int x1 = min(x0 + 1, int((col + 1u) * uint(fw)) - 1);
-    int y1 = min(y0 + 1, int((row + 1u) * uint(fh)) - 1);
+    int x1 = min(x0 + 1, int((col + 1u) * 128u) - 1);
+    int y1 = min(y0 + 1, int((row + 1u) * 128u) - 1);
     float2 frac_xy = float2(fx - float(x0), fy - float(y0));
     float3 c00 = src_sky_env.Load(int3(x0, y0, 0)).rgb;
     float3 c10 = src_sky_env.Load(int3(x1, y0, 0)).rgb;
@@ -318,20 +313,37 @@ float3 sample_terrain_albedo(float3 world_pos, float3 fallback) {
     if (u < 0.005 || u > 0.995 || v < 0.005 || v > 0.995) {
         return fallback;
     }
-    uint w, h;
-    src_terrain_map.GetDimensions(w, h);
-    float fx = u * float(w - 1u);
-    float fy = v * float(h - 1u);
+    float fx = u * (TERRAIN_MAP_SIZE_F - 1.0);
+    float fy = v * (TERRAIN_MAP_SIZE_F - 1.0);
     int x0 = int(floor(fx));
     int y0 = int(floor(fy));
-    int x1 = min(x0 + 1, int(w) - 1);
-    int y1 = min(y0 + 1, int(h) - 1);
+    int x1 = min(x0 + 1, 511);
+    int y1 = min(y0 + 1, 511);
     float2 fr = float2(fx - float(x0), fy - float(y0));
     float3 c00 = src_terrain_map.Load(int3(x0, y0, 0)).rgb;
     float3 c10 = src_terrain_map.Load(int3(x1, y0, 0)).rgb;
     float3 c01 = src_terrain_map.Load(int3(x0, y1, 0)).rgb;
     float3 c11 = src_terrain_map.Load(int3(x1, y1, 0)).rgb;
     float3 col = lerp(lerp(c00, c10, fr.x), lerp(c01, c11, fr.x), fr.y);
+    if (dot(col, float3(1.0, 1.0, 1.0)) < 1e-4) {
+        return fallback;
+    }
+    return clamp(col, float3(0.03, 0.03, 0.03), float3(0.95, 0.95, 0.95));
+}
+
+// Boost #5: 1-tap nearest terrain map fetch for diffuse GI bounces (4x fewer loads).
+float3 sample_terrain_albedo_fast(float3 world_pos, float3 fallback) {
+    if (params.terrain_map_bounds.w <= 0.5) {
+        return fallback;
+    }
+    float u = (world_pos.x - params.terrain_map_bounds.x) * params.terrain_map_bounds.z;
+    float v = (params.terrain_map_bounds.y - world_pos.z) * params.terrain_map_bounds.z;
+    if (u < 0.005 || u > 0.995 || v < 0.005 || v > 0.995) {
+        return fallback;
+    }
+    int tx = clamp(int(u * (TERRAIN_MAP_SIZE_F - 1.0) + 0.5), 0, 511);
+    int ty = clamp(int(v * (TERRAIN_MAP_SIZE_F - 1.0) + 0.5), 0, 511);
+    float3 col = src_terrain_map.Load(int3(tx, ty, 0)).rgb;
     if (dot(col, float3(1.0, 1.0, 1.0)) < 1e-4) {
         return fallback;
     }
@@ -355,7 +367,7 @@ float3 ggx_sample(float3 normal, float roughness, float u1, float u2) {
     return normalize(t * (c_phi * sin_theta) + b * (s_phi * sin_theta) + normal * cos_theta);
 }
 
-bool occluded(float3 origin, float3 dir, float t_min, float t_max, uint seed) {
+bool occluded(float3 origin, float3 dir, float t_min, float t_max, uint seed, uint opaque_offset, uint tri_count) {
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = dir;
@@ -364,11 +376,10 @@ bool occluded(float3 origin, float3 dir, float t_min, float t_max, uint seed) {
 
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
     q.TraceRayInline(scene_tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
-    uint opaque_offset = uint(round(params.fog.w));
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
             uint cand_prim = q.CandidatePrimitiveIndex() + (q.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
-            if (accept_opacity(cand_prim, q.CandidateTriangleBarycentrics(), seed)) {
+            if (accept_opacity(cand_prim, q.CandidateTriangleBarycentrics(), seed, tri_count)) {
                 q.CommitNonOpaqueTriangleHit();
             }
         }
@@ -468,6 +479,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
 
     uint samples = max(uint(params.frame.y), 1u);
     uint max_bounces = min(uint(round(params.frame.z)), 6u);
+    uint opaque_offset = uint(round(params.fog.w));
+    uint tri_count = uint(params.counts.x);
     uint state = id.x * 0x9e3779b9u ^ id.y * 0x85ebca6bu ^ uint(params.frame.x) * 0xc2b2ae35u;
 
     float accum_shadow = 0.0;
@@ -520,7 +533,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     // Distant shadows (>240u): pure fixed-function RT-core opaque hit (zero shader ejection).
                     hit_s = occluded_fast(ray_origin, shadow_dir, shadow_t_min, params.lens.y);
                 } else {
-                    hit_s = occluded(ray_origin, shadow_dir, shadow_t_min, params.lens.y, state ^ k);
+                    hit_s = occluded(ray_origin, shadow_dir, shadow_t_min, params.lens.y, state ^ k, opaque_offset, tri_count);
                 }
                 if (hit_s) {
                     sun_hits = sun_hits + 1u;
@@ -562,7 +575,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float m = 1.0 - saturate(dot(-view_dir, h));
             float m2 = m * m;
             float fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
-            Hit rhit = closest_hit(ray_origin, reflect_dir, bias, params.lens.y);
+            float refl_max_t = min(params.lens.y, 900.0);
+            Hit rhit = closest_hit(ray_origin, reflect_dir, bias, refl_max_t, opaque_offset, tri_count);
             if (rhit.index != 0xffffffffu) {
                 float3 hit_pos = ray_origin + reflect_dir * rhit.t;
                 float4 screen_col = sample_screen_radiance(hit_pos, rhit.t);
@@ -576,7 +590,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         : rmat.albedo.rgb;
                     float r_ndl = max(dot(rhit.normal, params.sun_dir.xyz), 0.0);
                     float r_shadow = 1.0;
-                    if (bits_shadows && r_ndl > 0.02) {
+                    if (bits_shadows && r_ndl > 0.02 && rhit.t < 260.0) {
                         float3 rhit_pos = hit_pos + rhit.normal * bias;
                         if (occluded_fast(rhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y)) {
                             r_shadow = 0.0;
@@ -599,11 +613,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // 1..=6 bounce coloured surface indirect lighting). Replaces flat raster ambient
         // in layered mode so there is zero double-ambient grey tint and real sky/sun
         // bounce colour bleeding across terrain, buildings, and overhangs.
-        if (bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
+        // Boost #7: Water pixels use rt.rgb purely for mirror reflections; skip GI rays on water.
+        if (bits_gi && roughness > 0.12 && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
             {
                 uint gi_taps = (dist < 90.0) ? 4u : ((dist < 180.0) ? 2u : 1u);
                 float3 gi_sum = float3(0.0, 0.0, 0.0);
-                float bounce_max_t = min(params.lens.y, 72.0);
+                float bounce_max_t = min(params.lens.y, 56.0);
                 float day_gi_scale = 0.03 + 0.97 * sun_strength;
                 for (uint g = 0u; g < gi_taps; g = g + 1u) {
                     float3 throughput = float3(1.0, 1.0, 1.0);
@@ -624,17 +639,19 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         float z = sqrt(max(0.0, 1.0 - u1));
                         float3 d = b_t * (r * c_phi) + b_b * (r * s_phi) + b_n * z;
                         Hit bhit;
-                        if (bounce == 0u) {
-                            bhit = closest_hit(b_origin, d, b_step_bias, bounce_max_t);
+                        // Boost #1: Use fixed-function RT-core opaque hit past 45u on bounce 0.
+                        if (bounce == 0u && dist < 45.0) {
+                            bhit = closest_hit(b_origin, d, b_step_bias, bounce_max_t, opaque_offset, tri_count);
                         } else {
-                            bhit = closest_hit_fast(b_origin, d, b_step_bias, bounce_max_t);
+                            bhit = closest_hit_fast(b_origin, d, b_step_bias, bounce_max_t, opaque_offset, tri_count);
                         }
                         if (bhit.index != 0xffffffffu) {
                             float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
                             float3 bhit_world = b_origin + d * bhit.t;
-                            float b_bias = max(b_step_bias, length(bhit_world - params.eye.xyz) * 0.004);
+                            float b_bias = max(b_step_bias, (dist + bhit.t) * 0.004);
                             float b_shadow = 1.0;
-                            if (bits_shadows && b_ndl > 0.01) {
+                            // Boost #4: Skip secondary shadow ray on high bounces or grazing hits.
+                            if (bits_shadows && bounce < 2u && b_ndl > 0.08) {
                                 float3 bhit_pos = bhit_world + bhit.normal * b_bias;
                                 if (occluded_fast(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y)) {
                                     b_shadow = 0.0;
@@ -643,7 +660,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                             Material bmat = material_of(bhit.index);
                             float bkind = tris[bhit.index].a.w;
                             float3 b_base_albedo = (bkind > 1.5 && bkind < 2.5)
-                                ? sample_terrain_albedo(bhit_world, bmat.albedo.rgb)
+                                ? sample_terrain_albedo_fast(bhit_world, bmat.albedo.rgb)
                                 : bmat.albedo.rgb;
                             float b_avg = dot(b_base_albedo, float3(0.3333, 0.3333, 0.3333));
                             float3 b_chroma = clamp(
@@ -712,8 +729,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float4 pl_pr = params.point_lights_pos_rad[li];
             float4 pl_ci = params.point_lights_col_int[li];
             float3 to_l = pl_pr.xyz - world_pos;
-            float pl_dist = length(to_l);
-            if (pl_dist > 1e-3 && pl_dist < pl_pr.w) {
+            float pl_d2 = dot(to_l, to_l);
+            if (pl_d2 > 1e-6 && pl_d2 < pl_pr.w * pl_pr.w) {
+                float pl_dist = sqrt(pl_d2);
                 float3 l_dir = to_l / pl_dist;
                 float pl_ndl = max(dot(normal, l_dir), 0.0);
                 if (pl_ndl > 0.001) {
@@ -753,7 +771,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // Phase 2: Separate raster lighting into sun vs ambient fractions so
         // V_sun modulates ONLY the sun contribution and AO modulates ONLY the
         // ambient contribution (exact 1:1 identity at V_sun=1, AO=1).
-        float sun_e = max(dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722)), 0.0) * n_dot_l;
+        float sun_e = max(sun_luma, 0.0) * n_dot_l;
         float amb_e = max(dot(params.ambient.xyz, float3(0.2126, 0.7152, 0.0722)) * params.tuning.z, 0.005);
         float sun_f = saturate(sun_e / max(sun_e + amb_e, 1e-4));
         float amb_f = 1.0 - sun_f;
@@ -806,7 +824,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         if (roughness <= 0.12) {
             occ_kind = 1.0;
         } else {
-            Hit ph = closest_hit(params.eye.xyz, view_dir, 0.1, params.lens.y);
+            Hit ph = closest_hit(params.eye.xyz, view_dir, 0.1, params.lens.y, opaque_offset, tri_count);
             if (ph.index != 0xffffffffu) {
                 occ_kind = tris[ph.index].a.w;
             }
@@ -818,7 +836,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float rkind = 0.0;
         if (roughness <= params.effects.x) {
             float3 rdir = reflect(view_dir, normal);
-            Hit rh = closest_hit(ray_origin, rdir, bias, params.lens.y);
+            Hit rh = closest_hit(ray_origin, rdir, bias, params.lens.y, opaque_offset, tri_count);
             if (rh.index != 0xffffffffu) {
                 rkind = tris[rh.index].a.w;
             }

@@ -852,7 +852,7 @@ pub struct RtMeshTriangle {
 /// Hard per-page cap on retained CPU triangles so whole-world preloads across
 /// hundreds of pages stay within a few megabytes of RAM while near-camera
 /// buildings and props retain real mesh silhouettes for shadows & reflections.
-const MAX_RT_TRIS_PER_PAGE: usize = 131_072;
+const MAX_RT_TRIS_PER_PAGE: usize = 262_144;
 
 #[inline]
 fn srgb_to_linear_u8(v: u8) -> f32 {
@@ -1084,27 +1084,59 @@ fn extract_rt_triangles(
                             (ab, bc, ca, uv_ab, uv_bc, uv_ca),
                         ];
                         for (sa, sb, sc, u0, u1, u2) in subs {
-                            let su = [(u0[0] + u1[0] + u2[0]) / 3.0, (u0[1] + u1[1] + u2[1]) / 3.0];
-                            if let Some((srgb, sa_val)) =
-                                sample_atlas_rgba(atlas, atlas_w, atlas_h, v0.color, kind, su)
-                            {
-                                if sa_val < 0.35 {
-                                    continue;
+                            // Sample 3 points (centroid + 2 mid-edges) so a single
+                            // transparent texel never punches a triangular hole in
+                            // sails, railings, banners, or BMD foliage clusters.
+                            let su_c =
+                                [(u0[0] + u1[0] + u2[0]) / 3.0, (u0[1] + u1[1] + u2[1]) / 3.0];
+                            let su_1 = [(u0[0] + u1[0]) * 0.5, (u0[1] + u1[1]) * 0.5];
+                            let su_2 = [(u1[0] + u2[0]) * 0.5, (u1[1] + u2[1]) * 0.5];
+                            let mut s_rgb = [0.0f32; 3];
+                            let mut s_w = 0.0f32;
+                            let mut s_a_max = 0.0f32;
+                            let mut s_a_sum = 0.0f32;
+                            let mut s_cnt = 0u32;
+                            for su in [su_c, su_1, su_2] {
+                                if let Some((c, a)) =
+                                    sample_atlas_rgba(atlas, atlas_w, atlas_h, v0.color, kind, su)
+                                {
+                                    s_cnt += 1;
+                                    s_a_sum += a;
+                                    if a > s_a_max {
+                                        s_a_max = a;
+                                    }
+                                    if a >= 0.15 {
+                                        s_rgb[0] += c[0] * a;
+                                        s_rgb[1] += c[1] * a;
+                                        s_rgb[2] += c[2] * a;
+                                        s_w += a;
+                                    }
                                 }
-                                let sub_albedo = [
-                                    srgb[0].clamp(0.06, 0.95),
-                                    srgb[1].clamp(0.06, 0.95),
-                                    srgb[2].clamp(0.06, 0.95),
-                                ];
-                                out.push(RtMeshTriangle {
-                                    a: sa,
-                                    b: sb,
-                                    c: sc,
-                                    normal: smooth_n,
-                                    albedo: sub_albedo,
-                                    opacity: (sa_val * 0.78).clamp(0.28, 0.82),
-                                });
                             }
+                            if s_cnt == 0 {
+                                continue;
+                            }
+                            let sa_avg = s_a_sum / s_cnt as f32;
+                            if sa_avg < 0.18 && s_a_max < 0.35 {
+                                continue;
+                            }
+                            let sub_albedo = if s_w > 1e-4 {
+                                [
+                                    (s_rgb[0] / s_w).clamp(0.06, 0.95),
+                                    (s_rgb[1] / s_w).clamp(0.06, 0.95),
+                                    (s_rgb[2] / s_w).clamp(0.06, 0.95),
+                                ]
+                            } else {
+                                albedo
+                            };
+                            out.push(RtMeshTriangle {
+                                a: sa,
+                                b: sb,
+                                c: sc,
+                                normal: smooth_n,
+                                albedo: sub_albedo,
+                                opacity: (sa_avg.max(s_a_max * 0.75) * 0.92).clamp(0.42, 0.94),
+                            });
                         }
                         t += 1;
                         continue;

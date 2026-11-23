@@ -390,11 +390,17 @@ mod imp {
         resource: *mut d12::ID3D12Resource,
         gpu_va: u64,
         size: u64,
+        mapped: *mut u8,
     }
 
     impl Drop for RawBuffer {
         fn drop(&mut self) {
-            unsafe { com_release(self.resource as *mut c_void) };
+            unsafe {
+                if !self.mapped.is_null() {
+                    (*self.resource).Unmap(0, null());
+                }
+                com_release(self.resource as *mut c_void);
+            }
         }
     }
 
@@ -449,7 +455,24 @@ mod imp {
                 resource,
                 gpu_va,
                 size,
+                mapped: null_mut(),
             })
+        }
+
+        /// Boost #11: Persistently map an upload heap buffer once to eliminate
+        /// per-frame Map/Unmap kernel transitions on CBVs.
+        unsafe fn map_persistent(&mut self) -> Result<(), String> {
+            if !self.mapped.is_null() {
+                return Ok(());
+            }
+            let mut ptr: *mut c_void = null_mut();
+            let read_range = d12::D3D12_RANGE { Begin: 0, End: 0 };
+            let hr = (*self.resource).Map(0, &read_range, &mut ptr);
+            if hr < 0 || ptr.is_null() {
+                return Err(format!("DXR persistent Map failed (0x{hr:08x})"));
+            }
+            self.mapped = ptr as *mut u8;
+            Ok(())
         }
 
         unsafe fn write_upload(&self, bytes: &[u8]) -> Result<(), String> {
@@ -462,6 +485,10 @@ mod imp {
                     bytes.len(),
                     self.size
                 ));
+            }
+            if !self.mapped.is_null() {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.mapped, bytes.len());
+                return Ok(());
             }
             let mut mapped: *mut c_void = null_mut();
             let read_range = d12::D3D12_RANGE { Begin: 0, End: 0 };
@@ -523,6 +550,9 @@ mod imp {
         /// True once `wgpu` has copied from the corresponding output target,
         /// leaving wgpu's DX12 state tracker expecting `COPY_SOURCE`.
         wgpu_tracked_copy_src: [bool; 5],
+        /// True when an output plane is already resident in `UNORDERED_ACCESS`
+        /// (unused planes stay in UAV across frames with zero pre/post barriers).
+        uav_resident: [bool; 5],
         /// True once `wgpu` has copied into the G-buffer input targets,
         /// leaving wgpu's DX12 state tracker expecting `COPY_DEST`.
         wgpu_tracked_copy_dst: bool,
@@ -643,6 +673,7 @@ mod imp {
                 albedo,
                 extent: (w, h),
                 wgpu_tracked_copy_src: [false; 5],
+                uav_resident: [false; 5],
                 wgpu_tracked_copy_dst: false,
             })
         }
@@ -716,13 +747,15 @@ mod imp {
             let desc_heap_guard = ComGuard(desc_heap as *mut c_void);
             let cbv_size = align256(size_of::<RayParams>() as u64);
             let mk_cbv = || unsafe {
-                RawBuffer::create(
+                let mut buf = RawBuffer::create(
                     dev_ptr,
                     cbv_size,
                     d12::D3D12_HEAP_TYPE_UPLOAD,
                     d12::D3D12_RESOURCE_FLAG_NONE,
                     d12::D3D12_RESOURCE_STATE_GENERIC_READ,
-                )
+                )?;
+                buf.map_persistent()?;
+                Ok::<RawBuffer, String>(buf)
             };
             let cbvs = [mk_cbv()?, mk_cbv()?, mk_cbv()?];
             let (dxr_scene, staging, build_fence) =
@@ -913,11 +946,13 @@ mod imp {
             // Count opaque vs alpha-tested triangles in one pass, then write
             // partitioned RayTriangles and flat [f32; 3] BLAS vertices directly
             // into mapped DX12 upload heaps (zero intermediate Vec allocations).
+            // Boost #12: Precompute opaque-material table once + integer cast per tri.
             let mat_max = mats_data.len().saturating_sub(1);
+            let mat_opaque: Vec<bool> = mats_data.iter().map(|m| m.surface[3] >= 0.99).collect();
             let mut opaque_tri_count = 0u32;
             for t in raw_tris {
-                let mat_idx = (t.b[3].round().max(0.0) as usize).min(mat_max);
-                if mats_data[mat_idx].surface[3] >= 0.99 {
+                let mat_idx = ((t.b[3] + 0.5).max(0.0) as usize).min(mat_max);
+                if mat_opaque[mat_idx] {
                     opaque_tri_count += 1;
                 }
             }
@@ -960,8 +995,8 @@ mod imp {
                     let mut o_idx = 0usize;
                     let mut a_idx = opaque_tri_count as usize;
                     for &t in raw_tris {
-                        let mat_idx = (t.b[3].round().max(0.0) as usize).min(mat_max);
-                        let dst = if mats_data[mat_idx].surface[3] >= 0.99 {
+                        let mat_idx = ((t.b[3] + 0.5).max(0.0) as usize).min(mat_max);
+                        let dst = if mat_opaque[mat_idx] {
                             let i = o_idx;
                             o_idx += 1;
                             i
@@ -1481,11 +1516,13 @@ mod imp {
                     self.targets.normals.resource.as_mut_ptr(),
                     self.targets.albedo.resource.as_mut_ptr(),
                 ];
+                // Boost #10: Only transition output UAV planes that will actually be copied
+                // back to wgpu; unused planes stay in COMMON/UAV without barrier flushes.
+                let out_used = [true, dst_guide.is_some(), true, true, dst_albedo.is_some()];
                 let mut pre_barriers: [d12::D3D12_RESOURCE_BARRIER; 10] = zeroed();
-                for (b, res) in pre_barriers[0..5]
-                    .iter_mut()
-                    .zip(in_resources.iter().copied())
-                {
+                let mut pre_count = 0usize;
+                for res in in_resources {
+                    let b = &mut pre_barriers[pre_count];
                     b.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     *b.u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
                         pResource: res,
@@ -1493,25 +1530,28 @@ mod imp {
                         StateBefore: in_wgpu_state,
                         StateAfter: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                     };
+                    pre_count += 1;
                 }
-                for ((b, res), tracked) in pre_barriers[5..10]
-                    .iter_mut()
-                    .zip(resources.iter().copied())
-                    .zip(self.targets.wgpu_tracked_copy_src.iter().copied())
-                {
+                for i in 0..5 {
+                    if self.targets.uav_resident[i] {
+                        continue;
+                    }
+                    let b = &mut pre_barriers[pre_count];
                     b.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     *b.u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: res,
+                        pResource: resources[i],
                         Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore: if tracked {
+                        StateBefore: if self.targets.wgpu_tracked_copy_src[i] {
                             d12::D3D12_RESOURCE_STATE_COPY_SOURCE
                         } else {
                             d12::D3D12_RESOURCE_STATE_COMMON
                         },
                         StateAfter: d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     };
+                    self.targets.uav_resident[i] = true;
+                    pre_count += 1;
                 }
-                (*list).ResourceBarrier(pre_barriers.len() as UINT, pre_barriers.as_ptr());
+                (*list).ResourceBarrier(pre_count as UINT, pre_barriers.as_ptr());
 
                 let mut heaps = [self.desc_heap];
                 (*list).SetDescriptorHeaps(1, heaps.as_mut_ptr());
@@ -1523,10 +1563,9 @@ mod imp {
                 (*list).Dispatch(w.div_ceil(8), h.div_ceil(4), 1);
 
                 let mut post_barriers: [d12::D3D12_RESOURCE_BARRIER; 10] = zeroed();
-                for (b, res) in post_barriers[0..5]
-                    .iter_mut()
-                    .zip(in_resources.iter().copied())
-                {
+                let mut post_count = 0usize;
+                for res in in_resources {
+                    let b = &mut post_barriers[post_count];
                     b.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     *b.u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
                         pResource: res,
@@ -1534,28 +1573,33 @@ mod imp {
                         StateBefore: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         StateAfter: in_wgpu_state,
                     };
+                    post_count += 1;
                 }
-                for ((b, res), tracked) in post_barriers[5..10]
-                    .iter_mut()
-                    .zip(resources.iter().copied())
-                    .zip(self.targets.wgpu_tracked_copy_src.iter().copied())
-                {
+                for i in 0..5 {
+                    if !out_used[i] {
+                        // Leave unused plane in UNORDERED_ACCESS so future frames skip
+                        // both pre- and post-barriers until a mode toggle copies it.
+                        continue;
+                    }
+                    let b = &mut post_barriers[post_count];
                     b.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     *b.u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: res,
+                        pResource: resources[i],
                         Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                         StateBefore: d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         // Return to whatever state wgpu's DX12 tracker expects:
                         // COMMON until wgpu has copied from this target once,
                         // COPY_SOURCE thereafter.
-                        StateAfter: if tracked {
+                        StateAfter: if self.targets.wgpu_tracked_copy_src[i] {
                             d12::D3D12_RESOURCE_STATE_COPY_SOURCE
                         } else {
                             d12::D3D12_RESOURCE_STATE_COMMON
                         },
                     };
+                    self.targets.uav_resident[i] = false;
+                    post_count += 1;
                 }
-                (*list).ResourceBarrier(post_barriers.len() as UINT, post_barriers.as_ptr());
+                (*list).ResourceBarrier(post_count as UINT, post_barriers.as_ptr());
 
                 self.ring.retire(slot_idx, &self.raw_queue, "DXR-Trace")?;
             }
