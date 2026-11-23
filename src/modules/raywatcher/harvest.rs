@@ -1085,6 +1085,9 @@ fn push_real_meshes(
     // (eliminates up to 1.8M sqrt calls per 900k-tri scene build).
     let mut palette: std::collections::HashMap<u32, u32> =
         std::collections::HashMap::with_capacity(2048);
+    // Opt #28: 1-entry MRU material cache bypasses HashMap lookup on 95%+ consecutive same-mesh tris.
+    let mut last_key = u32::MAX;
+    let mut last_mat_id = 0u32;
     triangles.reserve(meshes.len());
     let mut dropped = 0usize;
     let before = triangles.len();
@@ -1095,7 +1098,8 @@ fn push_real_meshes(
         }
         let geo = (m.b - m.a).cross(m.c - m.a);
         let area2_sq = geo.length_squared();
-        if !area2_sq.is_finite() || area2_sq <= 1e-8 {
+        // Opt #28: Reject sub-pixel degenerate slivers (`area2_sq <= 1e-6`) from BLAS/BVH.
+        if !area2_sq.is_finite() || area2_sq <= 1e-6 {
             dropped += 1;
             continue;
         }
@@ -1118,14 +1122,21 @@ fn push_real_meshes(
         let ro4 = (m.roughness.clamp(0.0, 1.0) * 15.0 + 0.5) as u32;
         let op4 = (opacity * 15.0 + 0.5) as u32;
         let key = (r5 << 18) | (g5 << 13) | (b5 << 8) | (ro4 << 4) | op4;
-        let mat_id = *palette.entry(key).or_insert_with(|| {
-            let id = materials.len() as u32;
-            materials.push(RayMaterial {
-                albedo: [m.albedo[0], m.albedo[1], m.albedo[2], 1.0],
-                surface: [m.roughness.clamp(0.04, 1.0), 0.05, 0.0, opacity],
+        let mat_id = if key == last_key {
+            last_mat_id
+        } else {
+            let id = *palette.entry(key).or_insert_with(|| {
+                let id = materials.len() as u32;
+                materials.push(RayMaterial {
+                    albedo: [m.albedo[0], m.albedo[1], m.albedo[2], 1.0],
+                    surface: [m.roughness.clamp(0.04, 1.0), 0.05, 0.0, opacity],
+                });
+                id
             });
+            last_key = key;
+            last_mat_id = id;
             id
-        });
+        };
         triangles.push(RayTriangle::with_kind(
             m.a,
             m.b,

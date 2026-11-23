@@ -333,6 +333,82 @@ impl SceneGeometry {
             centroids.push((a + b + c) * (1.0 / 3.0));
         }
         let mut index: Vec<u32> = (0..n as u32).collect();
+        // Opt #26: Parallel multi-threaded BVH build via std::thread::scope for scenes > 4096 tris.
+        if n > 4096 {
+            let root_bounds = geometry.bounds;
+            let mid = partition_sah(&tri_bounds, &centroids, &mut index, root_bounds);
+            let (left_idx, right_idx) = index.split_at_mut(mid);
+            let (left_state, right_state) = std::thread::scope(|scope| {
+                let tb = &tri_bounds;
+                let ct = &centroids;
+                let handle = scope.spawn(move || {
+                    let mut st = BuildState {
+                        tri_bounds: tb,
+                        centroids: ct,
+                        nodes: Vec::with_capacity(
+                            right_idx.len().saturating_mul(2).clamp(1, 1 << 21),
+                        ),
+                        order: Vec::with_capacity(right_idx.len()),
+                        depth: 0,
+                        widest: 0,
+                    };
+                    st.build_node(right_idx, 1);
+                    st
+                });
+                let mut left_st = BuildState {
+                    tri_bounds: tb,
+                    centroids: ct,
+                    nodes: Vec::with_capacity(left_idx.len().saturating_mul(2).clamp(1, 1 << 21)),
+                    order: Vec::with_capacity(left_idx.len()),
+                    depth: 0,
+                    widest: 0,
+                };
+                left_st.build_node(left_idx, 1);
+                let right_st = handle.join().expect("BVH worker thread panicked");
+                (left_st, right_st)
+            });
+            let left_nodes = left_state.nodes.len() as u32;
+            let left_order = left_state.order.len() as u32;
+            let right_root = 1 + left_nodes;
+            let mut nodes =
+                Vec::with_capacity(1 + left_state.nodes.len() + right_state.nodes.len());
+            nodes.push(BvhNode {
+                min: [
+                    root_bounds.min.x,
+                    root_bounds.min.y,
+                    root_bounds.min.z,
+                    -1.0,
+                ],
+                max: [
+                    root_bounds.max.x,
+                    root_bounds.max.y,
+                    root_bounds.max.z,
+                    right_root as f32,
+                ],
+            });
+            for mut node in left_state.nodes {
+                if node.min[3] < 0.0 {
+                    node.max[3] += 1.0;
+                }
+                nodes.push(node);
+            }
+            for mut node in right_state.nodes {
+                if node.min[3] < 0.0 {
+                    node.max[3] += right_root as f32;
+                } else {
+                    node.max[3] += left_order as f32;
+                }
+                nodes.push(node);
+            }
+            let mut order = Vec::with_capacity(n);
+            order.extend_from_slice(&left_state.order);
+            order.extend_from_slice(&right_state.order);
+            geometry.nodes = nodes;
+            geometry.order = order;
+            geometry.depth = left_state.depth.max(right_state.depth);
+            geometry.widest_leaf = left_state.widest.max(right_state.widest);
+            return geometry;
+        }
         let mut state = BuildState {
             tri_bounds: &tri_bounds,
             centroids: &centroids,
@@ -573,24 +649,27 @@ impl<'a> BuildState<'a> {
             };
             return node_index;
         }
-        // Split at the median of the widest centroid axis. Ties resolve to X,
-        // then Y, then Z, so the tree is reproducible.
-        let mut axis = 0usize;
-        let mut best = f32::NEG_INFINITY;
-        for a in 0..3 {
-            let spread = bounds.half_extent()[a];
-            if spread > best {
-                best = spread;
-                axis = a;
+        // Opt #27: Fast 8-bin Surface Area Heuristic (SAH) split for partitions > 64 tris.
+        let mid = if partition.len() > 64 {
+            partition_sah(self.tri_bounds, self.centroids, partition, bounds)
+        } else {
+            let mut axis = 0usize;
+            let mut best = f32::NEG_INFINITY;
+            for a in 0..3 {
+                let spread = bounds.half_extent()[a];
+                if spread > best {
+                    best = spread;
+                    axis = a;
+                }
             }
-        }
-        let mid = partition.len() / 2;
-        // Boost #29: Fast finite float ordering avoids NaN/signbit overhead on 1M+ tris.
-        partition.select_nth_unstable_by(mid, |&l, &r| {
-            let lc = self.centroids[l as usize][axis];
-            let rc = self.centroids[r as usize][axis];
-            lc.partial_cmp(&rc).unwrap_or(std::cmp::Ordering::Equal)
-        });
+            let m = partition.len() / 2;
+            partition.select_nth_unstable_by(m, |&l, &r| {
+                let lc = self.centroids[l as usize][axis];
+                let rc = self.centroids[r as usize][axis];
+                lc.partial_cmp(&rc).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            m
+        };
         let (left, right) = partition.split_at_mut(mid);
         self.build_node(left, depth + 1);
         let right_child = self.build_node(right, depth + 1);
@@ -605,6 +684,113 @@ impl<'a> BuildState<'a> {
         };
         node_index
     }
+}
+
+/// Opt #27: Fast 8-bin Surface Area Heuristic (SAH) partitioner.
+fn partition_sah(
+    tri_bounds: &[(Vec3, Vec3)],
+    centroids: &[Vec3],
+    partition: &mut [u32],
+    bounds: Bounds,
+) -> usize {
+    const BINS: usize = 8;
+    let ext = bounds.max - bounds.min;
+    let mut best_axis = 0usize;
+    let mut best_split = 0usize;
+    let mut best_cost = f32::INFINITY;
+
+    for axis in 0..3 {
+        let len = ext[axis];
+        if len <= 1e-5 {
+            continue;
+        }
+        let inv_len = (BINS as f32) / len;
+        let min_a = bounds.min[axis];
+        let mut bin_min = [Vec3::splat(f32::INFINITY); BINS];
+        let mut bin_max = [Vec3::splat(f32::NEG_INFINITY); BINS];
+        let mut bin_cnt = [0u32; BINS];
+
+        for &i in partition.iter() {
+            let c = centroids[i as usize][axis];
+            let b = (((c - min_a) * inv_len) as usize).min(BINS - 1);
+            let (lo, hi) = tri_bounds[i as usize];
+            bin_min[b] = bin_min[b].min(lo);
+            bin_max[b] = bin_max[b].max(hi);
+            bin_cnt[b] += 1;
+        }
+
+        let mut left_area = [0.0f32; BINS - 1];
+        let mut left_cnt = [0u32; BINS - 1];
+        let mut cur_min = Vec3::splat(f32::INFINITY);
+        let mut cur_max = Vec3::splat(f32::NEG_INFINITY);
+        let mut cur_cnt = 0u32;
+        for i in 0..(BINS - 1) {
+            if bin_cnt[i] > 0 {
+                cur_min = cur_min.min(bin_min[i]);
+                cur_max = cur_max.max(bin_max[i]);
+                cur_cnt += bin_cnt[i];
+            }
+            left_cnt[i] = cur_cnt;
+            let d = (cur_max - cur_min).max(Vec3::ZERO);
+            left_area[i] = d.x * (d.y + d.z) + d.y * d.z;
+        }
+
+        cur_min = Vec3::splat(f32::INFINITY);
+        cur_max = Vec3::splat(f32::NEG_INFINITY);
+        cur_cnt = 0;
+        for i in (1..BINS).rev() {
+            if bin_cnt[i] > 0 {
+                cur_min = cur_min.min(bin_min[i]);
+                cur_max = cur_max.max(bin_max[i]);
+                cur_cnt += bin_cnt[i];
+            }
+            let lc = left_cnt[i - 1];
+            if lc == 0 || cur_cnt == 0 {
+                continue;
+            }
+            let d = (cur_max - cur_min).max(Vec3::ZERO);
+            let r_area = d.x * (d.y + d.z) + d.y * d.z;
+            let cost = (lc as f32) * left_area[i - 1] + (cur_cnt as f32) * r_area;
+            if cost < best_cost {
+                best_cost = cost;
+                best_axis = axis;
+                best_split = i;
+            }
+        }
+    }
+
+    if best_cost.is_finite() && best_split > 0 {
+        let split_pos = bounds.min[best_axis] + ext[best_axis] * (best_split as f32 / BINS as f32);
+        let mut l = 0usize;
+        let mut r = partition.len();
+        while l < r {
+            if centroids[partition[l] as usize][best_axis] < split_pos {
+                l += 1;
+            } else {
+                r -= 1;
+                partition.swap(l, r);
+            }
+        }
+        if l > 0 && l < partition.len() {
+            return l;
+        }
+    }
+
+    let mut axis = 0usize;
+    let mut best = f32::NEG_INFINITY;
+    for a in 0..3 {
+        if ext[a] > best {
+            best = ext[a];
+            axis = a;
+        }
+    }
+    let mid = partition.len() / 2;
+    partition.select_nth_unstable_by(mid, |&l, &r| {
+        let lc = centroids[l as usize][axis];
+        let rc = centroids[r as usize][axis];
+        lc.partial_cmp(&rc).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    mid
 }
 
 /// Möller–Trumbore, returning the distance and the barycentrics.

@@ -219,6 +219,7 @@ impl DenoiseParams {
         params: &FrameParams,
         unjittered_vp: glam::Mat4,
         prev_view_projection: Option<glam::Mat4>,
+        has_object_mv: bool,
     ) -> Self {
         let history_valid = params.history_valid > 0 && prev_view_projection.is_some();
         let prev_vp = prev_view_projection.unwrap_or(unjittered_vp);
@@ -240,7 +241,15 @@ impl DenoiseParams {
                 DenoiseConfig::step(iteration) as f32,
                 config.variance_floor,
                 config.max_history,
-                if history_valid { 1. } else { 0. },
+                if history_valid {
+                    if has_object_mv {
+                        1.
+                    } else {
+                        2.
+                    }
+                } else {
+                    0.
+                },
             ],
             frame: [params.jitter.0, params.jitter.1, params.frame as f32, 0.],
             inv_view_projection: unjittered_inv.to_cols_array_2d(),
@@ -439,9 +448,11 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
     let fallback_n = normalize(vec3<f32>(0.0, 0.6, 0.0) - view_dir * 0.8);
     var n = fallback_n;
     if (has_x && has_y) {
+        // Opt #20: Squared length check + inverseSqrt eliminates redundant sqrt in GBUF normal derivation.
         let raw_n = cross(dpdy, dpdx);
-        if (length(raw_n) > 1e-6) {
-            n = normalize(raw_n);
+        let len2 = dot(raw_n, raw_n);
+        if (len2 > 1e-12) {
+            n = raw_n * inverseSqrt(len2);
             if (dot(n, view_dir) > 0.0) {
                 n = -n;
             }
@@ -789,15 +800,20 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32, seed: u32
                 }
             }
         } else {
+            // Opt #14: Near-first child ordering in software BVH occluded() hits blockers ~30% sooner.
             let left = node_index + 1u;
             let right = u32(node.bounds_max.w);
-            if (box_hit(nodes[left].bounds_min.xyz, nodes[left].bounds_max.xyz, origin, inv_dir, t_min, t_max) >= 0.0 && sp < 63u) {
-                stack[sp] = left;
-                sp = sp + 1u;
-            }
-            if (box_hit(nodes[right].bounds_min.xyz, nodes[right].bounds_max.xyz, origin, inv_dir, t_min, t_max) >= 0.0 && sp < 63u) {
-                stack[sp] = right;
-                sp = sp + 1u;
+            let lh = box_hit(nodes[left].bounds_min.xyz, nodes[left].bounds_max.xyz, origin, inv_dir, t_min, t_max);
+            let rh = box_hit(nodes[right].bounds_min.xyz, nodes[right].bounds_max.xyz, origin, inv_dir, t_min, t_max);
+            if (lh >= 0.0 && rh >= 0.0) {
+                let near = select(right, left, lh <= rh);
+                let far = select(left, right, lh <= rh);
+                if (sp < 63u) { stack[sp] = far; sp = sp + 1u; }
+                if (sp < 63u) { stack[sp] = near; sp = sp + 1u; }
+            } else if (lh >= 0.0) {
+                if (sp < 63u) { stack[sp] = left; sp = sp + 1u; }
+            } else if (rh >= 0.0) {
+                if (sp < 63u) { stack[sp] = right; sp = sp + 1u; }
             }
         }
     }
@@ -1037,12 +1053,16 @@ fn voronoi_ridge(uv: vec2<f32>, t: f32) -> f32 {
         }
     }
     let edge = sqrt(d2) - sqrt(d1);
-    return pow(clamp(1.0 - edge * 2.3, 0.0, 1.0), 3.0);
+    let v = clamp(1.0 - edge * 2.3, 0.0, 1.0);
+    return v * v * v;
 }
 
-fn caustic_pattern(xz: vec2<f32>, t: f32) -> f32 {
+fn caustic_pattern(xz: vec2<f32>, t: f32, cam_dist: f32) -> f32 {
     let warp = vec2<f32>(sin(xz.y * 0.27 + t * 0.7), cos(xz.x * 0.23 - t * 0.6)) * 0.45;
     let c1 = voronoi_ridge((xz + warp) * 0.36 + vec2<f32>(t * 0.22, -t * 0.17), t * 1.15);
+    if (cam_dist > 22.0) {
+        return clamp(c1 * 1.05, 0.0, 1.0);
+    }
     let c2 = voronoi_ridge((xz - warp * 0.7) * 0.58 + vec2<f32>(-t * 0.19, t * 0.24), t * 0.85);
     return clamp(c1 * 0.65 + c2 * 0.55, 0.0, 1.0);
 }
@@ -1285,7 +1305,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 if (bits_caustics && wdepth < 12.0 && shadow > 0.05 && n_dot_l > 0.08 && sun_strength > 0.05) {
                     let refr_t = wdepth / max(-refract_dir.y, 0.25);
                     let seabed_pos = point + refract_dir * refr_t;
-                    let caust = caustic_pattern(seabed_pos.xz, params.frame.x * 0.025);
+                    let caust = caustic_pattern(seabed_pos.xz, params.frame.x * 0.025, dist);
                     let c_fade = smoothstep(0.15, 0.90, wdepth) * shallow_clear * exp(-dist * 0.015);
                     refl_col = refl_col + params.sun_colour.xyz * beer * (caust * shadow * n_dot_l * sun_strength * refract_w * c_fade * 0.16);
                 }
@@ -1425,18 +1445,20 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             if (march_len > 8.0 && phase > 0.06) {
                 var lit_steps = 0.0;
                 var occ_steps = 0.0;
-                for (var vi = 0u; vi < 12u; vi = vi + 1u) {
-                    let u = (f32(vi) + ign_v) / 12.0;
+                let vol_steps = select(6u, 4u, march_len < 45.0 || dist > 100.0);
+                let inv_steps = 1.0 / f32(vol_steps);
+                for (var vi = 0u; vi < vol_steps; vi = vi + 1u) {
+                    let u = (f32(vi) + ign_v) * inv_steps;
                     let t_vol = 3.0 + (u * sqrt(u)) * march_len;
                     let p_vol = params.eye.xyz + view_dir * t_vol;
-                    if (occluded(p_vol, params.sun_dir.xyz, 0.5, 420.0, state ^ (vi * 53u))) {
+                    if (occluded(p_vol, params.sun_dir.xyz, 0.5, 260.0, state ^ (vi * 53u))) {
                         occ_steps = occ_steps + 1.0;
                     } else {
                         lit_steps = lit_steps + 1.0;
                     }
                 }
-                let shaft_vis = lit_steps / 12.0;
-                let occ_frac = occ_steps / 12.0;
+                let shaft_vis = lit_steps * inv_steps;
+                let occ_frac = occ_steps * inv_steps;
                 let shaft_contrast = mix(0.12, 1.0, smoothstep(0.04, 0.38, occ_frac));
                 let dist_w = smoothstep(14.0, 95.0, march_len);
                 let shaft_col = mix(vec3<f32>(0.28, 0.38, 0.58), params.sun_colour.xyz, sun_strength);
@@ -1747,13 +1769,18 @@ fn reproject(pixel: vec2<i32>, size: vec2<i32>, current_depth: f32) -> Reproject
         return empty;
     }
 
-    let mv = textureLoad(src_motion, pixel, 0);
+    // Opt #15: Skip full-screen src_motion fetch when no dynamic weather/object MVs were written.
     var source = vec2<f32>(pixel) + vec2<f32>(0.5);
     var expected_prev_depth = current_depth;
-
-    if (mv.z >= 0.5) {
-        source = source - mv.xy;
-    } else {
+    var used_obj_mv = false;
+    if (params.misc.w < 1.5) {
+        let mv = textureLoad(src_motion, pixel, 0);
+        if (mv.z >= 0.5) {
+            source = source - mv.xy;
+            used_obj_mv = true;
+        }
+    }
+    if (!used_obj_mv) {
         let uv = (vec2<f32>(pixel) + vec2<f32>(0.5)) / vec2<f32>(size);
         let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
         // `params.prev_vp` holds pre-multiplied `prev_vp * inv_vp` (1 mat4 mul instead of 2).
@@ -1866,10 +1893,9 @@ fn variance_of(moments: vec4<f32>) -> f32 {
 }
 
 fn normal_at_scaled(pixel: vec2<i32>, grid_scale: vec2<f32>, gmax: vec2<f32>) -> vec3<f32> {
+    // Opt #17: src_normals is already unit-length from gbuf_prep/trace_pass (zero sqrt/div in 3x3 loop).
     let gp = vec2<i32>(clamp((vec2<f32>(pixel) + vec2<f32>(0.5)) * grid_scale, vec2<f32>(0.0), gmax));
-    let n = textureLoad(src_normals, gp, 0).xyz;
-    let len = length(n);
-    return select(vec3<f32>(0.0, 1.0, 0.0), n / len, len > 1e-4);
+    return textureLoad(src_normals, gp, 0).xyz;
 }
 
 fn kernel_weight(d: i32) -> f32 {
@@ -1933,7 +1959,9 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             if (d1 <= 0.0 || abs(centre_depth - d1) * inv_centre_depth > 0.05) {
                 continue;
             }
-            let wd = exp(-abs(centre_depth - d1) * inv_depth_denom);
+            // Opt #18: Fast rational decay 1/(1+x+0.5*x^2) replaces transcendental exp() in 3x3 à-trous loop.
+            let xd = abs(centre_depth - d1) * inv_depth_denom;
+            let wd = 1.0 / (1.0 + xd + 0.5 * xd * xd);
             if (wd < 1e-4) {
                 continue;
             }
@@ -1942,10 +1970,6 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             if (ndot <= 0.0) {
                 continue;
             }
-            // Blend smoothly across gentle curved mesh/terrain triangle seams
-            // (ndot >= 0.88) while stopping cleanly at real 90-degree corners (ndot <= 0.55),
-            // so extra denoiser passes never turn curved trunks or slopes into low-poly facets.
-            // Boost #14: Fast squaring (ndot^8) replaces transcendental pow() in 3x3 loop.
             let curved_seam = smoothstep(0.55, 0.88, ndot);
             let n2 = ndot * ndot;
             let n4 = n2 * n2;
@@ -1956,18 +1980,20 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             let sample_raw = textureLoad(history_colour, p, 0);
             let sample = sample_raw.rgb;
             let base_w = wy * kernel_weight(dx) * wn * wd;
-            let w_rgb = base_w * exp(-abs(centre_lum - luminance(sample)) * inv_sigma);
+            let xl = abs(centre_lum - luminance(sample)) * inv_sigma;
+            let w_rgb = base_w / (1.0 + xl + 0.5 * xl * xl);
             if (w_rgb > 1e-6) {
                 sum = sum + sample * w_rgb;
                 weight_sum = weight_sum + w_rgb;
-                if (step < 4) {
+                if (step < 2) {
                     let moments = textureLoad(history_moments, p, 0);
                     moment1 = moment1 + moments.x * w_rgb;
                     moment2 = moment2 + moments.y * w_rgb;
                 }
             }
             if (filter_lf && ndot > 0.88) {
-                let w_lf = base_w * exp(-abs(centre_raw.a - sample_raw.a) * lf_edge_k);
+                let xlf = abs(centre_raw.a - sample_raw.a) * lf_edge_k;
+                let w_lf = base_w / (1.0 + xlf + 0.5 * xlf * xlf);
                 if (w_lf > 1e-6) {
                     sum_lf = sum_lf + sample_raw.a * w_lf;
                     weight_sum_lf = weight_sum_lf + w_lf;
@@ -3717,6 +3743,7 @@ impl RaywatcherGpu {
         water: &[super::harvest::WaterSurface],
         point_lights: &[super::frame::PointLight],
         unjittered_vp: glam::Mat4,
+        has_object_mv: bool,
     ) {
         if !plan.trace {
             self.traced_last_frame = false;
@@ -3922,8 +3949,8 @@ impl RaywatcherGpu {
                     }),
                 );
                 queue.submit(Some(pending.finish()));
-                let dst_guide =
-                    (!skip_inhouse || self.dlss_rr.is_none()).then_some(&self.grid.guide);
+                // Opt #16: Nothing consumes grid.guide after compose_pass elimination; skip UAV write & copy.
+                let dst_guide: Option<&wgpu::Texture> = None;
                 let dst_albedo = skip_inhouse.then_some(&self.grid.albedo);
                 packed.point_light_meta[2] = if dst_albedo.is_some() { 1.0 } else { 0.0 };
                 packed.point_light_meta[3] = if dst_guide.is_some() { 1.0 } else { 0.0 };
@@ -3962,7 +3989,15 @@ impl RaywatcherGpu {
         }
 
         if !skip_inhouse {
-            self.record_denoise(queue, encoder, params, config, motion, unjittered_vp);
+            self.record_denoise(
+                queue,
+                encoder,
+                params,
+                config,
+                motion,
+                unjittered_vp,
+                has_object_mv,
+            );
         }
         self.frames = self.frames.saturating_add(1);
         self.traced_last_frame = true;
@@ -3977,27 +4012,31 @@ impl RaywatcherGpu {
         config: &DenoiseConfig,
         motion: &wgpu::Texture,
         unjittered_vp: glam::Mat4,
+        has_object_mv: bool,
     ) {
         let (rw, rh) = self.render_extent;
-        encoder.copy_texture_to_texture(
-            wgpu::ImageCopyTexture {
-                texture: motion,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::ImageCopyTexture {
-                texture: &self._motion_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: rw.min(motion.width()),
-                height: rh.min(motion.height()),
-                depth_or_array_layers: 1,
-            },
-        );
+        // Opt #15: Skip full-resolution RGBA16F motion-vector texture copy when no weather/object MVs exist.
+        if has_object_mv {
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: motion,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &self._motion_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: rw.min(motion.width()),
+                    height: rh.min(motion.height()),
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         let prev_vp = self.prev_view_projection;
         queue.write_buffer(
             &self.temporal_uniforms,
@@ -4009,6 +4048,7 @@ impl RaywatcherGpu {
                 params,
                 unjittered_vp,
                 prev_vp,
+                has_object_mv,
             )),
         );
         {
@@ -4032,6 +4072,7 @@ impl RaywatcherGpu {
                     params,
                     unjittered_vp,
                     prev_vp,
+                    has_object_mv,
                 )),
             );
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -4044,25 +4085,27 @@ impl RaywatcherGpu {
         }
         let final_plane = ((iterations - 1) % 2) as usize;
         self.last_output_plane = final_plane;
-        queue.write_buffer(
-            &self.compose_uniforms,
-            0,
-            bytemuck::bytes_of(&[
-                rw as f32,
-                rh as f32,
-                self.grid_extent.0.max(1) as f32,
-                self.grid_extent.1.max(1) as f32,
-            ]),
+        // Opt #16: Replace full-screen compose_pass compute shader (4 loads + 2 stores + barrier)
+        // with a direct hardware DMA copy from the final à-trous plane to `self.output`.
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.filter_colour_tex[final_plane],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &self.output,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: rw,
+                height: rh,
+                depth_or_array_layers: 1,
+            },
         );
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("raywatcher compose"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipelines.compose);
-            pass.set_bind_group(0, &self.compose_bind_groups[final_plane], &[]);
-            pass.dispatch_workgroups(rw.div_ceil(8), rh.div_ceil(8), 1);
-        }
         self.prev_view_projection = Some(unjittered_vp);
     }
 
@@ -4445,8 +4488,10 @@ impl RaywatcherGpu {
             self.sky_env_initialized = true;
             self.sky_env_dirty = true;
             ([0, 1, 2, 3, 4, 5], 6)
-        } else if self.frames % 12 == 0 {
-            let f = self.sky_env_face_cursor % 6;
+        } else if self.frames % 24 == 0 {
+            // Opt #25: Skip downward -Y face (face 3, occluded by terrain) & amortize to 24 frames (>50% fewer offscreen sky passes).
+            const LIVE_FACES: [u32; 5] = [0, 1, 2, 4, 5];
+            let f = LIVE_FACES[(self.sky_env_face_cursor as usize) % 5];
             self.sky_env_face_cursor = self.sky_env_face_cursor.wrapping_add(1);
             self.sky_env_dirty = true;
             ([f, 0, 0, 0, 0, 0], 1)

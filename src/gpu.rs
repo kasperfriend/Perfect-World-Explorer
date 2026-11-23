@@ -4337,8 +4337,9 @@ impl Renderer {
                 // Reserve up to 24 slots for static/dynamic point lights and leave 24..48
                 // slots for active world effects (Archosaur ring beams, wandering lights,
                 // dungeon entry circles, portals, torches, and 3D effect models).
-                point_lights.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                // Opt #29: O(N) partial selection when > 48 lights (avoids full O(N log N) sort).
                 if point_lights.len() > 48 {
+                    point_lights.select_nth_unstable_by(48, |a, b| a.0.total_cmp(&b.0));
                     point_lights.truncate(48);
                 }
                 let eff_slots = 128usize.saturating_sub(point_lights.len());
@@ -4571,6 +4572,7 @@ impl Renderer {
             &active_water,
             &active_point_lights,
             unjittered_vp,
+            camera.weather_override != crate::client_weather::WeatherOverride::Clear,
         );
         let mut dlss_rr_ran = false;
         if plan.reconstruction
@@ -4613,6 +4615,7 @@ impl Renderer {
                         &denoise,
                         &self.object_mv,
                         unjittered_vp,
+                        camera.weather_override != crate::client_weather::WeatherOverride::Clear,
                     );
                 }
                 let rr_err = gpu.dlss_rr_error().map(str::to_string);

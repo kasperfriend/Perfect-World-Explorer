@@ -292,28 +292,48 @@ fn fs(i: VOut) -> FOut {
     let rcoord = vec2<i32>(clamp(i.uv * rdim, vec2<f32>(0.0), rdim - vec2<f32>(1.0)));
     let raster_rgb = textureLoad(src_raster, rcoord, 0).rgb;
 
-    // Sky pixels pass through 100% untouched so bilinear filtering never bleeds
-    // rooftop GI or shadow edges onto sky/clouds in DLSS Ray Reconstruction.
+    // Compute exact full-screen camera + object motion vectors for BOTH sky/clouds
+    // (`d <= 1e-6`) and world geometry so DLSS RR never ghosts rotating clouds or
+    // smears buildings during camera motion / upscaler jitter.
+    var mv_px = vec2<f32>(0.0);
+    let obj_mv = textureLoad(src_object_mv, dcoord, 0);
+    if (obj_mv.z > 0.5) {
+        mv_px = obj_mv.xy;
+    } else if (prep_u.flags.z > 0.5) {
+        let uv_c = (vec2<f32>(dcoord) + vec2<f32>(0.5)) / depth_dim;
+        let ndc = vec2<f32>(uv_c.x * 2.0 - 1.0, 1.0 - uv_c.y * 2.0);
+        let z_reproj = select(d, 0.0, d <= 1e-6);
+        let prev_clip = prep_u.prev_vp_inv_vp * vec4<f32>(ndc, z_reproj, 1.0);
+        if (abs(prev_clip.w) > 1e-5) {
+            let prev_ndc = prev_clip.xyz / prev_clip.w;
+            let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+            mv_px = (prev_uv - uv_c) * depth_dim;
+        }
+    }
+
+    // Sky pixels pass through 100% untouched (with exact sky-dome motion vectors)
+    // so clouds never ghost and rooftop GI never bleeds onto sky in DLSS RR.
     var out: FOut;
     if (d <= 1e-6) {
         out.color = vec4<f32>(raster_rgb, 1.0);
-        out.depth = d;
+        out.depth = 0.0;
         out.normals = vec4<f32>(0.0, 1.0, 0.0, 1.0);
         out.diffuse_albedo = vec4<f32>(0.0, 0.0, 0.0, 1.0);
         out.specular_albedo = vec4<f32>(0.0, 0.0, 0.0, 1.0);
         out.hit_distance = 1.0;
-        out.motion = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        out.motion = vec4<f32>(mv_px, 0.0, 0.0);
         return out;
     }
 
     // Nearest texel fetch on ray-grid buffers prevents GI irradiance, shadow
     // light-factor, and surface normals from smearing across building silhouettes.
+    // Opt #19: Removed redundant unused `src_albedo` load and dummy bilinear sample
+    // (saves 2 full-screen RGBA16F texture fetches per pixel in DLSS RR prep).
     let gdim = vec2<f32>(textureDimensions(src_colour));
     let gcoord = vec2<i32>(clamp(i.uv * gdim, vec2<f32>(0.0), gdim - vec2<f32>(1.0)));
     let c = textureLoad(src_colour, gcoord, 0);
     let r = textureLoad(src_reflection, gcoord, 0);
     let n = textureLoad(src_normals, gcoord, 0);
-    let a = textureLoad(src_albedo, gcoord, 0);
 
     let layered = prep_u.flags.x > 0.5;
     let scene_gain = clamp(prep_u.flags.y, 1.0, 9.0);
@@ -322,33 +342,13 @@ fn fs(i: VOut) -> FOut {
     let modulated_gi = select(full_albedo * c.rgb, c.rgb, is_water);
     let base_rgb = select(c.rgb, max(raster_rgb * clamp(c.a, 0.0, 1.0) + modulated_gi, vec3<f32>(0.0)), layered);
     out.color = vec4<f32>(max(base_rgb + r.rgb, vec3<f32>(0.0)), 1.0);
-    let n_len = length(n.xyz);
-    let unit_n = select(vec3<f32>(0.0, 1.0, 0.0), n.xyz / n_len, n_len > 1e-4);
     let rough = clamp(n.w, 0.02, 1.0);
     out.depth = d;
-    out.normals = vec4<f32>(unit_n, rough);
+    out.normals = vec4<f32>(n.xyz, rough);
     out.diffuse_albedo = vec4<f32>(full_albedo, 1.0);
     let spec_f0 = select(select(0.02, 0.06, rough <= 0.36), 0.18, is_water);
     out.specular_albedo = vec4<f32>(spec_f0, spec_f0, spec_f0, 1.0);
     out.hit_distance = r.a;
-    let _keep_samp = textureSampleLevel(src_albedo, lin_samp, i.uv, 0.0).a * 0.0;
-    out.specular_albedo.w = 1.0 + _keep_samp;
-    // Full-screen camera + object motion vectors (`(prev_uv - uv) * size`) so DLSS RR
-    // never smears buildings during camera motion or upscaler jitter.
-    var mv_px = vec2<f32>(0.0);
-    let obj_mv = textureLoad(src_object_mv, dcoord, 0);
-    if (obj_mv.z > 0.5) {
-        mv_px = obj_mv.xy;
-    } else if (prep_u.flags.z > 0.5) {
-        let uv_c = (vec2<f32>(dcoord) + vec2<f32>(0.5)) / depth_dim;
-        let ndc = vec2<f32>(uv_c.x * 2.0 - 1.0, 1.0 - uv_c.y * 2.0);
-        let prev_clip = prep_u.prev_vp_inv_vp * vec4<f32>(ndc, d, 1.0);
-        if (abs(prev_clip.w) > 1e-5) {
-            let prev_ndc = prev_clip.xyz / prev_clip.w;
-            let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
-            mv_px = (prev_uv - uv_c) * depth_dim;
-        }
-    }
     out.motion = vec4<f32>(mv_px, 0.0, 0.0);
     return out;
 }

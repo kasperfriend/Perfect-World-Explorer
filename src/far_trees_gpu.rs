@@ -1365,6 +1365,8 @@ impl FarTrees {
         tri_budget: usize,
         out: &mut Vec<RtTreeTriangle>,
     ) -> (usize, usize, usize) {
+        // Opt #30: Pre-allocate RT tree triangle staging Vec to eliminate multi-MB reallocs during harvest.
+        out.reserve(tri_budget.min(65_536));
         harvest_rt_tree_species(&self.rt_species, eye, max_dist, lod_scale, tri_budget, out)
     }
 

@@ -698,6 +698,10 @@ mod imp {
         /// updated and queried by hardware RT cores for low-noise multi-bounce GI.
         radiance_cache: RawBuffer,
         targets: DxrTargets,
+        /// Opt #22: Reusable grow-only DXR AS scratch buffer (avoids per-rebuild WDDM allocs).
+        reusable_scratch: Option<(u64, RawBuffer)>,
+        /// Opt #22: Reusable persistent TLAS instance descriptor upload buffer.
+        reusable_instance_desc: Option<RawBuffer>,
     }
 
     // Descriptor heap slots:
@@ -762,8 +766,17 @@ mod imp {
                 Ok::<RawBuffer, String>(buf)
             };
             let cbvs = [mk_cbv()?, mk_cbv()?, mk_cbv()?];
-            let (dxr_scene, staging, build_fence) =
-                Self::build_scene(dev_ptr, device5_guard.0, &mut ring, &raw_queue, scene)?;
+            let mut reusable_scratch: Option<(u64, RawBuffer)> = None;
+            let mut reusable_instance_desc: Option<RawBuffer> = None;
+            let (dxr_scene, staging, build_fence) = Self::build_scene(
+                dev_ptr,
+                device5_guard.0,
+                &mut ring,
+                &raw_queue,
+                scene,
+                &mut reusable_scratch,
+                &mut reusable_instance_desc,
+            )?;
             let radiance_cache = unsafe {
                 RawBuffer::create(
                     dev_ptr,
@@ -790,6 +803,8 @@ mod imp {
                 retired_buffers: vec![(build_fence, staging)],
                 radiance_cache,
                 targets,
+                reusable_scratch,
+                reusable_instance_desc,
             };
             tracer.write_scene_descriptors();
             tracer.write_target_descriptors();
@@ -934,6 +949,8 @@ mod imp {
             ring: &mut NativeCommandRing,
             raw_queue: &d3d12::CommandQueue,
             scene: &Arc<SceneGeometry>,
+            reusable_scratch: &mut Option<(u64, RawBuffer)>,
+            reusable_instance_desc: &mut Option<RawBuffer>,
         ) -> Result<(DxrScene, Vec<RawBuffer>, u64), String> {
             // Ensure at least 1 degenerate triangle so BLAS/TLAS build always
             // succeeds even on an empty scene.
@@ -1126,18 +1143,24 @@ mod imp {
                     hit_group_and_flags: 0,
                     acceleration_structure: blas.gpu_va,
                 };
-                let instance_desc = RawBuffer::create(
-                    dev_ptr,
-                    size_of::<InstanceDesc>() as u64,
-                    d12::D3D12_HEAP_TYPE_UPLOAD,
-                    d12::D3D12_RESOURCE_FLAG_NONE,
-                    d12::D3D12_RESOURCE_STATE_GENERIC_READ,
-                )?;
+                // Opt #22: Reuse persistent mapped instance_desc upload buffer across rebuilds.
+                if reusable_instance_desc.is_none() {
+                    let mut buf = RawBuffer::create(
+                        dev_ptr,
+                        size_of::<InstanceDesc>() as u64,
+                        d12::D3D12_HEAP_TYPE_UPLOAD,
+                        d12::D3D12_RESOURCE_FLAG_NONE,
+                        d12::D3D12_RESOURCE_STATE_GENERIC_READ,
+                    )?;
+                    buf.map_persistent()?;
+                    *reusable_instance_desc = Some(buf);
+                }
+                let instance_desc_ref = reusable_instance_desc.as_ref().unwrap();
                 let inst_bytes = std::slice::from_raw_parts(
                     &instance as *const InstanceDesc as *const u8,
                     size_of::<InstanceDesc>(),
                 );
-                instance_desc.write_upload(inst_bytes)?;
+                instance_desc_ref.write_upload(inst_bytes)?;
 
                 let tlas_inputs = BuildAsInputs {
                     ty: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
@@ -1145,7 +1168,7 @@ mod imp {
                     num_descs: 1,
                     descs_layout: D3D12_ELEMENTS_LAYOUT_ARRAY,
                     u: BuildInputsUnion {
-                        instance_descs: instance_desc.gpu_va,
+                        instance_descs: instance_desc_ref.gpu_va,
                     },
                 };
                 let tlas_info = device5_get_prebuild_info(device5, &tlas_inputs);
@@ -1168,13 +1191,26 @@ mod imp {
                         .scratch_data_size_in_bytes
                         .max(tlas_info.scratch_data_size_in_bytes),
                 );
-                let scratch = RawBuffer::create(
-                    dev_ptr,
-                    scratch_size,
-                    d12::D3D12_HEAP_TYPE_DEFAULT,
-                    d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                    d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )?;
+                let mut staging = vec![vertices, tris_upload, mats_upload];
+                // Opt #22: Reuse grow-only persistent scratch buffer across rebuilds (zero WDDM alloc).
+                let need_new_scratch = reusable_scratch
+                    .as_ref()
+                    .is_none_or(|(cap, _)| *cap < scratch_size);
+                if need_new_scratch {
+                    if let Some((_, old_scratch)) = reusable_scratch.take() {
+                        staging.push(old_scratch);
+                    }
+                    let new_cap = align256(scratch_size + (scratch_size / 4));
+                    let buf = RawBuffer::create(
+                        dev_ptr,
+                        new_cap,
+                        d12::D3D12_HEAP_TYPE_DEFAULT,
+                        d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )?;
+                    *reusable_scratch = Some((new_cap, buf));
+                }
+                let scratch_gpu_va = reusable_scratch.as_ref().unwrap().1.gpu_va;
 
                 // Record and submit BLAS + TLAS build on ID3D12GraphicsCommandList4.
                 let slot_idx = ring.acquire("DXR-AS")?;
@@ -1185,11 +1221,23 @@ mod imp {
                 )
                 .map_err(|hr| format!("ID3D12GraphicsCommandList4 unavailable (0x{hr:08x})"))?;
 
+                // Opt #23: Enqueue DMA buffer copies BEFORE BLAS build so GPU copy/compute engines
+                // overlap vertex/material transfers with RT-core BVH construction, and merge all
+                // post-build UAV + Transition barriers into a single ResourceBarrier call.
+                (*list_ptr).CopyBufferRegion(tris.resource, 0, staging[1].resource, 0, tris_bytes);
+                (*list_ptr).CopyBufferRegion(
+                    materials.resource,
+                    0,
+                    staging[2].resource,
+                    0,
+                    mats_bytes,
+                );
+
                 let blas_desc = BuildAsDesc {
                     dest_as_data: blas.gpu_va,
                     inputs: blas_inputs,
                     source_as_data: 0,
-                    scratch_as_data: scratch.gpu_va,
+                    scratch_as_data: scratch_gpu_va,
                 };
                 cmdlist4_build_as(list4, &blas_desc);
 
@@ -1203,25 +1251,14 @@ mod imp {
                     dest_as_data: tlas.gpu_va,
                     inputs: tlas_inputs,
                     source_as_data: 0,
-                    scratch_as_data: scratch.gpu_va,
+                    scratch_as_data: scratch_gpu_va,
                 };
                 cmdlist4_build_as(list4, &tlas_desc);
 
-                uav_barrier.u.UAV_mut().pResource = tlas.resource;
-                (*list_ptr).ResourceBarrier(1, &uav_barrier);
-
-                // Copy triangles & materials into high-bandwidth DEFAULT VRAM
-                // and transition them to NON_PIXEL_SHADER_RESOURCE.
-                (*list_ptr).CopyBufferRegion(tris.resource, 0, tris_upload.resource, 0, tris_bytes);
-                (*list_ptr).CopyBufferRegion(
-                    materials.resource,
-                    0,
-                    mats_upload.resource,
-                    0,
-                    mats_bytes,
-                );
-                let mut copy_barriers: [d12::D3D12_RESOURCE_BARRIER; 2] = zeroed();
-                for (b, res) in copy_barriers
+                let mut final_barriers: [d12::D3D12_RESOURCE_BARRIER; 3] = zeroed();
+                final_barriers[0].Type = d12::D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                final_barriers[0].u.UAV_mut().pResource = tlas.resource;
+                for (b, res) in final_barriers[1..]
                     .iter_mut()
                     .zip([tris.resource, materials.resource])
                 {
@@ -1233,15 +1270,11 @@ mod imp {
                         StateAfter: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                     };
                 }
-                (*list_ptr).ResourceBarrier(2, copy_barriers.as_ptr());
+                (*list_ptr).ResourceBarrier(3, final_barriers.as_ptr());
 
                 com_release(list4);
                 ring.retire(slot_idx, raw_queue, "DXR-AS")?;
                 let build_fence = ring.current_fence();
-
-                // Keep staging/upload/scratch alive until the GPU passes `build_fence`
-                // instead of stalling the frame thread with `ring.wait_idle()`.
-                let staging = vec![vertices, tris_upload, mats_upload, instance_desc, scratch];
 
                 Ok((
                     DxrScene {
@@ -1471,6 +1504,10 @@ mod imp {
         }
 
         fn gc_retired(&mut self) {
+            // Opt #24: Skip DX12 ID3D12Fence::GetCompletedValue COM call when no retired resources exist.
+            if self.retired_buffers.is_empty() && self.retired_scenes.is_empty() {
+                return;
+            }
             let done = self.ring.completed_fence();
             self.retired_buffers.retain(|(f, _)| *f > done);
             self.retired_scenes.retain(|(f, _)| *f > done);
@@ -1485,6 +1522,8 @@ mod imp {
                 &mut self.ring,
                 &self.raw_queue,
                 scene,
+                &mut self.reusable_scratch,
+                &mut self.reusable_instance_desc,
             )?;
             let old_scene = std::mem::replace(&mut self.scene, new_scene);
             self.retired_scenes.push((prev_fence, old_scene));
@@ -1592,7 +1631,7 @@ mod imp {
                 (*list).SetComputeRootConstantBufferView(0, self.cbvs[slot_idx].gpu_va);
                 (*list).SetComputeRootDescriptorTable(1, self.gpu_handle(0));
                 (*list).SetComputeRootDescriptorTable(2, self.gpu_handle(8));
-                (*list).Dispatch(w.div_ceil(8), h.div_ceil(4), 1);
+                (*list).Dispatch(w.div_ceil(8), h.div_ceil(8), 1); // Opt #13: 8x8 threadgroup
 
                 let mut post_barriers: [d12::D3D12_RESOURCE_BARRIER; 10] = zeroed();
                 let mut post_count = 0usize;
