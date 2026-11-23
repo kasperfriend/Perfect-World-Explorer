@@ -83,7 +83,8 @@ pub fn decode(bytes: &[u8]) -> (String, bool) {
 /// Split the container into `Key: value` fields. The first colon separates the
 /// key, so values may contain colons and commas; blank lines carry no field.
 pub fn tokenize(source: &str) -> Vec<Field> {
-    let mut fields = Vec::new();
+    let mut fields = Vec::with_capacity(source.len() / 24);
+    let mut seen_element = false;
     for line in source.lines() {
         let line = line.trim_end_matches('\r');
         let Some((key, value)) = line.split_once(':') else {
@@ -97,7 +98,7 @@ pub fn tokenize(source: &str) -> Vec<Field> {
             // Only inside an element can a bare row be a grid vertex; anything
             // before the first `GFXELEMENTID` is a malformed container and must
             // still be reported as one.
-            if !row.is_empty() && fields.iter().any(|(key, _)| key == "GFXELEMENTID") {
+            if !row.is_empty() && seen_element {
                 fields.push((GRID_VERTEX.to_string(), row.to_string()));
             }
             continue;
@@ -105,6 +106,9 @@ pub fn tokenize(source: &str) -> Vec<Field> {
         let key = key.trim();
         if key.is_empty() {
             continue;
+        }
+        if key == "GFXELEMENTID" {
+            seen_element = true;
         }
         fields.push((key.to_string(), value.trim().to_string()));
     }
@@ -1344,6 +1348,7 @@ pub fn parse(source: &str) -> Result<Root, String> {
     if count < 0 || count > 4096 {
         return Err(format!("GFX element count {count} is out of range"));
     }
+    root.elements.reserve(count as usize);
     for index in 0..count {
         let id = clamp_u32(reader.integer("GFXELEMENTID")?);
         let element = element(&mut reader, id, version)
@@ -1370,16 +1375,19 @@ fn element(reader: &mut Reader, id: u32, version: u32) -> Result<Element, String
     // client writes its shared keys before the class payload, but 493 distinct
     // orders exist for element 100 alone because each optional key is version
     // gated, so the block is split by key rather than read as two runs.
-    let mut block: Vec<Field> = Vec::new();
+    let mut shared: Vec<Field> = Vec::with_capacity(24);
+    let mut spec_fields: Vec<Field> = Vec::with_capacity(24);
     while let Some(key) = reader.peek() {
         if SPEC_TERMINATORS.contains(&key) || key == "CtrlType" {
             break;
         }
-        block.push(reader.raw()?);
+        let field = reader.raw()?;
+        if SHARED_KEYS.contains(&field.0.as_str()) {
+            shared.push(field);
+        } else {
+            spec_fields.push(field);
+        }
     }
-    let (shared, spec_fields): (Vec<Field>, Vec<Field>) = block
-        .into_iter()
-        .partition(|(key, _)| SHARED_KEYS.contains(&key.as_str()));
     let common = common(&shared, id, version)?;
     let payload = spec(id, &spec_fields, version)?;
     let mut affectors = Vec::new();
@@ -1395,6 +1403,7 @@ fn element(reader: &mut Reader, id: u32, version: u32) -> Result<Element, String
         if count < 0 || count > 64 {
             return Err(format!("affector count {count} is out of range"));
         }
+        affectors.reserve(count as usize);
         for _ in 0..count {
             affectors.push(control(reader)?);
         }
@@ -1406,6 +1415,7 @@ fn element(reader: &mut Reader, id: u32, version: u32) -> Result<Element, String
         if count < 0 || count > 256 {
             return Err(format!("keypoint count {count} is out of range"));
         }
+        keypoints.reserve(count as usize);
         for _ in 0..count {
             keypoints.push(keypoint(reader)?);
         }
@@ -1722,8 +1732,9 @@ fn spec(id: u32, fields: &[Field], version: u32) -> Result<Spec, String> {
         }),
         180 => Spec::Wave(Wave {
             positions: {
-                let mut points = Vec::new();
-                for value in lookup.all("Pos") {
+                let raw = lookup.all("Pos");
+                let mut points = Vec::with_capacity(raw.len());
+                for value in raw {
                     let parts = components("Pos", value)?;
                     if parts.len() != 3 {
                         return Err("wave Pos needs three components".into());
@@ -1734,8 +1745,9 @@ fn spec(id: u32, fields: &[Field], version: u32) -> Result<Spec, String> {
             },
             segment_life: lookup.number("SegLife", 0.)?,
             amplitudes: {
-                let mut values = Vec::new();
-                for value in lookup.all("Amp") {
+                let raw = lookup.all("Amp");
+                let mut values = Vec::with_capacity(raw.len());
+                for value in raw {
                     values.push(float("Amp", value)?);
                 }
                 values
@@ -1743,8 +1755,9 @@ fn spec(id: u32, fields: &[Field], version: u32) -> Result<Spec, String> {
             bind: lookup.integer("Bind", 0)? as i32,
             enable_material: lookup.flag("EnableMat", false)?,
             enable_positions: {
-                let mut values = Vec::new();
-                for value in lookup.all("EnablePos") {
+                let raw = lookup.all("EnablePos");
+                let mut values = Vec::with_capacity(raw.len());
+                for value in raw {
                     values.push(boolean("EnablePos", value)?);
                 }
                 values

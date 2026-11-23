@@ -251,7 +251,7 @@ pub fn parse(text: &str) -> Result<Vec<Definition>, String> {
     let mut expected = None;
     let mut elements = 0;
     let mut current = None;
-    let mut fields = Vec::new();
+    let mut fields = Vec::with_capacity(32);
     let mut definitions = Vec::new();
     for line in lines {
         let Some((key, value)) = line.split_once(':') else {
@@ -267,6 +267,7 @@ pub fn parse(text: &str) -> Result<Vec<Definition>, String> {
             if n > 100000 {
                 return Err("excessive GFX element count".into());
             }
+            definitions.reserve(n.min(64));
             expected = Some(n);
         } else if key == "GFXELEMENTID" {
             elements += 1;

@@ -1976,7 +1976,8 @@ impl Player {
         let mut rng = self.rng;
         rng.next_u32();
         let mut stats = Stats::default();
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.quads);
+        out.clear();
 
         // The parent basis is normalized exactly like the verified static decal
         // path, so a non-uniform placement cannot shear the billboards. A
@@ -2007,7 +2008,12 @@ impl Player {
         // The owner's ground pass runs once per frame, before any element asks
         // for a frame (`0x6e53f0` is the owner's tick, `0x6fa7c0` is called from
         // the corner builder later in the same frame).
-        let frames = ground.and_then(|hit| self.ground_frames(hit, transform, base));
+        let pre_norm = if !self.root.face_to_viewer && !self.root.no_change_dir {
+            Some(orientation)
+        } else {
+            None
+        };
+        let frames = ground.and_then(|hit| self.ground_frames(hit, transform, base, pre_norm));
         // `A3DDecalEx::Fill_Verts_3D` takes its ground branch only for an owner
         // that was placed with ground data and sits within
         // `GROUND_NEAR_DISTANCE` of the surface (`m_pGfx->IsCloseToGrnd() &&
@@ -2073,16 +2079,17 @@ impl Player {
                 continue;
             }
             let element = &self.root.elements[index];
-            // Models are stored in element order, skipping the elements that are
-            // not models, so find this element's turn by counting earlier models.
-            let model_slot = self.root.elements[..index]
-                .iter()
-                .filter(|element| matches!(element.spec, Spec::Model(_)))
-                .count();
             // The instance owns this element's action clock, so the frame is
-            // posed per tick instead of once at load.
+            // posed per tick instead of once at load. Only scan earlier elements
+            // for the model slot when this element actually is a Spec::Model.
             let model_instance = match self.root.elements[index].spec {
-                Spec::Model(_) => self.models.get_mut(model_slot),
+                Spec::Model(_) => {
+                    let model_slot = self.root.elements[..index]
+                        .iter()
+                        .filter(|element| matches!(element.spec, Spec::Model(_)))
+                        .count();
+                    self.models.get_mut(model_slot)
+                }
                 _ => None,
             };
             let runtime = &mut self.elements[slot];
@@ -2111,7 +2118,7 @@ impl Player {
         // millisecond tick rather than any element's, which is why it sits after
         // the element loop: `0x6e4b7d` is called once per root update and reads
         // root+0x1cc directly.
-        let distance = (view.position - base.transform_point3(Vec3::ZERO)).length();
+        let distance = (view.position - origin).length();
         self.shake_offset = camera_shake_frame(
             &self.root,
             &mut self.shake,
@@ -2174,7 +2181,13 @@ impl Player {
     /// the near-ground byte at owner+0x284 and the two frames `0x6fa7c0` chooses
     /// between. The frames carry the same scale `base` does, so matching the
     /// ground can move and tilt an effect but never resize it.
-    fn ground_frames(&self, hit: GroundHit, transform: Mat4, base: Mat4) -> Option<GroundFrames> {
+    fn ground_frames(
+        &self,
+        hit: GroundHit,
+        transform: Mat4,
+        base: Mat4,
+        pre_norm: Option<Mat4>,
+    ) -> Option<GroundFrames> {
         if !hit.height.is_finite() || !hit.normal.is_finite() {
             return None;
         }
@@ -2183,7 +2196,8 @@ impl Player {
         // m_fGroundHeight) < _match_grnd_max_delta`, the 0.2 at :254. Absolute,
         // so an owner far below the surface is not close to it either.
         let near_ground = (origin.y - hit.height).abs() < GROUND_NEAR_DISTANCE;
-        let own = Quat::from_mat4(&normalize_basis(transform));
+        let norm_mat = pre_norm.unwrap_or_else(|| normalize_basis(transform));
+        let own = Quat::from_mat4(&norm_mat);
         let scale = Mat4::from_scale(Vec3::splat(base.x_axis.length()));
         // 0x6e5540..0x6e556e: the ground frame's translation is (pos.x, the
         // raycast height, pos.z).
@@ -3480,7 +3494,10 @@ pub fn texture_path(texture: &str) -> Result<String, String> {
     if path.is_empty() || !is_safe(&path) {
         return Err(format!("unsafe GFX texture path: {texture}"));
     }
-    Ok(format!("gfx/textures/{path}"))
+    let mut out = String::with_capacity(13 + path.len());
+    out.push_str("gfx/textures/");
+    out.push_str(&path);
+    Ok(out)
 }
 
 /// Archive path of a child root (`GfxPath`), relative to the `gfx` root.
@@ -3492,7 +3509,10 @@ pub fn child_path(path: &str) -> Result<String, String> {
     Ok(if normalized.starts_with("gfx/") {
         normalized
     } else {
-        format!("gfx/{normalized}")
+        let mut out = String::with_capacity(4 + normalized.len());
+        out.push_str("gfx/");
+        out.push_str(&normalized);
+        out
     })
 }
 
@@ -4727,22 +4747,23 @@ fn quad_corners(
             // same angle *down*, which is exactly the "sun rays point in random
             // directions" the field report describes.
             let client = context.placement.z_axis.truncate().normalize_or_zero();
-            // `parent` is the placement with the keypoint taken back out, i.e.
-            // the owner's own `GetParentDir`.
-            let parent = context.placement * Mat4::from_quat(keypoint.inverse());
             let dir = match context.shaft {
                 EffectShaft::Client => client,
                 // The root's own direction, whatever the .gfx keypoint adds on
                 // top of it: what the ecwld record asked for on its own.
-                EffectShaft::RootDir => parent.z_axis.truncate().normalize_or_zero(),
+                EffectShaft::RootDir => {
+                    let parent = context.placement * Mat4::from_quat(keypoint.inverse());
+                    parent.z_axis.truncate().normalize_or_zero()
+                }
                 EffectShaft::WorldUp => Vec3::Y,
                 // The client axis with its rise removed, so a shaft that should
                 // sweep across the ground stays in the ground plane.
                 EffectShaft::Horizontal => {
                     let flat = Vec3::new(client.x, 0., client.z);
-                    if flat.length() > 1e-4 {
+                    if flat.length_squared() > 1e-8 {
                         flat.normalize()
                     } else {
+                        let parent = context.placement * Mat4::from_quat(keypoint.inverse());
                         let root = parent.z_axis.truncate();
                         Vec3::new(root.x, 0., root.z).normalize_or_zero()
                     }
@@ -5217,24 +5238,22 @@ fn emit_cylinder(cylinder: &Cylinder, context: &ElementContext, out: &mut Vec<Ef
     let matrix = context.element_matrix(Vec3::Y);
     let uv = flipbook_uv(context.common, context.clock);
     let mut positions = [[0f32; 3]; 4];
+    let inv_sections = 1.0 / sections as f32;
+    let angle_step = std::f32::consts::TAU * inv_sections;
+    let u_start = uv[0][0];
+    let u_span = uv[1][0] - uv[0][0];
+    let (v_low, v_high) = (uv[2][1], uv[0][1]);
+    let top_y = base_y + height;
+    let (mut s0, mut c0) = (0.0f32, 1.0f32);
     for index in 0..sections {
-        let a0 = index as f32 / sections as f32 * std::f32::consts::TAU;
-        let a1 = (index + 1) as f32 / sections as f32 * std::f32::consts::TAU;
+        let (s1, c1) = ((index + 1) as f32 * angle_step).sin_cos();
         // Z-order [low0, low1, high0, high1] to match `gfx_effect_gpu`'s
         // `[0, 1, 3, 0, 3, 2]` quad triangulation (diagonal 0 <-> 3).
         let corners = [
-            Vec3::new(a0.cos() * lower_radius, base_y, a0.sin() * lower_radius),
-            Vec3::new(a1.cos() * lower_radius, base_y, a1.sin() * lower_radius),
-            Vec3::new(
-                a0.cos() * upper_radius,
-                base_y + height,
-                a0.sin() * upper_radius,
-            ),
-            Vec3::new(
-                a1.cos() * upper_radius,
-                base_y + height,
-                a1.sin() * upper_radius,
-            ),
+            Vec3::new(c0 * lower_radius, base_y, s0 * lower_radius),
+            Vec3::new(c1 * lower_radius, base_y, s1 * lower_radius),
+            Vec3::new(c0 * upper_radius, top_y, s0 * upper_radius),
+            Vec3::new(c1 * upper_radius, top_y, s1 * upper_radius),
         ];
         for (slot, corner) in corners.into_iter().enumerate() {
             positions[slot] = matrix.transform_point3(corner).to_array();
@@ -5242,13 +5261,12 @@ fn emit_cylinder(cylinder: &Cylinder, context: &ElementContext, out: &mut Vec<Ef
         // `tu = i * m_fTexWid / nSects + m_fTexU`, and the lower row of the
         // strip carries `tv = m_fTexV + m_fTexHei` while the upper carries
         // `m_fTexV`.
-        let u_start = uv[0][0];
-        let u_span = uv[1][0] - uv[0][0];
-        let u0 = u_start + u_span * index as f32 / sections as f32;
-        let u1 = u_start + u_span * (index + 1) as f32 / sections as f32;
-        let (v_low, v_high) = (uv[2][1], uv[0][1]);
+        let u0 = u_start + u_span * (index as f32 * inv_sections);
+        let u1 = u_start + u_span * ((index + 1) as f32 * inv_sections);
         let strip = [[u0, v_low], [u1, v_low], [u0, v_high], [u1, v_high]];
         push_quad(out, context, &texture, positions, strip, color);
+        s0 = s1;
+        c0 = c1;
     }
 }
 
@@ -5340,14 +5358,20 @@ fn emit_paraboloid(curve: &Curve, context: &ElementContext, out: &mut Vec<Effect
     // `_unit_z` — the bowl's own axis, since its surface of revolution runs
     // along local Z.
     let matrix = context.element_matrix(Vec3::Z);
+    let angle_step = std::f32::consts::TAU / PARABOLOID_SEGMENTS as f32;
+    let sincos: [(f32, f32); PARABOLOID_SEGMENTS + 1] =
+        std::array::from_fn(|seg| (angle_step * seg as f32).sin_cos());
+    let u_center = u_base + u_span * 0.5;
+    let v_center = v_base + v_span * 0.5;
     let vertex = |ring: usize, seg: usize| -> (Vec3, [f32; 2]) {
-        let angle = std::f32::consts::TAU / PARABOLOID_SEGMENTS as f32 * seg as f32;
-        let radius = (coefficient * ring as f32 * grid).max(0.).sqrt();
-        let height = grid * ring as f32;
-        let point = Vec3::new(radius * angle.cos(), radius * angle.sin(), height) * local_scale;
+        let (s, c) = sincos[seg];
+        let ring_f = ring as f32;
+        let radius = (coefficient * ring_f * grid).max(0.).sqrt();
+        let height = grid * ring_f;
+        let point = Vec3::new(radius * c, radius * s, height) * local_scale;
         let uv = [
-            u_base + u_span * 0.5 + tex_x_step * ring as f32 * angle.cos(),
-            v_base + v_span * 0.5 - tex_y_step * ring as f32 * angle.sin(),
+            u_center + tex_x_step * ring_f * c,
+            v_center - tex_y_step * ring_f * s,
         ];
         (point, uv)
     };
@@ -5559,6 +5583,11 @@ fn emit_particles(
         }
     }
     if dt > 0. {
+        let acc_dir_norm = if particle.acc != 0. && particle.acc_dir.length_squared() > 1e-9 {
+            particle.acc_dir.normalize()
+        } else {
+            Vec3::ZERO
+        };
         // `age >= ttl` unlinks the node (0x71a247).
         particles.retain_mut(|state| {
             state.age += dt;
@@ -5566,7 +5595,7 @@ fn emit_particles(
             if particle.ttl > 0. && state.age >= particle.ttl {
                 return false;
             }
-            integrate(state, particle, affectors, ramps, dt);
+            integrate(state, particle, acc_dir_norm, affectors, ramps, dt);
             true
         });
     }
@@ -6410,8 +6439,8 @@ fn random_unit_ball(rng: &mut Rng) -> Vec3 {
 fn random_unit(rng: &mut Rng) -> Vec3 {
     let z = rng.signed();
     let radius = (1. - z * z).max(0.).sqrt();
-    let theta = rng.unit() * std::f32::consts::TAU;
-    Vec3::new(radius * theta.cos(), radius * theta.sin(), z)
+    let (s, c) = (rng.unit() * std::f32::consts::TAU).sin_cos();
+    Vec3::new(radius * c, radius * s, z)
 }
 
 /// Spawn colour, drawn the way the client's colour slot `0x7237f0` draws it.
@@ -6587,6 +6616,7 @@ fn hsva_to_packed(hsva: [f32; 4]) -> u32 {
 fn integrate(
     state: &mut ParticleState,
     particle: &Particle,
+    acc_dir_norm: Vec3,
     affectors: &[Control],
     ramps: &[Option<ColorTrack>],
     dt: f32,
@@ -6789,11 +6819,7 @@ fn integrate(
         let before = state.acc_speed;
         state.acc_speed += particle.acc * dt;
         let step = (before + state.acc_speed) * half;
-        let direction = if particle.acc_dir.length_squared() > 1e-9 {
-            particle.acc_dir.normalize()
-        } else {
-            Vec3::ZERO
-        };
+        let direction = acc_dir_norm;
         state.position += direction * step;
         state.displacement += direction * step;
     }
@@ -10425,7 +10451,7 @@ mod tests {
         // A minimal player, only for its ground helpers.
         let player = build(&(header37(1) + &SPRITE));
         let frames = player
-            .ground_frames(hit, place, base)
+            .ground_frames(hit, place, base, None)
             .expect("a finite hit must build the frames");
         let parsed = gfx_file::parse(&(header37(1) + &SPRITE)).unwrap();
         let mut element = parsed.elements[0].clone();
