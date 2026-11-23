@@ -268,6 +268,14 @@ pub struct Effects {
     pub refraction: bool,
     /// Animated ray-traced Voronoi water caustics (subtle from above, vivid underwater).
     pub caustics: bool,
+    /// Drifting ray-traced cloud shadows projected from the live sky-dome cloud cover.
+    pub cloud_shadows: bool,
+    /// High-precision short-range screen-space/RT micro-contact shadows for fine grounding.
+    pub contact_shadows: bool,
+    /// Directional moonlit night sky & starlight hemispherical bounce (pitch black in deep shade).
+    pub moonlit_night: bool,
+    /// Shadowed atmospheric aerial perspective (warm sunlit valleys vs cool shadowed ridges).
+    pub aerial_perspective: bool,
 }
 
 impl Default for Effects {
@@ -283,6 +291,10 @@ impl Default for Effects {
             global_illumination: true,
             refraction: true,
             caustics: true,
+            cloud_shadows: true,
+            contact_shadows: true,
+            moonlit_night: true,
+            aerial_perspective: true,
         }
     }
 }
@@ -298,6 +310,10 @@ impl Effects {
             self.global_illumination,
             self.refraction,
             self.caustics,
+            self.cloud_shadows,
+            self.contact_shadows,
+            self.moonlit_night,
+            self.aerial_perspective,
         ]
         .iter()
         .filter(|on| **on)
@@ -502,6 +518,10 @@ impl Plan {
             global_illumination: false,
             refraction: false,
             caustics: false,
+            cloud_shadows: false,
+            contact_shadows: false,
+            moonlit_night: false,
+            aerial_perspective: false,
         },
         reconstruction: RayReconstruction::Off,
         grid: (0, 0),
@@ -689,6 +709,10 @@ mod tests {
             global_illumination: false,
             refraction: false,
             caustics: false,
+            cloud_shadows: false,
+            contact_shadows: false,
+            moonlit_night: false,
+            aerial_perspective: false,
         };
         assert!(!s.replaces_effects());
         assert_eq!(
@@ -705,6 +729,10 @@ mod tests {
                 global_illumination: false,
                 refraction: false,
                 caustics: false,
+                cloud_shadows: false,
+                contact_shadows: false,
+                moonlit_night: false,
+                aerial_perspective: false,
             };
             match enable {
                 0 => e.shadows = true,

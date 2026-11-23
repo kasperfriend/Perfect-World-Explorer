@@ -407,6 +407,10 @@ impl Raywatcher {
             ("Global illumination", &mut effects.global_illumination),
             ("Water refraction", &mut effects.refraction),
             ("Water caustics", &mut effects.caustics),
+            ("Cloud shadows", &mut effects.cloud_shadows),
+            ("Contact shadows", &mut effects.contact_shadows),
+            ("Moonlit night sky", &mut effects.moonlit_night),
+            ("Aerial perspective", &mut effects.aerial_perspective),
         ] {
             changed_effects |= ui.checkbox(slot, label).changed();
         }
@@ -633,6 +637,10 @@ impl Raywatcher {
             ("global_illumination", effects.global_illumination),
             ("refraction", effects.refraction),
             ("caustics", effects.caustics),
+            ("cloud_shadows", effects.cloud_shadows),
+            ("contact_shadows", effects.contact_shadows),
+            ("moonlit_night", effects.moonlit_night),
+            ("aerial_perspective", effects.aerial_perspective),
         ] {
             let _ = writeln!(out, "{name}={}", u8::from(on));
         }
@@ -711,6 +719,10 @@ impl Raywatcher {
             ("global_illumination", &mut effects.global_illumination),
             ("refraction", &mut effects.refraction),
             ("caustics", &mut effects.caustics),
+            ("cloud_shadows", &mut effects.cloud_shadows),
+            ("contact_shadows", &mut effects.contact_shadows),
+            ("moonlit_night", &mut effects.moonlit_night),
+            ("aerial_perspective", &mut effects.aerial_perspective),
         ] {
             if let Some(v) = get(name).and_then(parse_flag) {
                 *slot = v;
@@ -1031,6 +1043,10 @@ mod tests {
             global_illumination: false,
             refraction: false,
             caustics: false,
+            cloud_shadows: false,
+            contact_shadows: false,
+            moonlit_night: false,
+            aerial_perspective: false,
         };
         m.set_settings(s);
         let none = m.status((640, 360), false);
@@ -1051,6 +1067,10 @@ mod tests {
         s.denoise_iterations = 5;
         s.effects.reflections = false;
         s.effects.refraction = false;
+        s.effects.cloud_shadows = false;
+        s.effects.contact_shadows = false;
+        s.effects.moonlit_night = false;
+        s.effects.aerial_perspective = false;
         s.sun_radius_degrees = 1.5;
         m.set_settings(s.clone());
         let mut text = String::new();

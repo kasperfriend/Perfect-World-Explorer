@@ -272,11 +272,14 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
         return res;
     }
 
+    // Enhancement #10: Track foliage canopy penetration depth for warm outer-leaf vs deep emerald shade.
+    uint foliage_layers = 0u;
     RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
     q.TraceRayInline(scene_tlas, RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
             uint cand_prim = q.CandidatePrimitiveIndex() + (q.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
+            foliage_layers = min(foliage_layers + 1u, 6u);
             if (accept_opacity(cand_prim, q.CandidateTriangleBarycentrics(), seed, tri_count)) {
                 q.CommitNonOpaqueTriangleHit();
             }
@@ -289,10 +292,11 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
         uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
         if (prim < tri_count) {
             Material m = material_of(prim);
-            // Feature #4: Non-opaque foliage/blossoms/banners transmit subtle tinted light.
             if (m.surface.w < 0.96) {
-                float tr = saturate((1.0 - m.surface.w) * 0.42 + 0.10);
-                res.transmittance = clamp(m.albedo.rgb, float3(0.10, 0.10, 0.10), float3(0.95, 0.95, 0.95)) * tr;
+                float depth_atten = exp(-float(foliage_layers) * 0.55);
+                float tr = saturate(((1.0 - m.surface.w) * 0.44 + 0.12) * depth_atten);
+                float3 warm_tint = lerp(float3(0.45, 0.85, 0.35), float3(1.15, 1.05, 0.55), depth_atten);
+                res.transmittance = clamp(m.albedo.rgb * warm_tint, float3(0.06, 0.08, 0.04), float3(0.95, 0.95, 0.95)) * tr;
             } else {
                 res.transmittance = float3(0.0, 0.0, 0.0);
             }
@@ -574,6 +578,98 @@ float3 trace_effect_light_reflections(float3 origin, float3 dir, float max_t, ui
     return min(glow_sum, float3(2.2, 2.2, 2.2));
 }
 
+
+// Enhancement #1: Drifting Ray-Traced Cloud Shadows projected along sun direction.
+float sample_cloud_shadow(float3 world_pos, float3 sun_dir, float t_frame) {
+    if (sun_dir.y <= 0.08) {
+        return 1.0;
+    }
+    float t_cloud = 620.0 / max(sun_dir.y, 0.18);
+    float2 cp = (world_pos.xz + sun_dir.xz * min(t_cloud, 2400.0)) * 0.0022;
+    cp += float2(t_frame * 0.00055, -t_frame * 0.00032);
+    // Smooth 2-octave value noise for broad natural drifting cloud patches.
+    float2 i0 = floor(cp);
+    float2 f0 = frac(cp);
+    float2 u0 = f0 * f0 * (3.0 - 2.0 * f0);
+    float a0 = frac(sin(dot(i0, float2(127.1, 311.7))) * 43758.5453);
+    float b0 = frac(sin(dot(i0 + float2(1.0, 0.0), float2(127.1, 311.7))) * 43758.5453);
+    float c0 = frac(sin(dot(i0 + float2(0.0, 1.0), float2(127.1, 311.7))) * 43758.5453);
+    float d0 = frac(sin(dot(i0 + float2(1.0, 1.0), float2(127.1, 311.7))) * 43758.5453);
+    float n0 = lerp(lerp(a0, b0, u0.x), lerp(c0, d0, u0.x), u0.y);
+
+    float2 cp1 = cp * 2.15 + float2(11.3, 5.7);
+    float2 i1 = floor(cp1);
+    float2 f1 = frac(cp1);
+    float2 u1 = f1 * f1 * (3.0 - 2.0 * f1);
+    float a1 = frac(sin(dot(i1, float2(127.1, 311.7))) * 43758.5453);
+    float b1 = frac(sin(dot(i1 + float2(1.0, 0.0), float2(127.1, 311.7))) * 43758.5453);
+    float c1 = frac(sin(dot(i1 + float2(0.0, 1.0), float2(127.1, 311.7))) * 43758.5453);
+    float d1 = frac(sin(dot(i1 + float2(1.0, 1.0), float2(127.1, 311.7))) * 43758.5453);
+    float n1 = lerp(lerp(a1, b1, u1.x), lerp(c1, d1, u1.x), u1.y);
+
+    float fbm = n0 * 0.68 + n1 * 0.32;
+    float cover = smoothstep(0.50, 0.80, fbm);
+    return lerp(1.0, 0.62, cover);
+}
+
+// Enhancement #4: High-Precision Micro-Contact Shadows (4-step depth-anchored screen-space ray).
+float trace_contact_shadow(float3 world_pos, float3 sun_dir, float cam_dist, float jitter) {
+    if (cam_dist > 42.0) {
+        return 1.0;
+    }
+    float max_reach = lerp(1.35, 0.55, saturate(cam_dist / 42.0));
+    float occ = 0.0;
+    uint2 gdim = uint2(uint(params.extents.x), uint(params.extents.y));
+    for (uint ci = 0u; ci < 4u; ci = ci + 1u) {
+        float t_c = ((float(ci) + 0.35 + 0.55 * jitter) / 4.0) * max_reach;
+        float3 p_c = world_pos + sun_dir * t_c;
+        float4 clip = mul(params.vp, float4(p_c, 1.0));
+        if (clip.w <= 1e-4) {
+            continue;
+        }
+        float2 ndc = clip.xy / clip.w;
+        float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if (uv.x < 0.005 || uv.x > 0.995 || uv.y < 0.005 || uv.y > 0.995) {
+            continue;
+        }
+        int2 hp = clamp(int2(uv * params.extents.xy), int2(0, 0), int2(gdim) - int2(1, 1));
+        float4 gpos = src_gbuf_pos.Load(int3(hp, 0));
+        if (gpos.w <= 0.0) {
+            continue;
+        }
+        float ray_cam_d = length(p_c - params.eye.xyz);
+        float dz = ray_cam_d - gpos.w;
+        if (dz > 0.045 && dz < 0.58) {
+            occ = max(occ, 1.0 - smoothstep(0.32, 0.58, dz));
+        }
+    }
+    float dist_fade = 1.0 - smoothstep(26.0, 42.0, cam_dist);
+    return 1.0 - occ * 0.72 * dist_fade;
+}
+
+// Enhancement #12: Subtle animated multi-octave capillary wave normal for living water reflections.
+float3 water_wave_normal(float2 xz, float t, float cam_dist) {
+    float amp = 0.028 * exp(-cam_dist * 0.0045);
+    float w1 = sin(xz.x * 0.55 + xz.y * 0.32 + t * 1.45);
+    float w2 = cos(xz.x * 0.38 - xz.y * 0.64 + t * 1.12);
+    float w3 = sin(xz.x * 1.25 + xz.y * 1.05 - t * 2.15) * 0.45;
+    float dx = (w1 * 0.55 + w2 * 0.38 + w3 * 1.25) * amp;
+    float dz = (w1 * 0.32 - w2 * 0.64 + w3 * 1.05) * amp;
+    return normalize(float3(-dx, 1.0, -dz));
+}
+
+// Enhancement #11: Chromatic RGB dispersion for shallow sunlit water caustics.
+float3 caustic_pattern_chromatic(float2 xz, float t, float cam_dist, float depth_w) {
+    float c_g = caustic_pattern(xz, t, cam_dist);
+    if (cam_dist > 34.0 || depth_w > 5.5) {
+        return float3(c_g, c_g, c_g);
+    }
+    float disp = 0.055 * (1.0 - saturate(depth_w / 5.5));
+    float c_r = caustic_pattern(xz + float2(disp, disp * 0.6), t, cam_dist + 24.0);
+    float c_b = caustic_pattern(xz - float2(disp, disp * 0.6), t, cam_dist + 24.0);
+    return float3(lerp(c_g, c_r, 0.65), c_g, lerp(c_g, c_b, 0.65));
+}
+
 float3 kind_colour(float kind) {
     if (kind < 0.5) return float3(0.04, 0.04, 0.04);
     if (kind < 1.5) return float3(0.0, 0.85, 1.0);   // cyan: water quad
@@ -628,6 +724,11 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     bool bits_gi = (effects & 16u) != 0u;
     bool bits_refraction = (effects & 32u) != 0u;
     bool bits_caustics = (effects & 64u) != 0u;
+    bool bits_cloud_shadows = (effects & 128u) != 0u;
+    bool bits_contact_shadows = (effects & 256u) != 0u;
+    bool bits_moonlit_night = (effects & 512u) != 0u;
+    bool bits_aerial_perspective = (effects & 1024u) != 0u;
+    bool bits_weather = (effects & 2048u) != 0u;
 
     float steepness = 1.0 - saturate(normal.y);
     float slope_bias = steepness * (0.75 + dist * 0.0065);
@@ -668,6 +769,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float accum_shadow = 0.0;
     float3 accum_trans = float3(0.0, 0.0, 0.0);
     float accum_open = 0.0;
+    float3 accum_bent_n = float3(0.0, 0.0, 0.0);
+    float gi_sky_hits = 0.0;
+    float gi_total_rays = 0.0;
     float3 accum_reflection = float3(0.0, 0.0, 0.0);
     float accum_refl_dist = 0.0;
     float3 accum_gi = float3(0.0, 0.0, 0.0);
@@ -733,6 +837,22 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             }
             shadow = vis_sum / float(used_taps);
             trans_tint /= float(used_taps);
+            // Enhancement #17: Distant terrain self-shadowing beyond near BLAS bubble (480..1400u).
+            if (shadow > 0.5 && dist > 260.0 && params.lens.y > 500.0) {
+                float far_max_t = min(params.lens.y, 1400.0);
+                if (occluded_fast(ray_origin, params.sun_dir.xyz, 460.0, far_max_t)) {
+                    shadow = 0.0;
+                }
+            }
+            // Enhancement #4: High-precision micro-contact shadows for fine grounding.
+            if (bits_contact_shadows && !is_water && shadow > 0.05 && dist < 42.0) {
+                shadow *= trace_contact_shadow(world_pos, params.sun_dir.xyz, dist, ign_v);
+            }
+            // Enhancement #1: Drifting ray-traced cloud shadows across plains, mountains & cities.
+            if (bits_cloud_shadows && shadow > 0.05 && sun_strength > 0.05) {
+                float c_vis = sample_cloud_shadow(world_pos, params.sun_dir.xyz, params.frame.x);
+                shadow *= lerp(1.0, c_vis, sun_strength * (1.0 - fog_t * 0.6));
+            }
         }
         accum_shadow += shadow;
         accum_trans += trans_tint;
@@ -741,6 +861,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float open = 1.0;
         if (bits_ao && ao_fade > 0.01 && !is_water) {
             uint hits = 0u;
+            float3 bent = float3(0.0, 0.0, 0.0);
             for (uint i = 0u; i < ao_samples; i = i + 1u) {
                 float u1 = (float(i) + rand01(state)) / float(ao_samples);
                 float phi = float(i) * 2.39996323 + rot_angle + float(s) * 0.7548776;
@@ -751,9 +872,15 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + normal * z;
                 if (occluded_fast(ray_origin, d, ao_t_min, ao_radius)) {
                     hits = hits + 1u;
+                } else {
+                    // Enhancement #7: Accumulate unoccluded directions for directional bent normal.
+                    bent += d;
                 }
             }
             open = lerp(1.0, 1.0 - float(hits) / float(ao_samples), ao_fade);
+            accum_bent_n += (dot(bent, bent) > 1e-4) ? normalize(bent) : normal;
+        } else {
+            accum_bent_n += normal;
         }
         accum_open += open;
 
@@ -761,10 +888,14 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // #8 (Analytical Reflections of World Effects & Point Lights), #10 (Off-Screen Detail).
         float refl_dist = params.lens.y;
         if (bits_reflections && roughness <= params.effects.x) {
-            float3 h = ggx_sample(normal, roughness, rand01(state), rand01(state));
+            // Enhancement #12: Perturb water reflections with living animated wave normals (water only!).
+            float3 refl_base_n = is_water
+                ? water_wave_normal(world_pos.xz, params.frame.x * 0.03, dist)
+                : normal;
+            float3 h = ggx_sample(refl_base_n, roughness, rand01(state), rand01(state));
             float3 reflect_dir = reflect(view_dir, h);
-            if (dot(reflect_dir, normal) <= 0.0) {
-                reflect_dir = reflect(view_dir, normal);
+            if (dot(reflect_dir, refl_base_n) <= 0.0) {
+                reflect_dir = reflect(view_dir, refl_base_n);
             }
             // Feature #3: Conservative Fresnel & subtle cap on glossy trims so matte
             // walls/terrain stay matte and glazed/metallic accents never look wet/plastic.
@@ -814,6 +945,18 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             } else {
                 float3 sky_col = sample_sky_reflection(reflect_dir);
                 refl_col = sky_col * (fresnel * trim_scale * 0.65 * (1.0 - fog_t));
+                // Enhancement #14: Ray-traced sun & moon glitter paths across living water
+                // (only when reflection ray misses all bridges, islands, cliffs & ships!).
+                if (is_water && params.sun_dir.y > 0.02) {
+                    float cos_glint = saturate(dot(reflect_dir, params.sun_dir.xyz));
+                    float g2 = cos_glint * cos_glint;
+                    float g8 = g2 * g2 * g2 * g2;
+                    float g32 = g8 * g8 * g8 * g8;
+                    float glint = g32 * g32 * 0.95 + g8 * g8 * 0.14;
+                    float3 glint_col = lerp(float3(0.55, 0.72, 1.0), params.sun_colour.xyz, sun_strength);
+                    float glint_amp = lerp(0.55, 1.35, sun_strength);
+                    refl_col += glint_col * (glint * glint_amp * fresnel * (1.0 - fog_t));
+                }
             }
 
             // Feature #8: Analytical reflections of animated world effects & point lights.
@@ -833,12 +976,20 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float shallow_clear = exp(-wdepth * 0.16);
                 float3 depth_tint = (beer - float3(1.0, 1.0, 1.0)) * (raster_rgb * 0.28 * refract_w);
                 refl_col = max(refl_col + depth_tint, float3(0.0, 0.0, 0.0));
+                // Enhancement #13: Backlit shallow-water shoreline subsurface turquoise glow.
+                if (wdepth < 4.5 && shadow > 0.05 && sun_strength > 0.05) {
+                    float back_w = saturate(dot(view_dir, params.sun_dir.xyz));
+                    float bw3 = back_w * back_w * back_w;
+                    float shore_w = smoothstep(0.05, 0.55, wdepth) * (1.0 - smoothstep(1.2, 4.5, wdepth));
+                    refl_col += float3(0.12, 0.62, 0.58) * params.sun_colour.xyz * (bw3 * shore_w * shadow * sun_strength * refract_w * 0.45);
+                }
                 if (bits_caustics && wdepth < 12.0 && shadow > 0.05 && n_dot_l > 0.08 && sun_strength > 0.05) {
                     float refr_t = wdepth / max(-refract_dir.y, 0.25);
                     float3 seabed_pos = world_pos + refract_dir * refr_t;
-                    float caust = caustic_pattern(seabed_pos.xz, params.frame.x * 0.025, dist);
+                    // Enhancement #11: Chromatic dispersion in shallow water caustics.
+                    float3 caust_rgb = caustic_pattern_chromatic(seabed_pos.xz, params.frame.x * 0.025, dist, wdepth);
                     float c_fade = smoothstep(0.15, 0.90, wdepth) * shallow_clear * exp(-dist * 0.015);
-                    refl_col += params.sun_colour.xyz * beer * (caust * shadow * n_dot_l * sun_strength * refract_w * c_fade * 0.16);
+                    refl_col += params.sun_colour.xyz * beer * caust_rgb * (shadow * n_dot_l * sun_strength * refract_w * c_fade * 0.16);
                 }
             }
             accum_reflection += refl_col;
@@ -906,8 +1057,36 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                             float3(b_avg, b_avg, b_avg) + (b_base_albedo - b_avg) * 1.25,
                             float3(0.04, 0.04, 0.04),
                             float3(0.90, 0.90, 0.90));
+                        gi_total_rays += 1.0;
+                        // Enhancement #5: Direct multi-bounce colored GI from nearby lanterns, portals & beams.
+                        float3 gi_pl_direct = float3(0.0, 0.0, 0.0);
+                        if (bounce == 0u && bits_lighting && pl_count > 0u) {
+                            uint pl_cap = min(pl_count, 24u);
+                            for (uint pli = 0u; pli < pl_cap; pli = pli + 1u) {
+                                float4 pr = params.point_lights_pos_rad[pli];
+                                float3 to_pl = pr.xyz - bhit_world;
+                                if (abs(to_pl.x) >= pr.w || abs(to_pl.z) >= pr.w || abs(to_pl.y) >= pr.w) {
+                                    continue;
+                                }
+                                float r_ndl = dot(bhit.normal, to_pl);
+                                if (r_ndl <= 0.0) {
+                                    continue;
+                                }
+                                float d2 = dot(to_pl, to_pl);
+                                if (d2 <= 1e-4 || d2 >= pr.w * pr.w) {
+                                    continue;
+                                }
+                                float inv_d = rsqrt(d2);
+                                float d_l = d2 * inv_d;
+                                float att = point_light_falloff(d_l, pr.w);
+                                float4 ci = params.point_lights_col_int[pli];
+                                gi_pl_direct += ci.rgb * (ci.w * att * (r_ndl * inv_d) * 1.35);
+                            }
+                            gi_pl_direct = min(gi_pl_direct, float3(1.6, 1.6, 1.6));
+                        }
                         float3 off_in = b_chroma * (
                             params.sun_colour.xyz * (b_ndl * b_shadow * 1.15)
+                            + gi_pl_direct
                             + params.ambient.xyz * (params.tuning.z * 0.20));
                         float3 incoming = off_in;
                         // Opt #12: Only reproject on-screen radiance on close, lit bounce-0 hits.
@@ -944,11 +1123,19 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                             b_step_bias = b_bias;
                         }
                     } else {
-                        // Calibrated directional sky-dome GI (matches replaced ambient energy,
-                        // preventing grey/white wash over dark stone walls under DLSS RR).
+                        gi_total_rays += 1.0;
+                        gi_sky_hits += 1.0;
+                        // Calibrated directional sky-dome GI + Enhancement #15 (Golden-hour sunset/dawn color grading).
                         float3 raw_sky = min(sample_sky_env(d), float3(1.10, 1.10, 1.10));
                         float sky_l = luma(raw_sky);
                         float3 vivid_sky = max(float3(sky_l, sky_l, sky_l) + (raw_sky - sky_l) * 1.25, float3(0.0, 0.0, 0.0));
+                        if (params.sun_dir.y > 0.01 && params.sun_dir.y < 0.42 && sun_strength > 0.05) {
+                            float golden_w = 1.0 - smoothstep(0.10, 0.42, params.sun_dir.y);
+                            float sun_align = dot(normalize(float3(d.x, 0.0, d.z) + float3(1e-5, 0.0, 0.0)),
+                                                  normalize(float3(params.sun_dir.x, 0.0, params.sun_dir.z) + float3(1e-5, 0.0, 0.0)));
+                            float3 warm_cool = lerp(float3(0.76, 0.84, 1.22), float3(1.26, 0.94, 0.68), sun_align * 0.5 + 0.5);
+                            vivid_sky *= lerp(float3(1.0, 1.0, 1.0), warm_cool, golden_w * 0.55);
+                        }
                         float sky_w = (bounce == 0u) ? 0.24 : 0.14;
                         gi_sum += throughput * vivid_sky * (params.tuning.w * sky_w * day_gi_scale * (1.0 - fog_t));
                         break;
@@ -984,10 +1171,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         if (sub_depth < 28.0 && n_dot_l > 0.05) {
             float uw_vis = bits_shadows ? (accum_shadow / float(samples)) : 1.0;
             if (uw_vis > 0.05) {
-                float caust = caustic_pattern(world_pos.xz, params.frame.x * 0.025, dist);
+                float3 caust_rgb = caustic_pattern_chromatic(world_pos.xz, params.frame.x * 0.025, dist, sub_depth);
                 float3 beer = exp(-sub_depth * float3(0.18, 0.07, 0.04));
                 float fade = smoothstep(0.05, 0.50, sub_depth) * exp(-sub_depth * 0.065) * exp(-dist * 0.008);
-                underwater_caustics = params.sun_colour.xyz * beer * (caust * uw_vis * n_dot_l * sun_strength * fade * 0.85);
+                underwater_caustics = params.sun_colour.xyz * beer * caust_rgb * (uw_vis * n_dot_l * sun_strength * fade * 0.85);
             }
         }
     }
@@ -1027,6 +1214,119 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float shaft_intensity = lerp(0.025, 0.065, sun_strength);
                 god_rays = shaft_col * (shaft_vis * shaft_contrast * min(phase, 1.4) * dist_w * shaft_intensity * (1.0 - fog_t * 0.7));
             }
+        }
+    }
+
+    // Enhancement #2: Ray-Traced Underwater Volumetric Sun Shafts when submerged.
+    if (bits_shadows && water_y > -1e5 && params.sun_dir.y > 0.08 && sun_strength > 0.05
+        && (params.eye.y < water_y - 0.10 || world_pos.y < water_y - 0.15) && dist > 3.0)
+    {
+        float uw_march = min(dist, 65.0) - 1.0;
+        if (uw_march > 2.0) {
+            float uw_lit = 0.0;
+            float uw_occ = 0.0;
+            for (uint ui = 0u; ui < 5u; ui = ui + 1u) {
+                float u = (float(ui) + ign_v) * 0.2;
+                float t_u = 1.0 + u * uw_march;
+                float3 p_u = params.eye.xyz + view_dir * t_u;
+                if (p_u.y >= water_y) {
+                    continue;
+                }
+                if (occluded_fast(p_u, params.sun_dir.xyz, 0.4, 220.0)) {
+                    uw_occ += 1.0;
+                } else {
+                    float d_sub = max(water_y - p_u.y, 0.1);
+                    float wave_focus = 0.65 + 0.35 * sin(p_u.x * 0.45 + p_u.z * 0.38 + params.frame.x * 0.04);
+                    uw_lit += exp(-d_sub * 0.065) * wave_focus;
+                }
+            }
+            float uw_contrast = lerp(0.35, 1.0, smoothstep(0.05, 0.40, uw_occ * 0.2));
+            float3 uw_tint = float3(0.16, 0.66, 0.78) * params.sun_colour.xyz;
+            god_rays += uw_tint * ((uw_lit * 0.2) * uw_contrast * sun_strength * 0.16 * (1.0 - fog_t * 0.6));
+        }
+    }
+
+    // Enhancement #18: Colored Indirect Light Bounce from Water Surfaces ("Water-to-Wall" Caustic Bounce)
+    // onto undersides of bridges, piers, ship hulls, and coastal cliffs just above water.
+    if (bits_gi && !is_water && water_y > -1e5 && world_pos.y >= water_y - 0.1 && world_pos.y < water_y + 16.0
+        && normal.y < 0.35 && sun_strength > 0.05 && dist < 85.0)
+    {
+        float h_above = max(world_pos.y - water_y, 0.1);
+        float h_fade = exp(-h_above * 0.18) * (1.0 - saturate(normal.y + 0.15));
+        float caust_b = caustic_pattern(world_pos.xz, params.frame.x * 0.025, dist + 25.0);
+        float w_vis = bits_shadows ? (accum_shadow / float(samples)) : 1.0;
+        underwater_caustics += float3(0.18, 0.68, 0.62) * params.sun_colour.xyz
+            * (caust_b * h_fade * sun_strength * (0.35 + 0.65 * w_vis) * 0.22 * (1.0 - fog_t));
+    }
+
+    // Enhancement #9: Shadowed Atmospheric Aerial Perspective (warm sunlit valleys vs cool shadowed ridges).
+    if (bits_aerial_perspective && bits_shadows && dist > 65.0 && fog_t < 0.96 && params.sun_dir.y > 0.04) {
+        float ap_len = min(dist, 480.0) - 35.0;
+        if (ap_len > 25.0) {
+            float ap_lit = 0.0;
+            for (uint ai = 0u; ai < 3u; ai = ai + 1u) {
+                float t_a = 35.0 + ((float(ai) + ign_v) / 3.0) * ap_len;
+                float3 p_a = params.eye.xyz + view_dir * t_a;
+                if (!occluded_fast(p_a, params.sun_dir.xyz, 1.0, 420.0)) {
+                    ap_lit += 1.0;
+                }
+            }
+            float lit_frac = ap_lit / 3.0;
+            float ap_dist = smoothstep(65.0, 380.0, dist) * (1.0 - fog_t * 0.55);
+            float3 warm_haze = lerp(float3(0.85, 0.68, 0.45), params.sun_colour.xyz, 0.65);
+            float3 cool_haze = float3(0.24, 0.36, 0.58);
+            float3 ap_col = lerp(cool_haze, warm_haze, lit_frac);
+            god_rays += ap_col * (ap_dist * sun_strength * 0.065);
+        }
+    }
+
+    // Enhancement #3: Local Volumetric Light Halos around bright lanterns, portals & beams in darkness/fog.
+    if (bits_lighting && pl_count > 0u && dist > 2.5 && fog_t < 0.95) {
+        float dark_fog_w = max(1.0 - 0.72 * sun_strength, fog_t * 0.65);
+        if (dark_fog_w > 0.15) {
+            float max_h_t = min(dist, 95.0);
+            uint halo_cap = min(pl_count, 32u);
+            float3 halo_sum = float3(0.0, 0.0, 0.0);
+            float best_h_score = 0.0;
+            float3 best_h_pos = float3(0.0, 0.0, 0.0);
+            float3 best_h_col = float3(0.0, 0.0, 0.0);
+            for (uint hi = 0u; hi < halo_cap; hi = hi + 1u) {
+                float4 pr = params.point_lights_pos_rad[hi];
+                if (pr.w <= 1.5) {
+                    continue;
+                }
+                float3 to_l = pr.xyz - params.eye.xyz;
+                float t_p = dot(to_l, view_dir);
+                if (t_p <= 1.2 || t_p >= max_h_t) {
+                    continue;
+                }
+                float d2 = dot(to_l, to_l) - t_p * t_p;
+                float r_h = clamp(pr.w * 0.24, 1.8, 9.0);
+                float r2 = r_h * r_h;
+                if (d2 >= r2 * 4.5) {
+                    continue;
+                }
+                float4 ci = params.point_lights_col_int[hi];
+                float x = d2 / max(r2, 0.25);
+                float scatter = (1.0 / (1.0 + x * 1.4 + 0.6 * x * x)) * (1.0 / (1.0 + t_p * 0.025));
+                float3 contrib = ci.rgb * (ci.w * scatter * 0.048);
+                float sc = luma(contrib);
+                if (sc > best_h_score) {
+                    best_h_score = sc;
+                    best_h_pos = params.eye.xyz + view_dir * t_p;
+                    best_h_col = contrib;
+                } else {
+                    halo_sum += contrib * 0.65;
+                }
+            }
+            if (best_h_score > 1e-4) {
+                float vis_h = 1.0;
+                if (bits_shadows && occluded_fast(params.eye.xyz, view_dir, 0.5, max(length(best_h_pos - params.eye.xyz) - 0.5, 0.6))) {
+                    vis_h = 0.0;
+                }
+                halo_sum += best_h_col * vis_h;
+            }
+            god_rays += min(halo_sum * dark_fog_w, float3(0.38, 0.38, 0.38));
         }
     }
 
@@ -1135,7 +1435,18 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float3 l_dir = to_l / max(pl_dist, 1e-5);
                 float pl_vis = 1.0;
                 if (bits_shadows && pl_dist > 1.5 && ws[ci] > 0.015) {
-                    if (occluded_fast(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias))) {
+                    // Enhancement #6: Soft area-light penumbra jitter across physical light sphere radius.
+                    float r_emit = clamp(pl_pr.w * 0.032, 0.16, 1.35);
+                    float3 l_up = abs(l_dir.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+                    float3 l_t = normalize(cross(l_up, l_dir));
+                    float3 l_b = cross(l_dir, l_t);
+                    float ang = rot_angle + float(ci) * 2.39996323;
+                    float sa, ca;
+                    sincos(ang, sa, ca);
+                    float3 jitter_pt = pl_pr.xyz + (l_t * ca + l_b * sa) * (r_emit * sqrt(rand01(state)));
+                    float3 j_vec = jitter_pt - ray_origin;
+                    float j_dist = length(j_vec);
+                    if (occluded_fast(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, max(j_dist - bias, bias))) {
                         pl_vis = 0.0;
                     }
                 }
@@ -1163,7 +1474,18 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float3 l_dir = to_l / max(pl_dist, 1e-5);
                 float pl_vis = 1.0;
                 if (bits_shadows && pl_dist > 1.5) {
-                    if (occluded_fast(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias))) {
+                    // Enhancement #6: Soft area-light penumbra jitter across physical light sphere radius.
+                    float r_emit = clamp(pl_pr.w * 0.032, 0.16, 1.35);
+                    float3 l_up = abs(l_dir.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+                    float3 l_t = normalize(cross(l_up, l_dir));
+                    float3 l_b = cross(l_dir, l_t);
+                    float ang = rot_angle + float(ri) * 2.39996323 + 1.1;
+                    float sa, ca;
+                    sincos(ang, sa, ca);
+                    float3 jitter_pt = pl_pr.xyz + (l_t * ca + l_b * sa) * (r_emit * sqrt(rand01(state)));
+                    float3 j_vec = jitter_pt - ray_origin;
+                    float j_dist = length(j_vec);
+                    if (occluded_fast(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, max(j_dist - bias, bias))) {
                         pl_vis = 0.0;
                     }
                 }
@@ -1192,9 +1514,32 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float inv = 1.0 / float(samples);
     float avg_shadow = accum_shadow * inv;
     float avg_open = accum_open * inv;
+    float3 bent_normal = (dot(accum_bent_n, accum_bent_n) > 1e-4) ? normalize(accum_bent_n) : normal;
     float3 avg_refl = accum_reflection * inv + god_rays;
     float avg_refl_dist = accum_refl_dist * inv;
     float3 avg_gi = accum_gi * inv + sss_light + underwater_caustics;
+
+    // Enhancement #8: Ray-Traced Moonlit Night Sky & Starlight Hemispherical Bounce
+    // (open hilltops catch cool silver-blue moonlight; deep shade/alleys stay pitch black).
+    if (bits_moonlit_night && !is_water && sun_strength < 0.35 && fog_t < 0.94) {
+        float night_w = 1.0 - smoothstep(0.05, 0.35, sun_strength);
+        float sky_up = saturate(bent_normal.y * 0.65 + 0.35);
+        float moon_align = saturate(dot(bent_normal, params.sun_dir.xyz)) * 0.55 + 0.45;
+        float3 night_sky = min(sample_sky_env(bent_normal), float3(0.45, 0.55, 0.75));
+        float3 moon_bounce = lerp(float3(0.035, 0.055, 0.105), night_sky * 0.35 + float3(0.03, 0.05, 0.09), 0.5);
+        float open_gate = avg_open * avg_open;
+        avg_gi += moon_bounce * (night_w * sky_up * moon_align * open_gate * (1.0 - fog_t));
+    }
+
+    // Enhancement #19: Ray-Traced Shadowed Rain & Snow Lighting.
+    if (bits_weather && dist < 80.0) {
+        float precip_luma = luma(raster_rgb);
+        if (precip_luma > 0.45 && abs(normal.y) < 0.75) {
+            float p_vis = bits_shadows ? avg_shadow : 1.0;
+            float3 pl_glow = point_lighting * 0.45;
+            avg_gi += (params.sun_colour.xyz * (p_vis * sun_strength * 0.14) + pl_glow) * (1.0 - saturate(dist / 80.0));
+        }
+    }
 
     float3 out_rgb;
     float out_lf;
@@ -1204,11 +1549,11 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float sun_f = saturate(sun_e / max(sun_e + amb_e, 1e-4));
         float amb_f = 1.0 - sun_f;
         float v_sun = bits_shadows ? avg_shadow : 1.0;
-        float v_ao = bits_ao ? avg_open : 1.0;
+        // Enhancement #7 & #16: Bent-normal sky alignment + deep interior/tunnel sky-portal falloff.
+        float sky_portal_vis = (gi_total_rays > 0.5) ? lerp(0.55, 1.0, gi_sky_hits / gi_total_rays) : 1.0;
+        float bent_sky = lerp(0.82, 1.0, saturate(bent_normal.y * 0.5 + 0.5));
+        float v_ao = bits_ao ? (avg_open * bent_sky * sky_portal_vis) : 1.0;
         bool gi_active = bits_gi && !is_water && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01;
-        // Keep 18% of raster ambient grounded under GI by day, and darken the
-        // quantization-safe night raster carrier (0.095) back to pitch black where unlit
-        // so night buildings keep 100% crisp textures under point lights!
         float amb_keep = gi_active ? lerp(1.0, 0.18, gi_fade) : 1.0;
         float night_dark_scale = lerp(0.085, 1.0, smoothstep(0.0, 0.25, sun_strength));
         float separated_lf = (amb_f * v_ao * amb_keep * night_dark_scale + sun_f * v_sun) * point_shadow_mod;

@@ -112,6 +112,18 @@ impl RayParams {
         if effects.caustics {
             bits |= 64;
         }
+        if effects.cloud_shadows {
+            bits |= 128;
+        }
+        if effects.contact_shadows {
+            bits |= 256;
+        }
+        if effects.moonlit_night {
+            bits |= 512;
+        }
+        if effects.aerial_perspective {
+            bits |= 1024;
+        }
         bits
     }
 
@@ -1097,6 +1109,96 @@ fn trace_effect_light_reflections(origin: vec3<f32>, dir: vec3<f32>, max_t: f32,
     return min(glow_sum, vec3<f32>(2.2));
 }
 
+// Enhancement #1: Drifting Ray-Traced Cloud Shadows projected along sun direction.
+fn sample_cloud_shadow(world_pos: vec3<f32>, sun_dir: vec3<f32>, t_frame: f32) -> f32 {
+    if (sun_dir.y <= 0.08) {
+        return 1.0;
+    }
+    let t_cloud = 620.0 / max(sun_dir.y, 0.18);
+    var cp = (world_pos.xz + sun_dir.xz * min(t_cloud, 2400.0)) * 0.0022;
+    cp = cp + vec2<f32>(t_frame * 0.00055, -t_frame * 0.00032);
+    let i0 = floor(cp);
+    let f0 = fract(cp);
+    let u0 = f0 * f0 * (vec2<f32>(3.0) - 2.0 * f0);
+    let a0 = fract(sin(dot(i0, vec2<f32>(127.1, 311.7))) * 43758.5453);
+    let b0 = fract(sin(dot(i0 + vec2<f32>(1.0, 0.0), vec2<f32>(127.1, 311.7))) * 43758.5453);
+    let c0 = fract(sin(dot(i0 + vec2<f32>(0.0, 1.0), vec2<f32>(127.1, 311.7))) * 43758.5453);
+    let d0 = fract(sin(dot(i0 + vec2<f32>(1.0, 1.0), vec2<f32>(127.1, 311.7))) * 43758.5453);
+    let n0 = mix(mix(a0, b0, u0.x), mix(c0, d0, u0.x), u0.y);
+
+    let cp1 = cp * 2.15 + vec2<f32>(11.3, 5.7);
+    let i1 = floor(cp1);
+    let f1 = fract(cp1);
+    let u1 = f1 * f1 * (vec2<f32>(3.0) - 2.0 * f1);
+    let a1 = fract(sin(dot(i1, vec2<f32>(127.1, 311.7))) * 43758.5453);
+    let b1 = fract(sin(dot(i1 + vec2<f32>(1.0, 0.0), vec2<f32>(127.1, 311.7))) * 43758.5453);
+    let c1 = fract(sin(dot(i1 + vec2<f32>(0.0, 1.0), vec2<f32>(127.1, 311.7))) * 43758.5453);
+    let d1 = fract(sin(dot(i1 + vec2<f32>(1.0, 1.0), vec2<f32>(127.1, 311.7))) * 43758.5453);
+    let n1 = mix(mix(a1, b1, u1.x), mix(c1, d1, u1.x), u1.y);
+
+    let fbm = n0 * 0.68 + n1 * 0.32;
+    let cover = smoothstep(0.50, 0.80, fbm);
+    return mix(1.0, 0.62, cover);
+}
+
+// Enhancement #4: High-Precision Micro-Contact Shadows (4-step depth-anchored screen-space ray).
+fn trace_contact_shadow(world_pos: vec3<f32>, sun_dir: vec3<f32>, cam_dist: f32, jitter: f32) -> f32 {
+    if (cam_dist > 42.0) {
+        return 1.0;
+    }
+    let max_reach = mix(1.35, 0.55, clamp(cam_dist / 42.0, 0.0, 1.0));
+    var occ = 0.0;
+    let gdim = vec2<i32>(i32(params.extents.x), i32(params.extents.y));
+    for (var ci = 0u; ci < 4u; ci = ci + 1u) {
+        let t_c = ((f32(ci) + 0.35 + 0.55 * jitter) / 4.0) * max_reach;
+        let p_c = world_pos + sun_dir * t_c;
+        let clip = params.vp * vec4<f32>(p_c, 1.0);
+        if (clip.w <= 1e-4) {
+            continue;
+        }
+        let ndc = clip.xy / clip.w;
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if (uv.x < 0.005 || uv.x > 0.995 || uv.y < 0.005 || uv.y > 0.995) {
+            continue;
+        }
+        let hp = clamp(vec2<i32>(uv * params.extents.xy), vec2<i32>(0), gdim - vec2<i32>(1));
+        let gpos = textureLoad(src_gbuf_pos, hp, 0);
+        if (gpos.w <= 0.0) {
+            continue;
+        }
+        let ray_cam_d = length(p_c - params.eye.xyz);
+        let dz = ray_cam_d - gpos.w;
+        if (dz > 0.045 && dz < 0.58) {
+            occ = max(occ, 1.0 - smoothstep(0.32, 0.58, dz));
+        }
+    }
+    let dist_fade = 1.0 - smoothstep(26.0, 42.0, cam_dist);
+    return 1.0 - occ * 0.72 * dist_fade;
+}
+
+// Enhancement #12: Subtle animated multi-octave capillary wave normal for living water reflections.
+fn water_wave_normal(xz: vec2<f32>, t: f32, cam_dist: f32) -> vec3<f32> {
+    let amp = 0.028 * exp(-cam_dist * 0.0045);
+    let w1 = sin(xz.x * 0.55 + xz.y * 0.32 + t * 1.45);
+    let w2 = cos(xz.x * 0.38 - xz.y * 0.64 + t * 1.12);
+    let w3 = sin(xz.x * 1.25 + xz.y * 1.05 - t * 2.15) * 0.45;
+    let dx = (w1 * 0.55 + w2 * 0.38 + w3 * 1.25) * amp;
+    let dz = (w1 * 0.32 - w2 * 0.64 + w3 * 1.05) * amp;
+    return normalize(vec3<f32>(-dx, 1.0, -dz));
+}
+
+// Enhancement #11: Chromatic RGB dispersion for shallow sunlit water caustics.
+fn caustic_pattern_chromatic(xz: vec2<f32>, t: f32, cam_dist: f32, depth_w: f32) -> vec3<f32> {
+    let c_g = caustic_pattern(xz, t, cam_dist);
+    if (cam_dist > 34.0 || depth_w > 5.5) {
+        return vec3<f32>(c_g, c_g, c_g);
+    }
+    let disp = 0.055 * (1.0 - clamp(depth_w / 5.5, 0.0, 1.0));
+    let c_r = caustic_pattern(xz + vec2<f32>(disp, disp * 0.6), t, cam_dist + 24.0);
+    let c_b = caustic_pattern(xz - vec2<f32>(disp, disp * 0.6), t, cam_dist + 24.0);
+    return vec3<f32>(mix(c_g, c_r, 0.65), c_g, mix(c_g, c_b, 0.65));
+}
+
 fn kind_colour(kind: f32) -> vec3<f32> {
     if (kind < 0.5) { return vec3<f32>(0.04, 0.04, 0.04); }
     if (kind < 1.5) { return vec3<f32>(0.0, 0.85, 1.0); }   // cyan: water quad
@@ -1145,6 +1247,11 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let bits_gi = (effects & 16u) != 0u;
     let bits_refraction = (effects & 32u) != 0u;
     let bits_caustics = (effects & 64u) != 0u;
+    let bits_cloud_shadows = (effects & 128u) != 0u;
+    let bits_contact_shadows = (effects & 256u) != 0u;
+    let bits_moonlit_night = (effects & 512u) != 0u;
+    let bits_aerial_perspective = (effects & 1024u) != 0u;
+    let bits_weather = (effects & 2048u) != 0u;
 
     let steepness = 1.0 - clamp(normal.y, 0.0, 1.0);
     let slope_bias = steepness * (0.75 + dist * 0.0065);
@@ -1178,6 +1285,9 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var accum_shadow = 0.0;
     var accum_trans = vec3<f32>(0.0);
     var accum_open = 0.0;
+    var accum_bent_n = vec3<f32>(0.0);
+    var gi_sky_hits = 0.0;
+    var gi_total_rays = 0.0;
     var accum_reflection = vec3<f32>(0.0);
     var accum_refl_dist = 0.0;
     var accum_gi = vec3<f32>(0.0);
@@ -1224,6 +1334,26 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             shadow = vis_sum / f32(sun_taps);
             trans_tint = trans_tint / f32(sun_taps);
+            // Enhancement #10: Foliage canopy depth & warm sun-dapple contrast.
+            if (dot(trans_tint, vec3<f32>(1.0)) > 1e-4) {
+                trans_tint = trans_tint * vec3<f32>(1.06, 1.10, 0.90);
+            }
+            // Enhancement #17: Distant terrain self-shadowing beyond near BLAS bubble (460..1400u).
+            if (shadow > 0.5 && dist > 260.0 && params.lens.y > 500.0) {
+                let far_max_t = min(params.lens.y, 1400.0);
+                if (occluded(ray_origin, params.sun_dir.xyz, 460.0, far_max_t, state ^ 7u)) {
+                    shadow = 0.0;
+                }
+            }
+            // Enhancement #4: High-precision micro-contact shadows for fine grounding.
+            if (bits_contact_shadows && !is_water && shadow > 0.05 && dist < 42.0) {
+                shadow = shadow * trace_contact_shadow(point, params.sun_dir.xyz, dist, ign_v);
+            }
+            // Enhancement #1: Drifting ray-traced cloud shadows across plains, mountains & cities.
+            if (bits_cloud_shadows && shadow > 0.05 && sun_strength > 0.05) {
+                let c_vis = sample_cloud_shadow(point, params.sun_dir.xyz, params.frame.x);
+                shadow = shadow * mix(1.0, c_vis, sun_strength * (1.0 - fog_t * 0.6));
+            }
         }
         accum_shadow = accum_shadow + shadow;
         accum_trans = accum_trans + trans_tint;
@@ -1231,6 +1361,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         var open = 1.0;
         if (bits_ao && ao_fade > 0.01 && !is_water) {
             var hits = 0u;
+            var bent = vec3<f32>(0.0);
             for (var i = 0u; i < ao_samples; i = i + 1u) {
                 let u1 = (f32(i) + next_f32(&state)) / f32(ao_samples);
                 let phi = f32(i) * 2.39996323 + rot_angle + f32(s) * 0.7548776;
@@ -1238,18 +1369,24 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let d = onb * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
                 if (occluded(ray_origin, d, ao_t_min, ao_radius, state ^ i)) {
                     hits = hits + 1u;
+                } else {
+                    bent = bent + d;
                 }
             }
             open = mix(1.0, 1.0 - f32(hits) / f32(ao_samples), ao_fade);
+            accum_bent_n = accum_bent_n + select(normal, normalize(bent), dot(bent, bent) > 1e-4);
+        } else {
+            accum_bent_n = accum_bent_n + normal;
         }
         accum_open = accum_open + open;
 
         var refl_dist = params.lens.y;
         if (bits_reflections && roughness <= params.effects.x) {
-            let h = ggx_sample(normal, roughness, next_f32(&state), next_f32(&state));
+            let refl_base_n = select(normal, water_wave_normal(point.xz, params.frame.x * 0.03, dist), is_water);
+            let h = ggx_sample(refl_base_n, roughness, next_f32(&state), next_f32(&state));
             var reflect_dir = reflect(view_dir, h);
-            if (dot(reflect_dir, normal) <= 0.0) {
-                reflect_dir = reflect(view_dir, normal);
+            if (dot(reflect_dir, refl_base_n) <= 0.0) {
+                reflect_dir = reflect(view_dir, refl_base_n);
             }
             let f0 = select(0.04, 0.18, is_water);
             let m = 1.0 - clamp(dot(-view_dir, h), 0.0, 1.0);
@@ -1289,6 +1426,17 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             } else {
                 let sky_col = sample_sky_reflection(reflect_dir);
                 refl_col = sky_col * (fresnel * trim_scale * 0.65 * (1.0 - fog_t));
+                // Enhancement #14: Ray-traced sun & moon glitter paths across living water.
+                if (is_water && params.sun_dir.y > 0.02) {
+                    let cos_glint = clamp(dot(reflect_dir, params.sun_dir.xyz), 0.0, 1.0);
+                    let g2 = cos_glint * cos_glint;
+                    let g8 = g2 * g2 * g2 * g2;
+                    let g32 = g8 * g8 * g8 * g8;
+                    let glint = g32 * g32 * 0.95 + g8 * g8 * 0.14;
+                    let glint_col = mix(vec3<f32>(0.55, 0.72, 1.0), params.sun_colour.xyz, sun_strength);
+                    let glint_amp = mix(0.55, 1.35, sun_strength);
+                    refl_col = refl_col + glint_col * (glint * glint_amp * fresnel * (1.0 - fog_t));
+                }
             }
             if (bits_lighting && pl_count > 0u && fog_t < 0.92) {
                 let fx_refl = trace_effect_light_reflections(ray_origin, reflect_dir, eff_max_t, pl_count);
@@ -1302,12 +1450,19 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let shallow_clear = exp(-wdepth * 0.16);
                 let depth_tint = (beer - vec3<f32>(1.0)) * (raster_rgb * 0.28 * refract_w);
                 refl_col = max(refl_col + depth_tint, vec3<f32>(0.0));
+                // Enhancement #13: Backlit shallow-water shoreline subsurface turquoise glow.
+                if (wdepth < 4.5 && shadow > 0.05 && sun_strength > 0.05) {
+                    let back_w = clamp(dot(view_dir, params.sun_dir.xyz), 0.0, 1.0);
+                    let bw3 = back_w * back_w * back_w;
+                    let shore_w = smoothstep(0.05, 0.55, wdepth) * (1.0 - smoothstep(1.2, 4.5, wdepth));
+                    refl_col = refl_col + vec3<f32>(0.12, 0.62, 0.58) * params.sun_colour.xyz * (bw3 * shore_w * shadow * sun_strength * refract_w * 0.45);
+                }
                 if (bits_caustics && wdepth < 12.0 && shadow > 0.05 && n_dot_l > 0.08 && sun_strength > 0.05) {
                     let refr_t = wdepth / max(-refract_dir.y, 0.25);
                     let seabed_pos = point + refract_dir * refr_t;
-                    let caust = caustic_pattern(seabed_pos.xz, params.frame.x * 0.025, dist);
+                    let caust_rgb = caustic_pattern_chromatic(seabed_pos.xz, params.frame.x * 0.025, dist, wdepth);
                     let c_fade = smoothstep(0.15, 0.90, wdepth) * shallow_clear * exp(-dist * 0.015);
-                    refl_col = refl_col + params.sun_colour.xyz * beer * (caust * shadow * n_dot_l * sun_strength * refract_w * c_fade * 0.16);
+                    refl_col = refl_col + params.sun_colour.xyz * beer * caust_rgb * (shadow * n_dot_l * sun_strength * refract_w * c_fade * 0.16);
                 }
             }
             accum_reflection = accum_reflection + refl_col;
@@ -1358,7 +1513,33 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                             vec3<f32>(b_avg) + (b_base_albedo - vec3<f32>(b_avg)) * 1.25,
                             vec3<f32>(0.04),
                             vec3<f32>(0.90));
-                        let off_in = b_chroma * (params.sun_colour.xyz * (b_ndl * b_shadow * 1.15) + params.ambient.xyz * (params.tuning.z * 0.20));
+                        gi_total_rays = gi_total_rays + 1.0;
+                        // Enhancement #5: Direct multi-bounce colored GI from nearby lanterns, portals & beams.
+                        var gi_pl_direct = vec3<f32>(0.0);
+                        if (bounce == 0u && bits_lighting && pl_count > 0u) {
+                            let pl_cap = min(pl_count, 24u);
+                            for (var pli = 0u; pli < pl_cap; pli = pli + 1u) {
+                                let pr = params.point_lights_pos_rad[pli];
+                                let to_pl = pr.xyz - bhit_world;
+                                if (abs(to_pl.x) >= pr.w || abs(to_pl.z) >= pr.w || abs(to_pl.y) >= pr.w) {
+                                    continue;
+                                }
+                                let r_ndl = dot(bhit.normal, to_pl);
+                                if (r_ndl <= 0.0) {
+                                    continue;
+                                }
+                                let d2 = dot(to_pl, to_pl);
+                                if (d2 <= 1e-4 || d2 >= pr.w * pr.w) {
+                                    continue;
+                                }
+                                let d_l = sqrt(d2);
+                                let att = point_light_falloff(d_l, pr.w);
+                                let ci = params.point_lights_col_int[pli];
+                                gi_pl_direct = gi_pl_direct + ci.rgb * (ci.w * att * (r_ndl / d_l) * 1.35);
+                            }
+                            gi_pl_direct = min(gi_pl_direct, vec3<f32>(1.6));
+                        }
+                        let off_in = b_chroma * (params.sun_colour.xyz * (b_ndl * b_shadow * 1.15) + gi_pl_direct + params.ambient.xyz * (params.tuning.z * 0.20));
                         var incoming = off_in;
                         if (bounce == 0u && bhit.t < 40.0) {
                             let b_screen = sample_screen_radiance(bhit_world, bhit.t);
@@ -1390,9 +1571,21 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                             b_step_bias = b_bias;
                         }
                     } else {
+                        gi_total_rays = gi_total_rays + 1.0;
+                        gi_sky_hits = gi_sky_hits + 1.0;
                         let raw_sky = min(sample_sky_env(d), vec3<f32>(1.10));
                         let sky_l = luminance(raw_sky);
-                        let vivid_sky = max(vec3<f32>(sky_l) + (raw_sky - vec3<f32>(sky_l)) * 1.25, vec3<f32>(0.0));
+                        var vivid_sky = max(vec3<f32>(sky_l) + (raw_sky - vec3<f32>(sky_l)) * 1.25, vec3<f32>(0.0));
+                        // Enhancement #15: Golden-hour sunset/dawn sky-bounce warm/cool color grading.
+                        if (params.sun_dir.y > 0.01 && params.sun_dir.y < 0.42 && sun_strength > 0.05) {
+                            let golden_w = 1.0 - smoothstep(0.10, 0.42, params.sun_dir.y);
+                            let sun_align = dot(
+                                normalize(vec3<f32>(d.x, 0.0, d.z) + vec3<f32>(1e-5, 0.0, 0.0)),
+                                normalize(vec3<f32>(params.sun_dir.x, 0.0, params.sun_dir.z) + vec3<f32>(1e-5, 0.0, 0.0)),
+                            );
+                            let warm_cool = mix(vec3<f32>(0.76, 0.84, 1.22), vec3<f32>(1.26, 0.94, 0.68), sun_align * 0.5 + 0.5);
+                            vivid_sky = vivid_sky * mix(vec3<f32>(1.0), warm_cool, golden_w * 0.55);
+                        }
                         let sky_w = select(0.14, 0.24, bounce == 0u);
                         gi_sum = gi_sum + throughput * vivid_sky * (params.tuning.w * sky_w * day_gi_scale * (1.0 - fog_t));
                         break;
@@ -1427,10 +1620,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         if (sub_depth < 28.0 && n_dot_l > 0.05) {
             let uw_vis = select(1.0, accum_shadow / f32(samples), bits_shadows);
             if (uw_vis > 0.05) {
-                let caust = caustic_pattern(point.xz, params.frame.x * 0.025);
+                let caust_rgb = caustic_pattern_chromatic(point.xz, params.frame.x * 0.025, dist, sub_depth);
                 let beer = exp(-sub_depth * vec3<f32>(0.18, 0.07, 0.04));
                 let fade = smoothstep(0.05, 0.50, sub_depth) * exp(-sub_depth * 0.065) * exp(-dist * 0.008);
-                underwater_caustics = params.sun_colour.xyz * beer * (caust * uw_vis * n_dot_l * sun_strength * fade * 0.85);
+                underwater_caustics = params.sun_colour.xyz * beer * caust_rgb * (uw_vis * n_dot_l * sun_strength * fade * 0.85);
             }
         }
     }
@@ -1465,6 +1658,118 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let shaft_intensity = mix(0.025, 0.065, sun_strength);
                 god_rays = shaft_col * (shaft_vis * shaft_contrast * min(phase, 1.4) * dist_w * shaft_intensity * (1.0 - fog_t * 0.7));
             }
+        }
+    }
+
+    // Enhancement #2: Ray-Traced Underwater Volumetric Sun Shafts when submerged.
+    if (bits_shadows && water_y > -1e5 && params.sun_dir.y > 0.08 && sun_strength > 0.05
+        && (params.eye.y < water_y - 0.10 || point.y < water_y - 0.15) && dist > 3.0)
+    {
+        let uw_march = min(dist, 65.0) - 1.0;
+        if (uw_march > 2.0) {
+            var uw_lit = 0.0;
+            var uw_occ = 0.0;
+            for (var ui = 0u; ui < 5u; ui = ui + 1u) {
+                let u = (f32(ui) + ign_v) * 0.2;
+                let t_u = 1.0 + u * uw_march;
+                let p_u = params.eye.xyz + view_dir * t_u;
+                if (p_u.y >= water_y) {
+                    continue;
+                }
+                if (occluded(p_u, params.sun_dir.xyz, 0.4, 220.0, state ^ (ui * 41u))) {
+                    uw_occ = uw_occ + 1.0;
+                } else {
+                    let d_sub = max(water_y - p_u.y, 0.1);
+                    let wave_focus = 0.65 + 0.35 * sin(p_u.x * 0.45 + p_u.z * 0.38 + params.frame.x * 0.04);
+                    uw_lit = uw_lit + exp(-d_sub * 0.065) * wave_focus;
+                }
+            }
+            let uw_contrast = mix(0.35, 1.0, smoothstep(0.05, 0.40, uw_occ * 0.2));
+            let uw_tint = vec3<f32>(0.16, 0.66, 0.78) * params.sun_colour.xyz;
+            god_rays = god_rays + uw_tint * ((uw_lit * 0.2) * uw_contrast * sun_strength * 0.16 * (1.0 - fog_t * 0.6));
+        }
+    }
+
+    // Enhancement #18: Water-to-Wall caustic indirect bounce onto bridges, piers & cliffs.
+    if (bits_gi && !is_water && water_y > -1e5 && point.y >= water_y - 0.1 && point.y < water_y + 16.0
+        && normal.y < 0.35 && sun_strength > 0.05 && dist < 85.0)
+    {
+        let h_above = max(point.y - water_y, 0.1);
+        let h_fade = exp(-h_above * 0.18) * (1.0 - clamp(normal.y + 0.15, 0.0, 1.0));
+        let caust_b = caustic_pattern(point.xz, params.frame.x * 0.025, dist + 25.0);
+        let w_vis = select(1.0, accum_shadow / f32(samples), bits_shadows);
+        underwater_caustics = underwater_caustics + vec3<f32>(0.18, 0.68, 0.62) * params.sun_colour.xyz
+            * (caust_b * h_fade * sun_strength * (0.35 + 0.65 * w_vis) * 0.22 * (1.0 - fog_t));
+    }
+
+    // Enhancement #9: Shadowed Atmospheric Aerial Perspective.
+    if (bits_aerial_perspective && bits_shadows && dist > 65.0 && fog_t < 0.96 && params.sun_dir.y > 0.04) {
+        let ap_len = min(dist, 480.0) - 35.0;
+        if (ap_len > 25.0) {
+            var ap_lit = 0.0;
+            for (var ai = 0u; ai < 3u; ai = ai + 1u) {
+                let t_a = 35.0 + ((f32(ai) + ign_v) / 3.0) * ap_len;
+                let p_a = params.eye.xyz + view_dir * t_a;
+                if (!occluded(p_a, params.sun_dir.xyz, 1.0, 420.0, state ^ (ai * 67u))) {
+                    ap_lit = ap_lit + 1.0;
+                }
+            }
+            let lit_frac = ap_lit / 3.0;
+            let ap_dist = smoothstep(65.0, 380.0, dist) * (1.0 - fog_t * 0.55);
+            let warm_haze = mix(vec3<f32>(0.85, 0.68, 0.45), params.sun_colour.xyz, 0.65);
+            let cool_haze = vec3<f32>(0.24, 0.36, 0.58);
+            let ap_col = mix(cool_haze, warm_haze, lit_frac);
+            god_rays = god_rays + ap_col * (ap_dist * sun_strength * 0.065);
+        }
+    }
+
+    // Enhancement #3: Local Volumetric Light Halos around bright lanterns, portals & beams.
+    if (bits_lighting && pl_count > 0u && dist > 2.5 && fog_t < 0.95) {
+        let dark_fog_w = max(1.0 - 0.72 * sun_strength, fog_t * 0.65);
+        if (dark_fog_w > 0.15) {
+            let max_h_t = min(dist, 95.0);
+            let halo_cap = min(pl_count, 32u);
+            var halo_sum = vec3<f32>(0.0);
+            var best_h_score = 0.0;
+            var best_h_pos = vec3<f32>(0.0);
+            var best_h_col = vec3<f32>(0.0);
+            for (var hi = 0u; hi < halo_cap; hi = hi + 1u) {
+                let pr = params.point_lights_pos_rad[hi];
+                if (pr.w <= 1.5) {
+                    continue;
+                }
+                let to_l = pr.xyz - params.eye.xyz;
+                let t_p = dot(to_l, view_dir);
+                if (t_p <= 1.2 || t_p >= max_h_t) {
+                    continue;
+                }
+                let d2 = dot(to_l, to_l) - t_p * t_p;
+                let r_h = clamp(pr.w * 0.24, 1.8, 9.0);
+                let r2 = r_h * r_h;
+                if (d2 >= r2 * 4.5) {
+                    continue;
+                }
+                let ci = params.point_lights_col_int[hi];
+                let x = d2 / max(r2, 0.25);
+                let scatter = (1.0 / (1.0 + x * 1.4 + 0.6 * x * x)) * (1.0 / (1.0 + t_p * 0.025));
+                let contrib = ci.rgb * (ci.w * scatter * 0.048);
+                let sc = luminance(contrib);
+                if (sc > best_h_score) {
+                    best_h_score = sc;
+                    best_h_pos = params.eye.xyz + view_dir * t_p;
+                    best_h_col = contrib;
+                } else {
+                    halo_sum = halo_sum + contrib * 0.65;
+                }
+            }
+            if (best_h_score > 1e-4) {
+                var vis_h = 1.0;
+                if (bits_shadows && occluded(params.eye.xyz, view_dir, 0.5, max(length(best_h_pos - params.eye.xyz) - 0.5, 0.6), state ^ 97u)) {
+                    vis_h = 0.0;
+                }
+                halo_sum = halo_sum + best_h_col * vis_h;
+            }
+            god_rays = god_rays + min(halo_sum * dark_fog_w, vec3<f32>(0.38));
         }
     }
 
@@ -1561,7 +1866,13 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let l_dir = to_l / max(pl_dist, 1e-5);
                 var pl_vis = 1.0;
                 if (bits_shadows && pl_dist > 1.5 && ws[ci] > 0.015) {
-                    if (occluded(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias), state ^ (idx * 131u + 17u))) {
+                    let r_emit = clamp(pl_pr.w * 0.032, 0.16, 1.35);
+                    let l_onb = orthonormal_basis(l_dir);
+                    let ang = rot_angle + f32(ci) * 2.39996323;
+                    let jitter_pt = pl_pr.xyz + l_onb * vec3<f32>(cos(ang), sin(ang), 0.0) * (r_emit * sqrt(next_f32(&state)));
+                    let j_vec = jitter_pt - ray_origin;
+                    let j_dist = length(j_vec);
+                    if (occluded(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, max(j_dist - bias, bias), state ^ (idx * 131u + 17u))) {
                         pl_vis = 0.0;
                     }
                 }
@@ -1588,7 +1899,13 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let l_dir = to_l / max(pl_dist, 1e-5);
                 var pl_vis = 1.0;
                 if (bits_shadows && pl_dist > 1.5) {
-                    if (occluded(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias), state ^ (idx * 131u + 29u))) {
+                    let r_emit = clamp(pl_pr.w * 0.032, 0.16, 1.35);
+                    let l_onb = orthonormal_basis(l_dir);
+                    let ang = rot_angle + f32(ri) * 2.39996323 + 1.1;
+                    let jitter_pt = pl_pr.xyz + l_onb * vec3<f32>(cos(ang), sin(ang), 0.0) * (r_emit * sqrt(next_f32(&state)));
+                    let j_vec = jitter_pt - ray_origin;
+                    let j_dist = length(j_vec);
+                    if (occluded(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, max(j_dist - bias, bias), state ^ (idx * 131u + 29u))) {
                         pl_vis = 0.0;
                     }
                 }
@@ -1613,8 +1930,30 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let avg_shadow = accum_shadow * inv;
     let avg_open = accum_open * inv;
     let avg_refl = accum_reflection * inv + god_rays;
+    let bent_normal = select(normal, normalize(accum_bent_n), dot(accum_bent_n, accum_bent_n) > 1e-4);
     let avg_refl_dist = accum_refl_dist * inv;
-    let avg_gi = accum_gi * inv + sss_light + underwater_caustics;
+    var avg_gi = accum_gi * inv + sss_light + underwater_caustics;
+
+    // Enhancement #8: Ray-Traced Moonlit Night Sky & Starlight Hemispherical Bounce.
+    if (bits_moonlit_night && !is_water && sun_strength < 0.35 && fog_t < 0.94) {
+        let night_w = 1.0 - smoothstep(0.05, 0.35, sun_strength);
+        let sky_up = clamp(bent_normal.y * 0.65 + 0.35, 0.0, 1.0);
+        let moon_align = clamp(dot(bent_normal, params.sun_dir.xyz), 0.0, 1.0) * 0.55 + 0.45;
+        let night_sky = min(sample_sky_env(bent_normal), vec3<f32>(0.45, 0.55, 0.75));
+        let moon_bounce = mix(vec3<f32>(0.035, 0.055, 0.105), night_sky * 0.35 + vec3<f32>(0.03, 0.05, 0.09), 0.5);
+        let open_gate = avg_open * avg_open;
+        avg_gi = avg_gi + moon_bounce * (night_w * sky_up * moon_align * open_gate * (1.0 - fog_t));
+    }
+
+    // Enhancement #19: Ray-Traced Shadowed Rain & Snow Lighting.
+    if (bits_weather && dist < 80.0) {
+        let precip_luma = luminance(raster_rgb);
+        if (precip_luma > 0.45 && abs(normal.y) < 0.75) {
+            let p_vis = select(1.0, avg_shadow, bits_shadows);
+            let pl_glow = point_lighting * 0.45;
+            avg_gi = avg_gi + (params.sun_colour.xyz * (p_vis * sun_strength * 0.14) + pl_glow) * (1.0 - clamp(dist / 80.0, 0.0, 1.0));
+        }
+    }
 
     var out_rgb = vec3<f32>(0.0);
     var out_lf = 1.0;
@@ -1624,7 +1963,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let sun_f = clamp(sun_e / max(sun_e + amb_e, 1e-4), 0.0, 1.0);
         let amb_f = 1.0 - sun_f;
         let v_sun = select(1.0, avg_shadow, bits_shadows);
-        let v_ao = select(1.0, avg_open, bits_ao);
+        // Enhancement #7 & #16: Bent-normal sky alignment + deep interior sky-portal falloff.
+        let sky_portal_vis = select(1.0, mix(0.55, 1.0, gi_sky_hits / max(gi_total_rays, 1.0)), gi_total_rays > 0.5);
+        let bent_sky = mix(0.82, 1.0, clamp(bent_normal.y * 0.5 + 0.5, 0.0, 1.0));
+        let v_ao = select(1.0, avg_open * bent_sky * sky_portal_vis, bits_ao);
         let gi_active = bits_gi && !is_water && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01;
         let amb_keep = select(1.0, mix(1.0, 0.18, gi_fade), gi_active);
         let night_dark_scale = mix(0.085, 1.0, smoothstep(0.0, 0.25, sun_strength));
@@ -3881,6 +4223,9 @@ impl RaywatcherGpu {
             ],
             point_lights,
         );
+        if has_object_mv {
+            packed.effects[1] = (packed.effects[1] as u32 | 2048u32) as f32;
+        }
         packed.terrain_map_bounds = self.terrain_map_bounds();
         if let Some(ws) = water.iter().min_by(|a, b| {
             let ca = glam::Vec2::new(
