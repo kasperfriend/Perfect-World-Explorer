@@ -50,6 +50,8 @@ mod effect_census;
 // A preview is a test-only harness. The skip is on the module: its literals
 // are authored GFX text and its tables are read top to bottom, neither of
 // which formatting improves, and every other module stays checked.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod client_diagnostics;
 mod display_gamma;
 mod dlss;
 mod dxt;

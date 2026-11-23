@@ -91,7 +91,7 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/gpu.rs` | 8449 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
 | `src/grass_random.rs` | 144 | `else-continue` | **unreachable** | `else {` |
 | `src/latency.rs` | 309 | `let-underscore` | **unreachable** | `let _ = end(1);` |
-| `src/launcher_ui.rs` | 221 | `ok-question` | **probe** | `decode(&fs::read(settings_file()?).ok()?)` |
+| `src/launcher_ui.rs` | 222 | `ok-question` | **probe** | `decode(&fs::read(settings_file()?).ok()?)` |
 | `src/load_status.rs` | 160 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
 | `src/loading_screen.rs` | 292 | `ok-question` | **probe** | `let number = number.parse::<u32>().ok()?;` |
 | `src/loading_screen.rs` | 397 | `ok-question` | **probe** | `let raw = std::env::var("PWE_LOADING_PICTURE").ok()?;` |

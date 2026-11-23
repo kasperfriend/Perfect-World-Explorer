@@ -316,7 +316,7 @@ impl Model {
         let up = v3(b, p + 24)?;
         let position = v3(b, p + 36)?;
         p += 48;
-        let v305_header_word = if version >= 0x10000305 {
+        let v305_header_word = if version >= 0x10000304 {
             // 0x10000305 models (e.g. world/47, login, a111) carry a 4-byte
             // model-level field (often 0xFFFFFFFF) immediately before nNumMeshes.
             let word = u(b, p)?;
@@ -1198,6 +1198,11 @@ mod tests {
         assert_eq!(model.meshes.len(), 2);
         assert_eq!(model.meshes[0].name, "Box4827");
         assert_eq!(model.meshes[1].name, "Box4828");
+
+        // 0x10000304 carries the same 4-byte header word before nNumMeshes.
+        b[4..8].copy_from_slice(&0x10000304u32.to_le_bytes());
+        let model304 = Model::parse(&b).expect("v304 with -1 sentinel + count=2 should parse");
+        assert_eq!(model304.meshes.len(), 2);
     }
 
     #[test]

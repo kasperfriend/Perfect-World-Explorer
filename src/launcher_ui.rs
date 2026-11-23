@@ -177,6 +177,7 @@ struct State {
     ready: bool,
     known: bool,
     low_memory: bool,
+    run_diagnostics: bool,
     hover: u8,
     focus: u8,
     /// Version rows from the folder scan: the game build, then the `tasks.data`
@@ -434,13 +435,18 @@ mod tests {
 pub fn low_memory() -> bool {
     state().lock().map(|s| s.low_memory).unwrap_or(false)
 }
+pub fn run_diagnostics() -> bool {
+    state().lock().map(|s| s.run_diagnostics).unwrap_or(false)
+}
 fn hit(x: i32, y: i32, ready: bool) -> u8 {
     if (54..284).contains(&x) && (362..410).contains(&y) {
         1
     } else if ready && (298..450).contains(&x) && (362..410).contains(&y) {
         2
-    } else if (54..420).contains(&x) && (444..474).contains(&y) {
+    } else if (54..420).contains(&x) && (444..470).contains(&y) {
         3
+    } else if (54..460).contains(&x) && (472..498).contains(&y) {
+        4
     } else {
         0
     }
@@ -473,6 +479,12 @@ pub fn click(hwnd: Handle, x: i32, y: i32) -> usize {
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
             }
+            4 => {
+                s.run_diagnostics = !s.run_diagnostics;
+                unsafe {
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+            }
             _ => {}
         }
     }
@@ -491,6 +503,7 @@ pub fn key(hwnd: Handle, k: usize) -> usize {
                         }
                     }
                     2 => 3,
+                    3 => 4,
                     _ => 1,
                 };
                 unsafe {
@@ -504,6 +517,12 @@ pub fn key(hwnd: Handle, k: usize) -> usize {
                     if let Err(e) = toggle_low_memory(&mut s) {
                         s.status = e;
                     }
+                    unsafe {
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    }
+                }
+                4 => {
+                    s.run_diagnostics = !s.run_diagnostics;
                     unsafe {
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     }
@@ -788,6 +807,24 @@ pub unsafe fn paint(hwnd: Handle) {
             13,
             400,
             rgb(183, 206, 207),
+        );
+        rect(dc, 54, 476, 16, 16, rgb(112, 166, 165));
+        rect(dc, 55, 477, 14, 14, rgb(12, 39, 46));
+        if s.run_diagnostics {
+            text(dc, 56, 473, "✓", 14, 700, rgb(224, 192, 142));
+        }
+        text(
+            dc,
+            80,
+            474,
+            "Run all-worlds diagnostics before launch (slow)",
+            13,
+            400,
+            if s.run_diagnostics {
+                rgb(224, 192, 142)
+            } else {
+                rgb(183, 206, 207)
+            },
         );
         text(
             dc,

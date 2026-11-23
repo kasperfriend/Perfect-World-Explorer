@@ -14,7 +14,7 @@ use std::{
 
 const CACHE_MAGIC: &[u8; 8] = b"PWWPAGE1";
 const PAGE_MAGIC: &[u8; 8] = b"PWWPG001";
-const FORMAT: u64 = 8;
+const FORMAT: u64 = 9;
 const MAX_CACHED_PAGES: usize = 100_000;
 const MAX_CACHED_VERTICES: usize = 16_000_000;
 const MAX_CACHED_INDICES: usize = 100_000_000;

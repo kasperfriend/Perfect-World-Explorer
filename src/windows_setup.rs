@@ -1701,6 +1701,52 @@ pub fn start_window() -> Result<Option<PathBuf>, String> {
                 }
                 2 => {
                     if let Some(client) = selected {
+                        if crate::launcher_ui::run_diagnostics() {
+                            let report_hint = client
+                                .element
+                                .parent()
+                                .unwrap_or(&client.element)
+                                .join("pw-explorer-diagnostics.txt");
+                            let prompt: Vec<u16> = format!(
+                                "Full client diagnostics will scan every map (ECWLD, EC-BSD, terrain textures, water, and all referenced BMDs) and write all errors with explanations to:\n\n{}\n\nThis can take a minute. Continue?",
+                                report_hint.display()
+                            )
+                            .encode_utf16()
+                            .chain(Some(0))
+                            .collect();
+                            let cap: Vec<u16> = "Perfect World Explorer — Diagnostics Warning"
+                                .encode_utf16()
+                                .chain(Some(0))
+                                .collect();
+                            // MB_OKCANCEL (0x1) | MB_ICONWARNING (0x30); IDOK == 1
+                            let choice = MessageBoxW(hwnd, prompt.as_ptr(), cap.as_ptr(), 0x31);
+                            if choice == 1 {
+                                match crate::client_diagnostics::run_all_worlds(&client.element) {
+                                    Ok(summary) => {
+                                        let done: Vec<u16> = format!(
+                                            "Diagnostics complete.\n\nMaps scanned: {} ({} with errors)\nUnique BMDs scanned: {} ({} failed)\nTotal errors: {}\n\nReport saved to:\n{}",
+                                            summary.maps_scanned,
+                                            summary.maps_failed,
+                                            summary.unique_bmds_scanned,
+                                            summary.bmds_failed,
+                                            summary.total_errors,
+                                            summary.report_path.display()
+                                        )
+                                        .encode_utf16()
+                                        .chain(Some(0))
+                                        .collect();
+                                        let done_cap: Vec<u16> = "Diagnostics Complete"
+                                            .encode_utf16()
+                                            .chain(Some(0))
+                                            .collect();
+                                        MessageBoxW(hwnd, done.as_ptr(), done_cap.as_ptr(), 0x40);
+                                    }
+                                    Err(err) => {
+                                        show_error(&format!("Diagnostics failed: {err}"));
+                                    }
+                                }
+                            }
+                        }
                         if crate::launcher_ui::low_memory() {
                             std::env::set_var("PW_SMALL_MASK_ATLAS", "1");
                         }
