@@ -316,19 +316,13 @@ impl Model {
         let up = v3(b, p + 24)?;
         let position = v3(b, p + 36)?;
         p += 48;
-        let count = u(b, p)? as usize;
+        let mut count = u(b, p)? as usize;
         p += 4;
-        if count == u32::MAX as usize {
-            let start = p - 4;
-            let end = b.len().min(start + 128);
-            let hex: String = b[start..end]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            return Err(format!(
-                "v305 sentinel mesh_count=-1 (version={version:#x}, len={}, tail={hex})",
-                b.len()
-            ));
+        if is_v300 && count == u32::MAX as usize {
+            // 0x10000305 models (e.g. world/47 and login) write -1 (0xFFFFFFFF)
+            // before the actual u32 mesh count.
+            count = u(b, p)? as usize;
+            p += 4;
         }
         if count > 65_536 {
             return Err(format!("too many meshes ({count}, version={version:#x})"));
@@ -1156,20 +1150,39 @@ mod tests {
     }
 
     #[test]
-    fn reports_hex_tail_for_v305_sentinel_mesh_count() {
+    fn parses_v305_sentinel_mesh_count_followed_by_real_count() {
         let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
         let mut b = Vec::new();
         put(&mut b, 0x42584f4d);
         put(&mut b, 0x10000305);
         b.extend_from_slice(&[0; 48]);
         put(&mut b, u32::MAX);
-        put(&mut b, 0x11223344);
-        let err = match Model::parse(&b) {
-            Ok(_) => panic!("expected error"),
-            Err(e) => e,
-        };
-        assert!(err.contains("version=0x10000305"), "{err}");
-        assert!(err.contains("tail=ffffffff44332211"), "{err}");
+        put(&mut b, 2);
+        b.extend_from_slice(&[0, 0]);
+        push_v300_mesh(
+            &mut b,
+            false,
+            true,
+            b"Box4827",
+            b"Building\\textures\\f\\697.dds",
+            [0xffc0bcb7; 3],
+            [0xff808080; 3],
+            16,
+        );
+        push_v300_mesh(
+            &mut b,
+            false,
+            true,
+            b"Box4828",
+            b"Building\\textures\\f\\697.dds",
+            [0xffffffff; 3],
+            [0xff909090; 3],
+            16,
+        );
+        let model = Model::parse(&b).expect("v305 with -1 sentinel + count=2 should parse");
+        assert_eq!(model.meshes.len(), 2);
+        assert_eq!(model.meshes[0].name, "Box4827");
+        assert_eq!(model.meshes[1].name, "Box4828");
     }
 
     #[test]
