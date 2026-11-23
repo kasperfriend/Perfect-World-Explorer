@@ -407,7 +407,7 @@ impl Default for Settings {
             reflection_roughness_cutoff: 0.4,
             show_denoiser_input: false,
             replace_raster: false,
-            point_light_shadows: false,
+            point_light_shadows: true,
             debug_view: DebugView::None,
             camera_light_enabled: false,
             camera_light_intensity: 5.0,
@@ -581,7 +581,7 @@ impl Plan {
             grid: ((render.0 / ray_scale).max(1), (render.1 / ray_scale).max(1)),
             render,
             replace_raster: settings.replace_raster,
-            point_light_shadows: settings.point_light_shadows,
+            point_light_shadows: true,
             debug_view: settings.debug_view,
         }
     }

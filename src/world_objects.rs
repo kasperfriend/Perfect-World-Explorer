@@ -1056,7 +1056,7 @@ fn extract_rt_triangles(
                                     if a > m_max_a {
                                         m_max_a = a;
                                     }
-                                    if a >= 0.30 {
+                                    if a >= 0.48 {
                                         m_bits |= 1u64 << (iy * 7 + ix);
                                         m_hits += 1;
                                         m_rgb[0] += c[0] * a;
@@ -1310,13 +1310,15 @@ impl GpuPage {
         };
         let normal = Arc::new(make(normal));
         let reflected = Arc::new(make(reflected));
-        // Retain mip 4 (256 x used_height/16, ~16-64 KiB) for shared-atlas RT
-        // texture & alpha extraction without keeping the 64 MiB base atlas in RAM.
-        let atlas_thumb: AtlasThumb = if let Some(mip4) = page.mips.get(3) {
+        // Retain mip 2 (1024 x used_height/4, 32x32 px per 128px leaf tile) for
+        // shared-atlas RT texture & 7x7 alpha cutout extraction. Only ~22 base atlases
+        // exist across the whole world, so mip 2 keeps foliage cutouts razor-sharp
+        // instead of smearing transparent leaf margins into solid quads at mip 4.
+        let atlas_thumb: AtlasThumb = if let Some(mip2) = page.mips.get(1) {
             Arc::new((
-                (SIDE / 16).max(1),
-                (page.used_height / 16).max(1),
-                mip4.clone(),
+                (SIDE / 4).max(1),
+                (page.used_height / 4).max(1),
+                mip2.clone(),
             ))
         } else {
             Arc::new((SIDE, page.used_height, page.atlas.clone()))

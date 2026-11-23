@@ -716,8 +716,8 @@ impl FarTrees {
                                 let frond_cutoff = lod
                                     .frond_alpha_ref
                                     .filter(|r| *r > 1.0)
-                                    .map(|r| (r / 255.0).clamp(0.18, 0.55))
-                                    .unwrap_or(0.32);
+                                    .map(|r| (r / 255.0).clamp(0.30, 0.62))
+                                    .unwrap_or(0.46);
                                 let (mut mask, mut albedo, mut hits) =
                                     sample_tri_alpha_mask49(img, v0.uv, v1.uv, v2.uv, frond_cutoff);
                                 if hits == 0 {
@@ -771,7 +771,7 @@ impl FarTrees {
                         // Sample exact 7x7 (49-bit) alpha cutout silhouettes from `tree.composite`
                         // for both triangles of this SpeedTree leaf card so shadows and reflections
                         // reproduce real individual leaves instead of flat boxy quads/diamonds.
-                        let leaf_cutoff = 84.0 / 255.0;
+                        let leaf_cutoff = 0.48f32;
                         let (mut m0, mut a0, mut h0) = sample_tri_alpha_mask49(
                             &tree.composite,
                             leaf.uv[0],
@@ -1519,26 +1519,35 @@ impl FarTrees {
     pub fn diagnostics_report(&self, eye: glam::Vec3, max_dist: f32) -> String {
         use std::fmt::Write;
         let max_d2 = max_dist * max_dist;
-        let mut out = String::new();
-        let _ = writeln!(
-            out,
-            "[SpeedTree RT Diagnostics] species_total={} max_dist={:.0}",
-            self.rt_species.len(),
-            max_dist
-        );
+        let mut rows: Vec<(f32, usize, [f32; 3], &RtTreeSpecies)> = Vec::new();
         for sp in &self.rt_species {
             let mut near_cnt = 0usize;
             let mut nearest_d2 = f32::INFINITY;
+            let mut nearest_pos = [0.0f32; 3];
             for &p in &sp.positions {
                 let d2 = (p[0] - eye.x).powi(2) + (p[1] - eye.y).powi(2) + (p[2] - eye.z).powi(2);
                 if d2 <= max_d2 {
                     near_cnt += 1;
-                    nearest_d2 = nearest_d2.min(d2);
+                    if d2 < nearest_d2 {
+                        nearest_d2 = d2;
+                        nearest_pos = p;
+                    }
                 }
             }
-            if near_cnt == 0 {
-                continue;
+            if near_cnt > 0 {
+                rows.push((nearest_d2.sqrt(), near_cnt, nearest_pos, sp));
             }
+        }
+        rows.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "[SpeedTree RT Diagnostics] species_total={} nearby_species={} max_dist={:.0}",
+            self.rt_species.len(),
+            rows.len(),
+            max_dist
+        );
+        for (nearest_d, near_cnt, np, sp) in rows {
             let d0 = sp.lod_diags.first().copied().unwrap_or_default();
             let warn = if d0.frond_tris + d0.fixed_3d_leaves + d0.billboard_leaves == 0 {
                 " [WARN: NO_FOLIAGE_IN_LOD0]"
@@ -1551,26 +1560,34 @@ impl FarTrees {
             };
             let _ = writeln!(
                 out,
-                "  species #{:03}: near_inst={} nearest={:.1}u h={:.1} comp={}x{} alpha=[{}..{}] lods={} | LOD0(branch={}, frond={}, frond_skip={}, 3d_leaf={}, bb_leaf={}, leaf_skip={}, masked={}, unmasked_foliage={}){}",
+                "  species #{:03}: near_inst={} nearest={:.1}u at=({:.1},{:.1},{:.1}) h={:.1} comp={}x{} alpha=[{}..{}] lods={}{}",
                 sp.species_id,
                 near_cnt,
-                nearest_d2.sqrt(),
+                nearest_d,
+                np[0], np[1], np[2],
                 sp.height,
                 sp.composite_size.0,
                 sp.composite_size.1,
                 sp.composite_alpha_min,
                 sp.composite_alpha_max,
                 sp.lods.len(),
-                d0.branch_tris,
-                d0.frond_tris,
-                d0.frond_skipped,
-                d0.fixed_3d_leaves,
-                d0.billboard_leaves,
-                d0.leaves_skipped,
-                d0.masked_tris,
-                d0.unmasked_foliage_tris,
                 warn,
             );
+            for (li, ld) in sp.lod_diags.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "    LOD{}: branch={} frond={} frond_skip={} 3d_leaf={} bb_leaf={} leaf_skip={} masked={} unmasked_foliage={}",
+                    li,
+                    ld.branch_tris,
+                    ld.frond_tris,
+                    ld.frond_skipped,
+                    ld.fixed_3d_leaves,
+                    ld.billboard_leaves,
+                    ld.leaves_skipped,
+                    ld.masked_tris,
+                    ld.unmasked_foliage_tris,
+                );
+            }
         }
         out
     }

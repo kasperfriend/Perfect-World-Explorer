@@ -1860,10 +1860,13 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         {
             let gdim_pl = vec2<i32>(i32(params.extents.x), i32(params.extents.y));
             let cpx = vec2<i32>(id.xy);
-            let d_thresh = max(0.45, dist * 0.018);
-            var offs = array<vec2<i32>, 4>(vec2<i32>(2, 0), vec2<i32>(-2, 0), vec2<i32>(0, 2), vec2<i32>(0, -2));
-            var n_acc = normal * 1.5;
-            for (var oi = 0u; oi < 4u; oi = oi + 1u) {
+            let d_thresh = max(0.80, dist * 0.026);
+            var offs = array<vec2<i32>, 8>(
+                vec2<i32>(2, 0), vec2<i32>(-2, 0), vec2<i32>(0, 2), vec2<i32>(0, -2),
+                vec2<i32>(4, 4), vec2<i32>(-4, 4), vec2<i32>(4, -4), vec2<i32>(-4, -4)
+            );
+            var n_acc = normal * 1.25;
+            for (var oi = 0u; oi < 8u; oi = oi + 1u) {
                 let npx = clamp(cpx + offs[oi], vec2<i32>(0), gdim_pl - vec2<i32>(1));
                 let nd = textureLoad(src_gbuf_pos, npx, 0).w;
                 if (nd > 0.0 && abs(nd - dist) < d_thresh) {
@@ -1871,7 +1874,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                     let nn_l = length(nn);
                     if (nn_l > 1e-4) {
                         nn = nn / nn_l;
-                        if (dot(normal, nn) > 0.65) {
+                        if (dot(normal, nn) > 0.56) {
                             n_acc = n_acc + nn;
                         }
                     }
@@ -1882,7 +1885,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 pl_normal = n_acc / acc_l;
             }
         }
-        let pl_terrain_skip = 1.8 + steepness * 10.0 + dist * 0.015;
+        let pl_terrain_skip = 2.4 + steepness * 12.0 + dist * 0.020;
 
         var res0_idx = 0xffffffffu;
         var res0_wsum = 0.0;
@@ -1914,10 +1917,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             let pl_dist = sqrt(pl_d2);
             let l_dir = to_l / pl_dist;
             let raw_cos = dot(pl_normal, l_dir);
-            if (raw_cos <= -0.22) {
+            if (raw_cos <= -0.28) {
                 continue;
             }
-            let pl_ndl = clamp((raw_cos + 0.25) / 1.25, 0.0, 1.0);
+            let pl_ndl = clamp((raw_cos + 0.32) / 1.32, 0.0, 1.0);
             if (pl_ndl <= 0.001) {
                 continue;
             }

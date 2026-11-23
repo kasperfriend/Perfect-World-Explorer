@@ -3902,7 +3902,7 @@ impl Renderer {
             let mut sum_drop = 0usize;
             let mut sum_degen = 0usize;
             let mut sum_untex = 0usize;
-            let mut suspect_lines = Vec::new();
+            let mut suspect_pages: Vec<(f32, String)> = Vec::new();
             for (pi, page) in pages_slice.iter().enumerate() {
                 let d = page.rt_diag();
                 sum_pages += 1;
@@ -3916,28 +3916,38 @@ impl Renderer {
                 sum_drop += d.dropped_transparent_tris;
                 sum_degen += d.degenerate_tris;
                 sum_untex += d.untextured_tris;
-                if suspect_lines.len() < 32
-                    && (d.semi_unmasked_tris > 0
-                        || d.untextured_tris > 0
-                        || d.degenerate_tris > 32
-                        || (d.used_thumb_atlas && d.total_tris > 0 && d.masked_tris == 0))
+                if d.semi_unmasked_tris > 0
+                    || d.untextured_tris > 0
+                    || d.degenerate_tris > 16
+                    || d.masked_tris > 0
                 {
                     let (bmin, bmax) = page.page_bounds();
-                    suspect_lines.push(format!(
-                        "  page#{pi}: thumb={} tris={} opaque={} masked={} semi_unmasked={} dropped_alpha={} degen={} untex={} bounds=({:.0},{:.0},{:.0})..({:.0},{:.0},{:.0})",
-                        d.used_thumb_atlas,
-                        d.total_tris,
-                        d.opaque_tris,
-                        d.masked_tris,
-                        d.semi_unmasked_tris,
-                        d.dropped_transparent_tris,
-                        d.degenerate_tris,
-                        d.untextured_tris,
-                        bmin[0], bmin[1], bmin[2],
-                        bmax[0], bmax[1], bmax[2],
-                    ));
+                    let pmin = glam::Vec3::from_array(bmin);
+                    let pmax = glam::Vec3::from_array(bmax);
+                    let clamped = camera.pos.clamp(pmin, pmax);
+                    let page_dist = camera.pos.distance(clamped);
+                    if page_dist <= detail_radius {
+                        suspect_pages.push((
+                            page_dist,
+                            format!(
+                                "  page#{pi}: dist={page_dist:.1}u thumb={} tris={} opaque={} masked={} semi_unmasked={} dropped_alpha={} degen={} untex={} bounds=({:.0},{:.0},{:.0})..({:.0},{:.0},{:.0})",
+                                d.used_thumb_atlas,
+                                d.total_tris,
+                                d.opaque_tris,
+                                d.masked_tris,
+                                d.semi_unmasked_tris,
+                                d.dropped_transparent_tris,
+                                d.degenerate_tris,
+                                d.untextured_tris,
+                                bmin[0], bmin[1], bmin[2],
+                                bmax[0], bmax[1], bmax[2],
+                            ),
+                        ));
+                    }
                 }
             }
+            suspect_pages.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            suspect_pages.truncate(64);
             let _ = writeln!(
                 report,
                 "\n[BMD / World Objects] pages={} (thumb_atlas={}) tris={} opaque={} masked={} semi_unmasked={} dropped_alpha={} degenerate={} untextured={}",
@@ -3951,20 +3961,23 @@ impl Renderer {
                 sum_degen,
                 sum_untex,
             );
-            if suspect_lines.is_empty() {
-                let _ = writeln!(report, "  (no suspect BMD pages)");
+            if suspect_pages.is_empty() {
+                let _ = writeln!(
+                    report,
+                    "  (no nearby foliage/suspect BMD pages within {detail_radius:.0}u)"
+                );
             } else {
-                let _ = writeln!(report, "  suspect pages (first {}):", suspect_lines.len());
-                for line in suspect_lines {
+                let _ = writeln!(
+                    report,
+                    "  nearest foliage/suspect pages within {detail_radius:.0}u (showing {}):",
+                    suspect_pages.len()
+                );
+                for (_, line) in suspect_pages {
                     let _ = writeln!(report, "{line}");
                 }
             }
             let _ = writeln!(report, "\n[SpeedTree / FarTrees]");
-            report.push_str(
-                &self
-                    .far_trees
-                    .diagnostics_report(camera.pos, detail_radius.min(640.0)),
-            );
+            report.push_str(&self.far_trees.diagnostics_report(camera.pos, detail_radius));
             let log_dir =
                 crate::diagnostics::dir().unwrap_or_else(crate::diagnostics::default_log_dir);
             let _ = std::fs::create_dir_all(&log_dir);

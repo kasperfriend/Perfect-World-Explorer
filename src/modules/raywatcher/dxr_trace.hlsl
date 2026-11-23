@@ -1434,16 +1434,19 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
         point_lighting = min(point_lighting * (1.0 - fog_t), float3(1.6, 1.6, 1.6));
     } else if (bits_lighting && pl_count > 0u) {
-        // Depth- and angle-aware 5-tap normal smoothing removes low-poly terrain/rock
+        // Wider depth- and angle-aware 9-tap normal smoothing removes low-poly terrain/rock
         // triangle faceting under point/effect lights while keeping 90-degree building corners crisp.
         float3 pl_normal = normal;
         {
             int2 gdim_pl = int2(int(params.extents.x), int(params.extents.y));
             int2 cpx = int2(id.xy);
-            float d_thresh = max(0.45, dist * 0.018);
-            int2 offs[4] = { int2(2, 0), int2(-2, 0), int2(0, 2), int2(0, -2) };
-            float3 n_acc = normal * 1.5;
-            for (uint oi = 0u; oi < 4u; oi = oi + 1u) {
+            float d_thresh = max(0.80, dist * 0.026);
+            int2 offs[8] = {
+                int2(2, 0), int2(-2, 0), int2(0, 2), int2(0, -2),
+                int2(4, 4), int2(-4, 4), int2(4, -4), int2(-4, -4)
+            };
+            float3 n_acc = normal * 1.25;
+            for (uint oi = 0u; oi < 8u; oi = oi + 1u) {
                 int2 npx = clamp(cpx + offs[oi], int2(0, 0), gdim_pl - int2(1, 1));
                 float nd = src_gbuf_pos.Load(int3(npx, 0)).w;
                 if (nd > 0.0 && abs(nd - dist) < d_thresh) {
@@ -1451,7 +1454,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float nn_l = length(nn);
                     if (nn_l > 1e-4) {
                         nn /= nn_l;
-                        if (dot(normal, nn) > 0.65) {
+                        if (dot(normal, nn) > 0.56) {
                             n_acc += nn;
                         }
                     }
@@ -1462,7 +1465,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 pl_normal = n_acc / acc_l;
             }
         }
-        float pl_terrain_skip = 1.8 + steepness * 10.0 + dist * 0.015;
+        float pl_terrain_skip = 2.4 + steepness * 12.0 + dist * 0.020;
 
         uint res0_idx = 0xffffffffu;
         float res0_wsum = 0.0;
@@ -1496,10 +1499,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float raw_cos = dot(pl_normal, to_l) * inv_pl_dist;
             // Gentle wrap-Lambert prevents harsh triangle-edge jumps on low-poly terrain slopes
             // while still rejecting genuinely back-facing building walls.
-            if (raw_cos <= -0.22) {
+            if (raw_cos <= -0.28) {
                 continue;
             }
-            float pl_ndl = saturate((raw_cos + 0.25) / 1.25);
+            float pl_ndl = saturate((raw_cos + 0.32) / 1.32);
             if (pl_ndl <= 0.001) {
                 continue;
             }

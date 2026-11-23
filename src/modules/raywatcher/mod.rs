@@ -504,13 +504,7 @@ impl Raywatcher {
             .on_hover_text(
                 "Draws the raw one-sample-per-pixel ray image instead of the filtered one. A debug switch: it makes the denoiser's work visible.",
             );
-        ui.checkbox(
-            &mut settings.point_light_shadows,
-            "RT point-light shadows (opt-in)",
-        )
-        .on_hover_text(
-            "Shadows the game's own SceneLights without adding extra light. Off by default.",
-        );
+        // Point lights & RT point-light shadows are always enabled when Raywatcher is active.
         ui.checkbox(&mut settings.replace_raster, "Replace raster lighting (debug opt-in)")
             .on_hover_text(
                 "Off by default: Raywatcher layers ray-traced shadows, reflections, AO, point lights and GI over the full textured raster world.",
