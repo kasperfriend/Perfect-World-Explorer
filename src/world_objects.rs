@@ -672,6 +672,12 @@ fn run(
         if let Some(mut reader) = crate::world_page_cache::Reader::open(&key) {
             let mut metadata = Vec::with_capacity(reader.page_count());
             let mut valid = true;
+            if reader.page_count() == 0 && !ornaments.is_empty() {
+                eprintln!("Whole-world cache rejected: 0 cached pages for non-empty map");
+                reader.invalidate();
+                let _ = tx.send(Message::CacheInvalid);
+                valid = false;
+            }
             for index in 0..reader.page_count() {
                 match reader.read_page(index) {
                     Ok(page) => {
@@ -950,9 +956,11 @@ fn run(
         }
     }
     let world_draw_cmds = world_culled_commands_from_meta(&world_metadata);
-    if let Some(writer) = cache.take() {
-        if let Err(error) = writer.finish(limit, skipped, atlas_pages, atlas_bytes) {
-            eprintln!("Whole-world cache publish failed: {error}");
+    if pages > 0 {
+        if let Some(writer) = cache.take() {
+            if let Err(error) = writer.finish(limit, skipped, atlas_pages, atlas_bytes) {
+                eprintln!("Whole-world cache publish failed: {error}");
+            }
         }
     }
     let _ = tx.send(Message::Done {

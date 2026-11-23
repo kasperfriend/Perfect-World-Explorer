@@ -316,16 +316,24 @@ impl Model {
         let up = v3(b, p + 24)?;
         let position = v3(b, p + 36)?;
         p += 48;
-        let mut count = u(b, p)? as usize;
-        p += 4;
-        if is_v300 && count == u32::MAX as usize {
-            // 0x10000305 models (e.g. world/47 and login) write -1 (0xFFFFFFFF)
-            // before the actual u32 mesh count.
-            count = u(b, p)? as usize;
+        let v305_header_word = if version >= 0x10000305 {
+            // 0x10000305 models (e.g. world/47, login, a111) carry a 4-byte
+            // model-level field (often 0xFFFFFFFF) immediately before nNumMeshes.
+            let word = u(b, p)?;
             p += 4;
-        }
+            Some(word)
+        } else {
+            None
+        };
+        let count = u(b, p)? as usize;
+        p += 4;
         if count > 65_536 {
-            return Err(format!("too many meshes ({count}, version={version:#x})"));
+            let extra = v305_header_word
+                .map(|w| format!(", hdr={w:#010x}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "too many meshes ({count}, version={version:#x}{extra})"
+            ));
         }
         let mut meshes = Vec::with_capacity(count.min(4096));
         let mut lossy_gbk_diagnostics = Vec::new();
@@ -1268,6 +1276,7 @@ mod tests {
         put(&mut b, 0x42584f4d);
         put(&mut b, 0x10000305);
         b.extend_from_slice(&[0; 48]);
+        put(&mut b, 0x12345678);
         put(&mut b, 1);
         b.extend_from_slice(&[0, 0]);
         push_v300_mesh(

@@ -6747,8 +6747,17 @@ pub fn run(
                                     world_rx = None;
                                     world_cancel = None;
                                     world_started_at = None;
+                                    let unavailable = stats.unavailable_models.len();
+                                    let unavailable_detail = if unavailable == 0 {
+                                        String::new()
+                                    } else {
+                                        format!(
+                                            "; {unavailable} unavailable scenery models: {}",
+                                            stats.unavailable_examples.join("; ")
+                                        )
+                                    };
                                     world_status = format!(
-                                        "World preload built no pages; local scenery kept ({processed} objects processed, {skipped} without a usable mesh; {})",
+                                        "World preload built no pages; local scenery kept ({processed} objects processed, {skipped} without a usable mesh; {}{unavailable_detail})",
                                         stats.status_line(),
                                     );
                                     crate::diag!(TimingLoad, "{world_status}");
