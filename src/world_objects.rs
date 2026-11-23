@@ -905,16 +905,33 @@ fn sample_atlas_rgba(
     Some(([r, g, b], a))
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RtPageDiag {
+    pub used_thumb_atlas: bool,
+    pub total_tris: usize,
+    pub opaque_tris: usize,
+    pub masked_tris: usize,
+    pub semi_unmasked_tris: usize,
+    pub dropped_transparent_tris: usize,
+    pub degenerate_tris: usize,
+    pub untextured_tris: usize,
+}
+
 fn extract_rt_triangles(
     vertices: &[Vertex],
     indices: &[u32],
     atlas: &[u8],
     atlas_w: usize,
     atlas_h: usize,
-) -> Vec<RtMeshTriangle> {
+    used_thumb_atlas: bool,
+) -> (Vec<RtMeshTriangle>, RtPageDiag) {
+    let mut diag = RtPageDiag {
+        used_thumb_atlas,
+        ..Default::default()
+    };
     let tri_count = indices.len() / 3;
     if tri_count == 0 {
-        return Vec::new();
+        return (Vec::new(), diag);
     }
     // Never stride individual triangles (step > 1 deletes every 2nd triangle of quads!).
     let mut out = Vec::with_capacity(tri_count.min(MAX_RT_TRIS_PER_PAGE));
@@ -966,9 +983,9 @@ fn extract_rt_triangles(
                 };
                 let kind = v0.kind;
                 let is_sdr_blend = (kind > 2.01 && kind < 2.03) || (kind > 2.11 && kind < 2.13);
-                // Sample real RGBA8 texture atlas at 4 triangle points (centroid + 3 mid-corners)
-                // so buildings, roofs, and BMD foliage cards (like City of Plume giant tree)
-                // get true textured RGB albedo and real alpha cutout coverage instead of grey boxes.
+                // Sample real RGBA8 texture atlas at 7 triangle points (centroid + 3 corners
+                // + 3 mid-edges). Checking the 3 corners catches leaf cards whose opaque
+                // cluster covers the interior while transparent margins live near corners.
                 let uv_c = [
                     (v0.uv[0] + v1.uv[0] + v2.uv[0]) / 3.0,
                     (v0.uv[1] + v1.uv[1] + v2.uv[1]) / 3.0,
@@ -976,9 +993,13 @@ fn extract_rt_triangles(
                 let mut tex_rgb = [0.0f32; 3];
                 let mut tex_rgb_w = 0.0f32;
                 let mut tex_alpha_sum = 0.0f32;
+                let mut tex_alpha_min = 1.0f32;
                 let mut tex_samples = 0u32;
                 for uv in [
                     uv_c,
+                    v0.uv,
+                    v1.uv,
+                    v2.uv,
                     [(uv_c[0] + v0.uv[0]) * 0.5, (uv_c[1] + v0.uv[1]) * 0.5],
                     [(uv_c[0] + v1.uv[0]) * 0.5, (uv_c[1] + v1.uv[1]) * 0.5],
                     [(uv_c[0] + v2.uv[0]) * 0.5, (uv_c[1] + v2.uv[1]) * 0.5],
@@ -988,6 +1009,9 @@ fn extract_rt_triangles(
                     {
                         tex_samples += 1;
                         tex_alpha_sum += a;
+                        if a < tex_alpha_min {
+                            tex_alpha_min = a;
+                        }
                         if a >= 0.20 {
                             tex_rgb[0] += rgb[0] * a;
                             tex_rgb[1] += rgb[1] * a;
@@ -999,17 +1023,17 @@ fn extract_rt_triangles(
                 let tex_alpha = if tex_samples > 0 {
                     Some(tex_alpha_sum / tex_samples as f32)
                 } else {
+                    diag.untextured_tris += 1;
                     None
                 };
-                // For any BMD triangle whose texture is not solidly opaque (`ta < 0.96`,
-                // e.g. BMD trees, blossoms, willows, bamboo, bushes, railings, banners),
-                // sample the exact 7x7 (49-bit) texture alpha cutout mask with zero 4x
-                // triangle blowup and zero page-size cutoff.
+                // For any BMD triangle whose texture is not solidly opaque (`ta < 0.96`
+                // or any corner/edge sample below 0.95), sample the exact 7x7 (49-bit)
+                // texture alpha cutout mask so leaf cards never degrade to solid quads.
                 let mut alpha_mask = 0u64;
                 let mut mask_albedo = None;
                 let mut mask_opacity = None;
                 if let Some(ta) = tex_alpha {
-                    if ta < 0.96 {
+                    if ta < 0.96 || tex_alpha_min < 0.95 {
                         let mut m_bits = 0u64;
                         let mut m_rgb = [0.0f32; 3];
                         let mut m_w = 0.0f32;
@@ -1044,6 +1068,7 @@ fn extract_rt_triangles(
                             }
                         }
                         if m_hits == 0 && m_max_a < 0.12 {
+                            diag.dropped_transparent_tris += 1;
                             t += 1;
                             continue;
                         }
@@ -1117,6 +1142,14 @@ fn extract_rt_triangles(
                 } else {
                     1.0
                 };
+                diag.total_tris += 1;
+                if alpha_mask != 0 {
+                    diag.masked_tris += 1;
+                } else if opacity >= 0.99 {
+                    diag.opaque_tris += 1;
+                } else {
+                    diag.semi_unmasked_tris += 1;
+                }
                 out.push(RtMeshTriangle {
                     a,
                     b,
@@ -1126,11 +1159,13 @@ fn extract_rt_triangles(
                     opacity,
                     alpha_mask,
                 });
+            } else {
+                diag.degenerate_tris += 1;
             }
         }
         t += 1;
     }
-    out
+    (out, diag)
 }
 
 /// Compact downsampled RGBA8 atlas thumbnail (`(width, height, rgba)`) kept on
@@ -1151,6 +1186,7 @@ pub struct GpuPage {
     page_max: [f32; 3],
     page_has_sdr: bool,
     rt_triangles: Arc<[RtMeshTriangle]>,
+    rt_diag: RtPageDiag,
 }
 #[derive(Clone)]
 struct WorldPageMeta {
@@ -1320,6 +1356,9 @@ impl GpuPage {
     pub fn rt_triangles_arc(&self) -> Arc<[RtMeshTriangle]> {
         Arc::clone(&self.rt_triangles)
     }
+    pub fn rt_diag(&self) -> RtPageDiag {
+        self.rt_diag
+    }
 
     pub fn page_bounds(&self) -> ([f32; 3], [f32; 3]) {
         (self.page_min, self.page_max)
@@ -1337,9 +1376,16 @@ impl GpuPage {
         atlas_thumb: AtlasThumb,
     ) -> Self {
         use wgpu::util::DeviceExt;
-        let rt_triangles: Arc<[RtMeshTriangle]> = if !page.atlas.is_empty() {
+        let (rt_vec, rt_diag) = if !page.atlas.is_empty() {
             let atlas_h = page.atlas.len() / (SIDE * 4);
-            extract_rt_triangles(&page.vertices, &page.indices, &page.atlas, SIDE, atlas_h).into()
+            extract_rt_triangles(
+                &page.vertices,
+                &page.indices,
+                &page.atlas,
+                SIDE,
+                atlas_h,
+                false,
+            )
         } else {
             extract_rt_triangles(
                 &page.vertices,
@@ -1347,9 +1393,10 @@ impl GpuPage {
                 &atlas_thumb.2,
                 atlas_thumb.0,
                 atlas_thumb.1,
+                true,
             )
-            .into()
         };
+        let rt_triangles: Arc<[RtMeshTriangle]> = rt_vec.into();
         let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("whole-world object vertices"),
             contents: bytemuck::cast_slice(&page.vertices),
@@ -1373,6 +1420,7 @@ impl GpuPage {
             page_max: page.page_max,
             page_has_sdr: page.page_has_sdr,
             rt_triangles,
+            rt_diag,
         }
     }
     /// Submits only the placements the recovered EC-BSD flags admit in this
@@ -2103,7 +2151,7 @@ mod raywatcher_extract_tests {
             v([4.0, 0.0, 0.0], 0x0000_0000, 2.0),
             v([0.0, 4.0, 0.0], 0x0000_0000, 2.0),
         ];
-        let tris = extract_rt_triangles(&verts, &[0, 1, 2, 3, 4, 5], &[], 0, 0);
+        let (tris, _diag) = extract_rt_triangles(&verts, &[0, 1, 2, 3, 4, 5], &[], 0, 0, false);
         assert_eq!(tris.len(), 2);
         assert!(
             (tris[0].opacity - 1.0).abs() < 1e-5,

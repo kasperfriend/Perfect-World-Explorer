@@ -450,6 +450,14 @@ impl Raywatcher {
                 });
             });
         ui.separator();
+        ui.checkbox(
+            &mut settings.diagnostics_log,
+            "Diagnostics log (trees & broken models -> raywatcher-diag.log)",
+        )
+        .on_hover_text(
+            "Writes detailed SpeedTree species/LOD leaf mask stats, BMD model alpha-mask & degenerate triangle stats, and active effect-light stats to pwe-logs/raywatcher-diag.log whenever the RT scene harvests.",
+        );
+        ui.separator();
         ui.heading("Quality");
         ui.add(
             egui::Slider::new(&mut settings.bounces, BOUNCES_RANGE.0..=BOUNCES_RANGE.1)
@@ -658,6 +666,7 @@ impl Raywatcher {
             "camera_light_warmness={}",
             self.settings.camera_light_warmness
         );
+        let _ = writeln!(out, "diagnostics_log={}", self.settings.diagnostics_log);
         if !self.settings.sdk_dir.is_empty() {
             let _ = writeln!(out, "sdk_dir={}", self.settings.sdk_dir);
         }
@@ -735,6 +744,9 @@ impl Raywatcher {
         }
         if let Some(v) = get("camera_light_warmness").and_then(|v| v.parse().ok()) {
             s.camera_light_warmness = v;
+        }
+        if let Some(v) = get("diagnostics_log").and_then(parse_flag) {
+            s.diagnostics_log = v;
         }
         if let Some(dir) = get("sdk_dir") {
             s.sdk_dir = dir.trim().to_string();

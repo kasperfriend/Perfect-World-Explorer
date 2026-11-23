@@ -364,6 +364,8 @@ pub struct Settings {
     pub camera_light_intensity: f32,
     /// Camera light colour warmness: -1.0 (hot red) -> 0.0 (white) -> +1.0 (cold blue).
     pub camera_light_warmness: f32,
+    /// Write tree, BMD model, and point/effect-light RT diagnostics to `raywatcher-diag.log`.
+    pub diagnostics_log: bool,
     /// Folder the reconstruction SDKs are loaded from. Empty means
     /// `PW_UPSCALER_SDK_DIR`, then `<exe>/sdk`, the same rule the upscalers use.
     pub sdk_dir: String,
@@ -410,6 +412,7 @@ impl Default for Settings {
             camera_light_enabled: false,
             camera_light_intensity: 5.0,
             camera_light_warmness: 0.0,
+            diagnostics_log: false,
             sdk_dir: String::new(),
         }
     }

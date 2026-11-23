@@ -222,11 +222,29 @@ pub struct RtTreeTriangle {
     pub alpha_mask: u64,
 }
 
+/// Per-LOD RT harvest diagnostics for one SpeedTree species.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RtTreeLodDiag {
+    pub branch_tris: usize,
+    pub frond_tris: usize,
+    pub frond_skipped: usize,
+    pub fixed_3d_leaves: usize,
+    pub billboard_leaves: usize,
+    pub leaves_skipped: usize,
+    pub masked_tris: usize,
+    pub unmasked_foliage_tris: usize,
+}
+
 /// Local-space SpeedTree LOD meshes retained for Raywatcher RT harvesting.
 pub struct RtTreeSpecies {
+    pub species_id: usize,
     pub height: f32,
+    pub composite_size: (u32, u32),
+    pub composite_alpha_min: u8,
+    pub composite_alpha_max: u8,
     pub positions: Vec<[f32; 3]>,
     pub lods: Vec<Vec<RtTreeTriangle>>,
+    pub lod_diags: Vec<RtTreeLodDiag>,
 }
 
 /// Sample linear RGB + alpha coverage from an RGBA8 texture at normalized UV.
@@ -575,7 +593,14 @@ impl FarTrees {
                 continue;
             }
             let first_batch = batches.len();
+            let mut comp_min_a = 255u8;
+            let mut comp_max_a = 0u8;
+            for p in tree.composite.pixels() {
+                comp_min_a = comp_min_a.min(p[3]);
+                comp_max_a = comp_max_a.max(p[3]);
+            }
             let mut species_rt_lods: Vec<Vec<RtTreeTriangle>> = Vec::with_capacity(tree.lods.len());
+            let mut species_lod_diags: Vec<RtTreeLodDiag> = Vec::with_capacity(tree.lods.len());
             for lod in &tree.lods {
                 let rocking_base = rocking_samples.len() / 64;
                 rocking_samples.extend(lod.rocking.iter().map(|v| [v[0], v[1], v[2], 0.]));
@@ -663,6 +688,7 @@ impl FarTrees {
                 // frond, and leaf triangles with per-material alpha coverage.
                 {
                     let mut lod_tris = Vec::new();
+                    let mut ldiag = RtTreeLodDiag::default();
                     for (part, img, is_foliage) in [
                         (&lod.branch, &tree.bark, false),
                         (&lod.frond, &tree.composite, true),
@@ -699,9 +725,16 @@ impl FarTrees {
                                         sample_tri_alpha_mask49(img, v0.uv, v1.uv, v2.uv, 0.12);
                                 }
                                 if hits == 0 {
+                                    ldiag.frond_skipped += 1;
                                     continue;
                                 }
                                 let coverage = hits as f32 / 49.0;
+                                ldiag.frond_tris += 1;
+                                if hits < 49 {
+                                    ldiag.masked_tris += 1;
+                                } else {
+                                    ldiag.unmasked_foliage_tris += 1;
+                                }
                                 lod_tris.push(RtTreeTriangle {
                                     a,
                                     b,
@@ -718,6 +751,7 @@ impl FarTrees {
                                     (v0.uv[1] + v1.uv[1] + v2.uv[1]) / 3.0,
                                 ];
                                 let (albedo, _) = sample_rgba_uv(img, uv_mid);
+                                ldiag.branch_tris += 1;
                                 lod_tris.push(RtTreeTriangle {
                                     a,
                                     b,
@@ -769,6 +803,7 @@ impl FarTrees {
                             );
                         }
                         if h0 + h1 == 0 {
+                            ldiag.leaves_skipped += 1;
                             continue;
                         }
                         let n = leaf
@@ -776,6 +811,51 @@ impl FarTrees {
                             .map(|n| glam::Vec3::new(n[0], n[2], n[1]).normalize_or_zero())
                             .filter(|n| n.length_squared() > 0.25)
                             .unwrap_or(glam::Vec3::Y);
+                        if leaf.rho > 1000.0 {
+                            // Fixed-orientation 3D SpeedTree leaf (`rho > 1000` in raster VS):
+                            // `leaf.corners[j]` are exact 3D vertex offsets in SpeedTree Z-up space.
+                            ldiag.fixed_3d_leaves += 1;
+                            let p = [0, 1, 2, 3].map(|j| {
+                                let v = leaf.corners[j];
+                                center + glam::Vec3::new(v[0], v[2], v[1])
+                            });
+                            if h0 > 0 && (p[1] - p[0]).cross(p[2] - p[0]).length_squared() > 1e-8 {
+                                if h0 < 49 {
+                                    ldiag.masked_tris += 1;
+                                } else {
+                                    ldiag.unmasked_foliage_tris += 1;
+                                }
+                                lod_tris.push(RtTreeTriangle {
+                                    a: p[0],
+                                    b: p[1],
+                                    c: p[2],
+                                    normal: n,
+                                    albedo: a0,
+                                    roughness: 0.84,
+                                    opacity: (0.45 + 0.48 * (h0 as f32 / 49.0)).clamp(0.45, 0.92),
+                                    alpha_mask: m0,
+                                });
+                            }
+                            if h1 > 0 && (p[2] - p[0]).cross(p[3] - p[0]).length_squared() > 1e-8 {
+                                if h1 < 49 {
+                                    ldiag.masked_tris += 1;
+                                } else {
+                                    ldiag.unmasked_foliage_tris += 1;
+                                }
+                                lod_tris.push(RtTreeTriangle {
+                                    a: p[0],
+                                    b: p[2],
+                                    c: p[3],
+                                    normal: n,
+                                    albedo: a1,
+                                    roughness: 0.84,
+                                    opacity: (0.45 + 0.48 * (h1 as f32 / 49.0)).clamp(0.45, 0.92),
+                                    alpha_mask: m1,
+                                });
+                            }
+                            continue;
+                        }
+                        ldiag.billboard_leaves += 1;
                         let up = if n.y.abs() < 0.95 {
                             glam::Vec3::Y
                         } else {
@@ -783,13 +863,26 @@ impl FarTrees {
                         };
                         let right = up.cross(n).normalize_or_zero();
                         let bitan = n.cross(right).normalize_or_zero();
-                        let mut avg_r = 0.0f32;
-                        for j in 0..4 {
-                            let c = leaf.corners[j];
-                            avg_r += (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
-                        }
-                        // Half-extent of the SpeedTree leaf card from its corner radius (diagonal / sqrt(2)).
-                        let half = ((avg_r * 0.25) * 0.7071).clamp(0.16, 2.2);
+                        // Preserve rectangular SpeedTree leaf aspect ratio (width vs height)
+                        // from `leaf.corners[0..4]` instead of forcing a square card.
+                        let edge_w = (glam::Vec3::from_array(leaf.corners[1])
+                            - glam::Vec3::from_array(leaf.corners[0]))
+                        .length()
+                        .max(
+                            (glam::Vec3::from_array(leaf.corners[2])
+                                - glam::Vec3::from_array(leaf.corners[3]))
+                            .length(),
+                        );
+                        let edge_h = (glam::Vec3::from_array(leaf.corners[3])
+                            - glam::Vec3::from_array(leaf.corners[0]))
+                        .length()
+                        .max(
+                            (glam::Vec3::from_array(leaf.corners[2])
+                                - glam::Vec3::from_array(leaf.corners[1]))
+                            .length(),
+                        );
+                        let w_half = (edge_w * 0.5).clamp(0.14, 2.4);
+                        let h_half = (edge_h * 0.5).clamp(0.14, 2.4);
                         let phase = (center.x * 3.17 + center.y * 5.41 + center.z * 2.73).sin();
                         let (s_a, c_a) = (phase * 1.1).sin_cos();
                         let ax1 = (right * c_a + n * s_a).normalize_or_zero();
@@ -799,11 +892,16 @@ impl FarTrees {
                         // texture silhouette so foliage has true 3D volume and crisp leaf cutouts
                         // from every shadow and reflection angle.
                         for &(horiz, norm_dir) in &[(ax1, ax2), (ax2, ax1)] {
-                            let c0 = center - horiz * half - up_axis * half;
-                            let c1 = center + horiz * half - up_axis * half;
-                            let c2 = center + horiz * half + up_axis * half;
-                            let c3 = center - horiz * half + up_axis * half;
+                            let c0 = center - horiz * w_half - up_axis * h_half;
+                            let c1 = center + horiz * w_half - up_axis * h_half;
+                            let c2 = center + horiz * w_half + up_axis * h_half;
+                            let c3 = center - horiz * w_half + up_axis * h_half;
                             if h0 > 0 && (c1 - c0).cross(c2 - c0).length_squared() > 1e-8 {
+                                if h0 < 49 {
+                                    ldiag.masked_tris += 1;
+                                } else {
+                                    ldiag.unmasked_foliage_tris += 1;
+                                }
                                 lod_tris.push(RtTreeTriangle {
                                     a: c0,
                                     b: c1,
@@ -816,6 +914,11 @@ impl FarTrees {
                                 });
                             }
                             if h1 > 0 && (c2 - c0).cross(c3 - c0).length_squared() > 1e-8 {
+                                if h1 < 49 {
+                                    ldiag.masked_tris += 1;
+                                } else {
+                                    ldiag.unmasked_foliage_tris += 1;
+                                }
                                 lod_tris.push(RtTreeTriangle {
                                     a: c0,
                                     b: c2,
@@ -830,6 +933,7 @@ impl FarTrees {
                         }
                     }
                     species_rt_lods.push(lod_tris);
+                    species_lod_diags.push(ldiag);
                 }
                 batches.push(Batch {
                     indices: start_idx..indices.len() as u32,
@@ -837,9 +941,14 @@ impl FarTrees {
                 });
             }
             rt_species.push(RtTreeSpecies {
+                species_id: id,
                 height,
+                composite_size: tree.composite.dimensions(),
+                composite_alpha_min: comp_min_a,
+                composite_alpha_max: comp_max_a,
                 positions: positions.clone(),
                 lods: species_rt_lods,
+                lod_diags: species_lod_diags,
             });
             groups.push(Group {
                 positions,
@@ -1405,6 +1514,67 @@ impl FarTrees {
         harvest_rt_tree_species(&self.rt_species, eye, max_dist, lod_scale, tri_budget, out)
     }
 
+    /// Build a human-readable diagnostic report of all SpeedTree species near `eye`
+    /// for `raywatcher-diag.log` (flagging leaf-less, opaque-composite, or skipped foliage).
+    pub fn diagnostics_report(&self, eye: glam::Vec3, max_dist: f32) -> String {
+        use std::fmt::Write;
+        let max_d2 = max_dist * max_dist;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "[SpeedTree RT Diagnostics] species_total={} max_dist={:.0}",
+            self.rt_species.len(),
+            max_dist
+        );
+        for sp in &self.rt_species {
+            let mut near_cnt = 0usize;
+            let mut nearest_d2 = f32::INFINITY;
+            for &p in &sp.positions {
+                let d2 = (p[0] - eye.x).powi(2) + (p[1] - eye.y).powi(2) + (p[2] - eye.z).powi(2);
+                if d2 <= max_d2 {
+                    near_cnt += 1;
+                    nearest_d2 = nearest_d2.min(d2);
+                }
+            }
+            if near_cnt == 0 {
+                continue;
+            }
+            let d0 = sp.lod_diags.first().copied().unwrap_or_default();
+            let warn = if d0.frond_tris + d0.fixed_3d_leaves + d0.billboard_leaves == 0 {
+                " [WARN: NO_FOLIAGE_IN_LOD0]"
+            } else if sp.composite_alpha_min == 255 && sp.composite_alpha_max == 255 {
+                " [WARN: OPAQUE_COMPOSITE_NO_ALPHA]"
+            } else if d0.leaves_skipped > (d0.fixed_3d_leaves + d0.billboard_leaves) {
+                " [WARN: MANY_LEAVES_SKIPPED]"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                out,
+                "  species #{:03}: near_inst={} nearest={:.1}u h={:.1} comp={}x{} alpha=[{}..{}] lods={} | LOD0(branch={}, frond={}, frond_skip={}, 3d_leaf={}, bb_leaf={}, leaf_skip={}, masked={}, unmasked_foliage={}){}",
+                sp.species_id,
+                near_cnt,
+                nearest_d2.sqrt(),
+                sp.height,
+                sp.composite_size.0,
+                sp.composite_size.1,
+                sp.composite_alpha_min,
+                sp.composite_alpha_max,
+                sp.lods.len(),
+                d0.branch_tris,
+                d0.frond_tris,
+                d0.frond_skipped,
+                d0.fixed_3d_leaves,
+                d0.billboard_leaves,
+                d0.leaves_skipped,
+                d0.masked_tris,
+                d0.unmasked_foliage_tris,
+                warn,
+            );
+        }
+        out
+    }
+
     pub fn update_resident_lods(
         &mut self,
         device: &wgpu::Device,
@@ -1824,9 +1994,14 @@ mod raywatcher_tree_tests {
             alpha_mask: 0,
         };
         let species = RtTreeSpecies {
+            species_id: 0,
             height: 8.0,
+            composite_size: (256, 256),
+            composite_alpha_min: 0,
+            composite_alpha_max: 255,
             positions: vec![[10.0, 0.0, 10.0]],
             lods: vec![vec![branch, leaf], vec![branch]],
+            lod_diags: vec![RtTreeLodDiag::default(); 2],
         };
         let mut out = Vec::new();
         let (real_inst, real_tris, fallbacks) = harvest_rt_tree_species(

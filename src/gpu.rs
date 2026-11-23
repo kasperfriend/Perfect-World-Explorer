@@ -3954,6 +3954,104 @@ impl Renderer {
                     detail_radius,
                 );
             }
+            if settings.diagnostics_log {
+                use std::fmt::Write as _;
+                let mut report = String::with_capacity(4096);
+                let _ = writeln!(
+                    report,
+                    "=== Raywatcher RT Diagnostics ===\ncamera=({:.1}, {:.1}, {:.1}) detail_radius={:.0} world_done={} real_mesh_pages={} tree_tris={} tree_inst={} tree_canopy_fallbacks={}",
+                    camera.pos.x,
+                    camera.pos.y,
+                    camera.pos.z,
+                    detail_radius,
+                    self.world_done,
+                    real_mesh_pages,
+                    real_tree_tris,
+                    real_tree_instances,
+                    tree_canopy_fallbacks,
+                );
+                let _ = writeln!(
+                    report,
+                    "lights: static_model_lights={}",
+                    self.model_lights.lights.len(),
+                );
+                let mut sum_pages = 0usize;
+                let mut thumb_pages = 0usize;
+                let mut sum_tris = 0usize;
+                let mut sum_opaque = 0usize;
+                let mut sum_masked = 0usize;
+                let mut sum_semi = 0usize;
+                let mut sum_drop = 0usize;
+                let mut sum_degen = 0usize;
+                let mut sum_untex = 0usize;
+                let mut suspect_lines = Vec::new();
+                for (pi, page) in pages_slice.iter().enumerate() {
+                    let d = page.rt_diag();
+                    sum_pages += 1;
+                    if d.used_thumb_atlas {
+                        thumb_pages += 1;
+                    }
+                    sum_tris += d.total_tris;
+                    sum_opaque += d.opaque_tris;
+                    sum_masked += d.masked_tris;
+                    sum_semi += d.semi_unmasked_tris;
+                    sum_drop += d.dropped_transparent_tris;
+                    sum_degen += d.degenerate_tris;
+                    sum_untex += d.untextured_tris;
+                    if suspect_lines.len() < 32
+                        && (d.semi_unmasked_tris > 0
+                            || d.untextured_tris > 0
+                            || d.degenerate_tris > 32
+                            || (d.used_thumb_atlas && d.total_tris > 0 && d.masked_tris == 0))
+                    {
+                        let (bmin, bmax) = page.page_bounds();
+                        suspect_lines.push(format!(
+                            "  page#{pi}: thumb={} tris={} opaque={} masked={} semi_unmasked={} dropped_alpha={} degen={} untex={} bounds=({:.0},{:.0},{:.0})..({:.0},{:.0},{:.0})",
+                            d.used_thumb_atlas,
+                            d.total_tris,
+                            d.opaque_tris,
+                            d.masked_tris,
+                            d.semi_unmasked_tris,
+                            d.dropped_transparent_tris,
+                            d.degenerate_tris,
+                            d.untextured_tris,
+                            bmin[0], bmin[1], bmin[2],
+                            bmax[0], bmax[1], bmax[2],
+                        ));
+                    }
+                }
+                let _ = writeln!(
+                    report,
+                    "\n[BMD / World Objects] pages={} (thumb_atlas={}) tris={} opaque={} masked={} semi_unmasked={} dropped_alpha={} degenerate={} untextured={}",
+                    sum_pages,
+                    thumb_pages,
+                    sum_tris,
+                    sum_opaque,
+                    sum_masked,
+                    sum_semi,
+                    sum_drop,
+                    sum_degen,
+                    sum_untex,
+                );
+                if suspect_lines.is_empty() {
+                    let _ = writeln!(report, "  (no suspect BMD pages)");
+                } else {
+                    let _ = writeln!(report, "  suspect pages (first {}):", suspect_lines.len());
+                    for line in suspect_lines {
+                        let _ = writeln!(report, "{line}");
+                    }
+                }
+                let _ = writeln!(report, "\n[SpeedTree / FarTrees]");
+                report.push_str(
+                    &self
+                        .far_trees
+                        .diagnostics_report(camera.pos, detail_radius.min(640.0)),
+                );
+                let log_dir =
+                    crate::diagnostics::dir().unwrap_or_else(crate::diagnostics::default_log_dir);
+                let _ = std::fs::create_dir_all(&log_dir);
+                let _ = std::fs::write(log_dir.join("raywatcher-diag.log"), report);
+            }
 
             // Reflective water surfaces across the visible frustum.
             let water: Vec<WaterSurface> = self
