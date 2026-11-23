@@ -878,8 +878,7 @@ fn terrain(
     // materials and objects instead of waiting behind a two-wave barrier.
     let (water, materials, (water_normals, water_simple_frames), objects, models, grass, trees) =
         std::thread::scope(|s| {
-            let water_task =
-                s.spawn(|| water::load(&world_scene, &dir).map_err(|e| e.to_string()));
+            let water_task = s.spawn(|| water::load(&world_scene, &dir).map_err(|e| e.to_string()));
             let materials_task = s.spawn(|| {
                 material::Materials::load(&dir, &t, &names, w, h, grid_spacing)
                     .map_err(|e| e.to_string())
@@ -890,9 +889,8 @@ fn terrain(
                     water::load_simple_frames(element).map_err(|e| e.to_string())?,
                 ))
             });
-            let objects_task = s.spawn(|| {
-                objects::Objects::open(element, ornaments).map_err(|e| e.to_string())
-            });
+            let objects_task =
+                s.spawn(|| objects::Objects::open(element, ornaments).map_err(|e| e.to_string()));
             let models_task =
                 s.spawn(
                     || match world_models::Assets::open(element, placements.clone()) {

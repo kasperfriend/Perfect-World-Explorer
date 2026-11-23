@@ -5703,7 +5703,7 @@ pub fn run(
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(|value| value.clamp(1, 250))
-        .unwrap_or(40);
+        .unwrap_or(64);
     // The expensive atlas and scene rebuild runs off the UI thread. At most one
     // request is in flight; once it completes, the latest camera position is used.
     let (width, height, spacing) = (t.width, t.height, t.grid_spacing);
@@ -6670,7 +6670,7 @@ pub fn run(
                         world_rx=None;renderer.world_pages.clear();renderer.world_draw_cmds=Default::default();renderer.world_done=false;
                         if world_enabled {
                          let (tx, rx) = std::sync::mpsc::sync_channel(
-                             if crate::objects::unbounded_textures() { 8 } else { 2 },
+                             if crate::objects::unbounded_textures() { 12 } else { 4 },
                          );
                          let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();

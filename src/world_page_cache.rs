@@ -7,7 +7,7 @@ use crate::{
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -97,26 +97,20 @@ fn cache_root() -> PathBuf {
 fn final_dir(key: &[u8; 32]) -> PathBuf {
     cache_root().join(hex(key))
 }
-fn write_hashed(file: &mut File, hash: &mut Sha256, bytes: &[u8]) -> std::io::Result<()> {
+fn write_hashed<W: Write>(file: &mut W, hash: &mut Sha256, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)?;
     hash.update(bytes);
     Ok(())
 }
-fn write_u64(file: &mut File, hash: &mut Sha256, value: u64) -> std::io::Result<()> {
+fn write_u64<W: Write>(file: &mut W, hash: &mut Sha256, value: u64) -> std::io::Result<()> {
     write_hashed(file, hash, &value.to_le_bytes())
-}
-fn write_u32(file: &mut File, hash: &mut Sha256, value: u32) -> std::io::Result<()> {
-    write_hashed(file, hash, &value.to_le_bytes())
-}
-fn write_f32(file: &mut File, hash: &mut Sha256, value: f32) -> std::io::Result<()> {
-    write_u32(file, hash, value.to_bits())
 }
 
 pub(crate) struct Writer {
     key: [u8; 32],
     temp: PathBuf,
     final_dir: PathBuf,
-    pages_file: Option<File>,
+    pages_file: Option<BufWriter<File>>,
     pages: usize,
     published: bool,
 }
@@ -144,7 +138,7 @@ impl Writer {
             key,
             temp,
             final_dir,
-            pages_file: Some(pages_file),
+            pages_file: Some(BufWriter::with_capacity(IO_CHUNK, pages_file)),
             pages: 0,
             published: false,
         })
@@ -152,8 +146,9 @@ impl Writer {
     pub(crate) fn write_page(&mut self, page: &Page) -> std::io::Result<()> {
         let file = self.pages_file.as_mut().expect("page cache file open");
         let mut hash = Sha256::new();
-        write_hashed(file, &mut hash, PAGE_MAGIC)?;
-        for value in [
+        let mut header = [0u8; 8 + 9 * 8 + 1 + 6 * 4];
+        header[0..8].copy_from_slice(PAGE_MAGIC);
+        let fields = [
             page.processed as u64,
             page.used_height as u64,
             page.shared_atlas.map(|n| n as u64).unwrap_or(u64::MAX),
@@ -163,13 +158,15 @@ impl Writer {
             page.mips.len() as u64,
             page.placements.len() as u64,
             page.bounds.len() as u64,
-        ] {
-            write_u64(file, &mut hash, value)?;
+        ];
+        for (i, value) in fields.into_iter().enumerate() {
+            header[8 + i * 8..16 + i * 8].copy_from_slice(&value.to_le_bytes());
         }
-        write_hashed(file, &mut hash, &[u8::from(page.page_has_sdr)])?;
-        for value in page.page_min.into_iter().chain(page.page_max) {
-            write_f32(file, &mut hash, value)?;
+        header[80] = u8::from(page.page_has_sdr);
+        for (i, value) in page.page_min.into_iter().chain(page.page_max).enumerate() {
+            header[81 + i * 4..85 + i * 4].copy_from_slice(&value.to_bits().to_le_bytes());
         }
+        write_hashed(file, &mut hash, &header)?;
         write_hashed(file, &mut hash, bytemuck::cast_slice(&page.vertices))?;
         write_hashed(file, &mut hash, bytemuck::cast_slice(&page.indices))?;
         write_hashed(file, &mut hash, &page.atlas)?;
@@ -177,25 +174,27 @@ impl Writer {
             write_u64(file, &mut hash, mip.len() as u64)?;
             write_hashed(file, &mut hash, mip)?;
         }
-        for placement in &page.placements {
-            write_u32(file, &mut hash, placement.start)?;
-            write_u32(file, &mut hash, placement.end)?;
-            write_u32(file, &mut hash, placement.export_id)?;
-            write_u64(file, &mut hash, placement.order)?;
-            write_hashed(
-                file,
-                &mut hash,
-                &[
-                    u8::from(placement.visibility.reflect),
-                    u8::from(placement.visibility.refract),
-                ],
-            )?;
-        }
-        for bound in &page.bounds {
-            for value in bound.min.into_iter().chain(bound.max) {
-                write_f32(file, &mut hash, value)?;
+        if !page.placements.is_empty() {
+            let mut buf = Vec::with_capacity(page.placements.len() * 22);
+            for placement in &page.placements {
+                buf.extend_from_slice(&placement.start.to_le_bytes());
+                buf.extend_from_slice(&placement.end.to_le_bytes());
+                buf.extend_from_slice(&placement.export_id.to_le_bytes());
+                buf.extend_from_slice(&placement.order.to_le_bytes());
+                buf.push(u8::from(placement.visibility.reflect));
+                buf.push(u8::from(placement.visibility.refract));
             }
-            write_hashed(file, &mut hash, &[u8::from(bound.has_sdr)])?;
+            write_hashed(file, &mut hash, &buf)?;
+        }
+        if !page.bounds.is_empty() {
+            let mut buf = Vec::with_capacity(page.bounds.len() * 25);
+            for bound in &page.bounds {
+                for value in bound.min.into_iter().chain(bound.max) {
+                    buf.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+                buf.push(u8::from(bound.has_sdr));
+            }
+            write_hashed(file, &mut hash, &buf)?;
         }
         file.write_all(&hash.finalize())?;
         self.pages += 1;
@@ -210,8 +209,9 @@ impl Writer {
     ) -> std::io::Result<()> {
         let mut pages_file = self.pages_file.take().expect("page cache file open");
         pages_file.flush()?;
-        pages_file.sync_all()?;
-        drop(pages_file);
+        let raw_file = pages_file.into_inner().map_err(|e| e.into_error())?;
+        raw_file.sync_all()?;
+        drop(raw_file);
         let manifest_tmp = self.temp.join("manifest.tmp");
         let mut file = File::create(&manifest_tmp)?;
         let mut bytes = Vec::with_capacity(88);
@@ -247,7 +247,7 @@ impl Drop for Writer {
 
 pub(crate) struct Reader {
     dir: PathBuf,
-    pages_file: Option<File>,
+    pages_file: Option<BufReader<File>>,
     pages: usize,
     next_page: usize,
     pub(crate) processed: usize,
@@ -285,7 +285,7 @@ impl Reader {
         let pages_file = File::open(dir.join("pages.bin")).ok()?;
         Some(Self {
             dir,
-            pages_file: Some(pages_file),
+            pages_file: Some(BufReader::with_capacity(IO_CHUNK, pages_file)),
             pages,
             next_page: 0,
             processed,
@@ -373,40 +373,48 @@ impl Reader {
             mips.push(read_byte_vec(file, &mut hash, len)?);
         }
         let mut placements = Vec::with_capacity(placement_count);
-        for _ in 0..placement_count {
-            let start = read_u32(file, &mut hash)?;
-            let end = read_u32(file, &mut hash)?;
-            let export_id = read_u32(file, &mut hash)?;
-            let order = read_u64(file, &mut hash)?;
-            let mut flags = [0; 2];
-            read_hashed(file, &mut hash, &mut flags)?;
-            if start > end || end as usize > index_count {
-                return Err("invalid cached placement index range".into());
+        if placement_count > 0 {
+            let pbytes = read_byte_vec(file, &mut hash, placement_count * 22)?;
+            for chunk in pbytes.chunks_exact(22) {
+                let start = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+                let end = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                let export_id = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+                let order = u64::from_le_bytes(chunk[12..20].try_into().unwrap());
+                if start > end || end as usize > index_count {
+                    return Err("invalid cached placement index range".into());
+                }
+                placements.push(PlacementRange {
+                    start,
+                    end,
+                    export_id,
+                    order,
+                    visibility: crate::scenery_visibility::Visibility {
+                        reflect: chunk[20] != 0,
+                        refract: chunk[21] != 0,
+                    },
+                });
             }
-            placements.push(PlacementRange {
-                start,
-                end,
-                export_id,
-                order,
-                visibility: crate::scenery_visibility::Visibility {
-                    reflect: flags[0] != 0,
-                    refract: flags[1] != 0,
-                },
-            });
         }
         let mut bounds = Vec::with_capacity(bounds_count);
-        for _ in 0..bounds_count {
-            let mut min = [0.; 3];
-            let mut max = [0.; 3];
-            for value in min.iter_mut().chain(max.iter_mut()) {
-                *value = read_f32(file, &mut hash)?;
+        if bounds_count > 0 {
+            let bbytes = read_byte_vec(file, &mut hash, bounds_count * 25)?;
+            for chunk in bbytes.chunks_exact(25) {
+                let min = [
+                    f32::from_bits(u32::from_le_bytes(chunk[0..4].try_into().unwrap())),
+                    f32::from_bits(u32::from_le_bytes(chunk[4..8].try_into().unwrap())),
+                    f32::from_bits(u32::from_le_bytes(chunk[8..12].try_into().unwrap())),
+                ];
+                let max = [
+                    f32::from_bits(u32::from_le_bytes(chunk[12..16].try_into().unwrap())),
+                    f32::from_bits(u32::from_le_bytes(chunk[16..20].try_into().unwrap())),
+                    f32::from_bits(u32::from_le_bytes(chunk[20..24].try_into().unwrap())),
+                ];
+                bounds.push(PlacementBounds {
+                    min,
+                    max,
+                    has_sdr: chunk[24] != 0,
+                });
             }
-            read_hashed(file, &mut hash, &mut byte)?;
-            bounds.push(PlacementBounds {
-                min,
-                max,
-                has_sdr: byte[0] != 0,
-            });
         }
         let mut expected_hash = [0; 32];
         file.read_exact(&mut expected_hash)
@@ -452,38 +460,33 @@ fn checked_count(value: u64, max: usize) -> Result<usize, String> {
     }
     Ok(value)
 }
-fn read_hashed(file: &mut File, hash: &mut Sha256, bytes: &mut [u8]) -> Result<(), String> {
+fn read_hashed<R: Read>(file: &mut R, hash: &mut Sha256, bytes: &mut [u8]) -> Result<(), String> {
     file.read_exact(bytes).map_err(|e| e.to_string())?;
     hash.update(bytes);
     Ok(())
 }
-fn read_u64(file: &mut File, hash: &mut Sha256) -> Result<u64, String> {
+fn read_u64<R: Read>(file: &mut R, hash: &mut Sha256) -> Result<u64, String> {
     let mut b = [0; 8];
     read_hashed(file, hash, &mut b)?;
     Ok(u64::from_le_bytes(b))
 }
-fn read_u32(file: &mut File, hash: &mut Sha256) -> Result<u32, String> {
+fn read_u32<R: Read>(file: &mut R, hash: &mut Sha256) -> Result<u32, String> {
     let mut b = [0; 4];
     read_hashed(file, hash, &mut b)?;
     Ok(u32::from_le_bytes(b))
 }
-fn read_f32(file: &mut File, hash: &mut Sha256) -> Result<f32, String> {
+fn read_f32<R: Read>(file: &mut R, hash: &mut Sha256) -> Result<f32, String> {
     Ok(f32::from_bits(read_u32(file, hash)?))
 }
-fn read_byte_vec(file: &mut File, hash: &mut Sha256, len: usize) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(len);
-    let mut scratch = vec![0; IO_CHUNK.min(len.max(1))];
-    let mut left = len;
-    while left != 0 {
-        let n = left.min(scratch.len());
-        read_hashed(file, hash, &mut scratch[..n])?;
-        out.extend_from_slice(&scratch[..n]);
-        left -= n;
+fn read_byte_vec<R: Read>(file: &mut R, hash: &mut Sha256, len: usize) -> Result<Vec<u8>, String> {
+    let mut out = vec![0u8; len];
+    if len > 0 {
+        read_hashed(file, hash, &mut out)?;
     }
     Ok(out)
 }
 fn read_pod_vec<T: bytemuck::Pod + bytemuck::Zeroable + Copy>(
-    file: &mut File,
+    file: &mut impl Read,
     hash: &mut Sha256,
     count: usize,
 ) -> Result<Vec<T>, String> {

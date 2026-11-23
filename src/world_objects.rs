@@ -667,9 +667,9 @@ fn run(
         rgba: vec![160, 160, 160, 255],
     };
     let batch_size = if crate::objects::unbounded_textures() {
-        64
+        128
     } else {
-        24
+        64
     };
     for start in (first..limit).step_by(batch_size) {
         if cancel.load(Ordering::Relaxed) {
@@ -806,14 +806,46 @@ fn run(
                 }
             }
         }
-        // A batch holds at most 32 placements' reused-atlas geometry; unlike
-        // keeping every atlas builder alive this never retains world pixels.
+        // Shared-atlas builders hold only vertices/indices (zero atlas pixels).
+        // Accumulate across batches until a builder reaches `max_vertices` (or
+        // total buffered shared vertices exceeds 2x `max_vertices`) instead of
+        // emitting tiny fragmented pages after every batch.
+        let total_shared_verts: usize = shared_geometry.values().map(|b| b.vertices.len()).sum();
+        if total_shared_verts >= max_vertices.saturating_mul(2)
+            || shared_geometry
+                .values()
+                .any(|b| b.vertices.len() >= max_vertices)
+        {
+            let mut flush_sources: Vec<usize> =
+                if total_shared_verts >= max_vertices.saturating_mul(2) {
+                    shared_geometry.keys().copied().collect()
+                } else {
+                    shared_geometry
+                        .iter()
+                        .filter(|(_, b)| b.vertices.len() >= max_vertices)
+                        .map(|(&s, _)| s)
+                        .collect()
+                };
+            flush_sources.sort_unstable();
+            for source in flush_sources {
+                if let Some(builder) = shared_geometry.remove(&source) {
+                    if !builder.indices.is_empty() {
+                        pages += 1;
+                        if !emit_page(tx, &mut cache, &mut world_metadata, builder.page(end)) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !shared_geometry.is_empty() {
         let mut ready: Vec<_> = shared_geometry.drain().collect();
         ready.sort_by_key(|(source, _)| *source);
         for (_, builder) in ready {
             if !builder.indices.is_empty() {
                 pages += 1;
-                if !emit_page(tx, &mut cache, &mut world_metadata, builder.page(end)) {
+                if !emit_page(tx, &mut cache, &mut world_metadata, builder.page(limit)) {
                     return Ok(());
                 }
             }
