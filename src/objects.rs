@@ -569,9 +569,9 @@ impl Objects {
             }
         }
 
-        let mut seen_models = HashSet::new();
-        let mut seen_refs = HashSet::new();
-        let mut unique_refs = Vec::new();
+        let mut seen_models = HashSet::with_capacity(ids.len());
+        let mut seen_refs: HashSet<&str> = HashSet::new();
+        let mut unique_refs: Vec<String> = Vec::new();
         for &i in ids {
             let name = self.model_names[i].as_str();
             if self.unavailable_models.contains(name) || !seen_models.insert(name) {
@@ -581,14 +581,14 @@ impl Objects {
                 continue;
             };
             for mesh in &model.meshes {
-                if seen_refs.insert(mesh.texture.clone()) {
+                if seen_refs.insert(mesh.texture.as_str()) {
                     unique_refs.push(mesh.texture.clone());
                 }
             }
         }
 
-        let mut pending = Vec::new();
-        let mut queued_keys = HashSet::new();
+        let mut pending = Vec::with_capacity(unique_refs.len());
+        let mut queued_keys = HashSet::with_capacity(unique_refs.len());
         for raw in unique_refs {
             if let Some(job) = self.resolve_texture_job(&raw) {
                 let key = match &job {

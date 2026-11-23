@@ -118,7 +118,25 @@ pub struct TextureResolver {
 /// Normalizes a reference the way the client's lookups do: lowercase
 /// (`_strlwr` before the VFS scan, 0x771970) and `\` folded to `/`.
 pub fn normalize(name: &str) -> String {
-    name.to_lowercase().replace('\\', "/")
+    if name.is_ascii() {
+        let mut out = String::with_capacity(name.len());
+        for b in name.bytes() {
+            out.push(if b == b'\\' { '/' } else { (b as char).to_ascii_lowercase() });
+        }
+        return out;
+    }
+    let mut out = name.to_lowercase();
+    if out.contains('\\') {
+        // SAFETY: replacing single-byte ASCII '\\' with ASCII '/' preserves UTF-8 validity.
+        unsafe {
+            for b in out.as_bytes_mut() {
+                if *b == b'\\' {
+                    *b = b'/';
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Keep an EC-BSD-derived map ID safe to use as an archive namespace. A direct

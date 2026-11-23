@@ -183,7 +183,17 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
         };
         let zero = data[..260].iter().position(|&x| x == 0).unwrap_or(260);
         let (decoded, _, _) = encoding_rs::GBK.decode(&data[..zero]);
-        let name = decoded.replace('\\', "/");
+        let mut name = decoded.into_owned();
+        if name.as_bytes().contains(&b'\\') {
+            // SAFETY: replacing ASCII '\\' with ASCII '/' preserves UTF-8 validity.
+            unsafe {
+                for b in name.as_bytes_mut() {
+                    if *b == b'\\' {
+                        *b = b'/';
+                    }
+                }
+            }
+        }
         let offset = u32le(&data, 260)?;
         let usize_ = u32le(&data, 264)?;
         let compressed = u32le(&data, 268)?;

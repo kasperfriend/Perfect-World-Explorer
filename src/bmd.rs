@@ -123,7 +123,18 @@ fn fixed(b: &[u8], p: usize, n: usize) -> Result<String, String> {
     if bad {
         return Err("invalid GBK in BMD".into());
     }
-    Ok(t.replace('\\', "/"))
+    let mut out = t.into_owned();
+    if out.as_bytes().contains(&b'\\') {
+        // SAFETY: replacing ASCII '\\' with ASCII '/' preserves UTF-8 validity.
+        unsafe {
+            for b in out.as_bytes_mut() {
+                if *b == b'\\' {
+                    *b = b'/';
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 impl Model {
     /// Mirrors the retail loaders exactly:
@@ -326,6 +337,7 @@ impl Model {
             if hull_count > 65_536 {
                 return Err(format!("BMD collision-hull limit exceeded: {hull_count}"));
             }
+            collision.reserve(hull_count);
             for _ in 0..hull_count {
                 let count = u(b, p)? as usize;
                 p += 4;

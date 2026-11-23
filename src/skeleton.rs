@@ -109,7 +109,7 @@ impl Skeleton {
             classes.push(c)
         }
         let mut joints = Vec::with_capacity(nj);
-        let mut embedded_tracks = Vec::new();
+        let mut embedded_tracks = Vec::with_capacity(if version < 6 { nj } else { 0 });
         for (index, class) in classes.into_iter().enumerate() {
             joints.push(Joint {
                 class,
