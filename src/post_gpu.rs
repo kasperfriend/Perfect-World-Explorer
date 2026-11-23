@@ -472,9 +472,15 @@ impl PostGpu {
             format: Some(self.format.remove_srgb_suffix()),
             ..Default::default()
         });
-        let fogged = plan.fog.then(|| self.fogged.create_view(&Default::default()));
-        let warped = plan.warp.then(|| self.warped.create_view(&Default::default()));
-        let downsample = plan.glow.then(|| self.downsample.create_view(&Default::default()));
+        let fogged = plan
+            .fog
+            .then(|| self.fogged.create_view(&Default::default()));
+        let warped = plan
+            .warp
+            .then(|| self.warped.create_view(&Default::default()));
+        let downsample = plan
+            .glow
+            .then(|| self.downsample.create_view(&Default::default()));
         let blur = self.blur.create_view(&Default::default());
         // Separate horizontal and composite bind groups avoid binding the blur texture
         // as both render target and shader resource in the same pass.

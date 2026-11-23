@@ -3095,15 +3095,9 @@ impl Populator {
                     }
                 }
                 (None, Some(meshes)) => {
-                    match renderer.build(
-                        device,
-                        queue,
-                        format,
-                        asset,
-                        &meshes,
-                        frame,
-                        |path| library.texture_candidates(path),
-                    ) {
+                    match renderer.build(device, queue, format, asset, &meshes, frame, |path| {
+                        library.texture_candidates(path)
+                    }) {
                         Ok(draw) => {
                             live.uploaded_stamp = live.pose_stamp;
                             live.draw = Some(draw);

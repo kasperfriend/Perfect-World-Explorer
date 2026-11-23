@@ -239,9 +239,10 @@ fn terrain_pass_fog(linear:vec3<f32>,reciprocal_w:f32,transmittance:f32)->vec3<f
   // (r5): factor 0 selects the day map and 1 the night map, then `mul_x2` doubles
   // the encoded result into the 8-bit target.
   let factor=clamp(camera.fog_range.w,0.,1.);
-  if factor<=0.001 {baked=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page),0.).rgb*2.;}
-  else if factor>=0.999 {baked=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page+settings.light.w),0.).rgb*2.;}
-  else {let day=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page),0.).rgb;let night=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page+settings.light.w),0.).rgb;baked=mix(day,night,factor)*2.;}}
+  var day=vec3<f32>(0.);var night=vec3<f32>(0.);
+  if factor<1. {day=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page),0.).rgb;}
+  if factor>0. {night=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page+settings.light.w),0.).rgb;}
+  baked=mix(day,night,factor)*2.;}
  let mask_side=f32(settings.areas.y);
  let mask_local=clamp(fcoord*mask_side,vec2<f32>(0.5),vec2<f32>(mask_side-0.5));
  let inv_mask_atlas=1./4096.;

@@ -3258,7 +3258,10 @@ impl Renderer {
         // neither local geometry nor any world/local page carries SDR sheets.
         let has_sdr = local_end > self.terrain_end
             || if self.world_done {
-                self.world_draw_cmds[world_slot].chunks.iter().any(|c| c.has_sdr)
+                self.world_draw_cmds[world_slot]
+                    .chunks
+                    .iter()
+                    .any(|c| c.has_sdr)
             } else {
                 !self.local_pages.is_empty()
             };

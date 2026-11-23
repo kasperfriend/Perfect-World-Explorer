@@ -819,24 +819,12 @@ impl Manager {
                 self.failures.push(format!("{origin}: {error}"));
             }
         }
-        // Admit up to 4 active visible roots/players per frame so torches,
-        // fire, and waterfalls appear quickly when entering an area, while
-        // keeping inactive background loads at 1 per frame.
-        const ACTIVE_ADMIT_BUDGET: usize = 4;
-        let mut loaded_active = 0usize;
-        while loaded_active < ACTIVE_ADMIT_BUDGET
-            && self
-                .owners
-                .iter()
-                .any(|o| matches!(o.state, State::Pending) && o.request.active)
-        {
-            self.load_one();
-            loaded_active += 1;
-        }
-        if loaded_active == 0 {
-            self.load_one();
-        }
-        for _ in 0..ACTIVE_ADMIT_BUDGET {
+        // Native 0x5b1a00 admits one pending root per frame; once live,
+        // warm up to 4 active visible players per frame so torches, fire,
+        // and waterfalls appear promptly when entering an area.
+        self.load_one();
+        const ACTIVE_PLAYER_BUDGET: usize = 4;
+        for _ in 0..ACTIVE_PLAYER_BUDGET {
             if !self.owners.iter().any(|o| {
                 matches!(o.state, State::Live { .. })
                     && o.player.is_none()
