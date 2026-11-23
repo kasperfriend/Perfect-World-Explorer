@@ -694,7 +694,6 @@ mod tests {
                 cloud_shadows: false,
                 contact_shadows: false,
                 moonlit_night: false,
-                aerial_perspective: false,
             };
             f(&mut e);
             RasterOverrides::for_effects(e, true)

@@ -166,12 +166,12 @@ bool accept_opacity(uint prim, float2 bary, uint seed, uint tri_count) {
         // Organic leaf-edge feathering + multi-scale breakup removes flat polygonal leaf edges.
         float bw = max(0.0, 1.0 - bary.x - bary.y);
         float edge_d = min(bary.x, min(bary.y, bw));
-        float edge_fade = smoothstep(0.0, 0.24, edge_d);
+        float edge_fade = smoothstep(0.0, 0.08, edge_d);
         uint cx = uint(bary.x * 11.0);
         uint cy = uint(bary.y * 11.0);
         uint ch = prim * 2654435761u ^ cx * 2246822519u ^ cy * 3266489917u;
         ch ^= ch >> 15u;
-        clump = (0.35 + 0.95 * (float(ch & 0xffu) / 255.0)) * edge_fade;
+        clump = (0.72 + 0.50 * (float(ch & 0xffu) / 255.0)) * edge_fade;
     }
     float eff_opacity = saturate(opacity * clump);
     uint h = prim * 747796405u ^ uint(bary.x * 64.0) * 2891336453u ^ uint(bary.y * 64.0) * 1664525u;
@@ -764,7 +764,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     bool bits_cloud_shadows = (effects & 128u) != 0u;
     bool bits_contact_shadows = (effects & 256u) != 0u;
     bool bits_moonlit_night = (effects & 512u) != 0u;
-    bool bits_aerial_perspective = (effects & 1024u) != 0u;
     bool bits_weather = (effects & 2048u) != 0u;
 
     float steepness = 1.0 - saturate(normal.y);
@@ -1078,7 +1077,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         // converged cache cells terminate deep paths immediately without extra rays.
                         float4 cached = rc_query(bhit_world, bhit.normal, dist + bhit.t);
                         if (bounce >= 1u && cached.w >= 6.0) {
-                            gi_sum += throughput * min(cached.rgb, float3(1.10, 1.10, 1.10)) * (params.tuning.w * 0.42 * (1.0 - fog_t));
+                            gi_sum += throughput * min(cached.rgb, float3(1.15, 1.15, 1.15)) * (params.tuning.w * 0.58 * (1.0 - fog_t));
                             break;
                         }
                         if (bits_shadows && bounce < 2u && b_ndl > 0.08) {
@@ -1145,7 +1144,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                             rc_update(bhit_world, bhit.normal, dist + bhit.t, incoming);
                         }
                         incoming = min(incoming, float3(1.10, 1.10, 1.10));
-                        gi_sum += throughput * incoming * (params.tuning.w * 0.42 * (1.0 - fog_t));
+                        gi_sum += throughput * incoming * (params.tuning.w * 0.58 * (1.0 - fog_t));
                         if (bounce + 1u < tap_bounces) {
                             throughput *= clamp(b_chroma * 1.02, float3(0.08, 0.08, 0.08), float3(0.84, 0.84, 0.84));
                             if (bounce >= 2u) {
@@ -1303,27 +1302,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float w_vis = bits_shadows ? (accum_shadow / float(samples)) : 1.0;
         underwater_caustics += float3(0.18, 0.68, 0.62) * params.sun_colour.xyz
             * (caust_b * h_fade * sun_strength * (0.35 + 0.65 * w_vis) * 0.22 * (1.0 - fog_t));
-    }
-
-    // Enhancement #9: Shadowed Atmospheric Aerial Perspective (warm sunlit valleys vs cool shadowed ridges).
-    if (bits_aerial_perspective && bits_shadows && dist > 65.0 && fog_t < 0.96 && params.sun_dir.y > 0.04) {
-        float ap_len = min(dist, 480.0) - 35.0;
-        if (ap_len > 25.0) {
-            float ap_lit = 0.0;
-            for (uint ai = 0u; ai < 3u; ai = ai + 1u) {
-                float t_a = 35.0 + ((float(ai) + ign_v) / 3.0) * ap_len;
-                float3 p_a = params.eye.xyz + view_dir * t_a;
-                if (!occluded_fast(p_a, params.sun_dir.xyz, 1.0, 420.0)) {
-                    ap_lit += 1.0;
-                }
-            }
-            float lit_frac = ap_lit / 3.0;
-            float ap_dist = smoothstep(65.0, 380.0, dist) * (1.0 - fog_t * 0.55);
-            float3 warm_haze = lerp(float3(0.85, 0.68, 0.45), params.sun_colour.xyz, 0.65);
-            float3 cool_haze = float3(0.24, 0.36, 0.58);
-            float3 ap_col = lerp(cool_haze, warm_haze, lit_frac);
-            god_rays += ap_col * (ap_dist * sun_strength * 0.065);
-        }
     }
 
     // Enhancement #3: Subtle, smooth edge-free Volumetric Light Halos around world lanterns/portals
@@ -1551,7 +1529,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 point_lighting += r_cols[ri] * (eff_w * pl_vis * 2.1);
             }
         }
-        point_lighting = min(point_lighting * (1.0 - fog_t), float3(3.5, 3.5, 3.5));
+        point_lighting = min(point_lighting * (1.0 - fog_t), float3(8.0, 8.0, 8.0));
         // Feed bright nearby point/effect lighting into the 3D World-Space Radiance Cache
         // so lanterns and beams bounce coloured light onto surrounding walls and ceilings!
         if (bits_gi && luma(point_lighting) > 0.08 && ((id.x + id.y + uint(params.frame.x)) & 7u) == 0u) {
@@ -1601,15 +1579,17 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float amb_e = max(luma(params.ambient.xyz) * params.tuning.z, 0.005);
         float sun_f = saturate(sun_e / max(sun_e + amb_e, 1e-4));
         float amb_f = 1.0 - sun_f;
+        float amb_base = max(amb_f, lerp(0.32, 0.42, sun_strength));
+        float sun_base = 1.0 - amb_base;
         float v_sun = bits_shadows ? avg_shadow : 1.0;
         // Enhancement #7 & #16: Bent-normal sky alignment + deep interior/tunnel sky-portal falloff.
-        float sky_portal_vis = (gi_total_rays > 0.5) ? lerp(0.55, 1.0, gi_sky_hits / gi_total_rays) : 1.0;
-        float bent_sky = lerp(0.82, 1.0, saturate(bent_normal.y * 0.5 + 0.5));
+        float sky_portal_vis = (gi_total_rays > 0.5) ? lerp(0.76, 1.0, gi_sky_hits / gi_total_rays) : 1.0;
+        float bent_sky = lerp(0.92, 1.0, saturate(bent_normal.y * 0.5 + 0.5));
         float v_ao = bits_ao ? (avg_open * bent_sky * sky_portal_vis) : 1.0;
         bool gi_active = bits_gi && !is_water && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01;
-        float amb_keep = gi_active ? lerp(1.0, 0.82, gi_fade) : 1.0;
-        float night_dark_scale = lerp(0.085, 1.0, smoothstep(0.0, 0.25, sun_strength));
-        float separated_lf = (amb_f * v_ao * amb_keep * night_dark_scale + sun_f * v_sun) * point_shadow_mod;
+        float amb_keep = gi_active ? lerp(1.0, 0.92, gi_fade) : 1.0;
+        float night_dark_scale = lerp(0.28, 1.0, smoothstep(0.0, 0.25, sun_strength));
+        float separated_lf = (amb_base * v_ao * amb_keep * night_dark_scale + sun_base * v_sun) * point_shadow_mod;
         out_lf = lerp(separated_lf, 1.0, fog_t);
         out_rgb = avg_gi + point_lighting;
     } else {

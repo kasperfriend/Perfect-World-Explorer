@@ -274,8 +274,6 @@ pub struct Effects {
     pub contact_shadows: bool,
     /// Directional moonlit night sky & starlight hemispherical bounce (pitch black in deep shade).
     pub moonlit_night: bool,
-    /// Shadowed atmospheric aerial perspective (warm sunlit valleys vs cool shadowed ridges).
-    pub aerial_perspective: bool,
 }
 
 impl Default for Effects {
@@ -294,7 +292,6 @@ impl Default for Effects {
             cloud_shadows: true,
             contact_shadows: true,
             moonlit_night: true,
-            aerial_perspective: true,
         }
     }
 }
@@ -313,7 +310,6 @@ impl Effects {
             self.cloud_shadows,
             self.contact_shadows,
             self.moonlit_night,
-            self.aerial_perspective,
         ]
         .iter()
         .filter(|on| **on)
@@ -447,7 +443,7 @@ impl Settings {
         self.bounce_strength = finite_or(self.bounce_strength, 1.).clamp(0., 2.);
         self.reflection_roughness_cutoff =
             finite_or(self.reflection_roughness_cutoff, 0.4).clamp(0., 1.);
-        self.camera_light_intensity = finite_or(self.camera_light_intensity, 5.0).clamp(0.5, 20.0);
+        self.camera_light_intensity = finite_or(self.camera_light_intensity, 5.0).clamp(0.5, 100.0);
         self.camera_light_warmness = finite_or(self.camera_light_warmness, 0.0).clamp(-1.0, 1.0);
     }
 
@@ -521,7 +517,6 @@ impl Plan {
             cloud_shadows: false,
             contact_shadows: false,
             moonlit_night: false,
-            aerial_perspective: false,
         },
         reconstruction: RayReconstruction::Off,
         grid: (0, 0),
@@ -712,7 +707,6 @@ mod tests {
             cloud_shadows: false,
             contact_shadows: false,
             moonlit_night: false,
-            aerial_perspective: false,
         };
         assert!(!s.replaces_effects());
         assert_eq!(
@@ -732,7 +726,6 @@ mod tests {
                 cloud_shadows: false,
                 contact_shadows: false,
                 moonlit_night: false,
-                aerial_perspective: false,
             };
             match enable {
                 0 => e.shadows = true,

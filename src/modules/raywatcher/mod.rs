@@ -410,7 +410,6 @@ impl Raywatcher {
             ("Cloud shadows", &mut effects.cloud_shadows),
             ("Contact shadows", &mut effects.contact_shadows),
             ("Moonlit night sky", &mut effects.moonlit_night),
-            ("Aerial perspective", &mut effects.aerial_perspective),
         ] {
             changed_effects |= ui.checkbox(slot, label).changed();
         }
@@ -430,7 +429,8 @@ impl Raywatcher {
                     "Attaches a real ray-traced shadow-casting point light to the camera for exploring dark interiors and night scenes.",
                 );
                 ui.add(
-                    egui::Slider::new(&mut settings.camera_light_intensity, 0.5..=20.0)
+                    egui::Slider::new(&mut settings.camera_light_intensity, 0.5..=100.0)
+                        .logarithmic(true)
                         .text("intensity"),
                 );
                 ui.horizontal(|ui| {
@@ -640,7 +640,6 @@ impl Raywatcher {
             ("cloud_shadows", effects.cloud_shadows),
             ("contact_shadows", effects.contact_shadows),
             ("moonlit_night", effects.moonlit_night),
-            ("aerial_perspective", effects.aerial_perspective),
         ] {
             let _ = writeln!(out, "{name}={}", u8::from(on));
         }
@@ -722,7 +721,6 @@ impl Raywatcher {
             ("cloud_shadows", &mut effects.cloud_shadows),
             ("contact_shadows", &mut effects.contact_shadows),
             ("moonlit_night", &mut effects.moonlit_night),
-            ("aerial_perspective", &mut effects.aerial_perspective),
         ] {
             if let Some(v) = get(name).and_then(parse_flag) {
                 *slot = v;
@@ -1046,7 +1044,6 @@ mod tests {
             cloud_shadows: false,
             contact_shadows: false,
             moonlit_night: false,
-            aerial_perspective: false,
         };
         m.set_settings(s);
         let none = m.status((640, 360), false);
@@ -1070,7 +1067,6 @@ mod tests {
         s.effects.cloud_shadows = false;
         s.effects.contact_shadows = false;
         s.effects.moonlit_night = false;
-        s.effects.aerial_perspective = false;
         s.sun_radius_degrees = 1.5;
         m.set_settings(s.clone());
         let mut text = String::new();

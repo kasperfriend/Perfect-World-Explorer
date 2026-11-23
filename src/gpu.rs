@@ -4273,9 +4273,9 @@ impl Renderer {
                     }
                     let raw_int = l.diffuse[3];
                     let intensity = if raw_int > 0.01 {
-                        raw_int.clamp(0.25, 4.0)
+                        raw_int.clamp(0.65, 8.0)
                     } else {
-                        1.0
+                        1.6
                     };
                     point_lights.push((
                         dist_sq,
@@ -4318,9 +4318,9 @@ impl Renderer {
                         }
                         let raw_int = dl.color[3];
                         let intensity = if raw_int > 0.01 {
-                            raw_int.clamp(0.25, 4.0)
+                            raw_int.clamp(0.65, 8.0)
                         } else {
-                            1.0
+                            1.6
                         };
                         point_lights.push((
                             dist_sq,
@@ -4431,22 +4431,35 @@ impl Renderer {
                             if center.distance_squared(camera.pos) > max_eff_d_sq {
                                 continue;
                             }
-                            let a = vert_rgba[3].clamp(0.0, 1.0);
-                            if a < (if is_additive { 0.04 } else { 0.08 }) {
+                            let is_mesh = q.mesh.is_some();
+                            let a = if is_mesh {
+                                vert_rgba[3].clamp(0.45, 1.0)
+                            } else {
+                                vert_rgba[3].clamp(0.0, 1.0)
+                            };
+                            if !is_mesh && a < (if is_additive { 0.02 } else { 0.03 }) {
                                 continue;
                             }
-                            let tex_rgb =
+                            let raw_tex =
                                 glam::Vec3::from_array(models.effect_texture_emissive(tex_name));
+                            let tex_rgb = if raw_tex.x.max(raw_tex.y).max(raw_tex.z) < 0.05 {
+                                glam::Vec3::ONE
+                            } else {
+                                raw_tex
+                            };
                             let v_rgb = glam::Vec3::new(
                                 vert_rgba[0].max(0.0),
                                 vert_rgba[1].max(0.0),
                                 vert_rgba[2].max(0.0),
                             );
-                            let mut col = v_rgb * tex_rgb * a.max(0.25) + mat_emissive * tex_rgb;
+                            let mut col = v_rgb * tex_rgb * a.max(0.35) + mat_emissive * tex_rgb;
+                            if is_mesh && col.x.max(col.y).max(col.z) < 0.05 {
+                                col += tex_rgb * 0.55;
+                            }
                             // Use peak chromatic channel (not Rec.709 luma) so vivid blue/cyan/violet/red
-                            // lamps (e.g. City of Raging Tides Tideborn coral lamps) are never filtered out!
+                            // lamps and 3D effect models are never filtered out.
                             let peak = col.x.max(col.y).max(col.z);
-                            let min_peak = if is_additive { 0.04 } else { 0.12 };
+                            let min_peak = if is_additive || is_mesh { 0.015 } else { 0.025 };
                             if peak < min_peak {
                                 continue;
                             }
@@ -4517,8 +4530,8 @@ impl Renderer {
                                             1.0
                                         };
                                     let intensity =
-                                        ((0.95 + max_lum * 1.15) * size_boost * night_boost)
-                                            .clamp(0.95, 3.2);
+                                        ((1.80 + max_lum * 2.40) * size_boost * night_boost)
+                                            .clamp(1.80, 6.5);
                                     Some((
                                         dist_sq,
                                         crate::modules::raywatcher::frame::PointLight {
@@ -4541,10 +4554,10 @@ impl Renderer {
                     point_lights.into_iter().map(|(_, l)| l).collect();
                 // Dynamic RT Camera Light (Hotkey: L): always placed at slot 0 so it never gets culled.
                 if settings.camera_light_enabled {
-                    let cam_int = settings.camera_light_intensity.clamp(0.5, 20.0);
+                    let cam_int = settings.camera_light_intensity.clamp(0.5, 100.0);
                     let cam_light = crate::modules::raywatcher::frame::PointLight {
                         position: camera.pos + camera.direction() * 1.2,
-                        radius: (18.0 + cam_int * 3.5).clamp(22.0, 85.0),
+                        radius: (18.0 + cam_int * 2.4).clamp(22.0, 180.0),
                         colour: crate::modules::raywatcher::plan::camera_light_rgb(
                             settings.camera_light_warmness,
                         ),

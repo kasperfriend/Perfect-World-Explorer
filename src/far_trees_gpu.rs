@@ -665,7 +665,7 @@ impl FarTrees {
                                     let (c2, a2) = sample_rgba_uv(img, uv_2);
                                     let a_avg = (a0 + a1 + a2) / 3.0;
                                     let a_max = a0.max(a1).max(a2);
-                                    if a_avg < 0.34 && a_max < 0.52 {
+                                    if a_avg < 0.20 && a_max < 0.34 {
                                         continue;
                                     }
                                     let wsum = (a0 + a1 + a2).max(1e-4);
@@ -687,7 +687,7 @@ impl FarTrees {
                                     let pa = sa + norm * lift;
                                     let pb = sb - norm * (lift * 0.6);
                                     let pc = sc + norm * (lift * 0.4);
-                                    let f_op = a_avg.max(a_max * 0.72).clamp(0.42, 0.78);
+                                    let f_op = a_avg.max(a_max * 0.85).clamp(0.64, 0.92);
                                     lod_tris.push(RtTreeTriangle {
                                         a: pa,
                                         b: pb,
@@ -712,7 +712,7 @@ impl FarTrees {
                                                 normal: fin_n,
                                                 albedo,
                                                 roughness: 0.85,
-                                                opacity: (f_op * 0.88).clamp(0.38, 0.72),
+                                                opacity: (f_op * 0.92).clamp(0.56, 0.88),
                                             });
                                         }
                                     }
@@ -756,13 +756,29 @@ impl FarTrees {
                                     v_top * (1.0 - tv) + v_bot * tv,
                                 ];
                                 let (rgb, a) = sample_rgba_uv(&tree.composite, uv);
-                                if a >= 0.45 {
+                                if a >= 0.28 {
                                     opaque_hits += 1;
                                     alpha_sum += a;
                                     rgb_sum[0] += rgb[0] * a;
                                     rgb_sum[1] += rgb[1] * a;
                                     rgb_sum[2] += rgb[2] * a;
                                 }
+                            }
+                        }
+                        if opaque_hits < 1 {
+                            let c_uv = [
+                                (leaf.uv[0][0] + leaf.uv[1][0] + leaf.uv[2][0] + leaf.uv[3][0])
+                                    * 0.25,
+                                (leaf.uv[0][1] + leaf.uv[1][1] + leaf.uv[2][1] + leaf.uv[3][1])
+                                    * 0.25,
+                            ];
+                            let (rgb, a) = sample_rgba_uv(&tree.composite, c_uv);
+                            if a >= 0.12 {
+                                opaque_hits = 1;
+                                alpha_sum = a;
+                                rgb_sum[0] = rgb[0] * a;
+                                rgb_sum[1] = rgb[1] * a;
+                                rgb_sum[2] = rgb[2] * a;
                             }
                         }
                         if opaque_hits < 1 || alpha_sum <= 1e-4 {
@@ -795,9 +811,9 @@ impl FarTrees {
                             avg_r += (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
                         }
                         let base_r = (avg_r * 0.25).clamp(0.18, 2.2);
-                        let r_h = base_r * (0.48 + 0.18 * coverage.sqrt()).clamp(0.48, 0.68);
-                        let r_v = r_h * 0.86;
-                        let opacity = (0.40 + 0.34 * coverage).clamp(0.42, 0.72);
+                        let r_h = base_r * (0.64 + 0.22 * coverage.sqrt()).clamp(0.64, 0.86);
+                        let r_v = r_h * 0.88;
+                        let opacity = (0.68 + 0.26 * coverage).clamp(0.68, 0.92);
                         // Tilt axes per leaf cluster so neighbouring leaves never align into flat sheets.
                         let phase = (center.x * 3.17 + center.y * 5.41 + center.z * 2.73).sin();
                         let (s_a, c_a) = (phase * 1.1).sin_cos();
