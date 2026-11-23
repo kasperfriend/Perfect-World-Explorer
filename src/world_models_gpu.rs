@@ -1401,6 +1401,14 @@ impl World {
     /// main view alone: the mirror and refraction depth feeds the water, and the
     /// motion vectors never read it.
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        self.draw_models_only(pass);
+        self.draw_effects(pass);
+    }
+
+    /// Draws opaque and alpha-blended world models without world effects.
+    /// Used by the main pass before water so water surfaces cannot overwrite
+    /// blended effect quads that do not write depth.
+    pub fn draw_models_only<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         for slot in &self.slots {
             if !slot.visible {
                 continue;
@@ -1414,10 +1422,67 @@ impl World {
                 draw.draw_alpha_mesh(pass, candidate.mesh);
             }
         }
-        // Blended effect quads last, after the opaque models and the alpha meshes,
-        // with their own render-layer sort inside the draw object.
+    }
+
+    /// Draws blended world effect quads. In the main view this runs after
+    /// water surfaces and shoreline waves so effects in front of water are
+    /// composited over the water surface and depth-tested against it.
+    pub fn draw_effects<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         if let Some(effects) = &self.effects {
             effects.draw(pass);
+        }
+    }
+
+    pub fn has_effect_quads(&self) -> bool {
+        self.effects.is_some() && !self.effect_quads.is_empty()
+    }
+
+    /// Re-binds the main-pass camera matrix, clip plane and lighting onto the
+    /// effect renderer after water reflection/refraction passes may have
+    /// overwritten its uniform buffer, without advancing effect clocks.
+    pub fn refresh_effects_view(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Frame,
+    ) {
+        if !self.owners.effects_enabled() || self.effect_quads.is_empty() {
+            return;
+        }
+        let Ok(view) = crate::gfx_player::View::try_from_inverse_view_projection(
+            glam::Mat4::from_cols_array_2d(&frame.matrix).inverse(),
+        ) else {
+            return;
+        };
+        let Self {
+            effects,
+            effect_quads,
+            read,
+            reported,
+            ..
+        } = self;
+        let Some(draw) = effects.as_mut() else {
+            return;
+        };
+        let light = gfx_effect_gpu::EffectLight {
+            lighting: frame.lighting,
+            direction: frame.direction,
+            fog_range: frame.fog_range,
+            fog_color: frame.fog_color,
+            directional_specular: frame.directional_specular,
+            eye_direction: frame.eye_direction,
+        };
+        if let Err(error) = draw.update(
+            device,
+            queue,
+            effect_quads,
+            frame.matrix,
+            frame.clip_plane,
+            [view.position.x, view.position.y, view.position.z, 0.],
+            Some(light),
+            &mut |path| read(path),
+        ) {
+            reported.push(format!("world effects: {error}"));
         }
     }
 

@@ -1103,6 +1103,7 @@ impl Walker {
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         frame: model_draw_gpu::Frame,
+        include_effects: bool,
     ) {
         if !self.is_active() || self.gpu_failed {
             return;
@@ -1344,8 +1345,20 @@ impl Walker {
                     PartVisibility::All => draw.draw(&mut pass),
                 }
             }
-            gpu.gfx.draw_quads(&mut pass);
-            gpu.effects.draw(&mut pass);
+            if include_effects {
+                gpu.gfx.draw_quads(&mut pass);
+                gpu.effects.draw(&mut pass);
+            }
+        }
+    }
+
+    pub fn render_effects<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        if !self.is_active() || self.gpu_failed {
+            return;
+        }
+        if let Some(gpu) = &self.gpu {
+            gpu.gfx.draw_quads(pass);
+            gpu.effects.draw(pass);
         }
     }
 }

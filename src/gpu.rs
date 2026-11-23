@@ -3376,27 +3376,57 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            models.draw(&mut pass);
+            // In the main view, blended effect quads are deferred until after
+            // water surfaces and shoreline waves so opaque/refracted water does
+            // not overwrite effects that overlap water without writing depth.
+            if matches!(view, Pass::Main) {
+                models.draw_models_only(&mut pass);
+            } else {
+                models.draw(&mut pass);
+            }
         }
-        // The sheets' own motion, in a pass of its own: their vector goes into the
-        // object-motion attachment, which the shared pass substitutes where a
-        // producer claims a pixel, and no depth is written. Published here, before
-        // any later view rewrites the frame block and the bucket order, and before
-        // the water and the add-ons are drawn, so nothing they draw is rejected
-        // behind a sheet (`docs/blockers.md` B-26).
-        if matches!(view, Pass::Main) {
-            let size = self.object_mv.size();
+    }
+
+    /// Draws main-view blended world effects and Walker character effects
+    /// after water surfaces and shoreline waves, depth-tested against the
+    /// full scene depth buffer (including water depth), followed by effect
+    /// motion vectors.
+    fn draw_post_water_effects(
+        &mut self,
+        target_raw: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        uniform: &Uniform,
+        camera: &Camera,
+        unjittered_vp: Mat4,
+        refresh_world_view: bool,
+    ) {
+        let has_world_effects = self
+            .models
+            .as_ref()
+            .is_some_and(|models| models.has_effect_quads());
+        let has_walker = self.modules.walker_active();
+        if !has_world_effects && !has_walker {
+            return;
+        }
+        if has_world_effects && refresh_world_view {
+            let light = camera.regional_light.or(self.retained_regional_light);
+            let frame = receiving_model_frame(uniform, camera, light);
+            if let Some(models) = &mut self.models {
+                models.refresh_effects_view(&self.device, &self.queue, frame);
+            }
+        }
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("world effect sheet motion"),
+                label: Some("post-water world and walker effects"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.object_mv_view,
+                    view: target_raw,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                // Tested, never written: a sheet behind a wall claims nothing.
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: depth,
                     depth_ops: Some(wgpu::Operations {
@@ -3408,13 +3438,47 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            models.draw_effect_motion(
-                &self.queue,
-                &mut pass,
-                unjittered_vp.to_cols_array_2d(),
-                (size.width, size.height),
-            );
+            if let Some(models) = &self.models {
+                models.draw_effects(&mut pass);
+            }
+            if has_walker {
+                self.modules.render_walker_effects(&mut pass);
+            }
         }
+        if let Some(models) = &mut self.models {
+            if models.has_effect_quads() {
+                let size = self.object_mv.size();
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("world effect sheet motion"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.object_mv_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    // Tested against full scene+water depth, never written.
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                models.draw_effect_motion(
+                    &self.queue,
+                    &mut pass,
+                    unjittered_vp.to_cols_array_2d(),
+                    (size.width, size.height),
+                );
+            }
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// The host player is not an ornamental EC model: WaterEffect 0 must not
@@ -3460,6 +3524,7 @@ impl Renderer {
                     target,
                     depth,
                     frame,
+                    !matches!(view, Pass::Main),
                 );
             }
             if population && matches!(view, Pass::Main) {
@@ -3916,6 +3981,14 @@ impl Renderer {
         lap(STAGE_MAIN, &mut stage_ms, &mut lap_at);
         // Diagnostic mode for exercising window/input UI on memory-limited software GPUs.
         if ui_test() {
+            self.draw_post_water_effects(
+                scene_target_raw,
+                &scene_depth,
+                &normal,
+                camera,
+                unjittered_vp,
+                false,
+            );
             if use_post {
                 self.post.render(
                     &self.device,
@@ -4012,6 +4085,14 @@ impl Renderer {
                     frame.active_fog_color,
                 );
             }
+            self.draw_post_water_effects(
+                scene_target_raw,
+                &scene_depth,
+                &normal,
+                camera,
+                unjittered_vp,
+                false,
+            );
             if use_post {
                 self.post.render(
                     &self.device,
@@ -4428,6 +4509,14 @@ impl Renderer {
                 frame.active_fog_color,
             );
         }
+        self.draw_post_water_effects(
+            scene_target_raw,
+            &scene_depth,
+            &normal,
+            camera,
+            unjittered_vp,
+            !self.visible_water_batches.is_empty(),
+        );
         if use_post {
             self.post.render(
                 &self.device,
