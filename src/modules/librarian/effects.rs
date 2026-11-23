@@ -253,16 +253,20 @@ impl Browser {
             .inner;
         if first || changed {
             let q = self.query.to_lowercase();
-            self.matches = catalog
-                .entries()
-                .iter()
-                .enumerate()
-                .filter(|(i, e)| {
-                    self.labels[*i].text.to_lowercase().contains(&q)
-                        || e.path.to_lowercase().contains(&q)
-                })
-                .map(|(i, _)| i)
-                .collect();
+            if q.is_empty() {
+                self.matches = (0..catalog.len()).collect();
+            } else {
+                self.matches = catalog
+                    .entries()
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, e)| {
+                        self.labels[*i].text.to_lowercase().contains(&q)
+                            || e.path.to_lowercase().contains(&q)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+            }
         }
         ui.label(format!(
             "{} of {} effects",

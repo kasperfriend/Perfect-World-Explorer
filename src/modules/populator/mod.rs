@@ -365,7 +365,7 @@ impl Library {
     /// sheets beside their rigs), but retain a duplicate from `textures.pck` as
     /// a decode fallback if the model-pack payload is damaged or unsupported.
     fn texture_candidates(&mut self, path: &str) -> Result<Vec<Vec<u8>>, String> {
-        let mut candidates = Vec::new();
+        let mut candidates = Vec::with_capacity(2);
         let mut failures = Vec::new();
         match self.models.read(path) {
             Ok(bytes) => candidates.push(bytes),
@@ -564,7 +564,7 @@ fn gait_candidate_rank(name: &str) -> u8 {
         "奔跑",
         "跑",
     ];
-    u8::from(!PLAIN.contains(&name.to_lowercase().as_str()))
+    u8::from(!PLAIN.iter().any(|p| p.eq_ignore_ascii_case(name)))
 }
 
 /// Rotation-only absolute rest orientations of a skeleton's bones, indexed by

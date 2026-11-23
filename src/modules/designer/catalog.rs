@@ -619,7 +619,7 @@ impl Catalog {
             .iter()
             .filter(|item| item.allows(class) && !item.model.is_empty() && item.model != "0")
             .collect();
-        items.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        items.sort_unstable_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         items
     }
     pub fn mount_options(&self, class: Class) -> Vec<&MountItem> {
@@ -628,7 +628,7 @@ impl Catalog {
             .iter()
             .filter(|item| item.class_mask & class.bit() != 0 && item.has_loadable_model())
             .collect();
-        items.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        items.sort_unstable_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         items
     }
     pub fn texture_options(&self, class: Class, gender: Gender, part: u32) -> Vec<&FaceTexture> {
@@ -642,7 +642,7 @@ impl Catalog {
                     && item.facepill_only == 0
             })
             .collect();
-        items.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        items.sort_unstable_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         items
     }
     pub fn shape_options(&self, class: Class, gender: Gender, part: u32) -> Vec<&FaceShape> {
@@ -656,7 +656,7 @@ impl Catalog {
                     && item.facepill_only == 0
             })
             .collect();
-        items.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        items.sort_unstable_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         items
     }
     pub fn hair_options(&self, class: Class, gender: Gender) -> Vec<&HairItem> {
@@ -669,7 +669,7 @@ impl Catalog {
                     && item.facepill_only == 0
             })
             .collect();
-        items.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        items.sort_unstable_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         items
     }
     pub fn preset_options(&self, class: Class, gender: Gender) -> Vec<&Preset> {
@@ -678,7 +678,7 @@ impl Catalog {
             .iter()
             .filter(|item| item.class_mask & class.bit() != 0 && item.gender == gender as u32)
             .collect();
-        items.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        items.sort_unstable_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         items
     }
 }

@@ -203,7 +203,7 @@ impl Assets {
                 path,
             });
         }
-        presets.sort_by(|a, b| a.name.cmp(&b.name));
+        presets.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         Ok(presets)
     }
 

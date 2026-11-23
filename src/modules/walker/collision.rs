@@ -698,7 +698,7 @@ fn tree_brushes(world: &mut CollisionWorld, element: &PathBuf, scene: &scene::Sc
         }
     };
     for (index, tree) in scene.tree_types.iter().enumerate() {
-        let key = tree.tree.to_lowercase().replace('\\', "/");
+        let key = crate::texture_resolution::normalize(&tree.tree);
         let Some(stem) = key.strip_suffix(".spt") else {
             report.failed += 1;
             report
