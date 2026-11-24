@@ -2134,94 +2134,289 @@ impl Renderer {
             .terrain_upload
             .take()
             .ok_or("initial terrain upload missing")?;
-        // Initialize all independent GPU subsystems concurrently across CPU
-        // cores (`wgpu::Device` and `wgpu::Queue` are Send + Sync), overlapping
-        // sky/weather/cloud/water/shore/tree/terrain texture decoding, mip
-        // generation, shader compilation, and staging uploads.
-        let (sky, weather, cloud, water, simple_water, shore, far_trees, terrain_gpu) =
-            std::thread::scope(|s| -> Result<_, String> {
-                let device_ref = &device;
-                let queue_ref = &queue;
-                let uniform_ref = &uniform;
-                let reflected_ref = &reflected_uniform;
-                let t_ref = &*t;
-                let upload_ref = &terrain_upload;
+        // Take owned model assets and initial local pages before spawning the
+        // parallel GPU initialization scope so shader/pipeline compilation,
+        // texture mip generation, post-processing setup, local scenery uploads,
+        // and world model/effect installation all overlap across CPU cores.
+        let initial_model_assets = if std::env::var_os("PW_DISABLE_WORLD_MODELS").is_none() {
+            Some(std::mem::take(&mut t.models))
+        } else {
+            None
+        };
+        let local_page_keys = m.local_page_keys;
+        let initial_local_pages = std::mem::take(&mut m.local_pages);
+        let (
+            sky,
+            weather,
+            cloud,
+            water,
+            simple_water,
+            shore,
+            far_trees,
+            terrain_gpu,
+            pipeline,
+            scenery_pipeline,
+            sdr_blend_pipeline,
+            post,
+            local_pages,
+            models,
+        ) = std::thread::scope(|s| -> Result<_, String> {
+            let device_ref = &device;
+            let queue_ref = &queue;
+            let layout_ref = &layout;
+            let sampler_ref = &sampler;
+            let uniform_ref = &uniform;
+            let reflected_ref = &reflected_uniform;
+            let t_ref = &*t;
+            let upload_ref = &terrain_upload;
 
-                let sky_task = s.spawn(move || {
-                    crate::sky_gpu::SkyGpu::new(device_ref, queue_ref, format, &t_ref.element)
-                });
-                let weather_cloud_task = s.spawn(move || {
-                    let weather = crate::weather_gpu::WeatherGpu::new(
-                        device_ref,
-                        queue_ref,
-                        &t_ref.element,
-                        format,
-                        &t_ref.water,
-                    );
-                    let cloud = t_ref.cloud_surface.as_deref().and_then(|surface| {
-                        match crate::cloud_gpu::CloudGpu::new(
-                            device_ref,
-                            queue_ref,
-                            format,
-                            &t_ref.element,
-                            surface,
-                        ) {
-                            Ok(cloud) => {
-                                eprintln!(
-                                    "Initialized indexed world cloud billboards from world.cld"
-                                );
-                                Some(cloud)
-                            }
-                            Err(error) => {
-                                eprintln!("World cloud renderer unavailable: {error}");
-                                None
-                            }
-                        }
-                    });
-                    (weather, cloud)
-                });
-                let water_task = s.spawn(move || {
-                    let water = crate::water_gpu::WaterGpu::new(
-                        device_ref,
-                        queue_ref,
-                        format,
-                        w,
-                        h,
-                        &t_ref.water_normals,
-                    );
-                    let simple_water = crate::simple_water_gpu::SimpleWaterGpu::new(
-                        device_ref,
-                        queue_ref,
-                        format,
-                        &t_ref.water_simple_frames,
-                    );
-                    let shore = match crate::shore_gpu::ShoreGpu::new(
+            let sky_task = s.spawn(move || {
+                crate::sky_gpu::SkyGpu::new(device_ref, queue_ref, format, &t_ref.element)
+            });
+            let weather_cloud_task = s.spawn(move || {
+                let weather = crate::weather_gpu::WeatherGpu::new(
+                    device_ref,
+                    queue_ref,
+                    &t_ref.element,
+                    format,
+                    &t_ref.water,
+                );
+                let cloud = t_ref.cloud_surface.as_deref().and_then(|surface| {
+                    match crate::cloud_gpu::CloudGpu::new(
                         device_ref,
                         queue_ref,
                         format,
                         &t_ref.element,
-                        &t_ref.water,
+                        surface,
                     ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("Shoreline waves unavailable: {e}");
+                        Ok(cloud) => {
+                            eprintln!("Initialized indexed world cloud billboards from world.cld");
+                            Some(cloud)
+                        }
+                        Err(error) => {
+                            eprintln!("World cloud renderer unavailable: {error}");
                             None
                         }
-                    };
-                    (water, simple_water, shore)
+                    }
                 });
-                let trees_task = s.spawn(move || {
-                    crate::far_trees_gpu::FarTrees::new(
-                        device_ref,
-                        queue_ref,
-                        format,
-                        &t_ref.trees,
-                        uniform_ref,
-                        reflected_ref,
-                        vegetation_authored_mips,
-                    )
+                (weather, cloud)
+            });
+            let water_task = s.spawn(move || {
+                let water = crate::water_gpu::WaterGpu::new(
+                    device_ref,
+                    queue_ref,
+                    format,
+                    w,
+                    h,
+                    &t_ref.water_normals,
+                );
+                let simple_water = crate::simple_water_gpu::SimpleWaterGpu::new(
+                    device_ref,
+                    queue_ref,
+                    format,
+                    &t_ref.water_simple_frames,
+                );
+                let shore = match crate::shore_gpu::ShoreGpu::new(
+                    device_ref,
+                    queue_ref,
+                    format,
+                    &t_ref.element,
+                    &t_ref.water,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Shoreline waves unavailable: {e}");
+                        None
+                    }
+                };
+                (water, simple_water, shore)
+            });
+            let trees_task = s.spawn(move || {
+                crate::far_trees_gpu::FarTrees::new(
+                    device_ref,
+                    queue_ref,
+                    format,
+                    &t_ref.trees,
+                    uniform_ref,
+                    reflected_ref,
+                    vegetation_authored_mips,
+                )
+            });
+            let world_pipelines_task = s.spawn(move || {
+                let shader = device_ref.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("world WGSL"),
+                    source: wgpu::ShaderSource::Wgsl(SHADER.into()),
                 });
-                let terrain_gpu = crate::terrain_gpu::TerrainGpu::new(
+                let pl = device_ref.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[layout_ref],
+                    push_constant_ranges: &[],
+                });
+                const ATTR: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x2,3=>Float32x4,4=>Float32,5=>Uint32,7=>Uint32];
+                let pipeline = device_ref.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("world GPU pipeline"),
+                    layout: Some(&pl),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: "vs",
+                        buffers: &[wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<Vertex>() as u64,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &ATTR,
+                        }],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: "fs",
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode: None,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::Greater,
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: Default::default(),
+                    multiview: None,
+                });
+                let scenery_pipeline =
+                    device_ref.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("scenery GPU pipeline"),
+                        layout: Some(&pl),
+                        vertex: wgpu::VertexState {
+                            module: &shader,
+                            entry_point: "vs",
+                            buffers: &[wgpu::VertexBufferLayout {
+                                array_stride: std::mem::size_of::<Vertex>() as u64,
+                                step_mode: wgpu::VertexStepMode::Vertex,
+                                attributes: &ATTR,
+                            }],
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &shader,
+                            entry_point: "fs",
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            cull_mode: None,
+                            ..Default::default()
+                        },
+                        depth_stencil: Some(wgpu::DepthStencilState {
+                            format: wgpu::TextureFormat::Depth32Float,
+                            depth_write_enabled: true,
+                            depth_compare: wgpu::CompareFunction::GreaterEqual,
+                            stencil: Default::default(),
+                            bias: Default::default(),
+                        }),
+                        multisample: Default::default(),
+                        multiview: None,
+                    });
+                let sdr_blend_pipeline =
+                    device_ref.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("sdr blend GPU pipeline"),
+                        layout: Some(&pl),
+                        vertex: wgpu::VertexState {
+                            module: &shader,
+                            entry_point: "vs",
+                            buffers: &[wgpu::VertexBufferLayout {
+                                array_stride: std::mem::size_of::<Vertex>() as u64,
+                                step_mode: wgpu::VertexStepMode::Vertex,
+                                attributes: &ATTR,
+                            }],
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &shader,
+                            entry_point: "fs_sdr",
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format,
+                                blend: Some(wgpu::BlendState {
+                                    color: wgpu::BlendComponent {
+                                        src_factor: wgpu::BlendFactor::SrcAlpha,
+                                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                        operation: wgpu::BlendOperation::Add,
+                                    },
+                                    alpha: wgpu::BlendComponent {
+                                        src_factor: wgpu::BlendFactor::One,
+                                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                        operation: wgpu::BlendOperation::Add,
+                                    },
+                                }),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            cull_mode: None,
+                            ..Default::default()
+                        },
+                        depth_stencil: Some(wgpu::DepthStencilState {
+                            format: wgpu::TextureFormat::Depth32Float,
+                            depth_write_enabled: false,
+                            depth_compare: wgpu::CompareFunction::GreaterEqual,
+                            stencil: Default::default(),
+                            bias: Default::default(),
+                        }),
+                        multisample: Default::default(),
+                        multiview: None,
+                    });
+                (pipeline, scenery_pipeline, sdr_blend_pipeline)
+            });
+            let post_task =
+                s.spawn(move || crate::post_gpu::PostGpu::new(device_ref, format, w, h));
+            let local_pages_task = s.spawn(move || {
+                let mut uploaded: Vec<crate::world_objects::GpuPage> =
+                    Vec::with_capacity(initial_local_pages.len());
+                if initial_local_pages.len() <= 1 {
+                    for page in initial_local_pages {
+                        uploaded.push(crate::world_objects::GpuPage::upload(
+                            device_ref,
+                            queue_ref,
+                            layout_ref,
+                            sampler_ref,
+                            uniform_ref,
+                            reflected_ref,
+                            page,
+                        ));
+                    }
+                } else {
+                    std::thread::scope(|ps| {
+                        let handles: Vec<_> = initial_local_pages
+                            .into_iter()
+                            .map(|page| {
+                                ps.spawn(move || {
+                                    crate::world_objects::GpuPage::upload(
+                                        device_ref,
+                                        queue_ref,
+                                        layout_ref,
+                                        sampler_ref,
+                                        uniform_ref,
+                                        reflected_ref,
+                                        page,
+                                    )
+                                })
+                            })
+                            .collect();
+                        for h in handles {
+                            uploaded.push(h.join().unwrap());
+                        }
+                    });
+                }
+                uploaded
+            });
+            let terrain_task = s.spawn(move || {
+                crate::terrain_gpu::TerrainGpu::new(
                     device_ref,
                     queue_ref,
                     format,
@@ -2229,22 +2424,67 @@ impl Renderer {
                     upload_ref,
                     uniform_ref,
                     reflected_ref,
-                )?;
-                let sky = sky_task.join().unwrap()?;
-                let (weather, cloud) = weather_cloud_task.join().unwrap();
-                let (water, simple_water, shore) = water_task.join().unwrap();
-                let far_trees = trees_task.join().unwrap();
-                Ok((
-                    sky,
-                    weather,
-                    cloud,
-                    water,
-                    simple_water,
-                    shore,
-                    far_trees,
-                    terrain_gpu,
-                ))
-            })?;
+                )
+            });
+            // Run `world_models_gpu::World` initialization on the calling thread
+            // (its archive reader closures are `!Send`) while all other GPU
+            // subsystems, pipelines, terrain uploads, and local scenery pages
+            // initialize concurrently on worker threads.
+            let models = initial_model_assets.map(|assets| {
+                let mut world = match crate::world_models_gpu::World::new(
+                    device_ref,
+                    format,
+                    assets,
+                    &t_ref.element,
+                ) {
+                    Ok(world) => world,
+                    Err(error) => {
+                        eprintln!(
+                            "World models unavailable ({error}); world effects continue"
+                        );
+                        crate::world_models_gpu::World::without_models(device_ref, format)
+                    }
+                };
+                match world.attach_gfx_archive(&t_ref.element) {
+                    Ok(()) => {}
+                    Err(e) => eprintln!("World FX light roots unavailable: {e}"),
+                }
+                let effects = world.install_scene_effects(&t_ref.scene);
+                let events = world.install_model_events();
+                eprintln!(
+                    "Installed {effects} scene effects and {events} model events (light producers and animated roots)"
+                );
+                for failure in world.gfx_failures() {
+                    eprintln!("FX light: {failure}");
+                }
+                world
+            });
+            let terrain_gpu = terrain_task.join().unwrap()?;
+            let sky = sky_task.join().unwrap()?;
+            let (weather, cloud) = weather_cloud_task.join().unwrap();
+            let (water, simple_water, shore) = water_task.join().unwrap();
+            let far_trees = trees_task.join().unwrap();
+            let (pipeline, scenery_pipeline, sdr_blend_pipeline) =
+                world_pipelines_task.join().unwrap();
+            let post = post_task.join().unwrap();
+            let local_pages = local_pages_task.join().unwrap();
+            Ok((
+                sky,
+                weather,
+                cloud,
+                water,
+                simple_water,
+                shore,
+                far_trees,
+                terrain_gpu,
+                pipeline,
+                scenery_pipeline,
+                sdr_blend_pipeline,
+                post,
+                local_pages,
+                models,
+            ))
+        })?;
         // Immutable tree meshes/motion samples and water frames now live on
         // the GPU. The streaming worker never reads these sources again.
         t.trees.types.clear();
@@ -2258,172 +2498,6 @@ impl Renderer {
         t.materials.release_gpu_source();
         t.heights.trim();
         queue.submit(std::iter::empty());
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("world WGSL"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
-        });
-        const ATTR: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x2,3=>Float32x4,4=>Float32,5=>Uint32,7=>Uint32];
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("world GPU pipeline"),
-            layout: Some(&pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs",
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &ATTR,
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Greater,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview: None,
-        });
-        // Static scenery shares the client's single depth buffer with the
-        // terrain, which is submitted first (`terrain_end..local_end`). Under
-        // the reversed projection the client's fixed-point `LESSEQUAL` test
-        // becomes `Greater`/`GreaterEqual`, and the tie rule matters: a
-        // duplicate baked triangle submitted after an identical one must win,
-        // exactly as a second draw at equal depth passes `LESSEQUAL`. Nothing
-        // in the baked path changes `ZFUNC` or `ZBIAS` (the only `ZBIAS` writes
-        // are the effect path's 2/0 pair at 0x417453 and 0x417471). Only the
-        // comparand differs from `pipeline`; the shader and layout are the same.
-        let scenery_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("scenery GPU pipeline"),
-            layout: Some(&pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs",
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &ATTR,
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    // Baked scenery is an alpha-test cutout, not a blend. The
-                    // 1.4.2 client enables `ALPHABLENDENABLE(1)` in all four
-                    // scenery passes (`0x42b5a5`, `0x42bc17`, `0x42c32e`,
-                    // `0x42c650`) and leaves `ZWRITEENABLE` on, so in the
-                    // client an alpha-0 texel still occupies the depth buffer.
-                    // Reproducing that here broke the viewer: the water pass is
-                    // depth-tested against this buffer, so a transparent lily
-                    // pad card occluded water as a solid square, and a canopy
-                    // card hid the canopy behind it through its transparent
-                    // gaps. The shared shader discards texels below the cutout
-                    // threshold (`tex.a < …`) so they write neither colour nor
-                    // depth; survivors are opaque and write depth as before.
-                    // Keeping a blend here would write depth for the surviving
-                    // partial-alpha texels against the pre-water colour, so the
-                    // pass stays unblended (as it was before the blend change).
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::GreaterEqual,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview: None,
-        });
-        // The client's baked-water law, for the one band the cutout above
-        // renders wrong. The `.sdr.` water/lava curtains (the downward-scroll
-        // scripts `瀑布`, `瀑布细长`, `青云山小瀑布`, `岩浆`, kind 2.02/2.12)
-        // are `ALPHABLENDENABLE(1)` with `SRCALPHA`/`INVSRCALPHA` and surface
-        // alpha `texture.a * diffuse.a` in the client (bmd_baked.rs header,
-        // `0x7a9785` `ALPHAOP(4)` = `MODULATE`), so their translucent texels
-        // show the scene through the sheet. The shared cutout draws them
-        // opaque instead — the reported "waterfalls are a white plain texture
-        // with no transparency". This pipeline draws JUST that band (the
-        // `fs_sdr` entry discards every other kind) with the client's blend,
-        // after the whole scenery range has finished. Depth write is off
-        // here: the client leaves `ZWRITEENABLE` on and gets away with it by
-        // mesh order, but this pass runs last, and a depth-writing translucent
-        // card is exactly the lily-pad/canopy failure the cutout exists to
-        // avoid (see the `scenery_pipeline` note). Depth *test* is unchanged,
-        // so nearer geometry still occludes the sheet.
-        let sdr_blend_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("sdr blend GPU pipeline"),
-            layout: Some(&pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs",
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &ATTR,
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_sdr",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::SrcAlpha,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::GreaterEqual,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview: None,
-        });
         // Sized once and kept: a block-window update rewrites the same geometry
         // through `queue.write_buffer` and only reallocates when the mesh grows.
         let vertex_capacity =
@@ -2462,69 +2536,6 @@ impl Renderer {
         );
         let d = depth_tex;
         let (object_mv, object_mv_view) = object_mv_target(&device, w, h);
-        let post = crate::post_gpu::PostGpu::new(&device, format, w, h);
-        let local_page_keys = m.local_page_keys;
-        let local_pages = m
-            .local_pages
-            .into_iter()
-            .map(|page| {
-                crate::world_objects::GpuPage::upload(
-                    &device,
-                    &queue,
-                    &layout,
-                    &sampler,
-                    &uniform,
-                    &reflected_uniform,
-                    page,
-                )
-            })
-            .collect();
-        // The verified ordinary world queue is enabled by default. Unsupported
-        // material/effect paths remain explicit instance failures, not stand-ins.
-        // The world's effects must not depend on the map placing an EC model.
-        // A block may author waterfalls, fire or glows and no animated model at
-        // all, and the effect half of this object has nothing to do with the
-        // model assets. Only the opt-out and a genuinely missing archive decide
-        // whether the object is built; the model queue inside it is skipped
-        // lazily when there are no instances.
-        let models = if std::env::var_os("PW_DISABLE_WORLD_MODELS").is_none() {
-            let assets = std::mem::take(&mut t.models);
-            // `models.pck` holds the model textures; the effect roots come from
-            // `gfx.pck` below. A map that ships no EC model still gets its
-            // effects, so a missing model archive costs the model queue and
-            // never the waterfalls.
-            let mut world =
-                match crate::world_models_gpu::World::new(&device, format, assets, &t.element) {
-                    Ok(world) => world,
-                    Err(error) => {
-                        eprintln!("World models unavailable ({error}); world effects continue");
-                        crate::world_models_gpu::World::without_models(&device, format)
-                    }
-                };
-            // Actual world effect owners: the ECWLD placements and the hook-free
-            // ECM EventType-100 roots publish into the same scene-light grid the
-            // receiving models query, and the same owners now play their animated
-            // roots — the waterfalls, torch fire, mist and glows the map authors —
-            // into the world pass. A missing archive is a reported failure, not a
-            // silent removal of either half.
-            match world.attach_gfx_archive(&t.element) {
-                Ok(()) => {}
-                Err(e) => eprintln!("World FX light roots unavailable: {e}"),
-            }
-            // A placement the reader or the owner queue rejects is a reported
-            // absence on the status line, not a refused world.
-            let effects = world.install_scene_effects(&t.scene);
-            let events = world.install_model_events();
-            eprintln!(
-                "Installed {effects} scene effects and {events} model events (light producers and animated roots)"
-            );
-            for failure in world.gfx_failures() {
-                eprintln!("FX light: {failure}");
-            }
-            Some(world)
-        } else {
-            None
-        };
         // Install the day/night pair the client's own `autoscene.cfg` names
         // (`sky_id_day = 0`, `sky_id_night = 1` for this build) after the
         // `sky.lst` rows have been loaded. The machine starts on the day set;

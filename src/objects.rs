@@ -510,7 +510,7 @@ impl Objects {
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
-                .min(16)
+                .min(32)
                 .min(missing_models.len());
             let chunk_size = (missing_models.len() + workers - 1) / workers;
             let parsed: Vec<Vec<(usize, String, Result<bmd::Model, String>)>> = {
@@ -654,7 +654,7 @@ impl Objects {
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
-                .min(16)
+                .min(32)
                 .min(jobs.len());
             let chunk_size = (jobs.len() + workers - 1) / workers;
             let decoded: Vec<Vec<(String, Result<Texture, String>)>> = {

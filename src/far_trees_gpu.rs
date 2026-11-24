@@ -623,7 +623,7 @@ impl FarTrees {
             let mip_workers = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
-                .min(8)
+                .min(32)
                 .min(gen_slots.len());
             let build_slot = |ox: usize,
                               oy: usize,

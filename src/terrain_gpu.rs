@@ -1116,7 +1116,7 @@ fn upload_masks(
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .min(8);
+        .min(32);
     let mut page = vec![0u8; MASK_PAGE * MASK_PAGE];
     for (page_id, jobs) in page_jobs.iter().enumerate() {
         page.fill(0);
@@ -1363,7 +1363,7 @@ fn load_lightmaps(
     let lm_workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .min(8);
+        .min(32);
     // Read and parse .t2lm/.t2lm1 pairs in parallel batches of 16 subtiles so
     // disk I/O and DDS parsing overlap across CPU cores while bounding RAM.
     for batch_start in (0..t.subterrain_names.len()).step_by(16) {

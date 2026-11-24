@@ -451,6 +451,307 @@ impl Reader {
         self.next_page += 1;
         Ok(page)
     }
+
+    /// Reads raw byte slabs for up to `batch_len` consecutive pages sequentially
+    /// at full disk speed, then SHA-256 verifies and deserializes all of them in
+    /// parallel across CPU cores.
+    pub(crate) fn read_pages_batch(&mut self, batch_len: usize) -> Vec<Result<Page, String>> {
+        let remaining = self.pages.saturating_sub(self.next_page);
+        let count = batch_len.min(remaining);
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut raw_pages: Vec<Result<Vec<u8>, String>> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let file = match self.pages_file.as_mut() {
+                Some(f) => f,
+                None => {
+                    raw_pages.push(Err("page cache file closed".into()));
+                    break;
+                }
+            };
+            let mut header = [0u8; 105];
+            if let Err(e) = file.read_exact(&mut header) {
+                raw_pages.push(Err(e.to_string()));
+                break;
+            }
+            if &header[0..8] != PAGE_MAGIC {
+                raw_pages.push(Err("bad page-cache record magic".into()));
+                break;
+            }
+            let used_height =
+                match usize::try_from(u64::from_le_bytes(header[16..24].try_into().unwrap())) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        raw_pages.push(Err("page height overflow".into()));
+                        break;
+                    }
+                };
+            let shared = u64::from_le_bytes(header[24..32].try_into().unwrap());
+            let vertex_count = match checked_count(
+                u64::from_le_bytes(header[32..40].try_into().unwrap()),
+                MAX_CACHED_VERTICES,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    raw_pages.push(Err(e));
+                    break;
+                }
+            };
+            let index_count = match checked_count(
+                u64::from_le_bytes(header[40..48].try_into().unwrap()),
+                MAX_CACHED_INDICES,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    raw_pages.push(Err(e));
+                    break;
+                }
+            };
+            let atlas_len = match checked_count(
+                u64::from_le_bytes(header[48..56].try_into().unwrap()),
+                crate::world_objects::SIDE * crate::world_objects::SIDE * 4,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    raw_pages.push(Err(e));
+                    break;
+                }
+            };
+            let mip_count =
+                match checked_count(u64::from_le_bytes(header[56..64].try_into().unwrap()), 7) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        raw_pages.push(Err(e));
+                        break;
+                    }
+                };
+            let placement_count = match checked_count(
+                u64::from_le_bytes(header[64..72].try_into().unwrap()),
+                MAX_CACHED_PLACEMENTS,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    raw_pages.push(Err(e));
+                    break;
+                }
+            };
+            let bounds_count = match checked_count(
+                u64::from_le_bytes(header[72..80].try_into().unwrap()),
+                MAX_CACHED_PLACEMENTS,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    raw_pages.push(Err(e));
+                    break;
+                }
+            };
+            if !(128..=crate::world_objects::SIDE).contains(&used_height)
+                || mip_count != if shared == u64::MAX { 7 } else { 0 }
+                || bounds_count != placement_count
+            {
+                raw_pages.push(Err("invalid cached page dimensions".into()));
+                break;
+            }
+            let mip_bytes: usize = (1..=mip_count)
+                .map(|level| 8 + (crate::world_objects::SIDE >> level) * (used_height >> level) * 4)
+                .sum();
+            let body_len = vertex_count * std::mem::size_of::<crate::gpu::Vertex>()
+                + index_count * 4
+                + atlas_len
+                + mip_bytes
+                + placement_count * 22
+                + bounds_count * 25
+                + 32;
+            let mut slab = vec![0u8; 105 + body_len];
+            slab[..105].copy_from_slice(&header);
+            if let Err(e) = file.read_exact(&mut slab[105..]) {
+                raw_pages.push(Err(e.to_string()));
+                break;
+            }
+            self.next_page += 1;
+            raw_pages.push(Ok(slab));
+        }
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(32)
+            .min(raw_pages.len().max(1));
+        if workers > 1 && raw_pages.len() >= 2 {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = raw_pages
+                    .into_iter()
+                    .map(|slab_res| {
+                        s.spawn(move || slab_res.and_then(|slab| decode_page_slab(&slab)))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            })
+        } else {
+            raw_pages
+                .into_iter()
+                .map(|slab_res| slab_res.and_then(|slab| decode_page_slab(&slab)))
+                .collect()
+        }
+    }
+}
+
+fn decode_page_slab(slab: &[u8]) -> Result<Page, String> {
+    if slab.len() < 105 + 32 {
+        return Err("truncated cached page slab".into());
+    }
+    let split = slab.len() - 32;
+    let payload = &slab[..split];
+    let expected_hash = &slab[split..];
+    let actual_hash = Sha256::digest(payload);
+    if expected_hash != actual_hash.as_slice() {
+        return Err("cached world page checksum mismatch".into());
+    }
+    let mut cur = std::io::Cursor::new(payload);
+    let mut dummy_hash = Sha256::new();
+    let mut magic = [0u8; 8];
+    cur.read_exact(&mut magic).map_err(|e| e.to_string())?;
+    if &magic != PAGE_MAGIC {
+        return Err("bad page-cache record magic".into());
+    }
+    let rd_u64 = |c: &mut std::io::Cursor<&[u8]>| -> Result<u64, String> {
+        let mut b = [0u8; 8];
+        c.read_exact(&mut b).map_err(|e| e.to_string())?;
+        Ok(u64::from_le_bytes(b))
+    };
+    let rd_f32 = |c: &mut std::io::Cursor<&[u8]>| -> Result<f32, String> {
+        let mut b = [0u8; 4];
+        c.read_exact(&mut b).map_err(|e| e.to_string())?;
+        Ok(f32::from_bits(u32::from_le_bytes(b)))
+    };
+    let processed = usize::try_from(rd_u64(&mut cur)?).map_err(|_| "processed count overflow")?;
+    let used_height = usize::try_from(rd_u64(&mut cur)?).map_err(|_| "page height overflow")?;
+    let shared = rd_u64(&mut cur)?;
+    let vertex_count = checked_count(rd_u64(&mut cur)?, MAX_CACHED_VERTICES)?;
+    let index_count = checked_count(rd_u64(&mut cur)?, MAX_CACHED_INDICES)?;
+    let atlas_len = checked_count(
+        rd_u64(&mut cur)?,
+        crate::world_objects::SIDE * crate::world_objects::SIDE * 4,
+    )?;
+    let mip_count = checked_count(rd_u64(&mut cur)?, 7)?;
+    let placement_count = checked_count(rd_u64(&mut cur)?, MAX_CACHED_PLACEMENTS)?;
+    let bounds_count = checked_count(rd_u64(&mut cur)?, MAX_CACHED_PLACEMENTS)?;
+    let mut byte = [0u8; 1];
+    cur.read_exact(&mut byte).map_err(|e| e.to_string())?;
+    let page_has_sdr = byte[0] != 0;
+    let mut page_min = [0.; 3];
+    let mut page_max = [0.; 3];
+    for value in page_min.iter_mut().chain(page_max.iter_mut()) {
+        *value = rd_f32(&mut cur)?;
+    }
+    let vertices = {
+        let mut out = vec![<crate::gpu::Vertex as bytemuck::Zeroable>::zeroed(); vertex_count];
+        cur.read_exact(bytemuck::cast_slice_mut(&mut out))
+            .map_err(|e| e.to_string())?;
+        out
+    };
+    let indices = {
+        let mut out = vec![0u32; index_count];
+        cur.read_exact(bytemuck::cast_slice_mut(&mut out))
+            .map_err(|e| e.to_string())?;
+        out
+    };
+    if indices.iter().any(|&index| index as usize >= vertex_count) {
+        return Err("cached page contains an out-of-range vertex index".into());
+    }
+    let mut atlas = vec![0u8; atlas_len];
+    if atlas_len > 0 {
+        cur.read_exact(&mut atlas).map_err(|e| e.to_string())?;
+    }
+    let mut mips = Vec::with_capacity(mip_count);
+    for level in 1..=mip_count {
+        let expected = (crate::world_objects::SIDE >> level) * (used_height >> level) * 4;
+        let len = checked_count(rd_u64(&mut cur)?, expected)?;
+        if len != expected {
+            return Err("invalid cached mip size".into());
+        }
+        let mut m = vec![0u8; len];
+        cur.read_exact(&mut m).map_err(|e| e.to_string())?;
+        mips.push(m);
+    }
+    let mut placements = Vec::with_capacity(placement_count);
+    if placement_count > 0 {
+        let pos = cur.position() as usize;
+        let pbytes = payload
+            .get(pos..pos + placement_count * 22)
+            .ok_or("truncated cached placements")?;
+        cur.set_position((pos + placement_count * 22) as u64);
+        for chunk in pbytes.chunks_exact(22) {
+            let start = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let end = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+            let export_id = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+            let order = u64::from_le_bytes(chunk[12..20].try_into().unwrap());
+            if start > end || end as usize > index_count {
+                return Err("invalid cached placement index range".into());
+            }
+            placements.push(PlacementRange {
+                start,
+                end,
+                export_id,
+                order,
+                visibility: crate::scenery_visibility::Visibility {
+                    reflect: chunk[20] != 0,
+                    refract: chunk[21] != 0,
+                },
+            });
+        }
+    }
+    let mut bounds = Vec::with_capacity(bounds_count);
+    if bounds_count > 0 {
+        let pos = cur.position() as usize;
+        let bbytes = payload
+            .get(pos..pos + bounds_count * 25)
+            .ok_or("truncated cached bounds")?;
+        cur.set_position((pos + bounds_count * 25) as u64);
+        for chunk in bbytes.chunks_exact(25) {
+            let min = [
+                f32::from_bits(u32::from_le_bytes(chunk[0..4].try_into().unwrap())),
+                f32::from_bits(u32::from_le_bytes(chunk[4..8].try_into().unwrap())),
+                f32::from_bits(u32::from_le_bytes(chunk[8..12].try_into().unwrap())),
+            ];
+            let max = [
+                f32::from_bits(u32::from_le_bytes(chunk[12..16].try_into().unwrap())),
+                f32::from_bits(u32::from_le_bytes(chunk[16..20].try_into().unwrap())),
+                f32::from_bits(u32::from_le_bytes(chunk[20..24].try_into().unwrap())),
+            ];
+            bounds.push(PlacementBounds {
+                min,
+                max,
+                has_sdr: chunk[24] != 0,
+            });
+        }
+    }
+    let _ = &mut dummy_hash;
+    if shared == u64::MAX && atlas.len() != crate::world_objects::SIDE * used_height * 4 {
+        return Err("cached atlas size mismatch".into());
+    }
+    if shared != u64::MAX && atlas_len != 0 {
+        return Err("shared page contains an atlas copy".into());
+    }
+    let shared_atlas = if shared == u64::MAX {
+        None
+    } else {
+        Some(usize::try_from(shared).map_err(|_| "shared atlas index overflow")?)
+    };
+    Ok(Page {
+        vertices,
+        indices,
+        atlas,
+        shared_atlas,
+        processed,
+        used_height,
+        mips,
+        placements,
+        bounds,
+        page_min,
+        page_max,
+        page_has_sdr,
+    })
 }
 
 fn checked_count(value: u64, max: usize) -> Result<usize, String> {

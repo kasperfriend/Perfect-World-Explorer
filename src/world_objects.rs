@@ -292,7 +292,7 @@ impl Page {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1)
-                    .min(16)
+                    .min(32)
             } else {
                 1
             };
@@ -649,30 +649,49 @@ fn run(
         if let Some(mut reader) = crate::world_page_cache::Reader::open(&key) {
             let mut metadata = Vec::with_capacity(reader.page_count());
             let mut valid = true;
-            for index in 0..reader.page_count() {
-                match reader.read_page(index) {
-                    Ok(page) => {
-                        if page.shared_atlas.is_some_and(|source| source >= index) {
-                            eprintln!("Whole-world cache rejected: forward/shared atlas reference at page {index}");
+            let total_pages = reader.page_count();
+            let cache_batch = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+                .clamp(2, 8);
+            let mut index = 0usize;
+            while index < total_pages && valid {
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let batch = reader.read_pages_batch(cache_batch);
+                if batch.is_empty() {
+                    reader.invalidate();
+                    let _ = tx.send(Message::CacheInvalid);
+                    valid = false;
+                    break;
+                }
+                for page_res in batch {
+                    match page_res {
+                        Ok(page) => {
+                            if page.shared_atlas.is_some_and(|source| source >= index) {
+                                eprintln!("Whole-world cache rejected: forward/shared atlas reference at page {index}");
+                                reader.invalidate();
+                                let _ = tx.send(Message::CacheInvalid);
+                                valid = false;
+                                break;
+                            }
+                            metadata.push(WorldPageMeta::from_page(&page));
+                            let mut page = page;
+                            page.placements = Vec::new();
+                            page.bounds = Vec::new();
+                            if tx.send(Message::Page(Arc::new(page))).is_err() {
+                                return Ok(());
+                            }
+                            index += 1;
+                        }
+                        Err(error) => {
+                            eprintln!("Whole-world cache rejected at page {index}: {error}");
                             reader.invalidate();
                             let _ = tx.send(Message::CacheInvalid);
                             valid = false;
                             break;
                         }
-                        metadata.push(WorldPageMeta::from_page(&page));
-                        let mut page = page;
-                        page.placements = Vec::new();
-                        page.bounds = Vec::new();
-                        if tx.send(Message::Page(Arc::new(page))).is_err() {
-                            return Ok(());
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("Whole-world cache rejected at page {index}: {error}");
-                        reader.invalidate();
-                        let _ = tx.send(Message::CacheInvalid);
-                        valid = false;
-                        break;
                     }
                 }
             }

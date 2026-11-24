@@ -561,35 +561,78 @@ impl Grass {
                 models.extend(chunk);
             }
         }
+        let mut unique_tex: Vec<(String, Option<&pck::Entry>)> = Vec::new();
+        let mut seen_tex: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for m in models.iter().flatten() {
             for mesh in &m.meshes {
-                if !textures.contains_key(&mesh.texture) {
+                if !textures.contains_key(&mesh.texture) && seen_tex.insert(mesh.texture.as_str()) {
                     let alt = mesh.texture.replace("/textures/", "/");
-                    // One retail asset names its DDS with a space while the
-                    // matching archive member uses an underscore.
                     let spaced = mesh.texture.replace(' ', "_");
                     let entry = entries
                         .get(&mesh.texture)
                         .or_else(|| entries.get(&alt))
                         .or_else(|| entries.get(&spaced));
-                    if let Some(entry) = entry {
-                        if let Ok(bytes) = pck::read_entry(&mut archive, entry) {
-                            if let Ok(img) = image::load_from_memory(&bytes) {
-                                textures.insert(mesh.texture.clone(), img.into_rgba8());
-                                match crate::vegetation_textures::authored_lower_mips(&bytes) {
-                                    Ok(mips) => {
-                                        texture_mips.insert(mesh.texture.clone(), mips);
-                                    }
-                                    Err(e) => eprintln!(
-                                        "Grass texture {} authored mips unavailable: {e}",
-                                        mesh.texture
-                                    ),
-                                }
-                                continue;
-                            }
+                    unique_tex.push((mesh.texture.clone(), entry));
+                }
+            }
+        }
+        if !unique_tex.is_empty() {
+            let tex_workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(32)
+                .min(unique_tex.len());
+            let decode_one = |(tex_name, entry): &(String, Option<&pck::Entry>),
+                              archive_ref: &File| {
+                if let Some(entry) = entry {
+                    if let Ok(bytes) = pck::read_entry_at(archive_ref, entry) {
+                        if let Ok(img) = image::load_from_memory(&bytes) {
+                            let mips = crate::vegetation_textures::authored_lower_mips(&bytes);
+                            return (tex_name.clone(), Some((img.into_rgba8(), mips)));
                         }
                     }
-                    warnings.insert(mesh.texture.clone());
+                }
+                (tex_name.clone(), None)
+            };
+            let decoded: Vec<_> = if tex_workers > 1 {
+                let chunk_size = unique_tex.len().div_ceil(tex_workers);
+                let archive_ref = &archive;
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = unique_tex
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            s.spawn(move || {
+                                chunk
+                                    .iter()
+                                    .map(|item| decode_one(item, archive_ref))
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .flat_map(|h| h.join().unwrap())
+                        .collect()
+                })
+            } else {
+                unique_tex
+                    .iter()
+                    .map(|item| decode_one(item, &archive))
+                    .collect()
+            };
+            for (tex_name, outcome) in decoded {
+                if let Some((img, mips)) = outcome {
+                    textures.insert(tex_name.clone(), img);
+                    match mips {
+                        Ok(mips) => {
+                            texture_mips.insert(tex_name, mips);
+                        }
+                        Err(e) => {
+                            eprintln!("Grass texture {tex_name} authored mips unavailable: {e}")
+                        }
+                    }
+                } else {
+                    warnings.insert(tex_name);
                 }
             }
         }

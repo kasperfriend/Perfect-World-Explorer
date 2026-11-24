@@ -275,7 +275,7 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .min(16);
+        .min(32);
     let result = if workers > 1 && count >= 512 {
         let chunk_size = (count + workers - 1) / workers;
         let table_ref = &table;

@@ -228,7 +228,7 @@ impl Materials {
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
-                .min(8)
+                .min(32)
                 .min(tex_entries.len());
             if workers > 1 && tex_entries.len() >= 8 {
                 let chunk_size = (tex_entries.len() + workers - 1) / workers;
@@ -434,7 +434,7 @@ impl Materials {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .min(8)
+            .min(32)
             .min(active_tiles.len().max(1));
         if workers > 1 && active_tiles.len() >= 2 {
             let chunk_size = (active_tiles.len() + workers - 1) / workers;
