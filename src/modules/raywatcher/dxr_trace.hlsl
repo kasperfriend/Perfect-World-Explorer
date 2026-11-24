@@ -1951,7 +1951,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float3 j_vec = jitter_pt - ray_origin;
                     float j_dist = length(j_vec);
                     float self_clear = clamp(pl_pr.w * 0.08, 1.4, 3.2);
-                    if (j_dist > self_clear + bias && occluded_point_light(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear, pl_terrain_skip, opaque_offset, tri_count)) {
+                    float pl_dyn_skip2 = (normal.y > 0.72) ? 0.14 : 0.62;
+                    if (j_dist > self_clear + bias && occluded_point_light(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear, pl_terrain_skip, pl_dyn_skip2, opaque_offset, tri_count)) {
                         pl_vis = 0.0;
                     }
                 }
