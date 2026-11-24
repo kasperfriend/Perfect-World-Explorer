@@ -411,11 +411,6 @@ impl Raywatcher {
             ("Contact shadows", &mut effects.contact_shadows),
             ("Moonlit night sky", &mut effects.moonlit_night),
             ("Twilight sky scattering", &mut effects.twilight_sky),
-            ("Volumetric clouds", &mut effects.volumetric_clouds),
-            (
-                "Realistic water (waves & flow)",
-                &mut effects.realistic_water,
-            ),
         ] {
             changed_effects |= ui.checkbox(slot, label).changed();
         }
@@ -655,8 +650,6 @@ impl Raywatcher {
             ("contact_shadows", effects.contact_shadows),
             ("moonlit_night", effects.moonlit_night),
             ("twilight_sky", effects.twilight_sky),
-            ("volumetric_clouds", effects.volumetric_clouds),
-            ("realistic_water", effects.realistic_water),
         ] {
             let _ = writeln!(out, "{name}={}", u8::from(on));
         }
@@ -740,8 +733,6 @@ impl Raywatcher {
             ("contact_shadows", &mut effects.contact_shadows),
             ("moonlit_night", &mut effects.moonlit_night),
             ("twilight_sky", &mut effects.twilight_sky),
-            ("volumetric_clouds", &mut effects.volumetric_clouds),
-            ("realistic_water", &mut effects.realistic_water),
         ] {
             if let Some(v) = get(name).and_then(parse_flag) {
                 *slot = v;
@@ -1069,8 +1060,6 @@ mod tests {
             contact_shadows: false,
             moonlit_night: false,
             twilight_sky: false,
-            volumetric_clouds: false,
-            realistic_water: false,
         };
         m.set_settings(s);
         let none = m.status((640, 360), false);

@@ -276,10 +276,6 @@ pub struct Effects {
     pub moonlit_night: bool,
     /// Physical sunset/twilight sky & horizon scattering (Rayleigh/Mie) feeding RT reflections & GI.
     pub twilight_sky: bool,
-    /// Deep 3D ray-marched volumetric clouds that drift and evolve over time.
-    pub volumetric_clouds: bool,
-    /// Realistic flowing water with wind-driven ripples, multi-directional waves, and crest/shore foam.
-    pub realistic_water: bool,
 }
 
 impl Default for Effects {
@@ -299,8 +295,6 @@ impl Default for Effects {
             contact_shadows: true,
             moonlit_night: true,
             twilight_sky: true,
-            volumetric_clouds: true,
-            realistic_water: true,
         }
     }
 }
@@ -320,8 +314,6 @@ impl Effects {
             self.contact_shadows,
             self.moonlit_night,
             self.twilight_sky,
-            self.volumetric_clouds,
-            self.realistic_water,
         ]
         .iter()
         .filter(|on| **on)
@@ -533,8 +525,6 @@ impl Plan {
             contact_shadows: false,
             moonlit_night: false,
             twilight_sky: false,
-            volumetric_clouds: false,
-            realistic_water: false,
         },
         reconstruction: RayReconstruction::Off,
         grid: (0, 0),
@@ -726,8 +716,6 @@ mod tests {
             contact_shadows: false,
             moonlit_night: false,
             twilight_sky: false,
-            volumetric_clouds: false,
-            realistic_water: false,
         };
         assert!(!s.replaces_effects());
         assert_eq!(
@@ -748,8 +736,6 @@ mod tests {
                 contact_shadows: false,
                 moonlit_night: false,
                 twilight_sky: false,
-                volumetric_clouds: false,
-                realistic_water: false,
             };
             match enable {
                 0 => e.shadows = true,

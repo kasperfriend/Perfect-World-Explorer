@@ -128,12 +128,6 @@ impl RayParams {
         if effects.twilight_sky {
             bits |= 4096;
         }
-        if effects.volumetric_clouds {
-            bits |= 65536;
-        }
-        if effects.realistic_water {
-            bits |= 131072;
-        }
         bits
     }
 
@@ -2673,14 +2667,8 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
         ddim - vec2<i32>(1),
     );
     let z_center = textureLoad(src_depth, dpx, 0);
-    // Sky pixels pass through 100% untouched unless volumetric clouds are active (`comp_params.y > 0.5`),
-    // in which case `src_rt` carries premultiplied `(cloud_rgb, transmittance)`.
+    // Sky pixels pass through 100% untouched.
     if (z_center <= 0.0) {
-        if (comp_params.y > 0.5) {
-            let cloud = textureSampleLevel(src_rt, src_samp, i.uv, 0.0);
-            let trans = clamp(cloud.a, 0.0, 1.0);
-            return vec4<f32>(max(raster.rgb * trans + cloud.rgb, vec3<f32>(0.0)), raster.a);
-        }
         return raster;
     }
 
@@ -4485,15 +4473,10 @@ impl RaywatcherGpu {
             transport.ambient_strength,
         );
         self.last_scene_albedo_gain = scene_albedo_gain;
-        let clouds_active = if plan.effects.volumetric_clouds {
-            1.0f32
-        } else {
-            0.0f32
-        };
         queue.write_buffer(
             &self.composite_uniforms,
             0,
-            bytemuck::bytes_of(&[scene_albedo_gain, clouds_active, 0.0, 0.0]),
+            bytemuck::bytes_of(&[scene_albedo_gain, 0.0, 0.0, 0.0]),
         );
 
         let skip_inhouse = plan.reconstruction

@@ -695,8 +695,6 @@ mod tests {
                 contact_shadows: false,
                 moonlit_night: false,
                 twilight_sky: false,
-                volumetric_clouds: false,
-                realistic_water: false,
             };
             f(&mut e);
             RasterOverrides::for_effects(e, true)

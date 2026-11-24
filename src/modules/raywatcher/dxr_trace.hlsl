@@ -791,243 +791,6 @@ float trace_contact_shadow(float3 world_pos, float3 sun_dir, float cam_dist, flo
 // ============================================================================
 // Deep 3D Ray-Marched Volumetric Clouds (time-evolving, drifting, self-shadowed)
 // ============================================================================
-float cloud_hash31(float3 p) {
-    p = frac(p * float3(0.1031, 0.1030, 0.0973));
-    p += dot(p, p.yxz + 33.33);
-    return frac((p.x + p.y) * p.z);
-}
-
-float cloud_noise3(float3 p) {
-    float3 i = floor(p);
-    float3 f = frac(p);
-    float3 u = f * f * (3.0 - 2.0 * f);
-    float n000 = cloud_hash31(i + float3(0.0, 0.0, 0.0));
-    float n100 = cloud_hash31(i + float3(1.0, 0.0, 0.0));
-    float n010 = cloud_hash31(i + float3(0.0, 1.0, 0.0));
-    float n110 = cloud_hash31(i + float3(1.0, 1.0, 0.0));
-    float n001 = cloud_hash31(i + float3(0.0, 0.0, 1.0));
-    float n101 = cloud_hash31(i + float3(1.0, 0.0, 1.0));
-    float n011 = cloud_hash31(i + float3(0.0, 1.0, 1.0));
-    float n111 = cloud_hash31(i + float3(1.0, 1.0, 1.0));
-    float nx00 = lerp(n000, n100, u.x);
-    float nx10 = lerp(n010, n110, u.x);
-    float nx01 = lerp(n001, n101, u.x);
-    float nx11 = lerp(n011, n111, u.x);
-    float nxy0 = lerp(nx00, nx10, u.y);
-    float nxy1 = lerp(nx01, nx11, u.y);
-    return lerp(nxy0, nxy1, u.z);
-}
-
-// 2-stage hierarchical 3D cloud density: cheap coarse shape first, detail erosion only inside clouds.
-float sample_cloud_density(float3 p, float h_frac, float t, bool high_detail) {
-    float h_profile = smoothstep(0.0, 0.18, h_frac) * (1.0 - smoothstep(0.46, 1.0, h_frac));
-    if (h_profile <= 0.005) {
-        return 0.0;
-    }
-    // Wind drift + gentle vertical evolution so clouds continuously morph and travel.
-    float3 wind = float3(t * 9.5, t * 0.35, t * 5.2);
-    float3 q = (p + wind) * 0.00145;
-    float base_n = cloud_noise3(q) * 0.65 + cloud_noise3(q * 2.08 + float3(11.3, 4.7, 7.1)) * 0.35;
-    // Time-varying global cloud coverage so weather slowly breathes over time.
-    float coverage = 0.45 + 0.075 * sin(t * 0.018);
-    float shaped = (base_n - coverage) * h_profile * 2.45;
-    if (shaped <= 0.005) {
-        return 0.0;
-    }
-    if (high_detail) {
-        float3 d_q = (p + wind * 1.18) * 0.0058;
-        float billow = cloud_noise3(d_q) * 0.65 + cloud_noise3(d_q * 2.15 + float3(5.2, 9.1, 3.4)) * 0.35;
-        shaped -= (1.0 - billow) * (0.28 + 0.22 * (1.0 - h_frac));
-    }
-    return saturate(shaped) * 0.032;
-}
-
-float cloud_hg_phase(float cos_theta, float g) {
-    float g2 = g * g;
-    float denom = max(1.0 + g2 - 2.0 * g * cos_theta, 0.08);
-    return (1.0 - g2) / (4.0 * 3.14159265 * denom * sqrt(denom));
-}
-
-// Ray-sphere distance to virtual curved atmosphere layer (clouds curve naturally to horizon).
-float2 cloud_layer_hit(float3 ro, float3 rd, float bot_y, float top_y) {
-    const float R_EARTH = 26000.0;
-    float r0 = R_EARTH + max(ro.y, 0.0);
-    float r_bot = R_EARTH + bot_y;
-    float r_top = R_EARTH + top_y;
-    float b = r0 * rd.y;
-    float d_bot = b * b - (r0 * r0 - r_bot * r_bot);
-    float d_top = b * b - (r0 * r0 - r_top * r_top);
-    float t0 = (ro.y < bot_y) ? max(-b + sqrt(max(d_bot, 0.0)), 0.0) : 0.0;
-    float t1 = max(-b + sqrt(max(d_top, 0.0)), t0);
-    return float2(t0, min(t1, 9500.0));
-}
-
-// Returns premultiplied float4(cloud_rgb, transmittance) for sky compositing.
-float4 trace_volumetric_clouds(
-    float3 ro,
-    float3 rd,
-    float3 sun_dir,
-    float3 sun_col,
-    float3 amb_col,
-    float sun_strength,
-    float t,
-    float jitter,
-    uint steps,
-    bool do_sun_march
-) {
-    if (rd.y <= 0.012) {
-        return float4(0.0, 0.0, 0.0, 1.0);
-    }
-    const float CLOUD_BOT = 260.0;
-    const float CLOUD_TOP = 470.0;
-    float2 span = cloud_layer_hit(ro, rd, CLOUD_BOT, CLOUD_TOP);
-    float march_len = span.y - span.x;
-    if (march_len <= 1.0) {
-        return float4(0.0, 0.0, 0.0, 1.0);
-    }
-    float dt = march_len / float(steps);
-    float cos_sun = dot(rd, sun_dir);
-    float phase = lerp(cloud_hg_phase(cos_sun, -0.22), cloud_hg_phase(cos_sun, 0.62), 0.65);
-    float phase_w = 0.72 + clamp(phase * 2.8, 0.0, 1.85);
-
-    // Time-of-day cloud palette: crisp sunlit cumulus by day, amber/crimson at sunset, cool silver-blue at night.
-    float twilight_w = smoothstep(-0.14, 0.02, sun_dir.y) * (1.0 - smoothstep(0.08, 0.36, sun_dir.y));
-    float3 day_sun = max(sun_col, float3(0.82, 0.78, 0.72)) * 1.18;
-    float3 sunset_sun = float3(1.38, 0.56, 0.24);
-    float3 night_moon = float3(0.14, 0.20, 0.34);
-    float3 direct_tint = lerp(night_moon, lerp(day_sun, sunset_sun, twilight_w * 0.82), sun_strength);
-
-    float3 day_amb = max(amb_col * 0.75, float3(0.32, 0.42, 0.58));
-    float3 sunset_amb = float3(0.36, 0.22, 0.34);
-    float3 night_amb = float3(0.035, 0.055, 0.105);
-    float3 amb_tint = lerp(night_amb, lerp(day_amb, sunset_amb, twilight_w * 0.75), sun_strength);
-
-    float3 accum = float3(0.0, 0.0, 0.0);
-    float trans = 1.0;
-    const float R_EARTH = 26000.0;
-
-    for (uint i = 0u; i < steps; i = i + 1u) {
-        float dist_c = span.x + (float(i) + jitter) * dt;
-        float3 p = ro + rd * dist_c;
-        float h_alt = length(float3(p.x, p.y + R_EARTH, p.z)) - R_EARTH;
-        float h_frac = saturate((h_alt - CLOUD_BOT) / (CLOUD_TOP - CLOUD_BOT));
-        float dens = sample_cloud_density(p, h_frac, t, do_sun_march);
-        if (dens > 0.0005) {
-            float sun_trans = 1.0;
-            if (do_sun_march) {
-                float sun_od = 0.0;
-                float3 s_dir = (sun_dir.y > 0.05) ? sun_dir : normalize(float3(sun_dir.x, 0.22, sun_dir.z));
-                for (uint si = 0u; si < 3u; si = si + 1u) {
-                    float st = (float(si) + 0.5) * 34.0;
-                    float3 sp = p + s_dir * st;
-                    float sh = saturate((length(float3(sp.x, sp.y + R_EARTH, sp.z)) - R_EARTH - CLOUD_BOT) / (CLOUD_TOP - CLOUD_BOT));
-                    sun_od += sample_cloud_density(sp, sh, t, false) * 34.0;
-                }
-                float beer = exp(-sun_od * 1.15);
-                float powder = 1.0 - exp(-sun_od * 2.2) * 0.55;
-                sun_trans = max(beer * powder, exp(-sun_od * 0.28) * 0.35);
-            } else {
-                sun_trans = lerp(0.45, 0.95, h_frac);
-            }
-            float3 sample_lit = direct_tint * (sun_trans * phase_w) + amb_tint * lerp(0.55, 1.10, h_frac);
-            float step_trans = exp(-dens * dt);
-            float alpha = 1.0 - step_trans;
-            accum += sample_lit * (trans * alpha);
-            trans *= step_trans;
-            if (trans < 0.025) {
-                trans = 0.0;
-                break;
-            }
-        }
-    }
-    // Smooth horizon fade so distant clouds merge naturally into sky atmosphere.
-    float horiz_fade = smoothstep(0.015, 0.14, rd.y);
-    float final_trans = lerp(1.0, trans, horiz_fade);
-    return float4(accum * horiz_fade, final_trans);
-}
-
-// ============================================================================
-// Realistic Flowing, Wind-Rippled, Multi-Wave & Foam Water Simulation
-// ============================================================================
-struct RealisticWaterSurface {
-    float3 normal;
-    float crest_foam;
-    float flow_foam;
-    float wave_height;
-};
-
-RealisticWaterSurface evaluate_realistic_water(float2 xz, float t, float cam_dist, float wdepth) {
-    RealisticWaterSurface out_w;
-    // Spatially varying river/current flow field (gentle meandering flow).
-    float flow_ang = 0.42 + 0.38 * sin(xz.x * 0.011 + xz.y * 0.008) + 0.22 * cos(xz.x * 0.007 - xz.y * 0.013);
-    float s_fa, c_fa;
-    sincos(flow_ang, s_fa, c_fa);
-    float2 flow_dir = float2(c_fa, s_fa);
-
-    // Dual-phase flow advection (seamless continuous current without UV stretching).
-    float f_cyc = t * 0.22;
-    float ph0 = frac(f_cyc);
-    float ph1 = frac(f_cyc + 0.5);
-    float f_blend = abs(2.0 * ph0 - 1.0);
-    float2 p0 = xz - flow_dir * (ph0 * 4.8);
-    float2 p1 = xz - flow_dir * (ph1 * 4.8);
-
-    // Shallow-water wave damping (tall swells calm smoothly near beaches/shores).
-    float depth_scale = smoothstep(0.15, 2.2, wdepth);
-    float dist_fade = exp(-cam_dist * 0.0032);
-    float amp_swell = 0.058 * depth_scale * dist_fade;
-
-    // 4 directional Gerstner-style swell octaves (steepened crests, broad troughs).
-    float2 d1 = float2(0.82, 0.57);
-    float2 d2 = float2(-0.54, 0.84);
-    float2 d3 = float2(0.95, -0.31);
-    float2 d4 = float2(0.28, -0.96);
-
-    float w1_p = dot(xz, d1) * 0.28 - t * 1.15;
-    float w2_p = dot(xz, d2) * 0.43 - t * 1.48;
-    float w3_p = dot(p0, d3) * 0.78 - t * 2.05;
-    float w4_p = dot(p1, d4) * 0.86 - t * 2.28;
-
-    float s1, c1, s2, c2, s3, c3, s4, c4;
-    sincos(w1_p, s1, c1);
-    sincos(w2_p, s2, c2);
-    sincos(w3_p, s3, c3);
-    sincos(w4_p, s4, c4);
-
-    // Steepened crest derivative: d/dx of (0.5 + 0.5*sin(p))^1.6
-    float steep1 = (0.55 + 0.45 * s1) * c1;
-    float steep2 = (0.55 + 0.45 * s2) * c2;
-    float2 grad = d1 * (steep1 * 0.28 * 1.35)
-                + d2 * (steep2 * 0.43 * 0.95)
-                + d3 * (c3 * 0.78 * 0.52 * (1.0 - f_blend))
-                + d4 * (c4 * 0.86 * 0.52 * f_blend);
-    grad *= amp_swell;
-
-    // Travelling wind-gust patches driving high-frequency anisotropic capillary ripples.
-    float2 wind_dir = float2(0.86, 0.51);
-    float2 wind_perp = float2(-0.51, 0.86);
-    float gust = 0.52 + 0.48 * sin(dot(xz, wind_dir) * 0.045 - t * 0.85 + sin(dot(xz, wind_perp) * 0.032) * 1.6);
-    float rip_amp = 0.032 * gust * exp(-cam_dist * 0.0065);
-    float2 wp0 = float2(dot(p0, wind_dir) * 2.35, dot(p0, wind_perp) * 1.15) - float2(t * 3.4, 0.0);
-    float2 wp1 = float2(dot(p1, wind_dir) * 2.65, dot(p1, wind_perp) * 1.30) - float2(t * 3.9, 0.0);
-    float r0 = cos(wp0.x + sin(wp0.y * 1.4) * 0.85);
-    float r1 = cos(wp1.x + cos(wp1.y * 1.3) * 0.85);
-    float r_mix = lerp(r0, r1, f_blend);
-    float r_cross = sin(wp0.y * 1.9 + wp1.x * 0.6) * 0.45;
-    grad += (wind_dir * r_mix + wind_perp * r_cross) * rip_amp;
-
-    out_w.normal = normalize(float3(-grad.x, 1.0, -grad.y));
-    float crest = saturate((s1 * 0.48 + s2 * 0.34 + lerp(s3, s4, f_blend) * 0.18) * 0.5 + 0.5);
-    out_w.wave_height = crest * depth_scale;
-    // Wind-driven whitecaps on steep wave peaks + subtle current flow foam streaks.
-    float slope_mag = length(grad);
-    float whitecap_raw = smoothstep(0.68, 0.94, crest) * smoothstep(0.032, 0.095, slope_mag) * gust * depth_scale;
-    float streak_n = sin(dot(p0, wind_perp) * 1.15 + sin(dot(p0, wind_dir) * 0.35) * 2.2) * 0.5 + 0.5;
-    out_w.crest_foam = saturate(whitecap_raw * 1.45);
-    out_w.flow_foam = saturate(smoothstep(0.78, 0.96, streak_n) * gust * 0.22 * depth_scale * dist_fade);
-    return out_w;
-}
-
 // Enhancement #12: Subtle animated multi-octave capillary wave normal for living water reflections.
 float3 water_wave_normal(float2 xz, float t, float cam_dist) {
     float amp = 0.028 * exp(-cam_dist * 0.0045);
@@ -1071,25 +834,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     if (dist <= 0.0) {
         float3 sky_rgb = src_gbuf_raster.Load(int3(id.xy, 0)).rgb;
         bool layered_sky = params.effects.w > 0.5;
-        uint sky_fx = uint(round(params.effects.y));
-        bool sky_clouds_on = (sky_fx & 65536u) != 0u;
         float4 sky_out = float4(layered_sky ? float3(0.0, 0.0, 0.0) : sky_rgb, 1.0);
-        if (sky_clouds_on) {
-            float2 uv_s = (float2(id.xy) + 0.5) / max(params.extents.xy, float2(1.0, 1.0));
-            float4 ndc_s = float4(uv_s.x * 2.0 - 1.0, 1.0 - uv_s.y * 2.0, 0.5, 1.0);
-            float4 wp_s = mul(params.inv_vp, ndc_s);
-            float3 sky_dir = normalize(wp_s.xyz / max(abs(wp_s.w), 1e-5) - params.eye.xyz);
-            float sky_sun_str = saturate(luma(params.sun_colour.xyz) * 1.25);
-            float sky_jit = ign(id.xy, uint(params.frame.x));
-            float4 cld = trace_volumetric_clouds(
-                params.eye.xyz, sky_dir, params.sun_dir.xyz, params.sun_colour.xyz,
-                params.ambient.xyz, sky_sun_str, params.frame.x * 0.03, sky_jit, 12u, true);
-            if (layered_sky) {
-                sky_out = cld;
-            } else {
-                sky_out = float4(sky_rgb * cld.a + cld.rgb, 1.0);
-            }
-        }
         out_colour[id.xy] = sky_out;
         if (params.point_light_meta.w > 0.5) {
             out_guide[id.xy] = float4(1.0, 1.0, 0.0, 0.0);
@@ -1129,8 +874,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     bool bits_moonlit_night = (effects & 512u) != 0u;
     bool bits_weather = (effects & 2048u) != 0u;
     bool bits_twilight_sky = (effects & 4096u) != 0u;
-    bool bits_volumetric_clouds = (effects & 65536u) != 0u;
-    bool bits_realistic_water = (effects & 131072u) != 0u;
 
     // Feature #6: True metallic PBR material separation for armor, weapons & gold roofs
     // (Opt: skip metallic classification completely on water pixels).
@@ -1339,22 +1082,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // #8 (Analytical Reflections of World Effects & Point Lights), #10 (Off-Screen Detail).
         float refl_dist = params.lens.y;
         if (bits_reflections && (eff_roughness <= params.effects.x || metalness > 0.1)) {
-            // Realistic flowing, wind-rippled, multi-wave water surface (toggleable via `bits_realistic_water`).
-            float rw_crest_foam = 0.0;
-            float rw_flow_foam = 0.0;
-            float rw_wave_h = 0.0;
             float3 refl_base_n = shade_normal;
             if (is_water) {
-                if (bits_realistic_water) {
-                    float w_est_d = (water_depth > 0.01) ? water_depth : 3.0;
-                    RealisticWaterSurface rws = evaluate_realistic_water(world_pos.xz, params.frame.x * 0.035, dist, w_est_d);
-                    refl_base_n = rws.normal;
-                    rw_crest_foam = rws.crest_foam;
-                    rw_flow_foam = rws.flow_foam;
-                    rw_wave_h = rws.wave_height;
-                } else {
-                    refl_base_n = water_wave_normal(world_pos.xz, params.frame.x * 0.03, dist);
-                }
+                refl_base_n = water_wave_normal(world_pos.xz, params.frame.x * 0.03, dist);
             }
             float3 h = ggx_sample(refl_base_n, eff_roughness, rand01(state), rand01(state));
             float3 reflect_dir = reflect(view_dir, h);
@@ -1414,12 +1144,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 refl_dist = rhit.t;
             } else {
                 float3 sky_col = apply_twilight_scattering(sample_sky_reflection(reflect_dir), reflect_dir, params.sun_dir.xyz, sun_strength, bits_twilight_sky);
-                if (is_water && bits_volumetric_clouds && reflect_dir.y > 0.02) {
-                    float4 cld_r = trace_volumetric_clouds(
-                        world_pos, reflect_dir, params.sun_dir.xyz, params.sun_colour.xyz,
-                        params.ambient.xyz, sun_strength, params.frame.x * 0.03, ign_v, 5u, false);
-                    sky_col = sky_col * cld_r.a + cld_r.rgb;
-                }
                 refl_col = sky_col * (fresnel_rgb * trim_scale * 0.65 * (1.0 - fog_t));
                 // Enhancement #14: Ray-traced sun & moon glitter paths across living water
                 // (only when reflection ray misses all bridges, islands, cliffs & ships!).
@@ -1488,28 +1212,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float bw3 = back_w * back_w * back_w;
                     float shore_w = smoothstep(0.05, 0.55, wdepth) * (1.0 - smoothstep(1.2, 4.5, wdepth));
                     refl_col += float3(0.12, 0.62, 0.58) * params.sun_colour.xyz * (bw3 * shore_w * shadow * sun_strength * refract_w * 0.45);
-                }
-                // Realistic water wave-crest subsurface turquoise glow (when backlit by sun).
-                if (bits_realistic_water && rw_wave_h > 0.35 && shadow > 0.05 && sun_strength > 0.05) {
-                    float back_c = saturate(dot(view_dir, params.sun_dir.xyz));
-                    float sss_c = (back_c * back_c * 0.65 + 0.35) * smoothstep(0.35, 0.92, rw_wave_h);
-                    refl_col += float3(0.08, 0.54, 0.50) * params.sun_colour.xyz * (sss_c * shadow * sun_strength * refract_w * 0.26);
-                }
-                // Realistic water whitecaps & flow foam.
-                if (bits_realistic_water && dist < 210.0) {
-                    float foam_mask = 0.0;
-                    if (bits_realistic_water) {
-                        float t_rw = params.frame.x * 0.04;
-                        float wc_cell = (rw_crest_foam + rw_flow_foam > 0.02)
-                            ? smoothstep(0.22, 0.78, voronoi_ridge(world_pos.xz * 0.55 + float2(t_rw * 0.45, t_rw * 0.25), t_rw * 0.5))
-                            : 0.0;
-                        foam_mask = saturate((rw_crest_foam * 0.85 + rw_flow_foam) * (0.45 + 0.55 * wc_cell));
-                    }
-                    if (foam_mask > 0.01) {
-                        float3 foam_lit = lerp(float3(0.18, 0.24, 0.32), params.sun_colour.xyz * 0.88 + params.ambient.xyz * 0.48, sun_strength);
-                        float dist_f = 1.0 - smoothstep(105.0, 210.0, dist);
-                        refl_col += foam_lit * (foam_mask * dist_f * (1.0 - fog_t) * 0.46);
-                    }
                 }
             }
             accum_reflection += refl_col;
