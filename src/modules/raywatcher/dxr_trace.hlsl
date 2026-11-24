@@ -506,6 +506,12 @@ float3 apply_twilight_scattering(float3 base_sky, float3 dir, float3 sun_dir, fl
     return max(scattered, float3(0.0, 0.0, 0.0));
 }
 
+float2 hash22(float2 p) {
+    float3 p3 = frac(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.xx + p3.yz) * p3.zy);
+}
+
 // Feature #10: Animated 3D world-space suspended underwater dust/plankton motes.
 float underwater_motes(float3 p, float t) {
     float3 q = p * 0.62 + float3(sin(t * 0.35 + p.y * 0.25) * 0.4, -t * 0.18, cos(t * 0.31 + p.x * 0.22) * 0.4);
@@ -603,11 +609,6 @@ float3 detail_offscreen_albedo(float3 hit_pos, float3 hit_normal, float3 base_al
     return clamp(base_albedo * slab, float3(0.02, 0.02, 0.02), float3(0.95, 0.95, 0.95));
 }
 
-float2 hash22(float2 p) {
-    float3 p3 = frac(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
-    p3 += dot(p3, p3.yzx + 33.33);
-    return frac((p3.xx + p3.yz) * p3.zy);
-}
 
 // Organic Voronoi cellular ridge (non-repeating natural water caustics, zero grid wallpaper).
 float voronoi_ridge(float2 uv, float t) {
