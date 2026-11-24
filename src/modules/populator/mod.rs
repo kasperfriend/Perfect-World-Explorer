@@ -797,6 +797,75 @@ fn retargeted_gait_from(source: &ModelAsset, target: &ModelAsset) -> Option<Reta
 }
 
 /// One spawned actor.
+/// Maximum distance from the camera at which Populator NPCs/creatures cast
+/// dynamic RT shadows and appear in RT water reflections.
+const POPULATOR_RT_RADIUS: f32 = 64.0;
+/// Radius within which off-screen actors (e.g. standing behind the camera) are
+/// posed on demand so their shadows and water reflections stay populated.
+const POPULATOR_RT_OFFSCREEN_RADIUS: f32 = 28.0;
+/// Per-actor triangle cap for dynamic BLAS builds (uniform stride downsampling).
+const POPULATOR_RT_TRIS_PER_ACTOR: usize = 480;
+
+fn extract_actor_rt_verts(
+    asset: &ModelAsset,
+    meshes: &[PosedMesh],
+    out: &mut Vec<[f32; 3]>,
+    max_tris: usize,
+) {
+    out.clear();
+    if max_tris == 0 {
+        return;
+    }
+    let mut total_tris = 0usize;
+    for posed in meshes {
+        if let Some(skin) = asset.skins.get(posed.skin) {
+            if let Some(mesh) = skin.data.meshes.get(posed.mesh) {
+                total_tris += mesh.indices.len() / 3;
+            }
+        }
+    }
+    if total_tris == 0 {
+        return;
+    }
+    let stride = (total_tris / max_tris).max(1);
+    out.reserve((total_tris / stride).min(max_tris) * 3);
+    let mut seen = 0usize;
+    let mut emitted = 0usize;
+    'outer: for posed in meshes {
+        let Some(skin) = asset.skins.get(posed.skin) else {
+            continue;
+        };
+        let Some(mesh) = skin.data.meshes.get(posed.mesh) else {
+            continue;
+        };
+        let idx = &mesh.indices;
+        let mut i = 0usize;
+        while i + 2 < idx.len() {
+            let take = seen % stride == 0;
+            seen += 1;
+            if take {
+                let i0 = idx[i] as usize;
+                let i1 = idx[i + 1] as usize;
+                let i2 = idx[i + 2] as usize;
+                if let (Some(a), Some(b), Some(c)) = (
+                    posed.vertices.get(i0),
+                    posed.vertices.get(i1),
+                    posed.vertices.get(i2),
+                ) {
+                    out.push(a.position);
+                    out.push(b.position);
+                    out.push(c.position);
+                    emitted += 1;
+                    if emitted >= max_tris {
+                        break 'outer;
+                    }
+                }
+            }
+            i += 3;
+        }
+    }
+}
+
 struct Live {
     /// Index into [`Population::spawns`].
     spawn: usize,
@@ -858,6 +927,9 @@ struct Live {
     route_attempt: u64,
     route_retry_seconds: f32,
     draw: Option<model_draw_gpu::Draw>,
+    /// Cached world-space triangle vertices (`[a, b, c]` per triangle) for nearby
+    /// real-time RT shadows and water reflections without re-skinning.
+    rt_verts: Vec<[f32; 3]>,
     /// Fatal per-actor error (rig, pose or draw); the actor is not submitted.
     failure: Option<String>,
 }
@@ -2055,6 +2127,49 @@ impl Populator {
         self.active
     }
 
+    /// Collect cached posed world-space triangle vertices (`[a, b, c]` per triangle)
+    /// for nearby active NPCs, guards, mounts, and monsters within `POPULATOR_RT_RADIUS`,
+    /// sorted nearest-first and capped at `max_tris` for fast dynamic RT BLAS builds.
+    pub fn rt_triangles(&self, eye: Vec3, out: &mut Vec<[f32; 3]>, max_tris: usize) {
+        if !self.active || max_tris == 0 || self.live.is_empty() {
+            return;
+        }
+        let r2 = POPULATOR_RT_RADIUS * POPULATOR_RT_RADIUS;
+        let mut nearby: Vec<(f32, usize)> = self
+            .live
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, live)| {
+                if live.failure.is_some() || live.rt_verts.is_empty() {
+                    return None;
+                }
+                let d2 = (live.position - eye).length_squared();
+                if d2 <= r2 {
+                    Some((d2, idx))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        nearby.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let mut remaining_verts = max_tris.saturating_mul(3);
+        for (_, idx) in nearby {
+            let verts = &self.live[idx].rt_verts;
+            if verts.len() > remaining_verts {
+                let take = (remaining_verts / 3) * 3;
+                if take > 0 {
+                    out.extend_from_slice(&verts[..take]);
+                }
+                break;
+            }
+            out.extend_from_slice(verts);
+            remaining_verts -= verts.len();
+            if remaining_verts < 3 {
+                break;
+            }
+        }
+    }
+
     pub fn set_active(&mut self, active: bool, eye: Vec3) {
         self.eye = eye;
         if self.active == active {
@@ -2727,6 +2842,7 @@ impl Populator {
             route_attempt: 0,
             route_retry_seconds: 0.,
             draw: None,
+            rt_verts: Vec::new(),
             failure: None,
         })
     }
@@ -3008,7 +3124,31 @@ impl Populator {
             // Nothing off screen is posed, uploaded or submitted: a crowd behind
             // the camera costs nothing.
             live.visible = on_screen(view_projection, live.position, live.head);
-            if !live.visible || live.pose_index == Some(frame_index) {
+            let dist_sq = (live.position - eye).length_squared();
+            if dist_sq > (POPULATOR_RT_RADIUS + 8.0) * (POPULATOR_RT_RADIUS + 8.0)
+                && !live.rt_verts.is_empty()
+            {
+                live.rt_verts.clear();
+            }
+            if !live.visible {
+                // Keep nearby off-screen actors (e.g. behind the camera) posed at a
+                // relaxed stride so their RT shadows and water reflections stay alive.
+                if dist_sq <= POPULATOR_RT_OFFSCREEN_RADIUS * POPULATOR_RT_OFFSCREEN_RADIUS
+                    && (live.rt_verts.is_empty()
+                        || (time_advanced && pose_due(frame_index, live.spawn, 4)))
+                {
+                    if let Ok(meshes) = live.pose() {
+                        extract_actor_rt_verts(
+                            &live.asset,
+                            &meshes,
+                            &mut live.rt_verts,
+                            POPULATOR_RT_TRIS_PER_ACTOR,
+                        );
+                    }
+                }
+                continue;
+            }
+            if live.pose_index == Some(frame_index) {
                 continue;
             }
             // Nothing advanced: the pose on the GPU is still this frame's pose.
@@ -3017,7 +3157,7 @@ impl Populator {
             }
             // Past `POSE_STRIDE_NEAR` an actor is re-skinned every other frame and
             // past `POSE_STRIDE_FAR` every third.
-            let stride = pose_stride((live.position - eye).length());
+            let stride = pose_stride(dist_sq.sqrt());
             if !pose_due(frame_index, live.spawn, stride) {
                 continue;
             }
@@ -3027,6 +3167,14 @@ impl Populator {
                     live.motion.observe(signature);
                     live.pose_stamp = Some(signature);
                     live.pose_index = Some(frame_index);
+                    if dist_sq <= POPULATOR_RT_RADIUS * POPULATOR_RT_RADIUS {
+                        extract_actor_rt_verts(
+                            &live.asset,
+                            &meshes,
+                            &mut live.rt_verts,
+                            POPULATOR_RT_TRIS_PER_ACTOR,
+                        );
+                    }
                     posed[index] = Some(meshes);
                 }
                 Err(error) => live.failure = Some(error),
@@ -4096,6 +4244,7 @@ mod tests {
             route_attempt: 0,
             route_retry_seconds: 0.,
             draw: None,
+            rt_verts: Vec::new(),
             failure: None,
         };
         let world = live.world();

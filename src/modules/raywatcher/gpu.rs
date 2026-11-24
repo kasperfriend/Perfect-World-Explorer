@@ -1665,7 +1665,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                         let warm_cool = mix(vec3<f32>(0.76, 0.84, 1.22), vec3<f32>(1.26, 0.94, 0.68), sun_align * 0.5 + 0.5);
                         vivid_sky = vivid_sky * mix(vec3<f32>(1.0), warm_cool, golden_w * 0.55);
                     }
-                    let sky_gain = select(0.24, 0.36, bounce == 0u);
+                    let sky_gain = select(0.34, 0.36, bounce == 0u);
                     gi_sample = gi_sample + throughput * vivid_sky * (sky_gain * day_gi_scale);
                     break;
                 }

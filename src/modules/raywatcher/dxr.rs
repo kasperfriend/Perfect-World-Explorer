@@ -707,9 +707,15 @@ mod imp {
         reusable_scratch: Option<(u64, RawBuffer)>,
         /// Opt #22: Reusable persistent TLAS instance descriptor upload buffer (2 instances).
         reusable_instance_desc: Option<RawBuffer>,
-        /// Feature #1: Reusable dynamic character vertex upload buffer & fast-build BLAS.
-        dyn_verts: Option<(u64, RawBuffer)>,
-        dyn_blas: Option<(u64, RawBuffer)>,
+        /// Feature #1: 3-slot race-free ring of reusable dynamic character/NPC buffers
+        /// (Walker + Populator) avoiding per-frame WDDM allocations and CPU/GPU races.
+        dyn_verts: [Option<(u64, RawBuffer)>; 3],
+        dyn_blas: [Option<(u64, RawBuffer)>; 3],
+        dyn_tlas: [Option<(u64, RawBuffer)>; 3],
+        dyn_inst_desc: [Option<RawBuffer>; 3],
+        dyn_slot: usize,
+        dyn_active_tlas_va: Option<u64>,
+        dyn_last_hash: u64,
         has_dyn_instance: bool,
     }
 
@@ -814,8 +820,13 @@ mod imp {
                 targets,
                 reusable_scratch,
                 reusable_instance_desc,
-                dyn_verts: None,
-                dyn_blas: None,
+                dyn_verts: [None, None, None],
+                dyn_blas: [None, None, None],
+                dyn_tlas: [None, None, None],
+                dyn_inst_desc: [None, None, None],
+                dyn_slot: 0,
+                dyn_active_tlas_va: None,
+                dyn_last_hash: 0,
                 has_dyn_instance: false,
             };
             tracer.write_scene_descriptors();
@@ -1324,12 +1335,13 @@ mod imp {
         fn write_scene_descriptors(&self) {
             unsafe {
                 let dev = self.raw_device.as_mut_ptr();
-                // Slot 0: TLAS SRV (must pass null resource pointer for AS SRV).
+                // Slot 0: TLAS SRV (prefers active 2-instance dynamic TLAS when present).
+                let active_tlas_va = self.dyn_active_tlas_va.unwrap_or(self.scene.tlas.gpu_va);
                 let tlas_srv = RawSrvDesc {
                     format: DXGI_FORMAT_UNKNOWN,
                     view_dimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
                     shader4_component_mapping: 0x0000_1688, // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
-                    u: [self.scene.tlas.gpu_va, 0, 0],
+                    u: [active_tlas_va, 0, 0],
                 };
                 (*dev).CreateShaderResourceView(
                     null_mut(),
@@ -1544,22 +1556,52 @@ mod imp {
             self.retired_scenes.push((prev_fence, old_scene));
             self.retired_buffers.push((build_fence, staging));
             self.has_dyn_instance = false;
+            self.dyn_active_tlas_va = None;
+            self.dyn_last_hash = 0;
             self.write_scene_descriptors();
             Ok(())
         }
 
-        /// Feature #1: Stream posed dynamic character triangles (Walker) into a fast-build
-        /// second BLAS instance (`InstanceID = 1`) in the TLAS without rebuilding static world BLAS.
+        /// Feature #1: Stream posed dynamic character & Populator NPC triangles into a
+        /// race-free 3-slot fast-build dynamic BLAS + 2-instance TLAS (`InstanceID = 1`)
+        /// without rebuilding the static world BLAS or allocating per-frame D3D12 buffers.
         pub fn update_dynamic_character(&mut self, verts: &[[f32; 3]]) -> Result<(), String> {
             let tri_count = (verts.len() / 3) as u32;
-            if tri_count == 0 && !self.has_dyn_instance {
+            if tri_count == 0 {
+                if self.has_dyn_instance {
+                    self.has_dyn_instance = false;
+                    self.dyn_active_tlas_va = None;
+                    self.dyn_last_hash = 0;
+                    self.write_scene_descriptors();
+                }
                 return Ok(());
             }
+
+            // Fast fingerprint of dynamic vertices: skip BLAS/TLAS rebuild if unchanged.
+            let vcount = (tri_count * 3) as usize;
+            let step = (vcount / 64).max(1);
+            let mut h: u64 = (vcount as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut idx = 0usize;
+            while idx < vcount {
+                let v = verts[idx];
+                h ^= (v[0].to_bits() as u64)
+                    | ((v[1].to_bits() as u64) << 21)
+                    | ((v[2].to_bits() as u64) << 42);
+                h = h.rotate_left(13).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                idx += step;
+            }
+            if self.has_dyn_instance && h == self.dyn_last_hash {
+                return Ok(());
+            }
+
             let dev_ptr = self.raw_device.as_mut_ptr();
+            let s = self.dyn_slot;
+            self.dyn_slot = (self.dyn_slot + 1) % 3;
+
             unsafe {
                 self.gc_retired();
                 let mut retired_now: Vec<RawBuffer> = Vec::new();
-                if self.reusable_instance_desc.is_none() {
+                if self.dyn_inst_desc[s].is_none() {
                     let mut buf = RawBuffer::create(
                         dev_ptr,
                         (size_of::<InstanceDesc>() * 2) as u64,
@@ -1568,192 +1610,81 @@ mod imp {
                         d12::D3D12_RESOURCE_STATE_GENERIC_READ,
                     )?;
                     buf.map_persistent()?;
-                    self.reusable_instance_desc = Some(buf);
+                    self.dyn_inst_desc[s] = Some(buf);
                 }
 
-                if tri_count > 0 {
-                    let vcount = (tri_count * 3) as usize;
-                    let vbytes = (vcount * size_of::<[f32; 3]>()) as u64;
-                    let need_vbuf = self.dyn_verts.as_ref().is_none_or(|(cap, _)| *cap < vbytes);
-                    if need_vbuf {
-                        if let Some((_, old)) = self.dyn_verts.take() {
-                            retired_now.push(old);
-                        }
-                        let cap = align256(vbytes.max(16 * 1024));
-                        let mut buf = RawBuffer::create(
-                            dev_ptr,
-                            cap,
-                            d12::D3D12_HEAP_TYPE_UPLOAD,
-                            d12::D3D12_RESOURCE_FLAG_NONE,
-                            d12::D3D12_RESOURCE_STATE_GENERIC_READ,
-                        )?;
-                        buf.map_persistent()?;
-                        self.dyn_verts = Some((cap, buf));
+                let vbytes = (vcount * size_of::<[f32; 3]>()) as u64;
+                if self.dyn_verts[s]
+                    .as_ref()
+                    .is_none_or(|(cap, _)| *cap < vbytes)
+                {
+                    if let Some((_, old)) = self.dyn_verts[s].take() {
+                        retired_now.push(old);
                     }
-                    let vbuf = &self.dyn_verts.as_ref().unwrap().1;
-                    vbuf.write_upload(bytemuck::cast_slice(&verts[..vcount]))?;
-
-                    let geom = GeometryDesc {
-                        ty: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
-                        flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
-                        triangles: GeometryTrianglesDesc {
-                            transform3x4: 0,
-                            index_format: DXGI_FORMAT_UNKNOWN,
-                            vertex_format: DXGI_FORMAT_R32G32B32_FLOAT,
-                            index_count: 0,
-                            vertex_count: tri_count * 3,
-                            index_buffer: 0,
-                            vertex_buffer: GpuVaAndStride {
-                                start_address: vbuf.gpu_va,
-                                stride_in_bytes: size_of::<[f32; 3]>() as u64,
-                            },
-                        },
-                    };
-                    let blas_inputs = BuildAsInputs {
-                        ty: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
-                        flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
-                        num_descs: 1,
-                        descs_layout: D3D12_ELEMENTS_LAYOUT_ARRAY,
-                        u: BuildInputsUnion {
-                            p_geometry_descs: &geom as *const GeometryDesc,
-                        },
-                    };
-                    let info = device5_get_prebuild_info(self.device5, &blas_inputs);
-                    if info.result_data_max_size_in_bytes == 0 {
-                        return Ok(());
-                    }
-                    let bsize = align256(info.result_data_max_size_in_bytes);
-                    let need_blas = self.dyn_blas.as_ref().is_none_or(|(cap, _)| *cap < bsize);
-                    if need_blas {
-                        if let Some((_, old)) = self.dyn_blas.take() {
-                            retired_now.push(old);
-                        }
-                        let cap = align256(bsize + bsize / 4);
-                        let buf = RawBuffer::create(
-                            dev_ptr,
-                            cap,
-                            d12::D3D12_HEAP_TYPE_DEFAULT,
-                            d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-                        )?;
-                        self.dyn_blas = Some((cap, buf));
-                    }
-                    let blas_gpu_va = self.dyn_blas.as_ref().unwrap().1.gpu_va;
-                    let mut scratch_needed = align256(info.scratch_data_size_in_bytes);
-
-                    let inst0 = InstanceDesc {
-                        transform: [
-                            [1.0, 0.0, 0.0, 0.0],
-                            [0.0, 1.0, 0.0, 0.0],
-                            [0.0, 0.0, 1.0, 0.0],
-                        ],
-                        instance_id_and_mask: 0xffu32 << 24,
-                        hit_group_and_flags: 0,
-                        acceleration_structure: self.scene._blas.gpu_va,
-                    };
-                    let inst1 = InstanceDesc {
-                        transform: [
-                            [1.0, 0.0, 0.0, 0.0],
-                            [0.0, 1.0, 0.0, 0.0],
-                            [0.0, 0.0, 1.0, 0.0],
-                        ],
-                        instance_id_and_mask: (0xffu32 << 24) | 1u32,
-                        hit_group_and_flags: 0,
-                        acceleration_structure: blas_gpu_va,
-                    };
-                    let insts = [inst0, inst1];
-                    let inst_bytes = std::slice::from_raw_parts(
-                        insts.as_ptr() as *const u8,
-                        size_of::<InstanceDesc>() * 2,
-                    );
-                    let inst_ref = self.reusable_instance_desc.as_ref().unwrap();
-                    inst_ref.write_upload(inst_bytes)?;
-
-                    let tlas_inputs = BuildAsInputs {
-                        ty: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-                        flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
-                        num_descs: 2,
-                        descs_layout: D3D12_ELEMENTS_LAYOUT_ARRAY,
-                        u: BuildInputsUnion {
-                            instance_descs: inst_ref.gpu_va,
-                        },
-                    };
-                    let tlas_info = device5_get_prebuild_info(self.device5, &tlas_inputs);
-                    if tlas_info.result_data_max_size_in_bytes == 0 {
-                        return Ok(());
-                    }
-                    scratch_needed =
-                        scratch_needed.max(align256(tlas_info.scratch_data_size_in_bytes));
-                    let need_scratch = self
-                        .reusable_scratch
-                        .as_ref()
-                        .is_none_or(|(cap, _)| *cap < scratch_needed);
-                    if need_scratch {
-                        if let Some((_, old)) = self.reusable_scratch.take() {
-                            retired_now.push(old);
-                        }
-                        let cap = align256(scratch_needed + scratch_needed / 4);
-                        let buf = RawBuffer::create(
-                            dev_ptr,
-                            cap,
-                            d12::D3D12_HEAP_TYPE_DEFAULT,
-                            d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                            d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        )?;
-                        self.reusable_scratch = Some((cap, buf));
-                    }
-                    let new_tlas = RawBuffer::create(
+                    let cap = align256((vbytes + vbytes / 4).max(32 * 1024));
+                    let mut buf = RawBuffer::create(
                         dev_ptr,
-                        align256(tlas_info.result_data_max_size_in_bytes),
+                        cap,
+                        d12::D3D12_HEAP_TYPE_UPLOAD,
+                        d12::D3D12_RESOURCE_FLAG_NONE,
+                        d12::D3D12_RESOURCE_STATE_GENERIC_READ,
+                    )?;
+                    buf.map_persistent()?;
+                    self.dyn_verts[s] = Some((cap, buf));
+                }
+                let vbuf = &self.dyn_verts[s].as_ref().unwrap().1;
+                vbuf.write_upload(bytemuck::cast_slice(&verts[..vcount]))?;
+
+                let geom = GeometryDesc {
+                    ty: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                    flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+                    triangles: GeometryTrianglesDesc {
+                        transform3x4: 0,
+                        index_format: DXGI_FORMAT_UNKNOWN,
+                        vertex_format: DXGI_FORMAT_R32G32B32_FLOAT,
+                        index_count: 0,
+                        vertex_count: tri_count * 3,
+                        index_buffer: 0,
+                        vertex_buffer: GpuVaAndStride {
+                            start_address: vbuf.gpu_va,
+                            stride_in_bytes: size_of::<[f32; 3]>() as u64,
+                        },
+                    },
+                };
+                let blas_inputs = BuildAsInputs {
+                    ty: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                    flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
+                    num_descs: 1,
+                    descs_layout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                    u: BuildInputsUnion {
+                        p_geometry_descs: &geom as *const GeometryDesc,
+                    },
+                };
+                let info = device5_get_prebuild_info(self.device5, &blas_inputs);
+                if info.result_data_max_size_in_bytes == 0 {
+                    return Ok(());
+                }
+                let bsize = align256(info.result_data_max_size_in_bytes);
+                if self.dyn_blas[s]
+                    .as_ref()
+                    .is_none_or(|(cap, _)| *cap < bsize)
+                {
+                    if let Some((_, old)) = self.dyn_blas[s].take() {
+                        retired_now.push(old);
+                    }
+                    let cap = align256(bsize + bsize / 4);
+                    let buf = RawBuffer::create(
+                        dev_ptr,
+                        cap,
                         d12::D3D12_HEAP_TYPE_DEFAULT,
                         d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
                     )?;
-                    let scratch_va = self.reusable_scratch.as_ref().unwrap().1.gpu_va;
-                    let slot_idx = self.ring.acquire("DXR-DynAS")?;
-                    let list_ptr = self.ring.slot_mut(slot_idx).list.as_mut_ptr();
-                    let list4 = com_query_interface(
-                        list_ptr as *mut c_void,
-                        &IID_ID3D12_GRAPHICS_COMMAND_LIST4,
-                    )
-                    .map_err(|hr| format!("ID3D12GraphicsCommandList4 unavailable (0x{hr:08x})"))?;
-
-                    let blas_desc = BuildAsDesc {
-                        dest_as_data: blas_gpu_va,
-                        inputs: blas_inputs,
-                        source_as_data: 0,
-                        scratch_as_data: scratch_va,
-                    };
-                    cmdlist4_build_as(list4, &blas_desc);
-
-                    let mut uav_b: d12::D3D12_RESOURCE_BARRIER = zeroed();
-                    uav_b.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                    uav_b.u.UAV_mut().pResource = null_mut();
-                    (*list_ptr).ResourceBarrier(1, &uav_b);
-
-                    let tlas_desc = BuildAsDesc {
-                        dest_as_data: new_tlas.gpu_va,
-                        inputs: tlas_inputs,
-                        source_as_data: 0,
-                        scratch_as_data: scratch_va,
-                    };
-                    cmdlist4_build_as(list4, &tlas_desc);
-                    (*list_ptr).ResourceBarrier(1, &uav_b);
-
-                    com_release(list4);
-                    self.ring.retire(slot_idx, &self.raw_queue, "DXR-DynAS")?;
-                    let fence = self.ring.current_fence();
-                    let old_tlas = std::mem::replace(&mut self.scene.tlas, new_tlas);
-                    retired_now.push(old_tlas);
-                    if !retired_now.is_empty() {
-                        self.retired_buffers.push((fence, retired_now));
-                    }
-                    self.has_dyn_instance = true;
-                    self.write_scene_descriptors();
-                    return Ok(());
+                    self.dyn_blas[s] = Some((cap, buf));
                 }
+                let blas_gpu_va = self.dyn_blas[s].as_ref().unwrap().1.gpu_va;
+                let mut scratch_needed = align256(info.scratch_data_size_in_bytes);
 
-                // tri_count == 0 && self.has_dyn_instance: restore 1-instance static TLAS
                 let inst0 = InstanceDesc {
                     transform: [
                         [1.0, 0.0, 0.0, 0.0],
@@ -1764,79 +1695,117 @@ mod imp {
                     hit_group_and_flags: 0,
                     acceleration_structure: self.scene._blas.gpu_va,
                 };
-                let inst_ref = self.reusable_instance_desc.as_ref().unwrap();
-                inst_ref.write_upload(std::slice::from_raw_parts(
-                    &inst0 as *const InstanceDesc as *const u8,
-                    size_of::<InstanceDesc>(),
-                ))?;
+                let inst1 = InstanceDesc {
+                    transform: [
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                    ],
+                    instance_id_and_mask: (0xffu32 << 24) | 1u32,
+                    hit_group_and_flags: 0,
+                    acceleration_structure: blas_gpu_va,
+                };
+                let insts = [inst0, inst1];
+                let inst_bytes = std::slice::from_raw_parts(
+                    insts.as_ptr() as *const u8,
+                    size_of::<InstanceDesc>() * 2,
+                );
+                let inst_ref = self.dyn_inst_desc[s].as_ref().unwrap();
+                inst_ref.write_upload(inst_bytes)?;
+
                 let tlas_inputs = BuildAsInputs {
                     ty: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-                    flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
-                    num_descs: 1,
+                    flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
+                    num_descs: 2,
                     descs_layout: D3D12_ELEMENTS_LAYOUT_ARRAY,
                     u: BuildInputsUnion {
                         instance_descs: inst_ref.gpu_va,
                     },
                 };
                 let tlas_info = device5_get_prebuild_info(self.device5, &tlas_inputs);
-                if tlas_info.result_data_max_size_in_bytes > 0 {
-                    let s_need = align256(tlas_info.scratch_data_size_in_bytes);
-                    if self
-                        .reusable_scratch
-                        .as_ref()
-                        .is_none_or(|(c, _)| *c < s_need)
-                    {
-                        if let Some((_, old)) = self.reusable_scratch.take() {
-                            retired_now.push(old);
-                        }
-                        let cap = align256(s_need + s_need / 4);
-                        let buf = RawBuffer::create(
-                            dev_ptr,
-                            cap,
-                            d12::D3D12_HEAP_TYPE_DEFAULT,
-                            d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                            d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        )?;
-                        self.reusable_scratch = Some((cap, buf));
+                if tlas_info.result_data_max_size_in_bytes == 0 {
+                    return Ok(());
+                }
+                scratch_needed = scratch_needed.max(align256(tlas_info.scratch_data_size_in_bytes));
+                if self
+                    .reusable_scratch
+                    .as_ref()
+                    .is_none_or(|(cap, _)| *cap < scratch_needed)
+                {
+                    if let Some((_, old)) = self.reusable_scratch.take() {
+                        retired_now.push(old);
                     }
-                    let new_tlas = RawBuffer::create(
+                    let cap = align256(scratch_needed + scratch_needed / 4);
+                    let buf = RawBuffer::create(
                         dev_ptr,
-                        align256(tlas_info.result_data_max_size_in_bytes),
+                        cap,
+                        d12::D3D12_HEAP_TYPE_DEFAULT,
+                        d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )?;
+                    self.reusable_scratch = Some((cap, buf));
+                }
+                let tsize = align256(tlas_info.result_data_max_size_in_bytes);
+                if self.dyn_tlas[s]
+                    .as_ref()
+                    .is_none_or(|(cap, _)| *cap < tsize)
+                {
+                    if let Some((_, old)) = self.dyn_tlas[s].take() {
+                        retired_now.push(old);
+                    }
+                    let cap = align256(tsize + tsize / 4);
+                    let buf = RawBuffer::create(
+                        dev_ptr,
+                        cap,
                         d12::D3D12_HEAP_TYPE_DEFAULT,
                         d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
                     )?;
-                    let scratch_va = self.reusable_scratch.as_ref().unwrap().1.gpu_va;
-                    let slot_idx = self.ring.acquire("DXR-DynAS-Clear")?;
-                    let list_ptr = self.ring.slot_mut(slot_idx).list.as_mut_ptr();
-                    let list4 = com_query_interface(
-                        list_ptr as *mut c_void,
-                        &IID_ID3D12_GRAPHICS_COMMAND_LIST4,
-                    )
-                    .map_err(|hr| format!("ID3D12GraphicsCommandList4 unavailable (0x{hr:08x})"))?;
-                    let tlas_desc = BuildAsDesc {
-                        dest_as_data: new_tlas.gpu_va,
-                        inputs: tlas_inputs,
-                        source_as_data: 0,
-                        scratch_as_data: scratch_va,
-                    };
-                    cmdlist4_build_as(list4, &tlas_desc);
-                    let mut uav_b: d12::D3D12_RESOURCE_BARRIER = zeroed();
-                    uav_b.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                    uav_b.u.UAV_mut().pResource = new_tlas.resource;
-                    (*list_ptr).ResourceBarrier(1, &uav_b);
-                    com_release(list4);
-                    self.ring
-                        .retire(slot_idx, &self.raw_queue, "DXR-DynAS-Clear")?;
-                    let fence = self.ring.current_fence();
-                    let old_tlas = std::mem::replace(&mut self.scene.tlas, new_tlas);
-                    retired_now.push(old_tlas);
-                    if !retired_now.is_empty() {
-                        self.retired_buffers.push((fence, retired_now));
-                    }
-                    self.write_scene_descriptors();
+                    self.dyn_tlas[s] = Some((cap, buf));
                 }
-                self.has_dyn_instance = false;
+                let tlas_gpu_va = self.dyn_tlas[s].as_ref().unwrap().1.gpu_va;
+                let scratch_va = self.reusable_scratch.as_ref().unwrap().1.gpu_va;
+
+                let slot_idx = self.ring.acquire("DXR-DynAS")?;
+                let list_ptr = self.ring.slot_mut(slot_idx).list.as_mut_ptr();
+                let list4 = com_query_interface(
+                    list_ptr as *mut c_void,
+                    &IID_ID3D12_GRAPHICS_COMMAND_LIST4,
+                )
+                .map_err(|hr| format!("ID3D12GraphicsCommandList4 unavailable (0x{hr:08x})"))?;
+
+                let blas_desc = BuildAsDesc {
+                    dest_as_data: blas_gpu_va,
+                    inputs: blas_inputs,
+                    source_as_data: 0,
+                    scratch_as_data: scratch_va,
+                };
+                cmdlist4_build_as(list4, &blas_desc);
+
+                let mut uav_b: d12::D3D12_RESOURCE_BARRIER = zeroed();
+                uav_b.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uav_b.u.UAV_mut().pResource = null_mut();
+                (*list_ptr).ResourceBarrier(1, &uav_b);
+
+                let tlas_desc = BuildAsDesc {
+                    dest_as_data: tlas_gpu_va,
+                    inputs: tlas_inputs,
+                    source_as_data: 0,
+                    scratch_as_data: scratch_va,
+                };
+                cmdlist4_build_as(list4, &tlas_desc);
+                (*list_ptr).ResourceBarrier(1, &uav_b);
+
+                com_release(list4);
+                self.ring.retire(slot_idx, &self.raw_queue, "DXR-DynAS")?;
+                let fence = self.ring.current_fence();
+                if !retired_now.is_empty() {
+                    self.retired_buffers.push((fence, retired_now));
+                }
+                self.has_dyn_instance = true;
+                self.dyn_active_tlas_va = Some(tlas_gpu_va);
+                self.dyn_last_hash = h;
+                self.write_scene_descriptors();
             }
             Ok(())
         }

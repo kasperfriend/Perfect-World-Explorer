@@ -268,7 +268,7 @@ Hit closest_hit_fast(float3 origin, float3 dir, float t_min, float t_max, uint o
 
 // Feature #4 & #7: Shadow ray returning blocker distance (for PCSS contact-hardening)
 // and colored translucent transmission when passing through foliage/banners.
-ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_max, uint seed, uint opaque_offset, uint tri_count, bool fast_mode, float terrain_self_skip) {
+ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_max, uint seed, uint opaque_offset, uint tri_count, bool fast_mode, float terrain_self_skip, float dyn_self_skip) {
     ShadowResult res;
     res.occluded = false;
     res.t_blocker = -1.0;
@@ -310,7 +310,7 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
         float hit_t = q.CommittedRayT();
         if (q.CommittedInstanceID() == 1u) {
-            if (hit_t < 0.85) {
+            if (hit_t < dyn_self_skip) {
                 return res;
             }
             res.occluded = true;
@@ -342,8 +342,17 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
                 if (q2.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
                     return res;
                 }
-                prim = q2.CommittedPrimitiveIndex() + (q2.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
                 hit_t = q2.CommittedRayT();
+                if (q2.CommittedInstanceID() == 1u) {
+                    if (hit_t < dyn_self_skip) {
+                        return res;
+                    }
+                    res.occluded = true;
+                    res.t_blocker = hit_t;
+                    res.transmittance = float3(0.0, 0.0, 0.0);
+                    return res;
+                }
+                prim = q2.CommittedPrimitiveIndex() + (q2.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
             }
         }
         res.occluded = true;
@@ -378,7 +387,7 @@ bool occluded_fast(float3 origin, float3 dir, float t_min, float t_max) {
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
-bool occluded_point_light(float3 origin, float3 dir, float t_min, float t_max, float terrain_skip, uint opaque_offset, uint tri_count) {
+bool occluded_point_light(float3 origin, float3 dir, float t_min, float t_max, float terrain_skip, float dyn_skip, uint opaque_offset, uint tri_count) {
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = dir;
@@ -391,10 +400,20 @@ bool occluded_point_light(float3 origin, float3 dir, float t_min, float t_max, f
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
         return false;
     }
+    if (q.CommittedInstanceID() == 1u) {
+        if (q.CommittedRayT() < dyn_skip) {
+            float next_t = q.CommittedRayT() + 0.55;
+            if (next_t < t_max) {
+                return occluded_fast(origin, dir, next_t, t_max);
+            }
+            return false;
+        }
+        return true;
+    }
     if (terrain_skip > 0.0 && q.CommittedRayT() < terrain_skip) {
-        uint tri_idx = (q.CommittedInstanceID() == 0u)
-            ? q.CommittedPrimitiveIndex()
-            : (opaque_offset + q.CommittedPrimitiveIndex());
+        uint tri_idx = (q.CommittedGeometryIndex() != 0u)
+            ? (opaque_offset + q.CommittedPrimitiveIndex())
+            : q.CommittedPrimitiveIndex();
         if (tri_idx < tri_count) {
             float k = tris[tri_idx].a.w;
             if (k > 1.5 && k < 2.5) {
@@ -975,9 +994,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float shadow_max_t = min(params.lens.y, 480.0);
             bool fast_shadow = dist > 520.0;
             float terrain_self_skip = is_water ? 0.0 : (2.5 + steepness * 14.0 + dist * 0.025);
+            float dyn_self_skip = (normal.y > 0.72) ? 0.14 : 0.62;
             ShadowResult sr0 = trace_sun_shadow(
                 ray_origin, params.sun_dir.xyz, shadow_t_min, shadow_max_t,
-                state, opaque_offset, tri_count, fast_shadow, terrain_self_skip);
+                state, opaque_offset, tri_count, fast_shadow, terrain_self_skip, dyn_self_skip);
             float vis_sum = sr0.occluded ? 0.0 : 1.0;
             if (sr0.occluded) {
                 trans_tint += sr0.transmittance;
@@ -998,7 +1018,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float3 shadow_dir1 = normalize(params.sun_dir.xyz + (sun_t * c_th + sun_b * s_th) * r);
                 ShadowResult sr1 = trace_sun_shadow(
                     ray_origin, shadow_dir1, shadow_t_min, shadow_max_t,
-                    state ^ 1u, opaque_offset, tri_count, fast_shadow, terrain_self_skip);
+                    state ^ 1u, opaque_offset, tri_count, fast_shadow, terrain_self_skip, dyn_self_skip);
                 if (!sr1.occluded) {
                     vis_sum += 1.0;
                 } else {
@@ -1232,11 +1252,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
         accum_refl_dist += refl_dist;
 
-        // True 1..6 multi-bounce Diffuse GI using fast 1-path `closest_hit_fast` tracing
-        // plus converged 3D World-Space Radiance Cache tail on the final bounce.
+        // True 1..6 multi-bounce Diffuse GI: every bounce carries sun, sky, point lights,
+        // world effects, and emissive meshes smoothly into shadowed open spaces & corners,
+        // feeding the converged multi-bounce path back into the 3D World-Space Radiance Cache.
         if (bits_gi && !is_water && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
-            float bounce_max_t = min(params.lens.y, 70.0);
-            float gi_shadow_max_t = min(params.lens.y, 200.0);
+            float bounce_max_t = min(params.lens.y, 110.0);
+            float gi_shadow_max_t = min(params.lens.y, 220.0);
             float day_gi_scale = 0.04 + 0.96 * sun_strength;
             float3 cur_origin = ray_origin;
             float3 cur_normal = normal;
@@ -1246,6 +1267,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float path_dist = dist;
             float3 throughput = float3(1.0, 1.0, 1.0);
             float3 gi_sample = float3(0.0, 0.0, 0.0);
+            bool has_b0 = false;
+            float3 b0_world = float3(0.0, 0.0, 0.0);
+            float3 b0_normal = float3(0.0, 1.0, 0.0);
+            float b0_dist = dist;
             gi_total_rays += 1.0;
 
             for (uint bounce = 0u; bounce < max_bounces; bounce = bounce + 1u) {
@@ -1264,7 +1289,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     path_dist += bhit.t;
                     float b_bias = max(bias, path_dist * 0.004);
                     float b_shadow = 1.0;
-                    if (bits_shadows && b_ndl > 0.06) {
+                    // Opt: skip sun shadow rays at night when sun_strength <= 0.02.
+                    if (bits_shadows && sun_strength > 0.02 && b_ndl > 0.04) {
                         float3 bhit_pos = bhit_world + bhit.normal * b_bias;
                         if (occluded_fast(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, gi_shadow_max_t)) {
                             b_shadow = 0.0;
@@ -1280,10 +1306,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         float3(b_avg, b_avg, b_avg) + (b_base_albedo - b_avg) * 1.35,
                         float3(0.05, 0.05, 0.05),
                         float3(0.94, 0.94, 0.94));
-                    // Direct bounce from up to 8 nearest active lights/lanterns/effects on first 2 bounces.
+                    // Direct bounce from nearest active point lights, lanterns & world effects on EVERY bounce.
                     float3 gi_pl_direct = float3(0.0, 0.0, 0.0);
-                    if (bounce < 2u && bits_lighting && pl_count > 0u) {
-                        uint pl_cap = min(pl_count, 8u);
+                    if (bits_lighting && pl_count > 0u) {
+                        uint pl_cap = min(pl_count, (bounce < 2u) ? 8u : 4u);
                         for (uint pli = 0u; pli < pl_cap; pli = pli + 1u) {
                             float4 pr = params.point_lights_pos_rad[pli];
                             float3 to_pl = pr.xyz - bhit_world;
@@ -1302,13 +1328,11 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                             float d_l = d2 * inv_d;
                             float att = point_light_falloff(d_l, pr.w);
                             float4 ci = params.point_lights_col_int[pli];
-                            gi_pl_direct += ci.rgb * (ci.w * att * (r_ndl * inv_d) * 2.0);
+                            gi_pl_direct += ci.rgb * (ci.w * att * (r_ndl * inv_d) * 2.15);
                         }
-                        gi_pl_direct = min(gi_pl_direct, float3(2.8, 2.8, 2.8));
+                        gi_pl_direct = min(gi_pl_direct, float3(3.2, 3.2, 3.2));
                     }
                     // Feature #8: Emissive mesh & glow-map auto-lighting (runes, lanterns, lava, crystals).
-                    // Detect vivid self-luminous surfaces (high chroma + brightness or translucent glowing trims)
-                    // on hit meshes so they act as real GI area emitters without extra light slots.
                     float b_max_c = max(b_base_albedo.r, max(b_base_albedo.g, b_base_albedo.b));
                     float b_min_c = min(b_base_albedo.r, min(b_base_albedo.g, b_base_albedo.b));
                     float b_sat = (b_max_c > 1e-4) ? ((b_max_c - b_min_c) / b_max_c) : 0.0;
@@ -1319,9 +1343,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         mesh_emissive = b_base_albedo * (em_w * trim_boost * 1.35);
                     }
                     float3 off_in = b_chroma * (
-                        params.sun_colour.xyz * (b_ndl * b_shadow * 2.40)
+                        params.sun_colour.xyz * (b_ndl * b_shadow * 2.45 * sun_strength)
                         + gi_pl_direct
-                        + params.ambient.xyz * (params.tuning.z * 0.22)) + mesh_emissive;
+                        + params.ambient.xyz * (params.tuning.z * 0.20)) + mesh_emissive;
                     float3 incoming = off_in;
                     // Exclude close foreground pixels (< 8.5u from camera, e.g. Walker character)
                     // from screen-space GI bounce so the character never radiates a glow onto surroundings.
@@ -1329,29 +1353,38 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     if (bounce == 0u && bhit.t < 28.0 && b_cam_d > 8.5) {
                         float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
                         float b_w = saturate(b_screen.a);
-                        // Also capture bright on-screen emissives (lava, runes, glowing windows) at night!
                         float scr_peak = max(b_screen.r, max(b_screen.g, b_screen.b));
                         float scr_min = min(b_screen.r, min(b_screen.g, b_screen.b));
                         float scr_sat = (scr_peak > 1e-4) ? ((scr_peak - scr_min) / scr_peak) : 0.0;
                         float3 scr_emissive = (scr_peak > 0.58 && scr_sat > 0.35)
                             ? (b_screen.rgb * (smoothstep(0.58, 0.95, scr_peak) * smoothstep(0.35, 0.68, scr_sat) * 1.15))
                             : float3(0.0, 0.0, 0.0);
-                        float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 1.45 * sun_strength + 0.18 * day_gi_scale) + scr_emissive;
+                        float3 on_in = b_screen.rgb * (b_ndl * b_shadow * 1.45 * sun_strength + 0.18 * day_gi_scale)
+                            + b_chroma * gi_pl_direct + scr_emissive;
                         incoming = lerp(off_in, max(on_in, mesh_emissive), b_w);
                     }
-                    // Add converged 3D radiance-cache tail only on the final bounce when bounces >= 2.
+                    // Converged multi-bounce 3D radiance-cache tail on the final bounce when bounces >= 2.
                     if (bounce + 1u == max_bounces && max_bounces >= 2u) {
                         float4 cached = rc_query(bhit_world, bhit.normal, path_dist);
                         if (cached.w >= 2.0) {
-                            incoming += b_chroma * min(cached.rgb, float3(2.0, 2.0, 2.0)) * 0.45;
+                            incoming += b_chroma * min(cached.rgb, float3(2.4, 2.4, 2.4)) * 0.42;
                         }
                     }
-                    if (bounce == 0u && b_cam_d > 8.5 && luma(incoming) > 0.02 && ((id.x + id.y + uint(params.frame.x)) & 3u) == 0u) {
-                        rc_update(bhit_world, bhit.normal, path_dist, incoming);
+                    if (bounce == 0u && b_cam_d > 8.5) {
+                        has_b0 = true;
+                        b0_world = bhit_world;
+                        b0_normal = bhit.normal;
+                        b0_dist = path_dist;
                     }
-                    gi_sample += throughput * min(incoming, float3(2.8, 2.8, 2.8));
-                    throughput *= clamp(b_chroma * 1.18, float3(0.12, 0.12, 0.12), float3(0.92, 0.92, 0.92));
-                    if (max(throughput.r, max(throughput.g, throughput.b)) < 0.04) {
+                    gi_sample += throughput * min(incoming, float3(3.2, 3.2, 3.2));
+                    // Perceptually lifted bounce reflectance so bounces 2..6 preserve real indirect energy
+                    // across stone/wood/terrain instead of dying out after bounce 2.
+                    float3 bounce_albedo = clamp(
+                        pow(max(b_chroma, float3(0.02, 0.02, 0.02)), float3(0.62, 0.62, 0.62)) * 0.88,
+                        float3(0.28, 0.28, 0.28),
+                        float3(0.88, 0.88, 0.88));
+                    throughput *= bounce_albedo;
+                    if (max(throughput.r, max(throughput.g, throughput.b)) < 0.012) {
                         break;
                     }
                     cur_origin = bhit_world + bhit.normal * b_bias;
@@ -1365,6 +1398,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         gi_sky_hits += 1.0;
                     }
                     // True directional sky-dome hemisphere irradiance + golden-hour color grading.
+                    // Rays escaping shadowed overhangs/alleys into open sky on bounce 1..5 smoothly
+                    // carry open-sky illumination back into shadowed areas.
                     float3 raw_sky = min(apply_twilight_scattering(sample_sky_env(d), d, params.sun_dir.xyz, sun_strength, bits_twilight_sky), float3(1.35, 1.35, 1.35));
                     float3 vivid_sky = raw_sky;
                     if (params.sun_dir.y > 0.01 && params.sun_dir.y < 0.42 && sun_strength > 0.05) {
@@ -1374,13 +1409,16 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         float3 warm_cool = lerp(float3(0.76, 0.84, 1.22), float3(1.26, 0.94, 0.68), sun_align * 0.5 + 0.5);
                         vivid_sky *= lerp(float3(1.0, 1.0, 1.0), warm_cool, golden_w * 0.55);
                     }
-                    float sky_gain = (bounce == 0u) ? 0.36 : 0.24;
+                    float sky_gain = (bounce == 0u) ? 0.36 : 0.34;
                     gi_sample += throughput * vivid_sky * (sky_gain * day_gi_scale);
                     break;
                 }
             }
+            if (has_b0 && luma(gi_sample) > 0.02 && ((id.x + id.y + uint(params.frame.x)) & 3u) == 0u) {
+                rc_update(b0_world, b0_normal, b0_dist, min(gi_sample, float3(2.8, 2.8, 2.8)));
+            }
             gi_sample *= (params.tuning.w * 1.25 * (1.0 - fog_t));
-            accum_gi += min(gi_sample * gi_fade, float3(3.2, 3.2, 3.2));
+            accum_gi += min(gi_sample * gi_fade, float3(4.0, 4.0, 4.0));
         }
     }
 
@@ -1449,7 +1487,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     if (vi < 3u && t_vol < 85.0) {
                         ShadowResult vsr = trace_sun_shadow(
                             p_vol, params.sun_dir.xyz, 0.4, 240.0,
-                            state ^ (vi * 31u), opaque_offset, tri_count, false, 0.0);
+                            state ^ (vi * 31u), opaque_offset, tri_count, false, 0.0, 0.0);
                         blocked = vsr.occluded;
                     } else {
                         blocked = occluded_fast(p_vol, params.sun_dir.xyz, 0.5, 280.0);
@@ -1871,7 +1909,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         float3 jitter_pt = pl_pr.xyz + (l_t * ca + l_b * sa) * rad_s + float3(0.0, y_off, 0.0);
                         float3 j_vec = jitter_pt - ray_origin;
                         float j_dist = length(j_vec);
-                        if (j_dist <= self_clear + bias || !occluded_point_light(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear, pl_terrain_skip, opaque_offset, tri_count)) {
+                        float pl_dyn_skip = (normal.y > 0.72) ? 0.14 : 0.62;
+                        if (j_dist <= self_clear + bias || !occluded_point_light(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear, pl_terrain_skip, pl_dyn_skip, opaque_offset, tri_count)) {
                             vis_acc += 1.0;
                         }
                     }
@@ -2039,8 +2078,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             occ_kind = 1.0;
         } else {
             Hit ph = closest_hit(params.eye.xyz, view_dir, 0.1, params.lens.y, opaque_offset, tri_count);
-            if (ph.index != 0xffffffffu) {
+            if (ph.index < tri_count) {
                 occ_kind = tris[ph.index].a.w;
+            } else if (ph.index == 0xfffffffeu) {
+                occ_kind = 3.0;
             }
         }
         out_rgb = kind_colour(occ_kind);
@@ -2051,8 +2092,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         if (roughness <= params.effects.x) {
             float3 rdir = reflect(view_dir, normal);
             Hit rh = closest_hit(ray_origin, rdir, bias, params.lens.y, opaque_offset, tri_count);
-            if (rh.index != 0xffffffffu) {
+            if (rh.index < tri_count) {
                 rkind = tris[rh.index].a.w;
+            } else if (rh.index == 0xfffffffeu) {
+                rkind = 3.0;
             }
         }
         out_rgb = kind_colour(rkind);

@@ -145,6 +145,15 @@ impl Modules {
         self.populator.is_active()
     }
 
+    pub fn populator_rt_triangles(
+        &self,
+        eye: glam::Vec3,
+        out: &mut Vec<[f32; 3]>,
+        max_tris: usize,
+    ) {
+        self.populator.rt_triangles(eye, out, max_tris);
+    }
+
     pub fn walker_zoom(&mut self, steps: f32) {
         self.walker.zoom(steps);
     }

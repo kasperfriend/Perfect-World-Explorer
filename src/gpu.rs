@@ -4754,6 +4754,10 @@ impl Renderer {
         if walker_pos.is_some() {
             self.modules.walker_rt_triangles(&mut walker_rt_verts, 4096);
         }
+        if self.modules.populator_active() {
+            self.modules
+                .populator_rt_triangles(camera.pos, &mut walker_rt_verts, 16_384);
+        }
         gpu.record(
             &self.device,
             &self.queue,
