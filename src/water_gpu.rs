@@ -238,6 +238,7 @@ pub struct WaterGpu {
     /// decodes it. The scissor for the reflection and refraction renders is sized
     /// from this instead of from the worst case a normal map could hold.
     normal_extent: f32,
+    has_water: bool,
 }
 fn color(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> wgpu::Texture {
     let alternate = [format.remove_srgb_suffix()];
@@ -273,6 +274,21 @@ impl WaterGpu {
         h: u32,
         frames: &[Vec<image::RgbaImage>],
     ) -> Self {
+        Self::new_for_map(device, queue, format, w, h, frames, true)
+    }
+
+    /// Create water GPU resources, allocating minimal 1x1 offscreen render
+    /// targets on dry maps (`has_water == false`) to save 48-198 MiB VRAM.
+    pub fn new_for_map(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        w: u32,
+        h: u32,
+        frames: &[Vec<image::RgbaImage>],
+        has_water: bool,
+    ) -> Self {
+        let (tw, th) = if has_water { (w, h) } else { (1, 1) };
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("water uniforms"),
             contents: bytemuck::bytes_of(&WaterUniform {
@@ -584,8 +600,8 @@ impl WaterGpu {
         let targets = Self::targets(
             device,
             format,
-            w,
-            h,
+            tw,
+            th,
             &layout,
             &uniform,
             &normal,
@@ -607,6 +623,7 @@ impl WaterGpu {
             edge_far,
             format,
             normal_extent: normal_extent(frames),
+            has_water,
         }
     }
     fn targets(
@@ -727,6 +744,9 @@ impl WaterGpu {
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) {
+        if !self.has_water {
+            return;
+        }
         self.targets = Self::targets(
             device,
             self.format,

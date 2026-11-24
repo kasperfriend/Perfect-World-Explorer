@@ -854,8 +854,11 @@ fn build(
     // `0x77e250`: the resident set follows the window. Blocks that enter are
     // meshed at the level `0x77e360` picked, blocks whose level changed are
     // re-meshed, and blocks the window leaves release their geometry.
-    let mut terrain_reader = t.heights.reader();
-    let census = residency.update_stitched(
+    let heights_ref = &t.heights;
+    let width = t.width;
+    let height = t.height;
+    let grid_spacing = t.grid_spacing;
+    let census = residency.update_stitched_parallel(
         &win,
         |x, y| {
             (
@@ -863,8 +866,8 @@ fn build(
                 levels.cases[(y - win.y0) * (win.x1 - win.x0) + x - win.x0],
             )
         },
-        |x, y, level| {
-            let cases = levels.cases[(y - win.y0) * (win.x1 - win.x0) + (x - win.x0)];
+        |x, y, level, cases| {
+            let mut reader = heights_ref.reader();
             let surface = crate::terrain_lod::block_surface(level, cases);
             let mut block_vertices = Vec::with_capacity(surface.grid.len());
             let mut low = [f32::INFINITY; 3];
@@ -872,11 +875,11 @@ fn build(
             for g in &surface.grid {
                 let (cell_x, cell_y, at) =
                     sample(x * TILE + g[0] as usize, y * TILE + g[1] as usize);
-                let (height, n) = terrain_reader.cell(at)?;
+                let (h_val, n) = reader.cell(at)?;
                 let pos = [
-                    (cell_x as f32 - t.width as f32 * 0.5) * t.grid_spacing,
-                    height,
-                    (t.height as f32 * 0.5 - cell_y as f32) * t.grid_spacing,
+                    (cell_x as f32 - width as f32 * 0.5) * grid_spacing,
+                    h_val,
+                    (height as f32 * 0.5 - cell_y as f32) * grid_spacing,
                 ];
                 for axis in 0..3 {
                     low[axis] = low[axis].min(pos[axis]);
@@ -899,6 +902,7 @@ fn build(
             ))
         },
     )?;
+    let mut terrain_reader = t.heights.reader();
     let spans = residency.append(&win, &mut vertices, &mut indices);
     // A channel line, not `eprintln!`: this runs on every block-window crossing,
     // and a synchronous console write per crossing costs more than the append it
@@ -1177,9 +1181,17 @@ fn build(
     // zero-fill, the pixel copies, the mip generation and — on the render
     // thread — the upload.
     let grass_atlas_key = grass_layout.value();
-    let grass_atlas_changed = grass_atlas_key != grass_atlas_hint;
+    let grass_atlas_changed = grass_atlas_key != grass_atlas_hint && !grass_copies.is_empty();
     let (atlas, grass_mips) = if grass_atlas_changed {
-        let mut atlas = vec![0u8; ATLAS * ATLAS * 4];
+        // Allocate only the rows actually packed into the grass atlas (multiple
+        // of 128 for mip alignment) instead of zeroing 64 MiB (4096x4096x4).
+        let used_grass_rows = grass_copies
+            .iter()
+            .map(|(slot, _, _)| slot.y + slot.h)
+            .max()
+            .unwrap_or(0);
+        let grass_rows = ((used_grass_rows + 127) & !127).clamp(128, ATLAS);
+        let mut atlas = vec![0u8; ATLAS * grass_rows * 4];
         for (slot, texture, authored) in &grass_copies {
             let Some(img) = t.grass.textures.get(texture) else {
                 continue;
@@ -2039,14 +2051,22 @@ impl Renderer {
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        // Maps without grass areas (dungeons, interiors, dry instances) use a
+        // 1x1 dummy texture instead of an unused 4096x4096x8-mip (85.3 MiB) atlas.
+        let has_grass = !t.grass.areas.is_empty();
+        let (grass_atlas_dim, grass_atlas_mips) = if has_grass {
+            (ATLAS as u32, 8u32)
+        } else {
+            (1u32, 1u32)
+        };
         let atlas = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("world material atlas with grass mips"),
             size: wgpu::Extent3d {
-                width: ATLAS as u32,
-                height: ATLAS as u32,
+                width: grass_atlas_dim,
+                height: grass_atlas_dim,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 8,
+            mip_level_count: grass_atlas_mips,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             // D3D8 samples/filter authored color bytes without automatic sRGB decode.
@@ -2202,13 +2222,14 @@ impl Renderer {
                 (weather, cloud)
             });
             let water_task = s.spawn(move || {
-                let water = crate::water_gpu::WaterGpu::new(
+                let water = crate::water_gpu::WaterGpu::new_for_map(
                     device_ref,
                     queue_ref,
                     format,
                     w,
                     h,
                     &t_ref.water_normals,
+                    !t_ref.water.is_empty(),
                 );
                 let simple_water = crate::simple_water_gpu::SimpleWaterGpu::new(
                     device_ref,
@@ -2492,7 +2513,13 @@ impl Renderer {
         t.trees.placements.clear();
         t.trees.placements.shrink_to_fit();
         t.water_normals.clear();
+        t.water_normals.shrink_to_fit();
         t.water_simple_frames.clear();
+        t.water_simple_frames.shrink_to_fit();
+        if !vegetation_authored_mips {
+            t.grass.texture_mips.clear();
+            t.grass.texture_mips.shrink_to_fit();
+        }
         // Material masks and DDS buffers are no longer needed once uploaded.
         drop(terrain_upload);
         t.materials.release_gpu_source();

@@ -256,10 +256,10 @@ struct In {@builtin(vertex_index) vertex_id:u32,@location(0) pos:vec3<f32>,@loca
 struct Out {@builtin(position) pos:vec4<f32>,@location(0) normal:vec3<f32>,@location(1) uv:vec2<f32>,@location(2) color:vec4<f32>,@location(3) @interpolate(flat) kind:f32,@location(4) world:vec3<f32>,@location(5) @interpolate(flat) tree:vec3<f32>,@location(6) @interpolate(flat) tex_h:f32,@location(7) @interpolate(flat) fade:vec2<f32>,@location(8) @interpolate(flat) alpha_ref:u32};
 @vertex fn vs(i:In)->Out {var o:Out;var pos=i.pos+i.instance;var norm=i.normal;
  if i.kind>4.5 {let d=normalize(camera.direction.xyz);let az=atan2(d.z,d.x);let el=asin(clamp(d.y,-1.,1.));let rho=i.color.w;var corner=i.normal;let rock_index=i.tex_h>>8u;if rock_index>0u {corner=mix(corner,rock_sample(rock_index-1u,camera.tree_bounds.w),clamp(camera.tree_bounds.z,0.,1.));}let q=vec3<f32>(cos(el)*corner.x-sin(el)*corner.z,corner.y,sin(el)*corner.x+cos(el)*corner.z);let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. {v=corner;}pos+=vec3<f32>(v.x,v.z,v.y);norm=vec3<f32>(0.,1.,0.);if i.vertex_id<arrayLength(&leaf_normals) {let n=leaf_normals[i.vertex_id];if n.w>0.5 {norm=n.xyz;}}}
- o.pos=camera.matrix*vec4<f32>(pos,1.);o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.tree=i.instance;o.tex_h=f32(i.tex_h & 127u)*select(128./8192.,128./2048.,(i.tex_h & 128u)!=0u);o.fade=i.info;o.alpha_ref=i.alpha_ref;return o;}
+ o.pos=camera.matrix*vec4<f32>(pos,1.);o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.tree=i.instance;o.tex_h=f32(i.tex_h & 127u)*128.;o.fade=i.info;o.alpha_ref=i.alpha_ref;return o;}
 @fragment fn fs(i:Out)->@location(0) vec4<f32>{if camera.clip.y!=0. && (i.world.y-camera.clip.x)*camera.clip.y<0. {discard;}
 
- let scale=vec2<f32>(i.color.z,i.tex_h);var dx=dpdx(i.uv);var dy=dpdy(i.uv);let lod_bias=exp2(camera.lod.x);dx*=lod_bias;dy*=lod_bias;let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(dx*dims),length(dy*dims)),1.)),0.,7.);let halfpixel=min(vec2<f32>(0.5*exp2(mip))/dims,scale*0.499);let uv=i.color.xy+clamp(fract((i.uv-i.color.xy)/scale)*scale,halfpixel,scale-halfpixel);let tex=textureSampleGrad(atlas,atlas_sampler,uv,dx,dy);if i.alpha_ref!=0xffffffffu {let threshold=bitcast<f32>(i.alpha_ref);if tex.a<=threshold {discard;}}else if i.kind>3.5 && tex.a<0.5 {discard;}
+ let dims=vec2<f32>(textureDimensions(atlas));let scale=vec2<f32>(i.color.z,i.tex_h/dims.y);var dx=dpdx(i.uv);var dy=dpdy(i.uv);let lod_bias=exp2(camera.lod.x);dx*=lod_bias;dy*=lod_bias;let mip=clamp(log2(max(max(length(dx*dims),length(dy*dims)),1.)),0.,7.);let halfpixel=min(vec2<f32>(0.5*exp2(mip))/dims,scale*0.499);let uv=i.color.xy+clamp(fract((i.uv-i.color.xy)/scale)*scale,halfpixel,scale-halfpixel);let tex=textureSampleGrad(atlas,atlas_sampler,uv,dx,dy);if i.alpha_ref!=0xffffffffu {let threshold=bitcast<f32>(i.alpha_ref);if tex.a<=threshold {discard;}}else if i.kind>3.5 && tex.a<0.5 {discard;}
  // Complementary ordered coverage: old and new snapshots never both draw
  // at the same pixel, while the tree is fully visible at the endpoints.
  if i.fade.y>0.5 {let xy=vec2<u32>(i.pos.xy)%vec2<u32>(4u);let b=(((xy.x&1u)^(xy.y&1u))*8u)+((xy.y&1u)*4u)+((((xy.x>>1u)&1u)^((xy.y>>1u)&1u))*2u)+((xy.y>>1u)&1u);let d=(f32(b)+0.5)/16.;if (i.fade.y<1.5 && d<i.fade.x)||(i.fade.y>1.5 && d>=i.fade.x){discard;}}
@@ -295,7 +295,11 @@ impl FarTrees {
         let side = if small { 2048usize } else { 8192usize };
         let grid = side / 128;
         let mut occupied = vec![false; grid * grid];
-        let mut atlas = vec![0u8; side * side * 4];
+        // Grow the tree atlas dynamically by rows instead of allocating the
+        // full 8192x8192x4 (256 MiB) up front; empty or sparse tree maps then
+        // allocate only the rows they actually pack.
+        let mut atlas: Vec<u8> = Vec::new();
+        let mut used_rows: usize = 0;
         let mut vertices = Vec::new();
         let mut rocking_samples: Vec<[f32; 4]> = Vec::new();
         let mut leaf_normals: Vec<[f32; 4]> = Vec::new();
@@ -395,6 +399,17 @@ impl FarTrees {
                     }
                 }
                 let (ox, oy) = (gx * 128, gy * 128);
+                let need_rows = oy + h;
+                if need_rows > used_rows {
+                    used_rows = need_rows;
+                    let needed_bytes = used_rows * side * 4;
+                    if atlas.len() < needed_bytes {
+                        let grown = (atlas.len().max(side * 128 * 4) * 2)
+                            .max(needed_bytes)
+                            .min(side * side * 4);
+                        atlas.resize(grown, 0);
+                    }
+                }
                 for y in 0..h {
                     for x in 0..w {
                         let sx = (x as u32 * img.width() / w as u32).min(img.width() - 1);
@@ -538,11 +553,32 @@ impl FarTrees {
         if instances.is_empty() {
             instances.push(Instance::zeroed())
         }
+        // Trim the tree atlas GPU texture to the exact packed row extent
+        // (multiple of 128 so all 7 lower mip levels stay tile-aligned). Maps
+        // with no trees allocate a minimal 128x128 placeholder (~64 KiB)
+        // instead of 8192x8192 (~341 MiB VRAM).
+        let (atlas_w, atlas_h) = if mip_slots.is_empty() {
+            atlas.clear();
+            atlas.resize(128 * 128 * 4, 0);
+            (128usize, 128usize)
+        } else {
+            let trimmed_h = ((used_rows + 127) & !127).clamp(128, side);
+            atlas.truncate(trimmed_h * side * 4);
+            atlas.resize(trimmed_h * side * 4, 0);
+            if trimmed_h < side {
+                let v_scale = side as f32 / trimmed_h as f32;
+                for v in &mut vertices {
+                    v.uv[1] *= v_scale;
+                    v.color[1] *= v_scale;
+                }
+            }
+            (side, trimmed_h)
+        };
         let image = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("far tree textures"),
             size: wgpu::Extent3d {
-                width: side as u32,
-                height: side as u32,
+                width: atlas_w as u32,
+                height: atlas_h as u32,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 8,
@@ -562,12 +598,12 @@ impl FarTrees {
             &atlas,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some((side * 4) as u32),
-                rows_per_image: Some(side as u32),
+                bytes_per_row: Some((atlas_w * 4) as u32),
+                rows_per_image: Some(atlas_h as u32),
             },
             wgpu::Extent3d {
-                width: side as u32,
-                height: side as u32,
+                width: atlas_w as u32,
+                height: atlas_h as u32,
                 depth_or_array_layers: 1,
             },
         );

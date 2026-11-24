@@ -952,9 +952,18 @@ impl Manager {
             }
             _ => None,
         };
+        struct StepJob {
+            transform: Mat4,
+            authored_scale: f32,
+            alpha: f32,
+            ground: Option<crate::gfx_player::GroundHit>,
+        }
         let mut failures = Vec::new();
+        let mut jobs: Vec<Option<StepJob>> = Vec::with_capacity(self.owners.len());
+        let mut active_count = 0usize;
         for owner in &mut self.owners {
             if !matches!(owner.state, State::Live { .. }) {
+                jobs.push(None);
                 continue;
             }
             if !owner.request.active || owner.elapsed < owner.request.start_ms {
@@ -968,10 +977,6 @@ impl Manager {
                         owner.request.start_ms
                     );
                 }
-                // Culling is the channel that filled a report with one repeated
-                // line per root per frame. Keyed by root, so every root says
-                // once why it is not drawn, and says it again only every ten
-                // seconds while that stays true.
                 crate::diag_keyed!(
                     EffectCulling,
                     format!("{} skipped", owner.request.path),
@@ -982,14 +987,11 @@ impl Manager {
                     owner.elapsed,
                     owner.request.start_ms
                 );
+                jobs.push(None);
                 continue;
             }
-            // The record's alpha is the *target* of the client's distance fade,
-            // not a second factor beside it: `FadeGFX` ramps the root to
-            // `max_alpha * fAlpha` and then holds it there, so the drawn alpha is
-            // `fAlpha * fade`. An owner with no `outer` colour draws at the
-            // fade alone (full alpha when nothing attenuates it).
             if owner.player.is_none() {
+                jobs.push(None);
                 continue;
             }
             let alpha = owner.request.outer.map_or(1., |outer| outer[3]) * owner.attenuation;
@@ -998,6 +1000,7 @@ impl Manager {
                 Err(error) => {
                     failures.push((owner.request.origin.clone(), error));
                     owner.player = None;
+                    jobs.push(None);
                     continue;
                 }
             };
@@ -1028,8 +1031,6 @@ impl Manager {
                 world[9],
                 world[10]
             );
-            // Cache terrain height + gradient normal for static effect origins
-            // (eliminates 5 terrain height queries per active effect per frame).
             let ground = if let Some(height_at) = terrain {
                 let ox = world[12];
                 let oz = world[14];
@@ -1061,37 +1062,109 @@ impl Manager {
             } else {
                 None
             };
-            let stepped = {
+            active_count += 1;
+            jobs.push(Some(StepJob {
+                transform,
+                authored_scale,
+                alpha,
+                ground,
+            }));
+        }
+
+        // Step active effect players in parallel across CPU cores when many
+        // effects are live simultaneously (cities, torch clusters, waterfalls).
+        let workers = if active_count >= 12 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(active_count / 4)
+                .min(16)
+        } else {
+            1
+        };
+        let mut step_errors: Vec<(usize, String)> = Vec::new();
+        if workers > 1 {
+            let chunk_len = self.owners.len().div_ceil(workers);
+            let dt = delta_ms as f32;
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(workers);
+                for (chunk_idx, (owner_chunk, job_chunk)) in self
+                    .owners
+                    .chunks_mut(chunk_len)
+                    .zip(jobs.chunks(chunk_len))
+                    .enumerate()
+                {
+                    let base = chunk_idx * chunk_len;
+                    handles.push(s.spawn(move || {
+                        let mut errs = Vec::new();
+                        for (i, (owner, job_opt)) in
+                            owner_chunk.iter_mut().zip(job_chunk.iter()).enumerate()
+                        {
+                            let Some(job) = job_opt else {
+                                continue;
+                            };
+                            let Some(player) = owner.player.as_mut() else {
+                                continue;
+                            };
+                            if let Err(error) = player.advance_with_terrain(
+                                dt,
+                                view,
+                                job.transform,
+                                job.authored_scale,
+                                job.alpha,
+                                job.ground,
+                                terrain,
+                            ) {
+                                owner.player = None;
+                                errs.push((base + i, error));
+                            }
+                        }
+                        errs
+                    }));
+                }
+                for h in handles {
+                    step_errors.extend(h.join().unwrap());
+                }
+            });
+        } else {
+            let dt = delta_ms as f32;
+            for (i, (owner, job_opt)) in self.owners.iter_mut().zip(jobs.iter()).enumerate() {
+                let Some(job) = job_opt else {
+                    continue;
+                };
                 let Some(player) = owner.player.as_mut() else {
                     continue;
                 };
-                let res = player.advance_with_terrain(
-                    delta_ms as f32,
+                if let Err(error) = player.advance_with_terrain(
+                    dt,
                     view,
-                    transform,
-                    authored_scale,
-                    alpha,
-                    ground,
+                    job.transform,
+                    job.authored_scale,
+                    job.alpha,
+                    job.ground,
                     terrain,
-                );
-                res.map(|()| {
-                    let quads = player.quads();
-                    if let Some(rows) = rows.as_mut() {
-                        rows.push(census_row(&owner.request.path, quads, player.clock_ms()));
-                    }
-                    // Skip emitting quads when the effect is completely faded out
-                    // by distance attenuation so invisible sheets cost zero GPU work.
-                    if alpha > 0.0 {
-                        out.extend(quads.iter().cloned());
-                    }
-                })
-            };
-            match stepped {
-                Ok(()) => {}
-                Err(error) => {
-                    failures.push((owner.request.origin.clone(), error));
+                ) {
                     owner.player = None;
+                    step_errors.push((i, error));
                 }
+            }
+        }
+        for (idx, error) in step_errors {
+            failures.push((self.owners[idx].request.origin.clone(), error));
+        }
+        for (owner, job_opt) in self.owners.iter().zip(jobs.iter()) {
+            let Some(job) = job_opt else {
+                continue;
+            };
+            let Some(player) = owner.player.as_ref() else {
+                continue;
+            };
+            let quads = player.quads();
+            if let Some(rows) = rows.as_mut() {
+                rows.push(census_row(&owner.request.path, quads, player.clock_ms()));
+            }
+            if job.alpha > 0.0 {
+                out.extend(quads.iter().cloned());
             }
         }
         for (origin, error) in failures {

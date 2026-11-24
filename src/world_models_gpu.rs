@@ -131,7 +131,7 @@ pub struct World {
     /// this module is also compiled into binaries whose crate root has no
     /// `navigation` (the shipped survey tools), and the query is all the effect
     /// pass needs anyway.
-    terrain: Option<Box<dyn Fn(f32, f32) -> Option<f32>>>,
+    terrain: Option<Box<dyn Fn(f32, f32) -> Option<f32> + Send + Sync>>,
     producers: Vec<Producer>,
     /// The animated half of the world's effects. Created on the first update that
     /// needs it, because `with_reader` has no queue to build a draw object with.
@@ -833,18 +833,18 @@ impl World {
     /// the first frame.
     pub fn set_terrain<F>(&mut self, height: F)
     where
-        F: Fn(f32, f32) -> Option<f32> + 'static,
+        F: Fn(f32, f32) -> Option<f32> + Send + Sync + 'static,
     {
-        let broken = std::cell::Cell::new(false);
+        let broken = std::sync::atomic::AtomicBool::new(false);
         self.terrain = Some(Box::new(move |x: f32, z: f32| {
-            if broken.get() {
+            if broken.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
             let read = || height(x, z);
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)) {
                 Ok(value) => value,
                 Err(_) => {
-                    broken.set(true);
+                    broken.store(true, std::sync::atomic::Ordering::Relaxed);
                     None
                 }
             }
@@ -898,7 +898,9 @@ impl World {
                 effect_quads,
                 ..
             } = self;
-            let sampler: Option<crate::gfx_player::GroundHeightQuery<'_>> = terrain.as_deref();
+            let sampler: Option<crate::gfx_player::GroundHeightQuery<'_>> = terrain
+                .as_deref()
+                .map(|f| f as crate::gfx_player::GroundHeightQuery<'_>);
             owners.effect_quads_with_ground_into(delta_ms, &view, sampler, effect_quads);
         }
         // Say once, on stderr, what the invisible pipeline is doing. Nothing in

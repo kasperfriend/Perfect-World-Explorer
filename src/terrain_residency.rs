@@ -65,7 +65,7 @@ pub struct Span {
 /// the only ones meshed and evicted blocks release their vertices.
 #[derive(Default)]
 pub struct Residency {
-    blocks: std::collections::BTreeMap<(usize, usize), Block>,
+    blocks: std::collections::HashMap<(usize, usize), Block>,
 }
 
 impl Residency {
@@ -134,6 +134,156 @@ impl Residency {
                 let (vertices, indices, bounds) = build(x, y, level)
                     .map_err(|e| format!("terrain block ({x},{y}) level {level}: {e}"))?;
                 if self.blocks.contains_key(&(x, y)) {
+                    census.remeshed += 1;
+                } else {
+                    census.loaded += 1;
+                }
+                self.blocks.insert(
+                    (x, y),
+                    Block {
+                        level,
+                        cases,
+                        vertices,
+                        indices,
+                        bounds,
+                    },
+                );
+            }
+        }
+        census.resident = self.blocks.len();
+        census.triangles = self.triangles();
+        Ok(census)
+    }
+
+    /// Parallel variant of [`Self::update_stitched`] for fast camera
+    /// flythroughs: collects all entering or re-meshed blocks and builds their
+    /// stitched surfaces concurrently across CPU cores when 4 or more blocks
+    /// are stale in the same crossing.
+    pub fn update_stitched_parallel<L, B>(
+        &mut self,
+        window: &crate::terrain_lod::Window,
+        state_of: L,
+        build: B,
+    ) -> Result<Census, String>
+    where
+        L: Fn(usize, usize) -> (u8, [u8; 4]),
+        B: Fn(usize, usize, u8, [u8; 4]) -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String>
+            + Sync,
+    {
+        let mut census = Census::default();
+        let before = self.blocks.len();
+        self.blocks.retain(|&(x, y), _| window.contains(x, y));
+        census.evicted = before - self.blocks.len();
+
+        let mut stale: Vec<(usize, usize, u8, [u8; 4], bool)> = Vec::new();
+        for y in window.y0..window.y1 {
+            for x in window.x0..window.x1 {
+                let (level, cases) = state_of(x, y);
+                if level == 0 {
+                    census.evicted += usize::from(self.blocks.remove(&(x, y)).is_some());
+                    continue;
+                }
+                match self.blocks.get(&(x, y)) {
+                    Some(block) if block.level == level && block.cases == cases => continue,
+                    Some(_) => stale.push((x, y, level, cases, true)),
+                    None => stale.push((x, y, level, cases, false)),
+                }
+            }
+        }
+
+        if stale.len() >= 4 {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(stale.len())
+                .min(16);
+            if workers > 1 {
+                let chunk_size = stale.len().div_ceil(workers);
+                let built: Vec<(
+                    usize,
+                    usize,
+                    u8,
+                    [u8; 4],
+                    bool,
+                    Vec<Vertex>,
+                    Vec<u32>,
+                    [f32; 6],
+                )> = std::thread::scope(|s| -> Result<_, String> {
+                    let build_ref = &build;
+                    let handles: Vec<_> = stale
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            s.spawn(move || {
+                                let mut local = Vec::with_capacity(chunk.len());
+                                for &(x, y, level, cases, was_present) in chunk {
+                                    let (vertices, indices, bounds) = build_ref(x, y, level, cases)
+                                        .map_err(|e| {
+                                            format!("terrain block ({x},{y}) level {level}: {e}")
+                                        })?;
+                                    local.push((
+                                        x,
+                                        y,
+                                        level,
+                                        cases,
+                                        was_present,
+                                        vertices,
+                                        indices,
+                                        bounds,
+                                    ));
+                                }
+                                Ok::<_, String>(local)
+                            })
+                        })
+                        .collect();
+                    let mut out = Vec::with_capacity(stale.len());
+                    for h in handles {
+                        out.extend(h.join().unwrap()?);
+                    }
+                    Ok(out)
+                })?;
+                for (x, y, level, cases, was_present, vertices, indices, bounds) in built {
+                    if was_present {
+                        census.remeshed += 1;
+                    } else {
+                        census.loaded += 1;
+                    }
+                    self.blocks.insert(
+                        (x, y),
+                        Block {
+                            level,
+                            cases,
+                            vertices,
+                            indices,
+                            bounds,
+                        },
+                    );
+                }
+            } else {
+                for (x, y, level, cases, was_present) in stale {
+                    let (vertices, indices, bounds) = build(x, y, level, cases)
+                        .map_err(|e| format!("terrain block ({x},{y}) level {level}: {e}"))?;
+                    if was_present {
+                        census.remeshed += 1;
+                    } else {
+                        census.loaded += 1;
+                    }
+                    self.blocks.insert(
+                        (x, y),
+                        Block {
+                            level,
+                            cases,
+                            vertices,
+                            indices,
+                            bounds,
+                        },
+                    );
+                }
+            }
+        } else {
+            for (x, y, level, cases, was_present) in stale {
+                let (vertices, indices, bounds) = build(x, y, level, cases)
+                    .map_err(|e| format!("terrain block ({x},{y}) level {level}: {e}"))?;
+                if was_present {
                     census.remeshed += 1;
                 } else {
                     census.loaded += 1;

@@ -1207,7 +1207,7 @@ const GROUND_NEAR_DISTANCE: f32 = 0.2;
 /// (`AfxGetGrndNorm` with a NULL normal, `A3DDecalEx.cpp:517`), which is why a
 /// ground decal can follow a crater floor instead of hovering over it. The
 /// viewer is handed the query rather than owning terrain it does not have.
-pub type GroundHeightQuery<'a> = &'a dyn Fn(f32, f32) -> Option<f32>;
+pub type GroundHeightQuery<'a> = &'a (dyn Fn(f32, f32) -> Option<f32> + Sync);
 
 /// The owner's terrain, threaded down to the sprite path so a `MatchGrnd` decal
 /// can be draped over the surface the way `A3DDecalEx::Fill_Verts_3D` drapes it.
