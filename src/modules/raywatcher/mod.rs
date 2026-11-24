@@ -414,6 +414,11 @@ impl Raywatcher {
             ("Localized valley mist", &mut effects.valley_mist),
             ("Water shore foam & ripples", &mut effects.water_shore_foam),
             ("Interactive grass bending", &mut effects.interactive_grass),
+            ("Volumetric clouds", &mut effects.volumetric_clouds),
+            (
+                "Realistic water (waves & flow)",
+                &mut effects.realistic_water,
+            ),
         ] {
             changed_effects |= ui.checkbox(slot, label).changed();
         }
@@ -656,6 +661,8 @@ impl Raywatcher {
             ("valley_mist", effects.valley_mist),
             ("water_shore_foam", effects.water_shore_foam),
             ("interactive_grass", effects.interactive_grass),
+            ("volumetric_clouds", effects.volumetric_clouds),
+            ("realistic_water", effects.realistic_water),
         ] {
             let _ = writeln!(out, "{name}={}", u8::from(on));
         }
@@ -742,6 +749,8 @@ impl Raywatcher {
             ("valley_mist", &mut effects.valley_mist),
             ("water_shore_foam", &mut effects.water_shore_foam),
             ("interactive_grass", &mut effects.interactive_grass),
+            ("volumetric_clouds", &mut effects.volumetric_clouds),
+            ("realistic_water", &mut effects.realistic_water),
         ] {
             if let Some(v) = get(name).and_then(parse_flag) {
                 *slot = v;
@@ -1072,6 +1081,8 @@ mod tests {
             valley_mist: false,
             water_shore_foam: false,
             interactive_grass: false,
+            volumetric_clouds: false,
+            realistic_water: false,
         };
         m.set_settings(s);
         let none = m.status((640, 360), false);

@@ -1777,6 +1777,8 @@ struct Renderer {
     raywatcher_diag_last_write: Option<std::time::Instant>,
     /// Temporally smoothed world-effect point lights keyed by 8u world cells to stop particle flicker.
     raywatcher_eff_light_cache: std::collections::HashMap<(i32, i32, i32), CachedEffectLight>,
+    /// Reusable dynamic RT vertex buffer (Walker + Populator) avoiding per-frame ~737 KB allocations.
+    raywatcher_dyn_rt_verts: Vec<[f32; 3]>,
     /// Last frame's sky parameters and blend sets, reused by Raywatcher to
     /// render the real `SkyGpu` + `CloudGpu` reflection environment atlas.
     last_sky_frame: Option<(crate::sky_gpu::SkyFrame, (i32, i32, f32))>,
@@ -2559,6 +2561,7 @@ impl Renderer {
             raywatcher_worst_frame_ms: 0.0,
             raywatcher_diag_last_write: None,
             raywatcher_eff_light_cache: std::collections::HashMap::new(),
+            raywatcher_dyn_rt_verts: Vec::new(),
             last_sky_frame: None,
             raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan::OFF,
             raywatcher_hw_probe: None,
@@ -4750,13 +4753,17 @@ impl Renderer {
                 Vec::new()
             };
         let walker_pos = self.modules.walker_world_pos();
-        let mut walker_rt_verts: Vec<[f32; 3]> = Vec::new();
+        self.raywatcher_dyn_rt_verts.clear();
         if walker_pos.is_some() {
-            self.modules.walker_rt_triangles(&mut walker_rt_verts, 4096);
+            self.modules
+                .walker_rt_triangles(&mut self.raywatcher_dyn_rt_verts, 4096);
         }
         if self.modules.populator_active() {
-            self.modules
-                .populator_rt_triangles(camera.pos, &mut walker_rt_verts, 16_384);
+            self.modules.populator_rt_triangles(
+                camera.pos,
+                &mut self.raywatcher_dyn_rt_verts,
+                16_384,
+            );
         }
         gpu.record(
             &self.device,
@@ -4775,7 +4782,7 @@ impl Renderer {
             unjittered_vp,
             camera.weather_override != crate::client_weather::WeatherOverride::Clear,
             walker_pos,
-            &walker_rt_verts,
+            &self.raywatcher_dyn_rt_verts,
         );
         let mut dlss_rr_ran = false;
         if plan.reconstruction

@@ -282,6 +282,10 @@ pub struct Effects {
     pub water_shore_foam: bool,
     /// Interactive wind-driven grass & foliage bending around the Walker character.
     pub interactive_grass: bool,
+    /// Deep 3D ray-marched volumetric clouds that drift and evolve over time.
+    pub volumetric_clouds: bool,
+    /// Realistic flowing water with wind-driven ripples, multi-directional waves, and crest/shore foam.
+    pub realistic_water: bool,
 }
 
 impl Default for Effects {
@@ -304,6 +308,8 @@ impl Default for Effects {
             valley_mist: true,
             water_shore_foam: true,
             interactive_grass: true,
+            volumetric_clouds: true,
+            realistic_water: true,
         }
     }
 }
@@ -326,6 +332,8 @@ impl Effects {
             self.valley_mist,
             self.water_shore_foam,
             self.interactive_grass,
+            self.volumetric_clouds,
+            self.realistic_water,
         ]
         .iter()
         .filter(|on| **on)
@@ -540,6 +548,8 @@ impl Plan {
             valley_mist: false,
             water_shore_foam: false,
             interactive_grass: false,
+            volumetric_clouds: false,
+            realistic_water: false,
         },
         reconstruction: RayReconstruction::Off,
         grid: (0, 0),
@@ -734,6 +744,8 @@ mod tests {
             valley_mist: false,
             water_shore_foam: false,
             interactive_grass: false,
+            volumetric_clouds: false,
+            realistic_water: false,
         };
         assert!(!s.replaces_effects());
         assert_eq!(
@@ -757,6 +769,8 @@ mod tests {
                 valley_mist: false,
                 water_shore_foam: false,
                 interactive_grass: false,
+                volumetric_clouds: false,
+                realistic_water: false,
             };
             match enable {
                 0 => e.shadows = true,
