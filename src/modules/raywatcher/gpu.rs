@@ -1862,8 +1862,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     if (bits_lighting && pl_count > 0u && is_water) {
         let w_norm = water_wave_normal(point.xz, params.frame.x * 0.03, dist);
         let view_to_eye = -view_dir;
-        let pl_loop_end = select(0u, pl_count, any_pl_near);
-        for (var li = 0u; li < pl_loop_end; li = li + 1u) {
+        for (var li = 0u; li < pl_count; li = li + 1u) {
             let pl_pr = params.point_lights_pos_rad[li];
             let to_l = pl_pr.xyz - point;
             if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
@@ -1983,7 +1982,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         var exact_ws = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
         var exact_cols = array<vec3<f32>, 4>(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
 
-        for (var li = 0u; li < pl_count; li = li + 1u) {
+        let pl_loop_end = select(0u, pl_count, any_pl_near);
+        for (var li = 0u; li < pl_loop_end; li = li + 1u) {
             let pl_pr = params.point_lights_pos_rad[li];
             let to_l = pl_pr.xyz - point;
             if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
@@ -5655,5 +5655,32 @@ mod phase_r1_tests {
         assert_eq!(packed.point_light_meta[0] as usize, MAX_RAY_LIGHTS);
         assert_eq!(packed.point_lights_pos_rad[127][0], 127.0);
         assert_eq!(packed.point_lights_col_int[127][3], 3.0);
+    }
+
+    #[test]
+    fn all_wgsl_shaders_parse_and_validate() {
+        let shaders = [
+            ("GBUF_PREP_SHADER", GBUF_PREP_SHADER),
+            ("RAY_SHADER", RAY_SHADER),
+            ("DENOISE_SHADER", DENOISE_SHADER),
+            ("COMPOSE_SHADER", COMPOSE_SHADER),
+            ("BLIT_SHADER", BLIT_SHADER),
+            ("COMPOSITE_SHADER", COMPOSITE_SHADER),
+        ];
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        );
+        for (name, source) in shaders {
+            let module = wgpu::naga::front::wgsl::parse_str(source).unwrap_or_else(|err| {
+                panic!("{name} WGSL parse failed:\n{}", err.emit_to_string(source))
+            });
+            validator.validate(&module).unwrap_or_else(|err| {
+                panic!(
+                    "{name} WGSL validation failed:\n{}",
+                    err.emit_to_string(source)
+                )
+            });
+        }
     }
 }
