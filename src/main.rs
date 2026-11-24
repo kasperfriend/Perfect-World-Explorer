@@ -430,6 +430,111 @@ where
     })
 }
 
+/// Decode and compress every block of one tile across worker threads when
+/// building the paged terrain cache, so XOR encoding, SHA-256, and zlib
+/// compression scale across all CPU cores while writes stay strictly ordered.
+fn decode_blocks_paged<F>(tile: &TileDecode, threads: usize, mut insert: F) -> Result<(), String>
+where
+    F: FnMut(usize, terrain_store::EncodedBlock) -> Result<(), String>,
+{
+    if tile.blocks == 0 {
+        return Ok(());
+    }
+    if threads.min(tile.blocks) <= 1 {
+        let mut scratch = BlockScratch::default();
+        for bi in 0..tile.blocks {
+            decode_block(tile, &mut scratch, bi)?;
+            let encoded =
+                terrain_store::encode_block(&scratch.heights, &scratch.normals, tile.grid)?;
+            insert(bi, encoded)?;
+        }
+        return Ok(());
+    }
+    let worker_count = threads.min(tile.blocks);
+    let window = worker_count.saturating_mul(2).max(worker_count);
+    let state = std::sync::Mutex::new(DecodeWindow {
+        next: 0,
+        next_expected: 0,
+        cancelled: false,
+    });
+    let wake = std::sync::Condvar::new();
+    let (tx, rx) =
+        std::sync::mpsc::channel::<(usize, Result<terrain_store::EncodedBlock, String>)>();
+    std::thread::scope(|scope| -> Result<(), String> {
+        for _ in 0..worker_count {
+            let tx = tx.clone();
+            let state = &state;
+            let wake = &wake;
+            scope.spawn(move || {
+                let mut scratch = BlockScratch::default();
+                loop {
+                    let bi = {
+                        let mut scheduler = state.lock().unwrap();
+                        loop {
+                            match scheduler.claim(tile.blocks, window) {
+                                DecodeClaim::Block(bi) => break bi,
+                                DecodeClaim::Done => return,
+                                DecodeClaim::Wait => {
+                                    scheduler = wake.wait(scheduler).unwrap();
+                                }
+                            }
+                        }
+                    };
+                    let encoded = decode_block(tile, &mut scratch, bi).and_then(|()| {
+                        terrain_store::encode_block(&scratch.heights, &scratch.normals, tile.grid)
+                    });
+                    let failed = encoded.is_err();
+                    if tx.send((bi, encoded)).is_err() {
+                        return;
+                    }
+                    if failed {
+                        let mut scheduler = state.lock().unwrap();
+                        scheduler.cancelled = true;
+                        wake.notify_all();
+                        return;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let result = (|| -> Result<(), String> {
+            let mut next_expected = 0usize;
+            let mut pending = std::collections::BTreeMap::new();
+            while next_expected < tile.blocks {
+                let Ok((bi, encoded)) = rx.recv() else {
+                    break;
+                };
+                match encoded {
+                    Ok(block) => {
+                        pending.insert(bi, block);
+                    }
+                    Err(e) => return Err(e),
+                }
+                while let Some(block) = pending.remove(&next_expected) {
+                    insert(next_expected, block)?;
+                    next_expected += 1;
+                    let mut scheduler = state.lock().unwrap();
+                    scheduler.next_expected = next_expected;
+                    wake.notify_one();
+                    if next_expected >= tile.blocks {
+                        break;
+                    }
+                }
+            }
+            if next_expected < tile.blocks {
+                return Err(format!("{}: terrain decode stopped early", tile.name));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let mut scheduler = state.lock().unwrap();
+            scheduler.cancelled = true;
+            wake.notify_all();
+        }
+        result
+    })
+}
+
 /// Decode one T2BK block into `scratch.heights` / `scratch.normals` (both
 /// `grid * grid`).
 ///
@@ -676,166 +781,270 @@ fn terrain(
     // * All to VRAM keeps the decoded grid in memory and never writes a cache.
     // * Otherwise the warm-start index is tried first; a hit skips the block
     //   decode and the whole recompression pass, and only a miss builds pages.
-    let identity = if all_to_vram {
-        String::new()
-    } else {
-        terrain_store::source_identity(&t, &dir, &names)?
-    };
-    let cached = if all_to_vram {
-        None
-    } else {
-        terrain_store::restore(&cache_root, &identity, w, h, grid, terrain_store::budget())?
-    };
-    let mut terrain_pages = if cached.is_some() {
-        None
-    } else if all_to_vram {
-        Some(terrain_store::Builder::new_resident(w, h, grid)?)
-    } else {
-        Some(terrain_store::Builder::new(&cache_root, w, h, grid)?.with_identity(&identity))
-    };
-    // Colour sections are validated per block below. Neither current CPU nor
-    // GPU renderer consumes them; do not allocate a second world-sized RGBA grid.
-    let sin_table: Vec<f32> = (0..256)
-        .map(|i| (i as f32 * std::f32::consts::TAU / 256.).sin())
-        .collect();
-    let cos_table: Vec<f32> = (0..256)
-        .map(|i| (i as f32 * std::f32::consts::TAU / 256.).cos())
-        .collect();
-    let subs_x = cols / per;
-    // Decoding threads for the block loop below: one per core unless pinned.
-    // Each block is independent, so this is pure throughput; the builder still
-    // sees the blocks in exactly the order the sequential loop produced them.
-    let threads = std::env::var("PW_TERRAIN_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| (1..=64).contains(n))
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        });
-    // A warm start already owns the grid, so the block loop is skipped entirely.
-    if terrain_pages.is_some() {
-        for name in &names {
-            if name.contains('/') || name.contains('\\') || name.contains("..") {
-                return Err("unsafe subterrain path".into());
+    let scene_path = world_catalog::data_file(&dir, "ecwld");
+    let cloud_path = world_catalog::data_file(&dir, "cld");
+    let lights_path = world_catalog::named_file(&dir, "scenelights.dat");
+    // Wave 1: overlap terrain height/normal decode (or warm cache restore) with
+    // all independent world metadata, material/mask loading, water textures,
+    // cloud surface, and scene lights instead of waiting serially behind .t2bk.
+    let (
+        (heights, normals),
+        (world_scene, ornaments),
+        cloud_surface,
+        materials,
+        water_normals,
+        water_simple_frames,
+        scene_lights,
+    ) = std::thread::scope(|wave1| -> Result<_, String> {
+        let dir_ref = &dir;
+        let t_ref = &t;
+        let names_ref = &names;
+        let scene_path_ref = &scene_path;
+        let cloud_path_ref = &cloud_path;
+        let lights_path_ref = &lights_path;
+
+        let scene_task = wave1.spawn(move || -> Result<_, String> {
+            let world_scene = scene::Scene::load(scene_path_ref)?;
+            if (world_scene.width - w as f32 * grid_spacing).abs() > 0.1
+                || (world_scene.length - h as f32 * grid_spacing).abs() > 0.1
+            {
+                return Err("ECWLD and TRN2 world dimensions differ".into());
             }
-        }
-        // Overlap disk reads of upcoming .t2bk tiles with CPU block decoding
-        // and cache writes via a bounded 2-tile prefetch channel.
-        let (tile_tx, tile_rx) =
-            std::sync::mpsc::sync_channel::<Result<(usize, Vec<u8>), String>>(2);
-        let dir_prefetch = dir.clone();
-        let names_prefetch = names.clone();
-        let prefetch_handle = std::thread::spawn(move || {
-            for (si, name) in names_prefetch.iter().enumerate() {
-                let res = fs::read(dir_prefetch.join(format!("{name}.t2bk")))
-                    .map(|data| (si, data))
-                    .map_err(|e| format!("{name}: {e}"));
-                if tile_tx.send(res).is_err() {
-                    break;
+            let ornaments = world_scene.load_ornaments(&world_catalog::ecbsd_path(dir_ref))?;
+            Ok((world_scene, ornaments))
+        });
+        let cloud_task = wave1.spawn(move || -> Result<_, String> {
+            match fs::read(cloud_path_ref) {
+                Ok(bytes) => {
+                    let cloud = cloud_surface::parse(&bytes)
+                        .map_err(|e| format!("{}: {e}", cloud_path_ref.display()))?;
+                    let (cell_count, vertex_count, group_count, index_count) =
+                        cloud.cells.iter().flatten().fold(
+                            (0usize, 0usize, 0usize, 0usize),
+                            |(cells, vertices, groups, indices), cell| {
+                                (
+                                    cells + usize::from(!cell.vertices.is_empty()),
+                                    vertices + cell.vertices.len(),
+                                    groups + cell.groups.len(),
+                                    indices
+                                        + cell.groups.iter().map(|g| g.indices.len()).sum::<usize>(),
+                                )
+                            },
+                        );
+                    eprintln!("Loaded native MOXB cloud grid {}x{}: {cell_count} populated cells, {vertex_count} vertices, {group_count} groups, {index_count} indices", cloud.width, cloud.height);
+                    Ok(Some(std::sync::Arc::new(cloud)))
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!(
+                        "{} unavailable; native cloud surface omitted",
+                        cloud_path_ref.display()
+                    );
+                    Ok(None)
+                }
+                Err(e) => Err(format!("{}: {e}", cloud_path_ref.display())),
             }
         });
-        for (si, name) in names.iter().enumerate() {
-            let (recv_si, data) = tile_rx
-                .recv()
-                .map_err(|_| format!("{name}: terrain prefetch thread exited"))??;
-            debug_assert_eq!(recv_si, si);
-            if u32at(&data, 0)? != 0x54424b42 {
-                return Err(format!("{name}: invalid T2BK"));
-            };
-            let v = u32at(&data, 4)?;
-            if !(2..=6).contains(&v) {
-                return Err(format!("{name}: unsupported version {v}"));
-            }
-            let n = u32at(&data, 8)? as usize;
-            if n < per * per {
-                return Err(format!("{name}: missing blocks"));
-            };
-            let flags = if v < 5 {
-                if data[12] != 0 {
-                    0x15
+        let materials_task = wave1.spawn(move || {
+            material::Materials::load(dir_ref, t_ref, names_ref, w, h, grid_spacing)
+                .map_err(|e| e.to_string())
+        });
+        let water_normals_task =
+            wave1.spawn(move || water::load_normals(element).map_err(|e| e.to_string()));
+        let water_simple_task =
+            wave1.spawn(move || water::load_simple_frames(element).map_err(|e| e.to_string()));
+        let scene_lights_task =
+            wave1.spawn(
+                move || match scene_lights::SceneLights::load(lights_path_ref) {
+                    Ok(lights) => {
+                        eprintln!(
+                            "Loaded {} client scene lights (static query only)",
+                            lights.lights.len()
+                        );
+                        lights
+                    }
+                    Err(e) => {
+                        eprintln!("Scene lights unavailable: {e}");
+                        scene_lights::SceneLights::default()
+                    }
+                },
+            );
+
+        let terrain_res: Result<(terrain_store::Heights, terrain_store::Normals), String> =
+            (|| {
+                // Residency choice, made before a single block is read:
+                //
+                // * All to VRAM keeps the decoded grid in memory and never writes a cache.
+                // * Otherwise the warm-start index is tried first; a hit skips the block
+                //   decode and the whole recompression pass, and only a miss builds pages.
+                let identity = if all_to_vram {
+                    String::new()
                 } else {
-                    0
+                    terrain_store::source_identity(&t, &dir, &names)?
+                };
+                let cached = if all_to_vram {
+                    None
+                } else {
+                    terrain_store::restore(
+                        &cache_root,
+                        &identity,
+                        w,
+                        h,
+                        grid,
+                        terrain_store::budget(),
+                    )?
+                };
+                let mut terrain_pages = if cached.is_some() {
+                    None
+                } else if all_to_vram {
+                    Some(terrain_store::Builder::new_resident(w, h, grid)?)
+                } else {
+                    Some(
+                        terrain_store::Builder::new(&cache_root, w, h, grid)?
+                            .with_identity(&identity),
+                    )
+                };
+                // Colour sections are validated per block below. Neither current CPU nor
+                // GPU renderer consumes them; do not allocate a second world-sized RGBA grid.
+                let sin_table: Vec<f32> = (0..256)
+                    .map(|i| (i as f32 * std::f32::consts::TAU / 256.).sin())
+                    .collect();
+                let cos_table: Vec<f32> = (0..256)
+                    .map(|i| (i as f32 * std::f32::consts::TAU / 256.).cos())
+                    .collect();
+                let subs_x = cols / per;
+                // Decoding threads for the block loop below: one per core unless pinned.
+                // Each block is independent, so this is pure throughput; the builder still
+                // sees the blocks in exactly the order the sequential loop produced them.
+                let threads = std::env::var("PW_TERRAIN_THREADS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|n| (1..=64).contains(n))
+                    .unwrap_or_else(|| {
+                        std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(1)
+                    });
+                // A warm start already owns the grid, so the block loop is skipped entirely.
+                if terrain_pages.is_some() {
+                    for name in &names {
+                        if name.contains('/') || name.contains('\\') || name.contains("..") {
+                            return Err("unsafe subterrain path".into());
+                        }
+                    }
+                    // Overlap disk reads of upcoming .t2bk tiles with CPU block decoding
+                    // and cache writes via a bounded 2-tile prefetch channel.
+                    let (tile_tx, tile_rx) =
+                        std::sync::mpsc::sync_channel::<Result<(usize, Vec<u8>), String>>(2);
+                    let dir_prefetch = dir.clone();
+                    let names_prefetch = names.clone();
+                    let prefetch_handle = std::thread::spawn(move || {
+                        for (si, name) in names_prefetch.iter().enumerate() {
+                            let res = fs::read(dir_prefetch.join(format!("{name}.t2bk")))
+                                .map(|data| (si, data))
+                                .map_err(|e| format!("{name}: {e}"));
+                            if tile_tx.send(res).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    let paged_cache = terrain_pages
+                        .as_ref()
+                        .is_some_and(terrain_store::Builder::is_paged);
+                    for (si, name) in names.iter().enumerate() {
+                        let (recv_si, data) = tile_rx
+                            .recv()
+                            .map_err(|_| format!("{name}: terrain prefetch thread exited"))??;
+                        debug_assert_eq!(recv_si, si);
+                        if u32at(&data, 0)? != 0x54424b42 {
+                            return Err(format!("{name}: invalid T2BK"));
+                        };
+                        let v = u32at(&data, 4)?;
+                        if !(2..=6).contains(&v) {
+                            return Err(format!("{name}: unsupported version {v}"));
+                        }
+                        let n = u32at(&data, 8)? as usize;
+                        if n < per * per {
+                            return Err(format!("{name}: missing blocks"));
+                        };
+                        let flags = if v < 5 {
+                            if data[12] != 0 {
+                                0x15
+                            } else {
+                                0
+                            }
+                        } else {
+                            data[12]
+                        };
+                        // Validate the whole offset table and section layout before reading any
+                        // heights: this is what catches a flags bit the reader does not implement,
+                        // and it is what found the missing per-vertex colour section.
+                        let block_layout = terrain_block::layout(&data, grid)
+                            .map_err(|e| format!("{name}: {e}"))?;
+                        let tile = TileDecode {
+                            data: &data,
+                            name,
+                            version: v,
+                            flags,
+                            layout: &block_layout,
+                            grid,
+                            sin_table: &sin_table,
+                            cos_table: &cos_table,
+                            blocks: per * per,
+                        };
+                        if paged_cache {
+                            decode_blocks_paged(&tile, threads, |bi, encoded| {
+                                let br = (si / subs_x) * per + bi / per;
+                                let bc = (si % subs_x) * per + bi % per;
+                                terrain_pages
+                                    .as_mut()
+                                    .expect("terrain builder present while parsing blocks")
+                                    .write_encoded_block(bc, br, encoded)
+                            })?;
+                        } else {
+                            decode_blocks(&tile, threads, |bi, heights, normals| {
+                                let br = (si / subs_x) * per + bi / per;
+                                let bc = (si % subs_x) * per + bi % per;
+                                terrain_pages
+                                    .as_mut()
+                                    .expect("terrain builder present while parsing blocks")
+                                    .block(bc, br, heights, normals)
+                            })?;
+                        }
+                        eprintln!("Loaded terrain tile {}/{}: {}", si + 1, count, name);
+                        #[cfg(windows)]
+                        windows_setup::loading_progress(format!(
+                            "Loading terrain tiles {}/{}",
+                            si + 1,
+                            count
+                        ));
+                    }
+                    let _ = prefetch_handle.join();
                 }
-            } else {
-                data[12]
-            };
-            // Validate the whole offset table and section layout before reading any
-            // heights: this is what catches a flags bit the reader does not implement,
-            // and it is what found the missing per-vertex colour section.
-            let block_layout =
-                terrain_block::layout(&data, grid).map_err(|e| format!("{name}: {e}"))?;
-            let tile = TileDecode {
-                data: &data,
-                name,
-                version: v,
-                flags,
-                layout: &block_layout,
-                grid,
-                sin_table: &sin_table,
-                cos_table: &cos_table,
-                blocks: per * per,
-            };
-            decode_blocks(&tile, threads, |bi, heights, normals| {
-                let br = (si / subs_x) * per + bi / per;
-                let bc = (si % subs_x) * per + bi % per;
-                terrain_pages
-                    .as_mut()
-                    .expect("terrain builder present while parsing blocks")
-                    .block(bc, br, heights, normals)
-            })?;
-            eprintln!("Loaded terrain tile {}/{}: {}", si + 1, count, name);
-            #[cfg(windows)]
-            windows_setup::loading_progress(format!("Loading terrain tiles {}/{}", si + 1, count));
-        }
-        let _ = prefetch_handle.join();
-    }
+                match (cached, terrain_pages) {
+                    (Some(grid), _) => Ok(grid),
+                    (None, Some(pages)) => pages.finish(terrain_store::budget()),
+                    (None, None) => Err("terrain cache was not built".into()),
+                }
+            })();
+
+        let scene_res = scene_task.join().unwrap();
+        let cloud_res = cloud_task.join().unwrap();
+        let materials_res = materials_task.join().unwrap();
+        let water_normals_res = water_normals_task.join().unwrap();
+        let water_simple_res = water_simple_task.join().unwrap();
+        let scene_lights = scene_lights_task.join().unwrap();
+        Ok((
+            terrain_res?,
+            scene_res?,
+            cloud_res?,
+            materials_res?,
+            water_normals_res?,
+            water_simple_res?,
+            scene_lights,
+        ))
+    })?;
     #[cfg(windows)]
     windows_setup::loading_progress("Loading world scenery and water...".into());
-    let (heights, normals) = match (cached, terrain_pages) {
-        (Some(grid), _) => grid,
-        (None, Some(pages)) => pages.finish(terrain_store::budget())?,
-        (None, None) => return Err("terrain cache was not built".into()),
-    };
-    let scene_path = world_catalog::data_file(&dir, "ecwld");
-    let world_scene = scene::Scene::load(&scene_path)?;
-    let cloud_path = world_catalog::data_file(&dir, "cld");
-    let cloud_surface = match fs::read(&cloud_path) {
-        Ok(bytes) => {
-            let cloud = cloud_surface::parse(&bytes)
-                .map_err(|e| format!("{}: {e}", cloud_path.display()))?;
-            let (cell_count, vertex_count, group_count, index_count) =
-                cloud.cells.iter().flatten().fold(
-                    (0usize, 0usize, 0usize, 0usize),
-                    |(cells, vertices, groups, indices), cell| {
-                        (
-                            cells + usize::from(!cell.vertices.is_empty()),
-                            vertices + cell.vertices.len(),
-                            groups + cell.groups.len(),
-                            indices + cell.groups.iter().map(|g| g.indices.len()).sum::<usize>(),
-                        )
-                    },
-                );
-            eprintln!("Loaded native MOXB cloud grid {}x{}: {cell_count} populated cells, {vertex_count} vertices, {group_count} groups, {index_count} indices", cloud.width, cloud.height);
-            Some(std::sync::Arc::new(cloud))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "{} unavailable; native cloud surface omitted",
-                cloud_path.display()
-            );
-            None
-        }
-        Err(e) => return Err(format!("{}: {e}", cloud_path.display())),
-    };
-    if (world_scene.width - w as f32 * grid_spacing).abs() > 0.1
-        || (world_scene.length - h as f32 * grid_spacing).abs() > 0.1
-    {
-        return Err("ECWLD and TRN2 world dimensions differ".into());
-    }
-    let ornaments = world_scene.load_ornaments(&world_catalog::ecbsd_path(&dir))?;
     eprintln!(
         "Loaded {} unique world ornament placements; nearby BMD meshes will stream during flight",
         ornaments.len()
@@ -843,9 +1052,6 @@ fn terrain(
     let count_trees: usize = world_scene.blocks.iter().map(|b| b.trees.len()).sum();
     let count_models: usize = world_scene.blocks.iter().map(|b| b.models.len()).sum();
     eprintln!("Loaded scene placements: {count_trees} trees, {count_models} EC models");
-    eprintln!("Loading world terrain textures and masks...");
-    #[cfg(windows)]
-    windows_setup::loading_progress("Loading terrain materials and masks...".into());
     // Shared PCK archives stay rooted at the owning `element` folder, while
     // terrain, scene and object data come from the selected map directory.
     let placements: Vec<_> = world_scene
@@ -873,49 +1079,36 @@ fn terrain(
             PathBuf::from("tree-cache")
         }
     };
-    // All seven loaders are independent; run them in one parallel scope in both
-    // paged and all-to-VRAM modes so models, grass and trees overlap with
-    // materials and objects instead of waiting behind a two-wave barrier.
-    let (water, materials, (water_normals, water_simple_frames), objects, models, grass, trees) =
-        std::thread::scope(|s| {
-            let water_task = s.spawn(|| water::load(&world_scene, &dir).map_err(|e| e.to_string()));
-            let materials_task = s.spawn(|| {
-                material::Materials::load(&dir, &t, &names, w, h, grid_spacing)
-                    .map_err(|e| e.to_string())
-            });
-            let water_normals_task =
-                s.spawn(|| water::load_normals(element).map_err(|e| e.to_string()));
-            let water_simple_task =
-                s.spawn(|| water::load_simple_frames(element).map_err(|e| e.to_string()));
-            let objects_task =
-                s.spawn(|| objects::Objects::open(element, ornaments).map_err(|e| e.to_string()));
-            let models_task =
-                s.spawn(
-                    || match world_models::Assets::open(element, placements.clone()) {
-                        Ok(models) => models,
-                        Err(e) => world_models::Assets::load_with(placements, |_| Err(e.clone())),
-                    },
-                );
-            let grass_task = s.spawn(|| {
-                grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string())
-            });
-            let trees_task = s.spawn(|| {
-                trees::Trees::open(element, &world_scene, &tree_cache).map_err(|e| e.to_string())
-            });
+    // Wave 2: all remaining scene-dependent loaders (water, scenery objects,
+    // animated world models, grass, trees, and regional environments) run
+    // concurrently in one parallel scope.
+    let (water, objects, models, grass, trees, environments) = std::thread::scope(|s| {
+        let water_task = s.spawn(|| water::load(&world_scene, &dir).map_err(|e| e.to_string()));
+        let objects_task =
+            s.spawn(|| objects::Objects::open(element, ornaments).map_err(|e| e.to_string()));
+        let models_task =
+            s.spawn(
+                || match world_models::Assets::open(element, placements.clone()) {
+                    Ok(models) => models,
+                    Err(e) => world_models::Assets::load_with(placements, |_| Err(e.clone())),
+                },
+            );
+        let grass_task =
+            s.spawn(|| grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string()));
+        let trees_task = s.spawn(|| {
+            trees::Trees::open(element, &world_scene, &tree_cache).map_err(|e| e.to_string())
+        });
+        let environments_task = s.spawn(|| environment::Environments::load(&world_scene, &dir));
 
-            Ok::<_, String>((
-                water_task.join().unwrap()?,
-                materials_task.join().unwrap()?,
-                (
-                    water_normals_task.join().unwrap()?,
-                    water_simple_task.join().unwrap()?,
-                ),
-                objects_task.join().unwrap()?,
-                models_task.join().unwrap(),
-                grass_task.join().unwrap()?,
-                trees_task.join().unwrap()?,
-            ))
-        })?;
+        Ok::<_, String>((
+            water_task.join().unwrap()?,
+            objects_task.join().unwrap()?,
+            models_task.join().unwrap(),
+            grass_task.join().unwrap()?,
+            trees_task.join().unwrap()?,
+            environments_task.join().unwrap()?,
+        ))
+    })?;
     eprintln!(
         "Loaded {} water areas from client BSData grids",
         water.len()
@@ -934,26 +1127,6 @@ fn terrain(
     {
         return Err(format!("Some prepared tree types could not be loaded. Close Perfect World Explorer, remove this cache folder, and try again:\n{}",tree_cache.display()));
     }
-    let environments = environment::Environments::load(&world_scene, &dir)?;
-    // Ordinary world-model receivers query these actual client records.
-    // Do not also add them to static baked BMDs or terrain: those surfaces
-    // use their separately traced baked-light paths.
-    let scene_lights = match scene_lights::SceneLights::load(&world_catalog::named_file(
-        &dir,
-        "scenelights.dat",
-    )) {
-        Ok(lights) => {
-            eprintln!(
-                "Loaded {} client scene lights (static query only)",
-                lights.lights.len()
-            );
-            lights
-        }
-        Err(e) => {
-            eprintln!("Scene lights unavailable: {e}");
-            scene_lights::SceneLights::default()
-        }
-    };
     Ok(Terrain {
         models,
         environments,

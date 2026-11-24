@@ -127,10 +127,76 @@ struct DirCacheKey {
     header_hash: [u8; 32],
 }
 
+struct CachedDir {
+    entries: std::sync::Arc<[Entry]>,
+    normalized_index: std::sync::OnceLock<std::sync::Arc<std::collections::HashMap<String, usize>>>,
+}
+
+fn normalize_pck_key(name: &str) -> String {
+    if name.is_ascii() {
+        let mut out = String::with_capacity(name.len());
+        for b in name.bytes() {
+            out.push(if b == b'\\' {
+                '/'
+            } else {
+                (b as char).to_ascii_lowercase()
+            });
+        }
+        return out;
+    }
+    let mut out = name.to_lowercase();
+    if out.contains('\\') {
+        // SAFETY: replacing single-byte ASCII '\\' with ASCII '/' preserves UTF-8 validity.
+        unsafe {
+            for b in out.as_bytes_mut() {
+                if *b == b'\\' {
+                    *b = b'/';
+                }
+            }
+        }
+    }
+    out
+}
+
+fn build_normalized_index(entries: &[Entry]) -> std::collections::HashMap<String, usize> {
+    let mut index = std::collections::HashMap::with_capacity(entries.len());
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(32);
+    if workers > 1 && entries.len() >= 2048 {
+        let chunk_size = entries.len().div_ceil(workers);
+        let chunks: Vec<Vec<(String, usize)>> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(workers);
+            for (ci, chunk) in entries.chunks(chunk_size).enumerate() {
+                let base = ci * chunk_size;
+                handles.push(s.spawn(move || {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for (offset, entry) in chunk.iter().enumerate() {
+                        out.push((normalize_pck_key(&entry.name), base + offset));
+                    }
+                    out
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for chunk in chunks {
+            for (key, idx) in chunk {
+                index.insert(key, idx);
+            }
+        }
+    } else {
+        for (idx, entry) in entries.iter().enumerate() {
+            index.insert(normalize_pck_key(&entry.name), idx);
+        }
+    }
+    index
+}
+
 fn dir_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<DirCacheKey, std::sync::Arc<Vec<Entry>>>> {
+) -> &'static std::sync::Mutex<std::collections::HashMap<DirCacheKey, std::sync::Arc<CachedDir>>> {
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<DirCacheKey, std::sync::Arc<Vec<Entry>>>>,
+        std::sync::Mutex<std::collections::HashMap<DirCacheKey, std::sync::Arc<CachedDir>>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -187,7 +253,7 @@ fn decode_entry_record(
     })
 }
 
-pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
+fn directory_cached(f: &mut File) -> Result<std::sync::Arc<CachedDir>, String> {
     let meta = f.metadata().map_err(|e| e.to_string())?;
     let size = meta.len();
     if size < 292 {
@@ -247,7 +313,7 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     if let Some(ref key) = cache_key {
         if let Ok(guard) = dir_cache().lock() {
             if let Some(cached) = guard.get(key) {
-                return Ok((**cached).clone());
+                return Ok(std::sync::Arc::clone(cached));
             }
         }
     }
@@ -322,8 +388,10 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
         }
         out
     };
-    let mut result = result;
-    result.shrink_to_fit();
+    let cached = std::sync::Arc::new(CachedDir {
+        entries: std::sync::Arc::from(result),
+        normalized_index: std::sync::OnceLock::new(),
+    });
     if let Some(key) = cache_key {
         if let Ok(mut guard) = dir_cache().lock() {
             // Cap cache to 32 distinct archives so tests creating temporary PCKs
@@ -331,10 +399,40 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
             if guard.len() >= 32 {
                 guard.clear();
             }
-            guard.insert(key, std::sync::Arc::new(result.clone()));
+            guard.insert(key, std::sync::Arc::clone(&cached));
         }
     }
-    Ok(result)
+    Ok(cached)
+}
+
+/// Shared zero-clone PCK directory view backed by the process-wide archive cache.
+pub fn directory_arc(f: &mut File) -> Result<std::sync::Arc<[Entry]>, String> {
+    Ok(std::sync::Arc::clone(&directory_cached(f)?.entries))
+}
+
+/// Shared zero-clone PCK directory and lazily-built normalized (lowercase, `/`
+/// separator) key-to-index table. Parallelizes key normalization across cores
+/// once per archive and reuses the `Arc` across all subsystems.
+pub fn normalized_index_arc(
+    f: &mut File,
+) -> Result<
+    (
+        std::sync::Arc<[Entry]>,
+        std::sync::Arc<std::collections::HashMap<String, usize>>,
+    ),
+    String,
+> {
+    let cached = directory_cached(f)?;
+    let index = std::sync::Arc::clone(
+        cached
+            .normalized_index
+            .get_or_init(|| std::sync::Arc::new(build_normalized_index(&cached.entries))),
+    );
+    Ok((std::sync::Arc::clone(&cached.entries), index))
+}
+
+pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
+    Ok(directory_arc(f)?.to_vec())
 }
 
 pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {

@@ -76,11 +76,11 @@ impl Assets {
         }
         let mut file =
             File::open(element.join("models.pck")).map_err(|e| format!("models.pck: {e}"))?;
-        let dir = crate::pck::directory(&mut file)?;
-        let mut entries = HashMap::with_capacity(dir.len());
-        for entry in dir {
+        let dir = crate::pck::directory_arc(&mut file)?;
+        let mut entries: HashMap<String, usize> = HashMap::with_capacity(dir.len());
+        for (idx, entry) in dir.iter().enumerate() {
             let name = ecmodel::normalize(&entry.name);
-            if entries.insert(name.clone(), entry).is_some() {
+            if entries.insert(name.clone(), idx).is_some() {
                 return Err(format!("duplicate normalized models.pck entry: {name}"));
             }
         }
@@ -105,6 +105,7 @@ impl Assets {
         let loaded: Vec<Result<ModelAsset, String>> = if workers > 1 && unique_paths.len() >= 2 {
             let chunk_size = unique_paths.len().div_ceil(workers);
             let file_ref = &file;
+            let dir_ref = &dir;
             let entries_ref = &entries;
             std::thread::scope(|s| {
                 let handles: Vec<_> = unique_paths
@@ -113,10 +114,10 @@ impl Assets {
                         s.spawn(move || {
                             let mut tracks = crate::model_asset::TrackCache::default();
                             let mut read = |path: &str| -> Result<Vec<u8>, String> {
-                                let entry = entries_ref
+                                let &idx = entries_ref
                                     .get(path)
                                     .ok_or_else(|| format!("missing models.pck entry: {path}"))?;
-                                crate::pck::read_entry_at(file_ref, entry)
+                                crate::pck::read_entry_at(file_ref, &dir_ref[idx])
                                     .map_err(|e| e.to_string())
                             };
                             chunk
@@ -134,10 +135,10 @@ impl Assets {
         } else {
             let mut tracks = crate::model_asset::TrackCache::default();
             let mut read = |path: &str| -> Result<Vec<u8>, String> {
-                let entry = entries
+                let &idx = entries
                     .get(path)
                     .ok_or_else(|| format!("missing models.pck entry: {path}"))?;
-                crate::pck::read_entry_at(&file, entry).map_err(|e| e.to_string())
+                crate::pck::read_entry_at(&file, &dir[idx]).map_err(|e| e.to_string())
             };
             unique_paths
                 .iter()

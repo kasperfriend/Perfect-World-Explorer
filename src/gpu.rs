@@ -1784,6 +1784,7 @@ struct Renderer {
     world_pages: Vec<crate::world_objects::GpuPage>,
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
     world_draw_cmds: [crate::world_objects::WorldDrawList; crate::world_objects::WORLD_VIEWS],
+    world_draw_scratch: std::cell::RefCell<crate::world_objects::WorldDrawScratch>,
     world_done: bool,
     /// The scenery half of the drawn mesh was left out because the whole-world
     /// preload owns it. Unlike `world_done` this describes the *mesh*, so the
@@ -2641,6 +2642,9 @@ impl Renderer {
             world_draw_cmds: std::array::from_fn(|_| {
                 crate::world_objects::WorldDrawList::default()
             }),
+            world_draw_scratch: std::cell::RefCell::new(
+                crate::world_objects::WorldDrawScratch::default(),
+            ),
             world_done: false,
             local_scenery_skipped: m.local_scenery_skipped,
             layout,
@@ -3251,7 +3255,7 @@ impl Renderer {
         view_runs: ViewRuns,
         terrain_depth_source: Option<&wgpu::Texture>,
         clear_color: Option<wgpu::Color>,
-        frustum: &[[f32; 4]; 6],
+        cull: &crate::world_objects::CullParams,
         // The water's extra views are read only by the water surface, inside
         // `water_view_scissor`'s rectangle. `None` draws the whole attachment.
         scissor: Option<[u32; 4]>,
@@ -3361,7 +3365,7 @@ impl Renderer {
         }
         if !self.world_done {
             for page in &self.local_pages {
-                page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, false);
+                page.draw_selected_culled(&mut p, reflected, pass_kind, cull, false);
             }
         }
         // Do not submit world pages on top of the same locally streamed
@@ -3369,27 +3373,27 @@ impl Renderer {
         // caused depth flicker. Switch atomically only after all pages arrive.
         let world_slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
         if self.world_done {
-            // The view's commands were folded once when the world finished
-            // loading: its placements are frozen, so nothing here is per-frame
-            // work beyond the page binds and the draws themselves.
+            let mut scratch = self.world_draw_scratch.borrow_mut();
             crate::world_objects::GpuPage::draw_world_culled(
                 &self.world_pages,
                 &self.world_draw_cmds[world_slot],
                 &mut p,
                 reflected,
-                frustum,
+                cull,
                 false,
+                &mut scratch,
             );
         }
         // The `.sdr.` water/lava curtains draw in their own blended pass over
         // the finished scene: skip the entire pipeline bind & traversal when
-        // neither local geometry nor any world/local page carries SDR sheets.
+        // neither local geometry nor any visible world/local chunk carries SDR.
         let has_sdr = local_end > self.terrain_end
             || if self.world_done {
-                self.world_draw_cmds[world_slot]
-                    .chunks
-                    .iter()
-                    .any(|c| c.has_sdr)
+                self.world_draw_cmds[world_slot].chunks.iter().any(|c| {
+                    c.has_sdr
+                        && crate::world_objects::aabb_survives_clip(cull.clip_plane, c.min, c.max)
+                        && crate::world_objects::aabb_in_frustum(&cull.frustum, c.min, c.max)
+                })
             } else {
                 !self.local_pages.is_empty()
             };
@@ -3403,17 +3407,19 @@ impl Renderer {
             }
             if !self.world_done {
                 for page in &self.local_pages {
-                    page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, true);
+                    page.draw_selected_culled(&mut p, reflected, pass_kind, cull, true);
                 }
             }
             if self.world_done {
+                let mut scratch = self.world_draw_scratch.borrow_mut();
                 crate::world_objects::GpuPage::draw_world_culled(
                     &self.world_pages,
                     &self.world_draw_cmds[world_slot],
                     &mut p,
                     reflected,
-                    frustum,
+                    cull,
                     true,
+                    &mut scratch,
                 );
             }
         }
@@ -3716,6 +3722,7 @@ impl Renderer {
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
         let frustum = crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array());
+        let map_cull = crate::world_objects::CullParams::frustum_only(frustum);
         let mut e = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3737,7 +3744,7 @@ impl Renderer {
             view_runs,
             None,
             None,
-            &frustum,
+            &map_cull,
             // The map image is read as a whole, so there is nothing to scissor.
             None,
         );
@@ -4000,6 +4007,14 @@ impl Renderer {
         // refraction passes all read the same matrix, and this used to be
         // extracted from it three times per frame.
         let frustum = crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array());
+        let proj_scale = 0.5 * h.max(1) as f32 / (CAMERA_FOV_Y_RADIANS * 0.5).tan();
+        let main_cull = crate::world_objects::CullParams {
+            frustum,
+            eye: camera.pos.to_array(),
+            proj_scale,
+            min_screen_px: 1.5,
+            clip_plane: None,
+        };
         // The main depth is copied into the water's `terrain_depth` for the edge
         // reconstruction, which only the water surface reads (and only when it is
         // above the plane). No water plane on screen, no reader.
@@ -4023,7 +4038,7 @@ impl Renderer {
                 None
             },
             None,
-            &frustum,
+            &main_cull,
             None,
         );
         let model_target = self.water.scene_raw();
@@ -4343,6 +4358,13 @@ impl Renderer {
                     }
                 };
                 let fog = camera.underwater_fog.color;
+                let uw_refr_cull = crate::world_objects::CullParams {
+                    frustum,
+                    eye: camera.pos.to_array(),
+                    proj_scale,
+                    min_screen_px: 4.0,
+                    clip_plane: Some((plane, -1.0)),
+                };
                 let mut re = self.device.create_command_encoder(&Default::default());
                 self.draw_opaque(
                     &mut re,
@@ -4363,7 +4385,7 @@ impl Renderer {
                         b: linear(fog[2]),
                         a: 1.,
                     }),
-                    &frustum,
+                    &uw_refr_cull,
                     refraction_scissor,
                 );
                 let model_view = self.water.refraction_raw();
@@ -4403,6 +4425,13 @@ impl Renderer {
                 above.fog_color = above_fog.color4();
                 self.queue
                     .write_buffer(&self.reflected_uniform, 0, bytemuck::bytes_of(&above));
+                let above_refr_cull = crate::world_objects::CullParams {
+                    frustum,
+                    eye: camera.pos.to_array(),
+                    proj_scale,
+                    min_screen_px: 4.0,
+                    clip_plane: Some((plane, 1.0)),
+                };
                 let mut re = self.device.create_command_encoder(&Default::default());
                 self.draw_opaque(
                     &mut re,
@@ -4417,7 +4446,7 @@ impl Renderer {
                     ViewRuns::Main,
                     None,
                     None,
-                    &frustum,
+                    &above_refr_cull,
                     refraction_scissor,
                 );
                 if let Some(cloud) = &self.cloud {
@@ -4535,6 +4564,13 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.reflected_uniform, 0, bytemuck::bytes_of(&reflected));
             self.queue_reflected_runs(matrix * flip);
+            let refl_cull = crate::world_objects::CullParams {
+                frustum: reflected_frustum,
+                eye: [camera.pos.x, 2.0 * plane - camera.pos.y, camera.pos.z],
+                proj_scale,
+                min_screen_px: 4.0,
+                clip_plane: Some((plane, reflected.clip[1])),
+            };
             let mut e = self.device.create_command_encoder(&Default::default());
             self.draw_opaque(
                 &mut e,
@@ -4550,7 +4586,7 @@ impl Renderer {
                 ViewRuns::Reflected,
                 None,
                 None,
-                &reflected_frustum,
+                &refl_cull,
                 // The mirror is read at `screen ± 0.25` by the same surface, so
                 // the same rectangle applies through the mirrored matrix.
                 water_view_scissor(matrix * flip, w, h, batch.bounds, plane, water_margin),
@@ -6784,7 +6820,7 @@ pub fn run(
                          // Each in-flight whole-world Page carries up to ~85 MiB of 4096^2 RGBA + mips;
                          // keeping 4/2 pages buffered saturates GPU upload while cutting peak RAM spikes by ~500-680 MiB.
                          let (tx, rx) = std::sync::mpsc::sync_channel(
-                             if crate::objects::unbounded_textures() { 4 } else { 2 },
+                             if crate::objects::unbounded_textures() { 8 } else { 4 },
                          );
                          let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
@@ -6893,6 +6929,10 @@ pub fn run(
                             }
                             Err(_) => break,
                         }
+                    }
+                    if uploaded_this_frame > 0 {
+                        renderer.queue.submit(std::iter::empty());
+                        renderer.device.poll(wgpu::Maintain::Poll);
                     }
                 }
                     camera.far = if world_enabled {settings.far.max(32000.)} else {settings.far};
@@ -8387,7 +8427,7 @@ pub fn preview(
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(device, queue, fmt, width, height, mesh, &mut t, false)?;
     if std::env::var_os("PW_PREVIEW_WORLD_TEST").is_some() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
         let root = t.element.clone();
         let ornaments = t.objects.ornaments.clone();
         std::thread::spawn(move || {

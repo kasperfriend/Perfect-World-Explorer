@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -340,8 +340,34 @@ fn decode(bytes: &[u8], side: usize) -> Page {
     }
     Page { heights, normals }
 }
+/// Pre-compressed and hashed terrain cache block produced on worker threads
+/// so the sequential writer never blocks on single-threaded zlib/SHA-256.
+pub struct EncodedBlock {
+    packed: Vec<u8>,
+    hash: [u8; 32],
+}
+
+/// Pure per-block XOR plane encoding + SHA-256 + fast zlib compression.
+/// Safe to invoke across worker threads before ordered sequential writes.
+pub fn encode_block(
+    heights: &[f32],
+    normals: &[[i8; 3]],
+    side: usize,
+) -> Result<EncodedBlock, String> {
+    if heights.len() != side * side || normals.len() != heights.len() {
+        return Err("invalid terrain cache block".into());
+    }
+    let raw = encode(heights, normals, side);
+    let hash = Sha256::digest(&raw).into();
+    let mut encoder = ZlibEncoder::new(Vec::with_capacity(raw.len() / 2), Compression::fast());
+    encoder.write_all(&raw).map_err(|e| e.to_string())?;
+    let packed = encoder.finish().map_err(|e| e.to_string())?;
+    Ok(EncodedBlock { packed, hash })
+}
+
 pub struct Builder {
-    file: Option<File>,
+    file: Option<BufWriter<File>>,
+    written: u64,
     path: PathBuf,
     root: PathBuf,
     width: usize,
@@ -387,7 +413,7 @@ impl Builder {
                 .as_nanos(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
@@ -398,11 +424,13 @@ impl Builder {
         header[8..16].copy_from_slice(&(width as u64).to_le_bytes());
         header[16..24].copy_from_slice(&(height as u64).to_le_bytes());
         header[24..32].copy_from_slice(&(side as u64).to_le_bytes());
+        let mut file = BufWriter::with_capacity(1024 * 1024, file);
         file.write_all(&header).map_err(|e| e.to_string())?;
         let mut hash = Sha256::new();
         hash.update(&header);
         Ok(Self {
             file: Some(file),
+            written: header.len() as u64,
             path,
             root: root.to_path_buf(),
             width,
@@ -425,6 +453,7 @@ impl Builder {
         let pages = (width / side) * (height / side);
         Ok(Self {
             file: None,
+            written: 0,
             path: PathBuf::new(),
             root: PathBuf::new(),
             width,
@@ -486,27 +515,43 @@ impl Builder {
             }
             return Ok(());
         }
+        let encoded = encode_block(heights, normals, self.side)?;
+        self.write_encoded_block(bx, by, encoded)
+    }
+    /// True when this builder writes compressed blocks to the paged disk cache.
+    pub fn is_paged(&self) -> bool {
+        self.resident.is_none()
+    }
+    /// Write a block already XOR-encoded, hashed, and zlib-compressed on a
+    /// worker thread, using buffered I/O and a tracked file offset.
+    pub fn write_encoded_block(
+        &mut self,
+        bx: usize,
+        by: usize,
+        encoded: EncodedBlock,
+    ) -> Result<(), String> {
+        if bx >= self.width / self.side || by >= self.height / self.side {
+            return Err("invalid terrain cache block".into());
+        }
+        let id = by * (self.width / self.side) + bx;
         if self.records[id].is_some() {
             return Err("duplicate terrain cache block".into());
         }
-        let raw = encode(heights, normals, self.side);
-        let hash = Sha256::digest(&raw).into();
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&raw).map_err(|e| e.to_string())?;
-        let packed = encoder.finish().map_err(|e| e.to_string())?;
-        let file = self.file.as_mut().unwrap();
-        let mut header = (id as u64).to_le_bytes().to_vec();
-        header.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+        let file = self.file.as_mut().ok_or("terrain cache file closed")?;
+        let mut header = [0u8; 16];
+        header[..8].copy_from_slice(&(id as u64).to_le_bytes());
+        header[8..16].copy_from_slice(&(encoded.packed.len() as u64).to_le_bytes());
         file.write_all(&header)
-            .and_then(|_| file.write_all(&packed))
+            .and_then(|_| file.write_all(&encoded.packed))
             .map_err(|e| format!("terrain cache write: {e}"))?;
         self.hash.update(&header);
-        self.hash.update(&packed);
-        let offset = file.stream_position().map_err(|e| e.to_string())? - packed.len() as u64;
+        self.hash.update(&encoded.packed);
+        let offset = self.written + header.len() as u64;
+        self.written = offset + encoded.packed.len() as u64;
         self.records[id] = Some(Record {
             offset,
-            size: packed.len(),
-            hash,
+            size: encoded.packed.len(),
+            hash: encoded.hash,
         });
         Ok(())
     }
@@ -535,7 +580,11 @@ impl Builder {
             self.abandon();
             return Err("incomplete terrain page cache".into());
         }
-        let file = self.file.take().unwrap();
+        let mut writer = self.file.take().unwrap();
+        writer.flush().map_err(|e| e.to_string())?;
+        let file = writer
+            .into_inner()
+            .map_err(|e| e.into_error().to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
         let digest = self.hash.clone().finalize();

@@ -478,10 +478,7 @@ impl Grass {
         eprintln!("Grass placement residency: {:.2} MiB compressed bitmaps; {} live cells; avoided {:.2} MiB of eager IDs/transforms", packed as f64 / 1048576., active,
             active as f64 * (4 + std::mem::size_of::<random::Placement>()) as f64 / 1048576.);
         let mut archive = File::open(element.join("grasses.pck")).map_err(|e| e.to_string())?;
-        let entries: HashMap<_, _> = pck::directory(&mut archive)?
-            .into_iter()
-            .map(|e| (e.name.to_lowercase(), e))
-            .collect();
+        let (dir_entries, entry_index) = pck::normalized_index_arc(&mut archive)?;
         let mut models = Vec::with_capacity(scene.grass_types.len());
         let mut textures = HashMap::new();
         let mut texture_mips = HashMap::new();
@@ -497,7 +494,8 @@ impl Grass {
                     .grass_types
                     .chunks(chunk_size)
                     .map(|chunk| {
-                        let entries = &entries;
+                        let dir_entries = &dir_entries;
+                        let entry_index = &entry_index;
                         let archive = &archive;
                         s.spawn(move || {
                             chunk.iter().map(|t| {
@@ -509,8 +507,9 @@ impl Grass {
                                 let mut name = t.path.to_lowercase();
                                 let mut skip = false;
                                 if name.ends_with(".mod") {
-                                    match entries
+                                    match entry_index
                                         .get(&name)
+                                        .map(|&i| &dir_entries[i])
                                         .ok_or_else(|| "missing MOXTMODEL".to_string())
                                            .and_then(|e| {
                                                pck::read_entry_at(archive, e)
@@ -533,7 +532,7 @@ impl Grass {
                                 if skip {
                                     None
                                 } else {
-                                    match entries.get(&name) {
+                                    match entry_index.get(&name).map(|&i| &dir_entries[i]) {
                                         Some(e) => match pck::read_entry_at(archive, e)
                                             .map_err(|e| e.to_string())
                                             .and_then(|bytes| parse_model(&bytes, &name))
@@ -568,10 +567,11 @@ impl Grass {
                 if !textures.contains_key(&mesh.texture) && seen_tex.insert(mesh.texture.as_str()) {
                     let alt = mesh.texture.replace("/textures/", "/");
                     let spaced = mesh.texture.replace(' ', "_");
-                    let entry = entries
+                    let entry = entry_index
                         .get(&mesh.texture)
-                        .or_else(|| entries.get(&alt))
-                        .or_else(|| entries.get(&spaced));
+                        .or_else(|| entry_index.get(&alt))
+                        .or_else(|| entry_index.get(&spaced))
+                        .map(|&i| &dir_entries[i]);
                     unique_tex.push((mesh.texture.clone(), entry));
                 }
             }

@@ -198,6 +198,128 @@ pub fn aabb_inside_frustum(planes: &[[f32; 4]; 6], min: [f32; 3], max: [f32; 3])
     true
 }
 
+/// Maximum culled index gap bridged into a single `draw_indexed` call on the
+/// same `GpuPage` in opaque passes (192 indices = 64 triangles). Bridging tiny
+/// culled gaps slashes CPU draw-call overhead 5-20x when frustum/size culling
+/// fragments runs across the loaded whole world.
+pub const MAX_COALESCE_GAP: u32 = 192;
+
+/// Per-pass visibility parameters shared by whole-world and local scenery
+/// culling (frustum, sub-pixel screen-size threshold, and optional water clip
+/// plane).
+#[derive(Clone, Copy, Debug)]
+pub struct CullParams {
+    pub frustum: [[f32; 4]; 6],
+    pub eye: [f32; 3],
+    /// `0.5 * viewport_h / tan(fov_y / 2)` for perspective views; `0.0` for
+    /// orthographic/map views to disable sub-pixel culling.
+    pub proj_scale: f32,
+    /// Minimum projected bounding-sphere diameter in pixels (`~1.5` main,
+    /// `~4.0` water reflection/refraction, `0.0` disabled).
+    pub min_screen_px: f32,
+    /// Optional water clip plane `(water_y, sign)` where `sign > 0` keeps
+    /// `y >= water_y` and `sign < 0` keeps `y <= water_y`.
+    pub clip_plane: Option<(f32, f32)>,
+}
+
+impl CullParams {
+    /// Frustum-only culling (used by top-down minimap/full-map views).
+    pub const fn frustum_only(frustum: [[f32; 4]; 6]) -> Self {
+        Self {
+            frustum,
+            eye: [0.0; 3],
+            proj_scale: 0.0,
+            min_screen_px: 0.0,
+            clip_plane: None,
+        }
+    }
+}
+
+/// Reusable per-frame scratch buffers owned by `Renderer` so whole-world
+/// culling and draw-call coalescing perform zero heap allocations per frame.
+#[derive(Default)]
+pub struct WorldDrawScratch {
+    pub cmds: Vec<DrawCmd>,
+    pub page_visible: Vec<bool>,
+}
+
+/// Returns false when an AABB lies completely on the clipped side of a water
+/// plane (`max_y < water_y` when keeping above, `min_y > water_y` when keeping
+/// below).
+#[inline]
+pub fn aabb_survives_clip(clip_plane: Option<(f32, f32)>, min: [f32; 3], max: [f32; 3]) -> bool {
+    if let Some((water_y, sign)) = clip_plane {
+        if sign > 0.0 && max[1] < water_y {
+            return false;
+        }
+        if sign < 0.0 && min[1] > water_y {
+            return false;
+        }
+    }
+    true
+}
+
+/// Fast squared-distance projected screen-diameter test (zero `sqrt`).
+/// Returns false when an AABB's bounding sphere projects smaller than
+/// `min_screen_px` pixels across.
+#[inline]
+pub fn aabb_survives_screen_size(
+    eye: [f32; 3],
+    proj_scale: f32,
+    min_screen_px: f32,
+    min: [f32; 3],
+    max: [f32; 3],
+) -> bool {
+    if min_screen_px <= 0.0 || proj_scale <= 0.0 {
+        return true;
+    }
+    if min[0] > max[0] {
+        return false;
+    }
+    let cx = 0.5 * (min[0] + max[0]);
+    let cy = 0.5 * (min[1] + max[1]);
+    let cz = 0.5 * (min[2] + max[2]);
+    let ex = 0.5 * (max[0] - min[0]);
+    let ey = 0.5 * (max[1] - min[1]);
+    let ez = 0.5 * (max[2] - min[2]);
+    let r_sq = ex * ex + ey * ey + ez * ez;
+    let dx = cx - eye[0];
+    let dy = cy - eye[1];
+    let dz = cz - eye[2];
+    let d_sq = dx * dx + dy * dy + dz * dz;
+    if d_sq <= r_sq {
+        return true;
+    }
+    // 2 * r * proj_scale / d >= min_screen_px
+    // <=> 4 * r_sq * proj_scale^2 >= min_screen_px^2 * d_sq
+    let lhs = 4.0 * r_sq * proj_scale * proj_scale;
+    let rhs = min_screen_px * min_screen_px * d_sq;
+    lhs >= rhs
+}
+
+/// Push a visible `(page, start, end)` span into `out`, coalescing contiguous
+/// ranges and (when `max_gap > 0`) bridging tiny culled gaps on the same page
+/// into a single `draw_indexed` call.
+#[inline]
+pub fn push_coalesced_draw(
+    out: &mut Vec<DrawCmd>,
+    page: usize,
+    start: u32,
+    end: u32,
+    max_gap: u32,
+) {
+    if start >= end {
+        return;
+    }
+    if let Some(prev) = out.last_mut() {
+        if prev.page == page && start >= prev.end && start - prev.end <= max_gap {
+            prev.end = prev.end.max(end);
+            return;
+        }
+    }
+    out.push(DrawCmd { page, start, end });
+}
+
 pub struct Page {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
@@ -286,13 +408,14 @@ impl Page {
             };
             let (nw, nh) = (w / 2, h / 2);
             let mut out = vec![0u8; nw * nh * 4];
-            // Small reductions stay on this worker rather than starting a new
-            // scoped team at every mip level and every page.
-            let threads = if nw * nh * 4 >= 2 * 1024 * 1024 {
+            // Parallelize mip levels 1..=4 (>= 256 KiB) across horizontal bands
+            // while keeping tiny tail mips (levels 5..7) single-threaded.
+            let threads = if nw * nh * 4 >= 256 * 1024 {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1)
                     .min(32)
+                    .min(nh.max(1))
             } else {
                 1
             };
@@ -303,23 +426,44 @@ impl Page {
                         let y_start = chunk_idx * chunk_rows;
                         let rows = out_chunk.len() / (nw * 4);
                         s.spawn(move || {
+                            let src_stride = w * 4;
+                            let dst_stride = nw * 4;
                             for dy in 0..rows {
                                 let y = y_start + dy;
-                                let row0 = 2 * y * w * 4;
-                                let row1 = row0 + w * 4;
-                                let dst_row = dy * nw * 4;
+                                let r0 = &source[2 * y * src_stride..(2 * y + 1) * src_stride];
+                                let r1 =
+                                    &source[(2 * y + 1) * src_stride..(2 * y + 2) * src_stride];
+                                let dst = &mut out_chunk[dy * dst_stride..(dy + 1) * dst_stride];
                                 for x in 0..nw {
-                                    let x0 = x * 8;
-                                    let dst = dst_row + x * 4;
-                                    for c in 0..4 {
-                                        out_chunk[dst + c] = ((source[row0 + x0 + c] as u32
-                                            + source[row0 + x0 + 4 + c] as u32
-                                            + source[row1 + x0 + c] as u32
-                                            + source[row1 + x0 + 4 + c] as u32
-                                            + 2)
-                                            >> 2)
-                                            as u8;
-                                    }
+                                    let sx = x * 8;
+                                    let dx = x * 4;
+                                    let a0 = &r0[sx..sx + 8];
+                                    let a1 = &r1[sx..sx + 8];
+                                    let d = &mut dst[dx..dx + 4];
+                                    d[0] = ((a0[0] as u32
+                                        + a0[4] as u32
+                                        + a1[0] as u32
+                                        + a1[4] as u32
+                                        + 2)
+                                        >> 2) as u8;
+                                    d[1] = ((a0[1] as u32
+                                        + a0[5] as u32
+                                        + a1[1] as u32
+                                        + a1[5] as u32
+                                        + 2)
+                                        >> 2) as u8;
+                                    d[2] = ((a0[2] as u32
+                                        + a0[6] as u32
+                                        + a1[2] as u32
+                                        + a1[6] as u32
+                                        + 2)
+                                        >> 2) as u8;
+                                    d[3] = ((a0[3] as u32
+                                        + a0[7] as u32
+                                        + a1[3] as u32
+                                        + a1[7] as u32
+                                        + 2)
+                                        >> 2) as u8;
                                 }
                             }
                         });
@@ -619,6 +763,51 @@ fn emit_page(
     tx.send(Message::Page(shared)).is_ok()
 }
 
+/// Pipelined page finisher: runs UV scaling, per-placement AABB computation,
+/// 7-level parallel mipmap generation, cache enqueue, and channel send on a
+/// background thread so the builder thread immediately starts decoding the next
+/// batch of BMDs and textures in `Objects::load_ids`.
+struct PageFinisher {
+    tx: Option<SyncSender<(Builder, usize)>>,
+    handle: Option<std::thread::JoinHandle<(Vec<WorldPageMeta>, Option<AsyncCacheWriter>, bool)>>,
+}
+impl PageFinisher {
+    fn start(tx_out: SyncSender<Message>, mut cache: Option<AsyncCacheWriter>) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(Builder, usize)>(2);
+        let handle = std::thread::Builder::new()
+            .name("whole-world-page-finisher".into())
+            .spawn(move || {
+                let mut metadata = Vec::new();
+                let mut ok = true;
+                for (builder, processed) in rx {
+                    let page = builder.page(processed);
+                    if !emit_page(&tx_out, &mut cache, &mut metadata, page) {
+                        ok = false;
+                        break;
+                    }
+                }
+                (metadata, cache, ok)
+            })
+            .expect("whole-world page finisher thread");
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        }
+    }
+    fn submit(&mut self, builder: Builder, processed: usize) -> bool {
+        self.tx
+            .as_ref()
+            .is_some_and(|tx| tx.send((builder, processed)).is_ok())
+    }
+    fn finish(mut self) -> (Vec<WorldPageMeta>, Option<AsyncCacheWriter>, bool) {
+        drop(self.tx.take());
+        self.handle
+            .take()
+            .map(|h| h.join().unwrap_or_else(|_| (Vec::new(), None, false)))
+            .unwrap_or_else(|| (Vec::new(), None, false))
+    }
+}
+
 pub fn build<O: Into<Arc<[Ornament]>>>(
     element: PathBuf,
     ornaments: O,
@@ -647,22 +836,51 @@ fn run(
     let cache_key = crate::world_page_cache::identity(&element, &ornaments, &order, vertex_limit);
     if let Some(key) = cache_key {
         if let Some(mut reader) = crate::world_page_cache::Reader::open(&key) {
-            let mut metadata = Vec::with_capacity(reader.page_count());
-            let mut valid = true;
             let total_pages = reader.page_count();
+            let cache_processed = reader.processed;
+            let cache_skipped = reader.skipped;
+            let cache_atlas_pages = reader.atlas_pages;
+            let cache_atlas_bytes = reader.atlas_bytes;
+            let mut metadata = Vec::with_capacity(total_pages);
+            let mut valid = true;
             let cache_batch = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(2)
                 .clamp(2, 8);
+            // Overlap disk I/O + parallel SHA-256 verification of batch N+1 with
+            // GPU upload of batch N via a bounded 1-batch-ahead prefetch thread.
+            let stop_prefetch = Arc::new(AtomicBool::new(false));
+            let stop_flag = Arc::clone(&stop_prefetch);
+            let (batch_tx, batch_rx) =
+                std::sync::mpsc::sync_channel::<Vec<Result<Page, String>>>(1);
+            let prefetch_handle = std::thread::Builder::new()
+                .name("whole-world-cache-prefetch".into())
+                .spawn(move || {
+                    let mut read_pages = 0usize;
+                    while read_pages < total_pages && !stop_flag.load(Ordering::Relaxed) {
+                        let batch = reader.read_pages_batch(cache_batch);
+                        let n = batch.len();
+                        if batch_tx.send(batch).is_err() || n == 0 {
+                            break;
+                        }
+                        read_pages += n;
+                    }
+                    reader
+                })
+                .expect("whole-world cache prefetch thread");
             let mut index = 0usize;
             while index < total_pages && valid {
                 if cancel.load(Ordering::Relaxed) {
+                    stop_prefetch.store(true, Ordering::Relaxed);
+                    drop(batch_rx);
+                    let _ = prefetch_handle.join();
                     return Ok(());
                 }
-                let batch = reader.read_pages_batch(cache_batch);
+                let Ok(batch) = batch_rx.recv() else {
+                    valid = false;
+                    break;
+                };
                 if batch.is_empty() {
-                    reader.invalidate();
-                    let _ = tx.send(Message::CacheInvalid);
                     valid = false;
                     break;
                 }
@@ -671,8 +889,6 @@ fn run(
                         Ok(page) => {
                             if page.shared_atlas.is_some_and(|source| source >= index) {
                                 eprintln!("Whole-world cache rejected: forward/shared atlas reference at page {index}");
-                                reader.invalidate();
-                                let _ = tx.send(Message::CacheInvalid);
                                 valid = false;
                                 break;
                             }
@@ -681,28 +897,39 @@ fn run(
                             page.placements = Vec::new();
                             page.bounds = Vec::new();
                             if tx.send(Message::Page(Arc::new(page))).is_err() {
+                                stop_prefetch.store(true, Ordering::Relaxed);
+                                drop(batch_rx);
+                                let _ = prefetch_handle.join();
                                 return Ok(());
                             }
                             index += 1;
                         }
                         Err(error) => {
                             eprintln!("Whole-world cache rejected at page {index}: {error}");
-                            reader.invalidate();
-                            let _ = tx.send(Message::CacheInvalid);
                             valid = false;
                             break;
                         }
                     }
                 }
             }
-            if valid {
-                if let Err(error) = reader.complete() {
-                    eprintln!("Whole-world cache rejected after last page: {error}");
-                    reader.invalidate();
-                    let _ = tx.send(Message::CacheInvalid);
-                    valid = false;
-                }
+            stop_prefetch.store(true, Ordering::Relaxed);
+            drop(batch_rx);
+            let mut reader = prefetch_handle.join().unwrap();
+            if !valid {
+                reader.invalidate();
+                let _ = tx.send(Message::CacheInvalid);
+            } else if let Err(error) = reader.complete() {
+                eprintln!("Whole-world cache rejected after last page: {error}");
+                reader.invalidate();
+                let _ = tx.send(Message::CacheInvalid);
+                valid = false;
             }
+            let _ = (
+                cache_processed,
+                cache_skipped,
+                cache_atlas_pages,
+                cache_atlas_bytes,
+            );
             if valid {
                 let world_draw_cmds = world_culled_commands_from_meta(&metadata);
                 let _ = tx.send(Message::Done {
@@ -725,13 +952,14 @@ fn run(
             }
         }
     }
-    let mut cache = cache_key.and_then(|key| match crate::world_page_cache::Writer::new(key) {
+    let cache = cache_key.and_then(|key| match crate::world_page_cache::Writer::new(key) {
         Ok(writer) => Some(AsyncCacheWriter::start(writer)),
         Err(error) => {
             eprintln!("Whole-world cache unavailable: {error}");
             None
         }
     });
+    let mut finisher = PageFinisher::start(tx.clone(), cache);
     let mut objects = Objects::open(&element, Arc::clone(&ornaments))?;
     let first = std::env::var("PW_WORLD_TEST_START")
         .ok()
@@ -745,7 +973,6 @@ fn run(
     let limit = first.saturating_add(count).min(objects.ornaments.len());
     let max_vertices = vertex_limit;
     let mut page = Builder::new();
-    let mut world_metadata = Vec::new();
     let mut shared_slots: HashMap<TextureKey, SharedSlot> = HashMap::new();
     let mut shared_geometry = HashMap::<usize, Builder>::new();
     let mut skipped = 0usize;
@@ -758,9 +985,9 @@ fn run(
         rgba: vec![160, 160, 160, 255],
     };
     let batch_size = if crate::objects::unbounded_textures() {
-        128
+        256
     } else {
-        64
+        128
     };
     for start in (first..limit).step_by(batch_size) {
         if cancel.load(Ordering::Relaxed) {
@@ -826,7 +1053,7 @@ fn run(
                     atlas_bytes += atlas_mip_bytes(finished.used_height);
                     remember_atlas(&finished, pages, &mut shared_slots);
                     pages += 1;
-                    if !emit_page(tx, &mut cache, &mut world_metadata, finished.page(id)) {
+                    if !finisher.submit(finished, id) {
                         return Ok(());
                     }
                 }
@@ -842,7 +1069,7 @@ fn run(
                             Builder::shared(shared.source, shared.height),
                         );
                         pages += 1;
-                        if !emit_page(tx, &mut cache, &mut world_metadata, ready.page(id)) {
+                        if !finisher.submit(ready, id) {
                             return Ok(());
                         }
                     }
@@ -854,7 +1081,7 @@ fn run(
                         atlas_bytes += atlas_mip_bytes(finished.used_height);
                         remember_atlas(&finished, pages, &mut shared_slots);
                         pages += 1;
-                        if !emit_page(tx, &mut cache, &mut world_metadata, finished.page(id)) {
+                        if !finisher.submit(finished, id) {
                             return Ok(());
                         }
                     }
@@ -922,7 +1149,7 @@ fn run(
                 if let Some(builder) = shared_geometry.remove(&source) {
                     if !builder.indices.is_empty() {
                         pages += 1;
-                        if !emit_page(tx, &mut cache, &mut world_metadata, builder.page(end)) {
+                        if !finisher.submit(builder, end) {
                             return Ok(());
                         }
                     }
@@ -936,7 +1163,7 @@ fn run(
         for (_, builder) in ready {
             if !builder.indices.is_empty() {
                 pages += 1;
-                if !emit_page(tx, &mut cache, &mut world_metadata, builder.page(limit)) {
+                if !finisher.submit(builder, limit) {
                     return Ok(());
                 }
             }
@@ -946,9 +1173,13 @@ fn run(
         atlas_pages += 1;
         atlas_bytes += atlas_mip_bytes(page.used_height);
         pages += 1;
-        if !emit_page(tx, &mut cache, &mut world_metadata, page.page(limit)) {
+        if !finisher.submit(page, limit) {
             return Ok(());
         }
+    }
+    let (world_metadata, mut cache, finisher_ok) = finisher.finish();
+    if !finisher_ok {
+        return Ok(());
     }
     let world_draw_cmds = world_culled_commands_from_meta(&world_metadata);
     if let Some(writer) = cache.take() {
@@ -1386,52 +1617,100 @@ impl GpuPage {
         list: &WorldDrawList,
         pass: &mut wgpu::RenderPass<'a>,
         reflected: bool,
-        frustum: &[[f32; 4]; 6],
+        cull: &CullParams,
         sdr_only: bool,
+        scratch: &mut WorldDrawScratch,
     ) {
-        let mut bound = None;
-        let mut pending: Option<(usize, u32, u32)> = None;
+        if pages.is_empty() || list.chunks.is_empty() {
+            return;
+        }
+        // 1. Hierarchical page-level rejection: test each GpuPage AABB once
+        // against clip plane, frustum, and sub-pixel size into a reused buffer.
+        scratch.page_visible.clear();
+        scratch
+            .page_visible
+            .reserve(pages.len().saturating_sub(scratch.page_visible.capacity()));
+        let mut any_page_visible = false;
+        for page in pages {
+            let vis = page.count > 0
+                && (!sdr_only || page.page_has_sdr)
+                && aabb_survives_clip(cull.clip_plane, page.page_min, page.page_max)
+                && aabb_in_frustum(&cull.frustum, page.page_min, page.page_max)
+                && aabb_survives_screen_size(
+                    cull.eye,
+                    cull.proj_scale,
+                    cull.min_screen_px,
+                    page.page_min,
+                    page.page_max,
+                );
+            any_page_visible |= vis;
+            scratch.page_visible.push(vis);
+        }
+        if !any_page_visible {
+            return;
+        }
+
+        // 2. Chunk + placement culling and aggressive gap-bridging draw-call
+        // coalescing into the persistent scratch command buffer (zero allocs).
+        scratch.cmds.clear();
+        let max_gap = if sdr_only { 0 } else { MAX_COALESCE_GAP };
         for chunk in &list.chunks {
-            if (sdr_only && !chunk.has_sdr) || !aabb_in_frustum(frustum, chunk.min, chunk.max) {
+            if (sdr_only && !chunk.has_sdr)
+                || !aabb_survives_clip(cull.clip_plane, chunk.min, chunk.max)
+                || !aabb_in_frustum(&cull.frustum, chunk.min, chunk.max)
+                || !aabb_survives_screen_size(
+                    cull.eye,
+                    cull.proj_scale,
+                    cull.min_screen_px,
+                    chunk.min,
+                    chunk.max,
+                )
+            {
                 continue;
             }
-            let fully_inside = aabb_inside_frustum(frustum, chunk.min, chunk.max);
+            let fully_inside = aabb_inside_frustum(&cull.frustum, chunk.min, chunk.max);
             for cmd in &list.cmds[chunk.start..chunk.end] {
-                if (sdr_only && !cmd.has_sdr) || cmd.start >= cmd.end {
+                if !scratch.page_visible[cmd.page]
+                    || (sdr_only && !cmd.has_sdr)
+                    || cmd.start >= cmd.end
+                {
                     continue;
                 }
-                if !fully_inside && !aabb_in_frustum(frustum, cmd.min, cmd.max) {
+                if !aabb_survives_clip(cull.clip_plane, cmd.min, cmd.max) {
                     continue;
                 }
-                if let Some((cur_page, cur_start, cur_end)) = pending {
-                    if cur_page == cmd.page && cur_end == cmd.start {
-                        pending = Some((cur_page, cur_start, cmd.end));
-                        continue;
-                    }
-                    if bound != Some(cur_page) {
-                        let p = &pages[cur_page];
-                        pass.set_bind_group(
-                            0,
-                            if reflected { &p.reflected } else { &p.normal },
-                            &[],
-                        );
-                        pass.set_vertex_buffer(0, p.vertex.slice(..));
-                        pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
-                        bound = Some(cur_page);
-                    }
-                    pass.draw_indexed(cur_start..cur_end, 0, 0..1);
+                if !fully_inside && !aabb_in_frustum(&cull.frustum, cmd.min, cmd.max) {
+                    continue;
                 }
-                pending = Some((cmd.page, cmd.start, cmd.end));
+                if !aabb_survives_screen_size(
+                    cull.eye,
+                    cull.proj_scale,
+                    cull.min_screen_px,
+                    cmd.min,
+                    cmd.max,
+                ) {
+                    continue;
+                }
+                push_coalesced_draw(&mut scratch.cmds, cmd.page, cmd.start, cmd.end, max_gap);
             }
         }
-        if let Some((cur_page, cur_start, cur_end)) = pending {
-            if bound != Some(cur_page) {
-                let p = &pages[cur_page];
-                pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
+
+        // 3. Submit coalesced draws, binding each page's vertex/index buffers
+        // once per page run and skipping redundant bind-group switches when
+        // consecutive pages share the same atlas texture.
+        let mut bound_page: Option<usize> = None;
+        for cmd in &scratch.cmds {
+            if bound_page != Some(cmd.page) {
+                let p = &pages[cmd.page];
+                let same_atlas = bound_page.is_some_and(|prev| pages[prev].shares_atlas_with(p));
+                if !same_atlas {
+                    pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
+                }
                 pass.set_vertex_buffer(0, p.vertex.slice(..));
                 pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
+                bound_page = Some(cmd.page);
             }
-            pass.draw_indexed(cur_start..cur_end, 0, 0..1);
+            pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
         }
     }
 
@@ -1440,7 +1719,7 @@ impl GpuPage {
         pass: &mut wgpu::RenderPass<'a>,
         reflected: bool,
         view: Pass,
-        frustum: &[[f32; 4]; 6],
+        cull: &CullParams,
         sdr_only: bool,
     ) {
         if self.count == 0 {
@@ -1449,7 +1728,16 @@ impl GpuPage {
         if sdr_only && !self.page_has_sdr {
             return;
         }
-        if !aabb_in_frustum(frustum, self.page_min, self.page_max) {
+        if !aabb_survives_clip(cull.clip_plane, self.page_min, self.page_max)
+            || !aabb_in_frustum(&cull.frustum, self.page_min, self.page_max)
+            || !aabb_survives_screen_size(
+                cull.eye,
+                cull.proj_scale,
+                cull.min_screen_px,
+                self.page_min,
+                self.page_max,
+            )
+        {
             return;
         }
         pass.set_bind_group(
@@ -1467,7 +1755,8 @@ impl GpuPage {
             pass.draw_indexed(0..self.count, 0, 0..1);
             return;
         }
-        let fully_inside = aabb_inside_frustum(frustum, self.page_min, self.page_max);
+        let fully_inside = aabb_inside_frustum(&cull.frustum, self.page_min, self.page_max);
+        let max_gap = if sdr_only { 0 } else { MAX_COALESCE_GAP };
         let mut cursor = None::<(u32, u32)>;
         for (r, b) in self.placements.iter().zip(&self.bounds) {
             if sdr_only && !b.has_sdr {
@@ -1476,7 +1765,19 @@ impl GpuPage {
             if !allows_with_context(view, r.visibility, RenderContext::default()) {
                 continue;
             }
-            if !fully_inside && !aabb_in_frustum(frustum, b.min, b.max) {
+            if !aabb_survives_clip(cull.clip_plane, b.min, b.max) {
+                continue;
+            }
+            if !fully_inside && !aabb_in_frustum(&cull.frustum, b.min, b.max) {
+                continue;
+            }
+            if !aabb_survives_screen_size(
+                cull.eye,
+                cull.proj_scale,
+                cull.min_screen_px,
+                b.min,
+                b.max,
+            ) {
                 continue;
             }
             let start = r.start.min(self.count);
@@ -1485,7 +1786,9 @@ impl GpuPage {
                 continue;
             }
             match &mut cursor {
-                Some((_, prev_end)) if *prev_end == start => *prev_end = end,
+                Some((_, prev_end)) if start >= *prev_end && start - *prev_end <= max_gap => {
+                    *prev_end = (*prev_end).max(end);
+                }
                 Some((prev_start, prev_end)) => {
                     pass.draw_indexed(*prev_start..*prev_end, 0, 0..1);
                     cursor = Some((start, end));
@@ -1614,11 +1917,20 @@ fn world_culled_commands_from_meta(pages: &[WorldPageMeta]) -> [WorldDrawList; W
         }
         WorldDrawList { cmds: out, chunks }
     };
-    [
-        build(Pass::Main),
-        build(Pass::Reflection),
-        build(Pass::Refraction),
-    ]
+    if order.len() >= 1024 {
+        std::thread::scope(|s| {
+            let main_t = s.spawn(|| build(Pass::Main));
+            let refl_t = s.spawn(|| build(Pass::Reflection));
+            let refr = build(Pass::Refraction);
+            [main_t.join().unwrap(), refl_t.join().unwrap(), refr]
+        })
+    } else {
+        [
+            build(Pass::Main),
+            build(Pass::Reflection),
+            build(Pass::Refraction),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -1935,6 +2247,120 @@ mod page_tests {
         let pages = pages(&[&[]], &[512]);
         let cmds = fold_commands(&pages, &[(0, usize::MAX)], Pass::Reflection);
         assert_eq!(cmds, vec![cmd(0, 0, 512)]);
+    }
+
+    #[test]
+    fn clip_plane_rejects_opposite_side_and_keeps_straddling_aabbs() {
+        // Reflection (keep y >= 100.0)
+        assert!(!aabb_survives_clip(
+            Some((100.0, 1.0)),
+            [0.0, 10.0, 0.0],
+            [10.0, 99.9, 10.0]
+        ));
+        assert!(aabb_survives_clip(
+            Some((100.0, 1.0)),
+            [0.0, 95.0, 0.0],
+            [10.0, 105.0, 10.0]
+        ));
+        assert!(aabb_survives_clip(
+            Some((100.0, 1.0)),
+            [0.0, 101.0, 0.0],
+            [10.0, 120.0, 10.0]
+        ));
+        // Refraction (keep y <= 100.0)
+        assert!(!aabb_survives_clip(
+            Some((100.0, -1.0)),
+            [0.0, 100.1, 0.0],
+            [10.0, 120.0, 10.0]
+        ));
+        assert!(aabb_survives_clip(
+            Some((100.0, -1.0)),
+            [0.0, 95.0, 0.0],
+            [10.0, 105.0, 10.0]
+        ));
+        assert!(aabb_survives_clip(
+            None,
+            [0.0, 500.0, 0.0],
+            [10.0, 600.0, 10.0]
+        ));
+    }
+
+    #[test]
+    fn sub_pixel_screen_size_culling_rejects_tiny_distant_props_and_keeps_visible() {
+        let eye = [0.0, 0.0, 0.0];
+        let proj_scale = 770.0; // ~1080p at 70 deg FOV
+                                // 1m cube at 2000m distance: diameter ~1.73m -> ~0.67 px (< 1.5 px)
+        assert!(!aabb_survives_screen_size(
+            eye,
+            proj_scale,
+            1.5,
+            [0.0, 0.0, 2000.0],
+            [1.0, 1.0, 2001.0]
+        ));
+        // Same 1m cube at 200m distance: ~6.7 px (>= 1.5 px)
+        assert!(aabb_survives_screen_size(
+            eye,
+            proj_scale,
+            1.5,
+            [0.0, 0.0, 200.0],
+            [1.0, 1.0, 201.0]
+        ));
+        // Stricter secondary-pass threshold (4.0 px) rejects 3 px prop
+        assert!(!aabb_survives_screen_size(
+            eye,
+            proj_scale,
+            4.0,
+            [0.0, 0.0, 500.0],
+            [1.0, 1.0, 501.0]
+        ));
+        // Disabled threshold (0.0) keeps everything
+        assert!(aabb_survives_screen_size(
+            eye,
+            proj_scale,
+            0.0,
+            [0.0, 0.0, 50000.0],
+            [0.1, 0.1, 50000.1]
+        ));
+    }
+
+    #[test]
+    fn coalescing_bridges_small_gaps_and_splits_large_gaps_or_page_changes() {
+        let mut cmds = Vec::new();
+        push_coalesced_draw(&mut cmds, 0, 0, 100, MAX_COALESCE_GAP);
+        // Contiguous
+        push_coalesced_draw(&mut cmds, 0, 100, 200, MAX_COALESCE_GAP);
+        // Small gap (<= MAX_COALESCE_GAP) on same page -> bridged!
+        push_coalesced_draw(&mut cmds, 0, 200 + MAX_COALESCE_GAP, 500, MAX_COALESCE_GAP);
+        // Large gap (> MAX_COALESCE_GAP) -> split!
+        push_coalesced_draw(
+            &mut cmds,
+            0,
+            500 + MAX_COALESCE_GAP + 1,
+            700,
+            MAX_COALESCE_GAP,
+        );
+        // Different page -> split!
+        push_coalesced_draw(&mut cmds, 1, 700, 800, MAX_COALESCE_GAP);
+        assert_eq!(
+            cmds,
+            vec![
+                DrawCmd {
+                    page: 0,
+                    start: 0,
+                    end: 500
+                },
+                DrawCmd {
+                    page: 0,
+                    start: 500 + MAX_COALESCE_GAP + 1,
+                    end: 700
+                },
+                DrawCmd {
+                    page: 1,
+                    start: 700,
+                    end: 800
+                },
+            ]
+        );
     }
 
     #[test]

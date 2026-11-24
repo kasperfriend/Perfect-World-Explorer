@@ -205,16 +205,14 @@ impl Materials {
         let element = archive_root(dir)?;
         let mut file =
             File::open(element.join("textures.pck")).map_err(|e| format!("textures.pck: {e}"))?;
-        let entries = if colors {
-            pck::directory(&mut file)?
+        let (entries, entry_index) = if colors {
+            pck::normalized_index_arc(&mut file)?
         } else {
-            Vec::new()
+            (
+                std::sync::Arc::from(Vec::new()),
+                std::sync::Arc::new(HashMap::new()),
+            )
         };
-        let entry_index: HashMap<String, usize> = entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (e.name.to_ascii_lowercase(), i))
-            .collect();
         let mut textures = Vec::with_capacity(if colors { paths.len() } else { 0 });
         if colors && !paths.is_empty() {
             let mut tex_entries = Vec::with_capacity(paths.len());
