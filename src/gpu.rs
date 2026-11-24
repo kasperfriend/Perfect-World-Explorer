@@ -4749,6 +4749,11 @@ impl Renderer {
             } else {
                 Vec::new()
             };
+        let walker_pos = self.modules.walker_world_pos();
+        let mut walker_rt_verts: Vec<[f32; 3]> = Vec::new();
+        if walker_pos.is_some() {
+            self.modules.walker_rt_triangles(&mut walker_rt_verts, 4096);
+        }
         gpu.record(
             &self.device,
             &self.queue,
@@ -4765,6 +4770,8 @@ impl Renderer {
             &active_point_lights,
             unjittered_vp,
             camera.weather_override != crate::client_weather::WeatherOverride::Clear,
+            walker_pos,
+            &walker_rt_verts,
         );
         let mut dlss_rr_ran = false;
         if plan.reconstruction
@@ -4911,7 +4918,21 @@ impl Renderer {
         } else {
             Pass::Main
         };
-        let normal = frame.uniform(
+        let mut main_frame = frame;
+        let (grass_bend_y, grass_bend_w) = if self.raywatcher_frame_plan.trace
+            && self.raywatcher_frame_plan.effects.interactive_grass
+        {
+            if let Some((wpos, flying)) = self.modules.walker_world_pos() {
+                main_frame.grass_wind[2] = wpos.x;
+                main_frame.grass_wind[3] = wpos.z;
+                (wpos.y, if flying { 2.0 } else { 1.0 })
+            } else {
+                (0., 0.)
+            }
+        } else {
+            (0., 0.)
+        };
+        let normal = main_frame.uniform(
             matrix,
             [direction.x, direction.y, direction.z, daylight],
             frame.clip,
@@ -4923,8 +4944,8 @@ impl Renderer {
             [
                 crate::render_scale::mip_bias(),
                 crate::render_scale::mip_gradient_scale(),
-                0.,
-                0.,
+                grass_bend_y,
+                grass_bend_w,
             ],
         );
         self.queue

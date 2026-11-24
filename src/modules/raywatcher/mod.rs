@@ -410,6 +410,10 @@ impl Raywatcher {
             ("Cloud shadows", &mut effects.cloud_shadows),
             ("Contact shadows", &mut effects.contact_shadows),
             ("Moonlit night sky", &mut effects.moonlit_night),
+            ("Twilight sky scattering", &mut effects.twilight_sky),
+            ("Localized valley mist", &mut effects.valley_mist),
+            ("Water shore foam & ripples", &mut effects.water_shore_foam),
+            ("Interactive grass bending", &mut effects.interactive_grass),
         ] {
             changed_effects |= ui.checkbox(slot, label).changed();
         }
@@ -648,6 +652,10 @@ impl Raywatcher {
             ("cloud_shadows", effects.cloud_shadows),
             ("contact_shadows", effects.contact_shadows),
             ("moonlit_night", effects.moonlit_night),
+            ("twilight_sky", effects.twilight_sky),
+            ("valley_mist", effects.valley_mist),
+            ("water_shore_foam", effects.water_shore_foam),
+            ("interactive_grass", effects.interactive_grass),
         ] {
             let _ = writeln!(out, "{name}={}", u8::from(on));
         }
@@ -730,6 +738,10 @@ impl Raywatcher {
             ("cloud_shadows", &mut effects.cloud_shadows),
             ("contact_shadows", &mut effects.contact_shadows),
             ("moonlit_night", &mut effects.moonlit_night),
+            ("twilight_sky", &mut effects.twilight_sky),
+            ("valley_mist", &mut effects.valley_mist),
+            ("water_shore_foam", &mut effects.water_shore_foam),
+            ("interactive_grass", &mut effects.interactive_grass),
         ] {
             if let Some(v) = get(name).and_then(parse_flag) {
                 *slot = v;
@@ -1056,6 +1068,10 @@ mod tests {
             cloud_shadows: false,
             contact_shadows: false,
             moonlit_night: false,
+            twilight_sky: false,
+            valley_mist: false,
+            water_shore_foam: false,
+            interactive_grass: false,
         };
         m.set_settings(s);
         let none = m.status((640, 360), false);

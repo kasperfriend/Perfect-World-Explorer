@@ -209,15 +209,21 @@ Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max, uint opaque
     }
 
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-        uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
-        if (prim < tri_count) {
-            float3 n = tris[prim].n.xyz; // Opt #3: pre-normalized in harvest.rs
-            if (dot(n, dir) > 0.0) {
-                n = -n;
-            }
-            hit.index = prim;
+        if (q.CommittedInstanceID() == 1u) {
+            hit.index = 0xfffffffeu;
             hit.t = q.CommittedRayT();
-            hit.normal = n;
+            hit.normal = normalize(-dir * 0.55 + float3(0.0, 0.83, 0.0));
+        } else {
+            uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
+            if (prim < tri_count) {
+                float3 n = tris[prim].n.xyz; // Opt #3: pre-normalized in harvest.rs
+                if (dot(n, dir) > 0.0) {
+                    n = -n;
+                }
+                hit.index = prim;
+                hit.t = q.CommittedRayT();
+                hit.normal = n;
+            }
         }
     }
     return hit;
@@ -240,15 +246,21 @@ Hit closest_hit_fast(float3 origin, float3 dir, float t_min, float t_max, uint o
     q.Proceed();
 
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-        uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
-        if (prim < tri_count) {
-            float3 n = tris[prim].n.xyz; // Opt #3: pre-normalized in harvest.rs
-            if (dot(n, dir) > 0.0) {
-                n = -n;
-            }
-            hit.index = prim;
+        if (q.CommittedInstanceID() == 1u) {
+            hit.index = 0xfffffffeu;
             hit.t = q.CommittedRayT();
-            hit.normal = n;
+            hit.normal = normalize(-dir * 0.55 + float3(0.0, 0.83, 0.0));
+        } else {
+            uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
+            if (prim < tri_count) {
+                float3 n = tris[prim].n.xyz; // Opt #3: pre-normalized in harvest.rs
+                if (dot(n, dir) > 0.0) {
+                    n = -n;
+                }
+                hit.index = prim;
+                hit.t = q.CommittedRayT();
+                hit.normal = n;
+            }
         }
     }
     return hit;
@@ -296,8 +308,17 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
     }
 
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-        uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
         float hit_t = q.CommittedRayT();
+        if (q.CommittedInstanceID() == 1u) {
+            if (hit_t < 0.85) {
+                return res;
+            }
+            res.occluded = true;
+            res.t_blocker = hit_t;
+            res.transmittance = float3(0.0, 0.0, 0.0);
+            return res;
+        }
+        uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
         // Skip local coarse KIND_TERRAIN_LOD self-intersections on curved slopes (fixes triangular black holes).
         if (prim < tri_count && terrain_self_skip > 0.0 && hit_t < terrain_self_skip) {
             float hkind = tris[prim].a.w;
@@ -459,6 +480,41 @@ float3 sample_sky_env(float3 dir) {
     float3 c01 = src_sky_env.Load(int3(x0, y1, 0)).rgb;
     float3 c11 = src_sky_env.Load(int3(x1, y1, 0)).rgb;
     return max(lerp(lerp(c00, c10, frac_xy.x), lerp(c01, c11, frac_xy.x), frac_xy.y), float3(0.0, 0.0, 0.0));
+}
+
+// Feature #2: Physical Rayleigh/Mie sunset & twilight sky/horizon scattering.
+float3 apply_twilight_scattering(float3 base_sky, float3 dir, float3 sun_dir, float sun_strength, bool enabled) {
+    if (!enabled) {
+        return base_sky;
+    }
+    float elev = sun_dir.y;
+    if (elev > 0.38 || elev < -0.18) {
+        return base_sky;
+    }
+    float twi_w = smoothstep(-0.16, 0.02, elev) * (1.0 - smoothstep(0.08, 0.38, elev));
+    if (twi_w <= 1e-3) {
+        return base_sky;
+    }
+    float horiz = exp(-abs(dir.y) * 4.8);
+    float zenith = saturate(dir.y * 1.4);
+    float sun_cos = saturate(dot(normalize(dir), normalize(sun_dir)));
+    float mie_glow = pow(sun_cos, 6.0) * 0.85 + pow(sun_cos, 2.0) * 0.35;
+    float3 warm_horizon = lerp(float3(0.95, 0.34, 0.14), float3(1.18, 0.56, 0.22), sun_strength);
+    float3 cool_zenith = float3(0.12, 0.20, 0.44);
+    float3 scattered = lerp(base_sky, cool_zenith, zenith * twi_w * 0.45)
+        + warm_horizon * (horiz * (0.32 + mie_glow * 0.78) * twi_w * 0.65);
+    return max(scattered, float3(0.0, 0.0, 0.0));
+}
+
+// Feature #10: Animated 3D world-space suspended underwater dust/plankton motes.
+float underwater_motes(float3 p, float t) {
+    float3 q = p * 0.62 + float3(sin(t * 0.35 + p.y * 0.25) * 0.4, -t * 0.18, cos(t * 0.31 + p.x * 0.22) * 0.4);
+    float3 cell = floor(q);
+    float3 f = frac(q);
+    float2 h = hash22(cell.xz + cell.y * 17.31);
+    float3 pt = float3(h.x, frac(h.x * 13.7 + h.y * 7.3), h.y) * 0.72 + 0.14;
+    float d2 = dot(f - pt, f - pt);
+    return exp(-d2 * 48.0) * step(0.45, h.x);
 }
 
 float3 sample_sky_reflection(float3 dir) {
@@ -804,6 +860,22 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     bool bits_contact_shadows = (effects & 256u) != 0u;
     bool bits_moonlit_night = (effects & 512u) != 0u;
     bool bits_weather = (effects & 2048u) != 0u;
+    bool bits_twilight_sky = (effects & 4096u) != 0u;
+    bool bits_valley_mist = (effects & 8192u) != 0u;
+    bool bits_water_shore_foam = (effects & 16384u) != 0u;
+    bool walker_active = params.fog_colour.w > 0.5;
+    float3 walker_pos = float3(params.sun_dir.w, params.sun_colour.w, params.ambient.w);
+
+    // Feature #6: True metallic PBR material separation for armor, weapons & gold roofs
+    // (stone, wood, dirt, and foliage remain 100% matte with metalness == 0).
+    float r_max_c = max(raster_rgb.r, max(raster_rgb.g, raster_rgb.b));
+    float r_min_c = min(raster_rgb.r, min(raster_rgb.g, raster_rgb.b));
+    float r_sat = (r_max_c > 1e-4) ? ((r_max_c - r_min_c) / r_max_c) : 0.0;
+    bool is_gold_metal = !is_water && raster_rgb.r > raster_rgb.g * 1.08 && raster_rgb.g > raster_rgb.b * 1.48 && raster_rgb.r > 0.22;
+    bool is_steel_metal = !is_water && dist < 24.0 && abs(normal.y) < 0.85 && r_max_c > 0.32 && r_sat < 0.15;
+    float metalness = is_gold_metal ? 0.85 : (is_steel_metal ? 0.62 : 0.0);
+    float3 metal_tint = is_gold_metal ? clamp(raster_rgb * 1.35, float3(0.55, 0.38, 0.12), float3(1.0, 0.86, 0.42)) : float3(0.76, 0.80, 0.86);
+    float eff_roughness = (metalness > 0.1) ? min(roughness, 0.24) : roughness;
 
     float steepness = 1.0 - saturate(normal.y);
     float slope_bias = steepness * (0.75 + dist * 0.0065);
@@ -811,7 +883,26 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float3 ray_origin = world_pos + normal * bias + float3(0.0, 1.0, 0.0) * (steepness * 0.55) - view_dir * (bias * 0.35);
     float shadow_t_min = max(bias * 1.15, 0.60 + steepness * 0.85);
     float ao_t_min = max(bias * 0.80, 0.40);
-    float n_dot_l = max(dot(normal, params.sun_dir.xyz), 0.0);
+
+    // Feature #7: Subtle micro-detail procedural normal/bump relief for nearby stone, bark & terrain
+    // (derived from raster luminance gradients; excludes water & close smooth Walker skin < 7.5u).
+    float3 shade_normal = normal;
+    if (!is_water && dist > 7.5 && dist < 68.0) {
+        int2 bdim = int2(int(params.extents.x), int(params.extents.y));
+        int2 bpx = int2(id.xy);
+        float l_r = luma(src_gbuf_raster.Load(int3(clamp(bpx + int2(1, 0), int2(0, 0), bdim - int2(1, 1)), 0)).rgb);
+        float l_l = luma(src_gbuf_raster.Load(int3(clamp(bpx + int2(-1, 0), int2(0, 0), bdim - int2(1, 1)), 0)).rgb);
+        float l_d = luma(src_gbuf_raster.Load(int3(clamp(bpx + int2(0, 1), int2(0, 0), bdim - int2(1, 1)), 0)).rgb);
+        float l_u = luma(src_gbuf_raster.Load(int3(clamp(bpx + int2(0, -1), int2(0, 0), bdim - int2(1, 1)), 0)).rgb);
+        float gx = clamp(l_r - l_l, -0.35, 0.35);
+        float gy = clamp(l_d - l_u, -0.35, 0.35);
+        float bump_fade = smoothstep(7.5, 14.0, dist) * (1.0 - smoothstep(38.0, 68.0, dist));
+        float3 b_up = abs(normal.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+        float3 b_t = normalize(cross(b_up, normal));
+        float3 b_b = cross(normal, b_t);
+        shade_normal = normalize(normal + (b_t * gx + b_b * gy) * (0.42 * bump_fade));
+    }
+    float n_dot_l = max(dot(shade_normal, params.sun_dir.xyz), 0.0);
 
     float fog_t = 0.0;
     float fog_start = params.fog.x;
@@ -972,25 +1063,38 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // Features #2 (Water Refraction & Underwater Caustics), #3 (Calibrated Glossy Trims),
         // #8 (Analytical Reflections of World Effects & Point Lights), #10 (Off-Screen Detail).
         float refl_dist = params.lens.y;
-        if (bits_reflections && roughness <= params.effects.x) {
-            // Enhancement #12: Perturb water reflections with living animated wave normals (water only!).
+        if (bits_reflections && (eff_roughness <= params.effects.x || metalness > 0.1)) {
+            // Perturb water reflections with living animated wave normals + Walker wading ripples (#4).
             float3 refl_base_n = is_water
                 ? water_wave_normal(world_pos.xz, params.frame.x * 0.03, dist)
-                : normal;
-            float3 h = ggx_sample(refl_base_n, roughness, rand01(state), rand01(state));
+                : shade_normal;
+            float walker_ripple_crest = 0.0;
+            if (is_water && bits_water_shore_foam && walker_active && abs(walker_pos.y - world_pos.y) < 2.2) {
+                float2 w_d = world_pos.xz - walker_pos.xz;
+                float w_r = length(w_d);
+                if (w_r > 0.15 && w_r < 6.8) {
+                    float r_fade = (1.0 - smoothstep(0.8, 6.8, w_r)) * smoothstep(0.15, 0.45, w_r);
+                    float phase_r = w_r * 7.2 - params.frame.x * 0.14;
+                    float wave_r = sin(phase_r) * r_fade;
+                    float2 dir_r = w_d / max(w_r, 1e-4);
+                    refl_base_n = normalize(refl_base_n + float3(dir_r.x, 0.0, dir_r.y) * (wave_r * 0.22));
+                    walker_ripple_crest = saturate(cos(phase_r) * 0.5 + 0.5) * r_fade * 0.35;
+                }
+            }
+            float3 h = ggx_sample(refl_base_n, eff_roughness, rand01(state), rand01(state));
             float3 reflect_dir = reflect(view_dir, h);
             if (dot(reflect_dir, refl_base_n) <= 0.0) {
                 reflect_dir = reflect(view_dir, refl_base_n);
             }
-            // Feature #3: Conservative Fresnel & subtle cap on glossy trims so matte
-            // walls/terrain stay matte and glazed/metallic accents never look wet/plastic.
-            float f0 = is_water ? 0.18 : 0.04;
+            // Feature #6: Conductor Fresnel for gold/steel armor/weapons/roofs; matte stays matte.
+            float f0 = is_water ? 0.18 : (metalness > 0.1 ? 0.55 : 0.04);
             float m = 1.0 - saturate(dot(-view_dir, h));
             float m2 = m * m;
             float fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
+            float3 fresnel_rgb = (metalness > 0.1) ? lerp(float3(fresnel, fresnel, fresnel), metal_tint * fresnel, metalness) : float3(fresnel, fresnel, fresnel);
             float trim_scale = is_water
                 ? 1.0
-                : (0.28 * (1.0 - smoothstep(0.24, 0.37, roughness)));
+                : (metalness > 0.1 ? (0.48 * metalness) : (0.28 * (1.0 - smoothstep(0.24, 0.37, eff_roughness))));
             // Opt #9: Use fast opaque RT traversal for blurry glossy trims & distant water (> 140u).
             float refl_max_t = is_water ? min(params.lens.y, 750.0) : min(params.lens.y, 140.0);
             Hit rhit;
@@ -1007,7 +1111,13 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float4 screen_col = sample_screen_radiance(hit_pos, rhit.t);
                 float screen_w = saturate(screen_col.a);
                 float3 lit = screen_col.rgb;
-                if (screen_w < 0.99) {
+                if (rhit.index == 0xfffffffeu) {
+                    // Dynamic Walker character reflection: prefer live textured screen colour,
+                    // with warm shaded armor/cloth fallback when reflected from offscreen angles.
+                    float c_ndl = max(dot(rhit.normal, params.sun_dir.xyz), 0.15);
+                    float3 char_fallback = float3(0.38, 0.34, 0.32) * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * c_ndl);
+                    lit = lerp(char_fallback, screen_col.rgb, max(screen_w, 0.15));
+                } else if (screen_w < 0.99) {
                     Material rmat = material_of(rhit.index);
                     float rkind = tris[rhit.index].a.w;
                     float3 r_albedo = (rkind > 1.5 && rkind < 2.5)
@@ -1025,11 +1135,11 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         params.sun_colour.xyz * (r_ndl * r_shadow));
                     lit = lerp(offscreen_lit, screen_col.rgb, screen_w);
                 }
-                refl_col = lit * (fresnel * trim_scale * (1.0 - fog_t));
+                refl_col = lit * (fresnel_rgb * trim_scale * (1.0 - fog_t));
                 refl_dist = rhit.t;
             } else {
-                float3 sky_col = sample_sky_reflection(reflect_dir);
-                refl_col = sky_col * (fresnel * trim_scale * 0.65 * (1.0 - fog_t));
+                float3 sky_col = apply_twilight_scattering(sample_sky_reflection(reflect_dir), reflect_dir, params.sun_dir.xyz, sun_strength, bits_twilight_sky);
+                refl_col = sky_col * (fresnel_rgb * trim_scale * 0.65 * (1.0 - fog_t));
                 // Enhancement #14: Ray-traced sun & moon glitter paths across living water
                 // (only when reflection ray misses all bridges, islands, cliffs & ships!).
                 if (is_water && params.sun_dir.y > 0.02) {
@@ -1098,6 +1208,24 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float shore_w = smoothstep(0.05, 0.55, wdepth) * (1.0 - smoothstep(1.2, 4.5, wdepth));
                     refl_col += float3(0.12, 0.62, 0.58) * params.sun_colour.xyz * (bw3 * shore_w * shadow * sun_strength * refract_w * 0.45);
                 }
+                // Feature #4: Animated shoreline & object-intersection foam + Walker wading ripple crests.
+                if (bits_water_shore_foam && dist < 180.0) {
+                    float foam_mask = 0.0;
+                    if (wdepth < 1.35) {
+                        float t_f = params.frame.x * 0.045;
+                        float lap = sin(wdepth * 14.0 - t_f * 2.4 + sin(world_pos.x * 0.55 + world_pos.z * 0.48) * 1.8) * 0.5 + 0.5;
+                        float cell_f = voronoi_ridge(world_pos.xz * 0.85, t_f * 0.6);
+                        float edge_band = (1.0 - smoothstep(0.06, 1.35, wdepth));
+                        float contact_ring = 1.0 - smoothstep(0.02, 0.28, wdepth);
+                        foam_mask = saturate(edge_band * (0.35 + 0.65 * lap) * smoothstep(0.28, 0.78, cell_f) + contact_ring * 0.72);
+                    }
+                    foam_mask = saturate(foam_mask + walker_ripple_crest);
+                    if (foam_mask > 0.01) {
+                        float3 foam_lit = lerp(float3(0.18, 0.24, 0.32), params.sun_colour.xyz * 0.85 + params.ambient.xyz * 0.45, sun_strength);
+                        float dist_f = 1.0 - smoothstep(90.0, 180.0, dist);
+                        refl_col += foam_lit * (foam_mask * dist_f * (1.0 - fog_t) * 0.42);
+                    }
+                }
             }
             accum_reflection += refl_col;
         }
@@ -1129,7 +1257,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float z = sqrt(max(0.0, 1.0 - u1));
                 float3 d = cur_t * (r * c_phi) + cur_b * (r * s_phi) + cur_normal * z;
                 Hit bhit = closest_hit_fast(cur_origin, d, cur_bias, bounce_max_t, opaque_offset, tri_count);
-                if (bhit.index != 0xffffffffu) {
+                if (bhit.index != 0xffffffffu && bhit.index != 0xfffffffeu) {
                     float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
                     float3 bhit_world = cur_origin + d * bhit.t;
                     path_dist += bhit.t;
@@ -1236,7 +1364,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         gi_sky_hits += 1.0;
                     }
                     // True directional sky-dome hemisphere irradiance + golden-hour color grading.
-                    float3 raw_sky = min(sample_sky_env(d), float3(1.25, 1.25, 1.25));
+                    float3 raw_sky = min(apply_twilight_scattering(sample_sky_env(d), d, params.sun_dir.xyz, sun_strength, bits_twilight_sky), float3(1.35, 1.35, 1.35));
                     float3 vivid_sky = raw_sky;
                     if (params.sun_dir.y > 0.01 && params.sun_dir.y < 0.42 && sun_strength > 0.05) {
                         float golden_w = 1.0 - smoothstep(0.10, 0.42, params.sun_dir.y);
@@ -1380,6 +1508,68 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float3 uw_tint = lerp(night_uw, day_uw, sun_strength);
             float uw_gain = is_submerged ? 0.34 : 0.18;
             god_rays += uw_tint * (uw_vis * uw_phase * uw_contrast * uw_gain * (1.0 - fog_t * 0.25));
+            // Feature #10: Depth-layered underwater volumetric grading + suspended plankton/dust motes
+            // + animated light-beam shimmer on submerged ruins.
+            if (is_submerged) {
+                float eye_sub = max(water_y - params.eye.y, 0.05);
+                float3 shallow_aqua = float3(0.05, 0.28, 0.34);
+                float3 deep_abyss = float3(0.015, 0.075, 0.16);
+                float depth_t = saturate(eye_sub / 22.0);
+                float3 vol_grade = lerp(shallow_aqua, deep_abyss, depth_t) * lerp(0.18, 1.0, sun_strength);
+                float vol_w = (1.0 - exp(-uw_march * 0.022)) * 0.32;
+                god_rays += vol_grade * vol_w;
+                // 3D suspended sun-lit plankton/dust motes along the underwater camera ray
+                float mote_acc = 0.0;
+                float t_mote = params.frame.x * 0.035;
+                for (uint mi = 0u; mi < 4u; mi = mi + 1u) {
+                    float t_m = 1.2 + (float(mi) + ign_v) * min(uw_march * 0.22, 5.5);
+                    if (t_m < dist - 0.5) {
+                        float3 pm = params.eye.xyz + view_dir * t_m;
+                        if (pm.y < water_y - 0.1) {
+                            mote_acc += underwater_motes(pm, t_mote) * exp(-t_m * 0.08);
+                        }
+                    }
+                }
+                god_rays += lerp(float3(0.18, 0.38, 0.52), float3(0.68, 0.96, 0.92) * max(params.sun_colour.xyz, float3(0.35, 0.35, 0.35)), sun_strength)
+                    * (mote_acc * (0.28 + 0.72 * uw_vis) * 0.38);
+            }
+        }
+    }
+
+    // Feature #3: Ray-traced localized height-based valley mist (strictly zero within 18u of camera!).
+    if (bits_valley_mist && !is_submerged && dist > 18.0 && fog_t < 0.96) {
+        float mist_base_y = (water_y > -1e5) ? (water_y + 2.5) : (params.eye.y - 16.0);
+        float mist_len = min(dist, 220.0) - 18.0;
+        if (mist_len > 4.0) {
+            float mist_acc = 0.0;
+            float mist_lit = 0.0;
+            for (uint vi = 0u; vi < 4u; vi = vi + 1u) {
+                float u = (float(vi) + ign_v) * 0.25;
+                float t_m = 18.0 + u * mist_len;
+                float3 pm = params.eye.xyz + view_dir * t_m;
+                float h_above = max(pm.y - mist_base_y, 0.0);
+                float h_dens = exp(-h_above * 0.075);
+                if (h_dens > 0.04) {
+                    // Subtle wispy modulation so valley mist looks organic rather than a flat slab
+                    float wisp = 0.65 + 0.35 * sin(pm.x * 0.035 + params.frame.x * 0.006) * cos(pm.z * 0.031 - params.frame.x * 0.005);
+                    float step_d = h_dens * wisp;
+                    mist_acc += step_d;
+                    bool m_occ = (bits_shadows && params.sun_dir.y > 0.04)
+                        ? occluded_fast(pm, params.sun_dir.xyz, 0.5, 220.0)
+                        : false;
+                    if (!m_occ) {
+                        mist_lit += step_d;
+                    }
+                }
+            }
+            float mist_opt = saturate((mist_acc * 0.25) * smoothstep(18.0, 95.0, dist) * 0.36);
+            if (mist_opt > 1e-3) {
+                float sun_frac = (mist_acc > 1e-4) ? saturate(mist_lit / mist_acc) : 0.0;
+                float3 mist_day = lerp(params.ambient.xyz * 0.55, params.sun_colour.xyz * 0.72 + float3(0.10, 0.14, 0.18), sun_frac);
+                float3 mist_night = float3(0.025, 0.045, 0.085);
+                float3 mist_col = lerp(mist_night, mist_day, sun_strength);
+                god_rays += mist_col * (mist_opt * (1.0 - fog_t * 0.75) * 0.45);
+            }
         }
     }
 
@@ -1660,20 +1850,31 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float3 l_dir = to_l / max(pl_dist, 1e-5);
                 float pl_vis = 1.0;
                 if (bits_shadows && pl_dist > 1.8 && exact_ws[ci] > 0.025) {
-                    float r_emit = clamp(pl_pr.w * 0.032, 0.16, 1.35);
+                    // Feature #8: Large world effects & portals (`radius >= 14u`) use 3D area emitter
+                    // disc/column sampling with 2 stratified taps for soft multi-directional penumbrae.
+                    bool is_area = pl_pr.w >= 14.0;
+                    float r_emit = is_area ? clamp(pl_pr.w * 0.12, 0.80, 3.60) : clamp(pl_pr.w * 0.032, 0.16, 1.35);
+                    float y_spread = is_area ? clamp(pl_pr.w * 0.08, 0.50, 2.60) : 0.0;
                     float3 l_up = abs(l_dir.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
                     float3 l_t = normalize(cross(l_up, l_dir));
                     float3 l_b = cross(l_dir, l_t);
-                    float ang = rot_angle + float(ci) * 2.39996323;
-                    float sa, ca;
-                    sincos(ang, sa, ca);
-                    float3 jitter_pt = pl_pr.xyz + (l_t * ca + l_b * sa) * (r_emit * sqrt(rand01(state)));
-                    float3 j_vec = jitter_pt - ray_origin;
-                    float j_dist = length(j_vec);
                     float self_clear = clamp(pl_pr.w * 0.08, 1.4, 3.2);
-                    if (j_dist > self_clear + bias && occluded_point_light(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear, pl_terrain_skip, opaque_offset, tri_count)) {
-                        pl_vis = 0.0;
+                    uint area_taps = (is_area && dist < 90.0) ? 2u : 1u;
+                    float vis_acc = 0.0;
+                    for (uint ai = 0u; ai < area_taps; ai = ai + 1u) {
+                        float ang = rot_angle + float(ci) * 2.39996323 + float(ai) * 3.14159265;
+                        float sa, ca;
+                        sincos(ang, sa, ca);
+                        float rad_s = r_emit * sqrt(rand01(state));
+                        float y_off = (rand01(state) - 0.5) * 2.0 * y_spread;
+                        float3 jitter_pt = pl_pr.xyz + (l_t * ca + l_b * sa) * rad_s + float3(0.0, y_off, 0.0);
+                        float3 j_vec = jitter_pt - ray_origin;
+                        float j_dist = length(j_vec);
+                        if (j_dist <= self_clear + bias || !occluded_point_light(ray_origin, j_vec / max(j_dist, 1e-4), bias * 0.5, j_dist - self_clear, pl_terrain_skip, opaque_offset, tri_count)) {
+                            vis_acc += 1.0;
+                        }
                     }
+                    pl_vis = vis_acc / float(area_taps);
                 }
                 pl_w_total += exact_ws[ci];
                 pl_w_lit += exact_ws[ci] * pl_vis;

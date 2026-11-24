@@ -125,6 +125,18 @@ impl RayParams {
         if effects.moonlit_night {
             bits |= 512;
         }
+        if effects.twilight_sky {
+            bits |= 4096;
+        }
+        if effects.valley_mist {
+            bits |= 8192;
+        }
+        if effects.water_shore_foam {
+            bits |= 16384;
+        }
+        if effects.interactive_grass {
+            bits |= 32768;
+        }
         bits
     }
 
@@ -4281,6 +4293,8 @@ impl RaywatcherGpu {
         point_lights: &[super::frame::PointLight],
         unjittered_vp: glam::Mat4,
         has_object_mv: bool,
+        walker_pos: Option<(glam::Vec3, bool)>,
+        walker_rt_verts: &[[f32; 3]],
     ) {
         if !plan.trace {
             self.traced_last_frame = false;
@@ -4421,6 +4435,12 @@ impl RaywatcherGpu {
         if has_object_mv {
             packed.effects[1] = (packed.effects[1] as u32 | 2048u32) as f32;
         }
+        if let Some((wpos, flying)) = walker_pos {
+            packed.sun_direction[3] = wpos.x;
+            packed.sun_colour[3] = wpos.y;
+            packed.ambient[3] = wpos.z;
+            packed.fog_colour[3] = if flying { 2.0 } else { 1.0 };
+        }
         packed.terrain_map_bounds = self.terrain_map_bounds();
         let containing_water = water
             .iter()
@@ -4479,6 +4499,7 @@ impl RaywatcherGpu {
                 }
             }
             if let Some(dxr) = self.dxr.as_mut() {
+                let _ = dxr.update_dynamic_character(walker_rt_verts);
                 // Copy the freshly built G-buffer planes into the shared DX12
                 // inputs and submit the wgpu encoder so the world pass +
                 // G-buffer prep complete on the GPU before DXR dispatches.

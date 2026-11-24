@@ -274,6 +274,14 @@ pub struct Effects {
     pub contact_shadows: bool,
     /// Directional moonlit night sky & starlight hemispherical bounce (pitch black in deep shade).
     pub moonlit_night: bool,
+    /// Physical sunset/twilight sky & horizon scattering (Rayleigh/Mie) feeding RT reflections & GI.
+    pub twilight_sky: bool,
+    /// Ray-traced localized height-based valley mist lit by sunbeams & lanterns (zero camera sphere).
+    pub valley_mist: bool,
+    /// Water shoreline foam, object-intersection rings, and Walker wading ripples.
+    pub water_shore_foam: bool,
+    /// Interactive wind-driven grass & foliage bending around the Walker character.
+    pub interactive_grass: bool,
 }
 
 impl Default for Effects {
@@ -292,6 +300,10 @@ impl Default for Effects {
             cloud_shadows: true,
             contact_shadows: true,
             moonlit_night: true,
+            twilight_sky: true,
+            valley_mist: true,
+            water_shore_foam: true,
+            interactive_grass: true,
         }
     }
 }
@@ -310,6 +322,10 @@ impl Effects {
             self.cloud_shadows,
             self.contact_shadows,
             self.moonlit_night,
+            self.twilight_sky,
+            self.valley_mist,
+            self.water_shore_foam,
+            self.interactive_grass,
         ]
         .iter()
         .filter(|on| **on)
@@ -520,6 +536,10 @@ impl Plan {
             cloud_shadows: false,
             contact_shadows: false,
             moonlit_night: false,
+            twilight_sky: false,
+            valley_mist: false,
+            water_shore_foam: false,
+            interactive_grass: false,
         },
         reconstruction: RayReconstruction::Off,
         grid: (0, 0),
@@ -710,6 +730,10 @@ mod tests {
             cloud_shadows: false,
             contact_shadows: false,
             moonlit_night: false,
+            twilight_sky: false,
+            valley_mist: false,
+            water_shore_foam: false,
+            interactive_grass: false,
         };
         assert!(!s.replaces_effects());
         assert_eq!(
@@ -729,6 +753,10 @@ mod tests {
                 cloud_shadows: false,
                 contact_shadows: false,
                 moonlit_night: false,
+                twilight_sky: false,
+                valley_mist: false,
+                water_shore_foam: false,
+                interactive_grass: false,
             };
             match enable {
                 0 => e.shadows = true,

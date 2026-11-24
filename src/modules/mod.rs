@@ -133,6 +133,14 @@ impl Modules {
         self.walker.is_active()
     }
 
+    pub fn walker_world_pos(&self) -> Option<(glam::Vec3, bool)> {
+        self.walker.world_pos()
+    }
+
+    pub fn walker_rt_triangles(&self, out: &mut Vec<[f32; 3]>, max_tris: usize) {
+        self.walker.rt_triangles(out, max_tris);
+    }
+
     pub fn populator_active(&self) -> bool {
         self.populator.is_active()
     }

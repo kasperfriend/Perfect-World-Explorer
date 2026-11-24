@@ -384,6 +384,85 @@ impl Walker {
         self.body.is_some() && self.character.is_some()
     }
 
+    /// World-space foot position of the active Walker character plus whether it is flying.
+    pub fn world_pos(&self) -> Option<(Vec3, bool)> {
+        let body = self.body.as_ref()?;
+        self.character.as_ref()?;
+        Some((body.position, self.travel == TravelState::Flying))
+    }
+
+    /// Collect posed world-space triangle vertices (`[a, b, c]` per triangle) of the active
+    /// Walker character (body, weapons, flight wings/sword, mount) for real-time RT shadows
+    /// and water reflections. Capped at `max_tris` via uniform stride to keep dynamic BLAS builds fast.
+    pub fn rt_triangles(&self, out: &mut Vec<[f32; 3]>, max_tris: usize) {
+        let Some(character) = self.character.as_ref() else {
+            return;
+        };
+        let Ok(models) = render_models(character, &character.posed.meshes) else {
+            return;
+        };
+        let mut total_tris = 0usize;
+        for model in &models {
+            if matches!(model.part, ModelPart::Face) {
+                continue;
+            }
+            for posed in model.poses {
+                if let Some(skin) = model.asset.skins.get(posed.skin) {
+                    if let Some(mesh) = skin.data.meshes.get(posed.mesh) {
+                        total_tris += mesh.indices.len() / 3;
+                    }
+                }
+            }
+        }
+        if total_tris == 0 {
+            return;
+        }
+        let step = (total_tris / max_tris.max(1)).max(1);
+        out.reserve(total_tris.min(max_tris) * 3);
+        let mut tri_idx = 0usize;
+        for model in &models {
+            if matches!(model.part, ModelPart::Face) {
+                continue;
+            }
+            for posed in model.poses {
+                let Some(skin) = model.asset.skins.get(posed.skin) else {
+                    continue;
+                };
+                let Some(mesh) = skin.data.meshes.get(posed.mesh) else {
+                    continue;
+                };
+                for tri in mesh.indices.chunks_exact(3) {
+                    let cur = tri_idx;
+                    tri_idx += 1;
+                    if cur % step != 0 {
+                        continue;
+                    }
+                    let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+                    if let (Some(v0), Some(v1), Some(v2)) = (
+                        posed.vertices.get(i0),
+                        posed.vertices.get(i1),
+                        posed.vertices.get(i2),
+                    ) {
+                        let a = v0.position;
+                        let b = v1.position;
+                        let c = v2.position;
+                        if a.iter().all(|v| v.is_finite())
+                            && b.iter().all(|v| v.is_finite())
+                            && c.iter().all(|v| v.is_finite())
+                        {
+                            out.push(a);
+                            out.push(b);
+                            out.push(c);
+                            if out.len() / 3 >= max_tris {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Starts and advances the building-hull loader on behalf of another
     /// add-on. The Populator stands authored placements on real BMD floors, so
     /// it needs the same hulls Walker collides with even when Walker itself is
