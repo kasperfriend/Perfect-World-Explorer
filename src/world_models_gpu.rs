@@ -881,7 +881,7 @@ impl World {
         ) {
             Ok(view) => view,
             Err(error) => {
-                if !self.reported.contains(&error) {
+                if self.reported.len() < 256 && !self.reported.contains(&error) {
                     self.reported.push(error);
                 }
                 self.effect_quads.clear();
@@ -971,7 +971,9 @@ impl World {
             ) {
                 Ok(draw) => *effects = Some(draw),
                 Err(error) => {
-                    reported.push(format!("world effects: {error}"));
+                    if reported.len() < 256 {
+                        reported.push(format!("world effects: {error}"));
+                    }
                     return;
                 }
             }
@@ -1004,7 +1006,9 @@ impl World {
             Some(light),
             &mut **read,
         ) {
-            reported.push(format!("world effects: {error}"));
+            if reported.len() < 256 {
+                reported.push(format!("world effects: {error}"));
+            }
         }
     }
 
@@ -1487,7 +1491,9 @@ impl World {
             [view.position.x, view.position.y, view.position.z, 0.],
             Some(light),
         ) {
-            reported.push(format!("world effects: {error}"));
+            if reported.len() < 256 {
+                reported.push(format!("world effects: {error}"));
+            }
         }
     }
 

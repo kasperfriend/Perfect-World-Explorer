@@ -303,49 +303,67 @@ impl WaterGpu {
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let (nw, nh) = frames[0][0].dimensions();
-        let normal = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("client water normals"),
-            size: wgpu::Extent3d {
-                width: nw,
-                height: nh,
-                depth_or_array_layers: frames.len() as u32,
-            },
-            mip_level_count: frames[0].len() as u32,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        for (i, levels) in frames.iter().enumerate() {
-            for (level, img) in levels.iter().enumerate() {
-                let (mw, mh) = img.dimensions();
-                queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: &normal,
-                        mip_level: level as u32,
-                        origin: wgpu::Origin3d {
-                            x: 0,
-                            y: 0,
-                            z: i as u32,
+        let normal = if has_water {
+            let (nw, nh) = frames[0][0].dimensions();
+            let normal = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("client water normals"),
+                size: wgpu::Extent3d {
+                    width: nw,
+                    height: nh,
+                    depth_or_array_layers: frames.len() as u32,
+                },
+                mip_level_count: frames[0].len() as u32,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            for (i, levels) in frames.iter().enumerate() {
+                for (level, img) in levels.iter().enumerate() {
+                    let (mw, mh) = img.dimensions();
+                    queue.write_texture(
+                        wgpu::ImageCopyTexture {
+                            texture: &normal,
+                            mip_level: level as u32,
+                            origin: wgpu::Origin3d {
+                                x: 0,
+                                y: 0,
+                                z: i as u32,
+                            },
+                            aspect: wgpu::TextureAspect::All,
                         },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    img.as_raw(),
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(mw * 4),
-                        rows_per_image: Some(mh),
-                    },
-                    wgpu::Extent3d {
-                        width: mw,
-                        height: mh,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                        img.as_raw(),
+                        wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(mw * 4),
+                            rows_per_image: Some(mh),
+                        },
+                        wgpu::Extent3d {
+                            width: mw,
+                            height: mh,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
-        }
+            normal
+        } else {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("client water normals (dry map dummy)"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
         let screen_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,

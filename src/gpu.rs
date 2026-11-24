@@ -1276,7 +1276,14 @@ fn build(
                 && crate::terrain_cutoff::contains(resident_bounds, t.objects.ornaments[i].position)
         })
         .collect();
-    t.objects.load_ids(&ornament_ids)?;
+    if skip_local_scenery {
+        // Whole-world GPU pages now own all scenery; drop local CPU-cached
+        // ornament meshes and decoded RGBA textures (often 100-512+ MiB RAM).
+        // They reload on demand if whole-world mode is later turned off.
+        t.objects.release_resident_caches();
+    } else {
+        t.objects.load_ids(&ornament_ids)?;
+    }
     let tree_lod_scale = lod_scale(detail.scenery_quality, Class::Trees);
     if skip_local_scenery {
         crate::diag!(
@@ -2231,11 +2238,12 @@ impl Renderer {
                     &t_ref.water_normals,
                     !t_ref.water.is_empty(),
                 );
-                let simple_water = crate::simple_water_gpu::SimpleWaterGpu::new(
+                let simple_water = crate::simple_water_gpu::SimpleWaterGpu::new_for_map(
                     device_ref,
                     queue_ref,
                     format,
                     &t_ref.water_simple_frames,
+                    !t_ref.water.is_empty(),
                 );
                 let shore = match crate::shore_gpu::ShoreGpu::new(
                     device_ref,
@@ -2520,6 +2528,14 @@ impl Renderer {
             t.grass.texture_mips.clear();
             t.grass.texture_mips.shrink_to_fit();
         }
+        if t.grass.areas.is_empty() {
+            t.grass.textures.clear();
+            t.grass.textures.shrink_to_fit();
+            t.grass.models.clear();
+            t.grass.models.shrink_to_fit();
+        }
+        t.grass.areas.shrink_to_fit();
+        t.water.shrink_to_fit();
         // Material masks and DDS buffers are no longer needed once uploaded.
         drop(terrain_upload);
         t.materials.release_gpu_source();
@@ -6765,10 +6781,12 @@ pub fn run(
                     if want_world != world_enabled {
                         world_enabled=want_world;
                         if let Some(c)=world_cancel.take(){c.store(true,std::sync::atomic::Ordering::Relaxed);}
-                        world_rx=None;renderer.world_pages.clear();renderer.world_draw_cmds=Default::default();renderer.world_done=false;
+                        world_rx=None;renderer.world_pages.clear();renderer.world_pages.shrink_to_fit();renderer.world_draw_cmds=Default::default();renderer.world_done=false;
                         if world_enabled {
+                         // Each in-flight whole-world Page carries up to ~85 MiB of 4096^2 RGBA + mips;
+                         // keeping 4/2 pages buffered saturates GPU upload while cutting peak RAM spikes by ~500-680 MiB.
                          let (tx, rx) = std::sync::mpsc::sync_channel(
-                             if crate::objects::unbounded_textures() { 12 } else { 4 },
+                             if crate::objects::unbounded_textures() { 4 } else { 2 },
                          );
                          let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
@@ -6821,6 +6839,7 @@ pub fn run(
                             }
                             Ok(crate::world_objects::Message::CacheInvalid) => {
                                 renderer.world_pages.clear();
+                                renderer.world_pages.shrink_to_fit();
                                 renderer.world_draw_cmds = Default::default();
                                 world_status = String::from("World cache invalid; rebuilding pages...");
                             }

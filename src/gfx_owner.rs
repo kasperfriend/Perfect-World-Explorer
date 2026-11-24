@@ -1168,7 +1168,9 @@ impl Manager {
             }
         }
         for (origin, error) in failures {
-            self.effect_failures.push(format!("{origin}: {error}"));
+            if self.effect_failures.len() < 512 {
+                self.effect_failures.push(format!("{origin}: {error}"));
+            }
         }
         if let Some(mut rows) = rows {
             // A file, not stderr: the shipped Windows build has no console, so a
@@ -1269,7 +1271,9 @@ impl Manager {
                 crate::diag!(EffectProblems, "{path} would not build: {error}");
                 crate::diag!(ModelQueue, "{path} rejected while loading effects: {error}");
                 self.owners[index].player_failed = true;
-                self.effect_failures.push(format!("{origin}: {error}"));
+                if self.effect_failures.len() < 512 {
+                    self.effect_failures.push(format!("{origin}: {error}"));
+                }
             }
         }
     }

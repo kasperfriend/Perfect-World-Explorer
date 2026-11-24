@@ -805,9 +805,24 @@ impl Draw {
                 bytemuck::cast_slice(&self.staging_vertices),
             );
         }
+        // Release burst high-water marks so effect spikes do not permanently
+        // pin megabytes of unused staging/scratch RAM.
+        const STAGING_TRIM_THRESHOLD: usize = 32_768;
+        if self.staging_vertices.capacity() > STAGING_TRIM_THRESHOLD
+            && self.staging_vertices.len() < self.staging_vertices.capacity() / 8
+        {
+            self.staging_vertices.shrink_to(STAGING_TRIM_THRESHOLD);
+        }
+        const MAX_SCRATCH_POOL: usize = 64;
+        const MAX_SCRATCH_VERTS: usize = 8_192;
         for (_, mut verts) in groups {
-            verts.clear();
-            self.scratch_pool.push(verts);
+            if self.scratch_pool.len() < MAX_SCRATCH_POOL {
+                verts.clear();
+                if verts.capacity() > MAX_SCRATCH_VERTS {
+                    verts.shrink_to(MAX_SCRATCH_VERTS);
+                }
+                self.scratch_pool.push(verts);
+            }
         }
         Ok(())
     }

@@ -178,13 +178,17 @@ fn texture(
 pub struct PostGpu {
     modulation: [f32; 4],
     sharpen: bool,
-    composite_target: wgpu::Texture,
+    /// Lazily allocated only when sharpen is enabled; dropped when disabled
+    /// (saves 8.3 MiB at 1080p / 33 MiB at 4K VRAM).
+    composite_target: std::sync::Mutex<Option<wgpu::Texture>>,
     encoded_finish: wgpu::RenderPipeline,
     sharpen_finish: wgpu::RenderPipeline,
     format: wgpu::TextureFormat,
     scene: wgpu::Texture,
     fogged: wgpu::Texture,
-    warped: wgpu::Texture,
+    /// Lazily allocated only when camera goes underwater (saves 8.3 MiB at
+    /// 1080p / 33 MiB at 4K VRAM during normal above-water exploration).
+    warped: std::sync::Mutex<Option<wgpu::Texture>>,
     downsample: wgpu::Texture,
     blur: wgpu::Texture,
     layout: wgpu::BindGroupLayout,
@@ -200,13 +204,7 @@ impl PostGpu {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> Self {
         let scene = texture(device, format, w, h, "post scene");
         let fogged = texture(device, format.remove_srgb_suffix(), w, h, "fogged scene");
-        let warped = texture(
-            device,
-            format.remove_srgb_suffix(),
-            w,
-            h,
-            "underwater warped scene",
-        );
+        let warped = std::sync::Mutex::new(None);
         let downsample = texture(
             device,
             format.remove_srgb_suffix(),
@@ -319,13 +317,7 @@ impl PostGpu {
         Self {
             modulation: [1.; 4],
             sharpen: false,
-            composite_target: texture(
-                device,
-                format.remove_srgb_suffix(),
-                w,
-                h,
-                "encoded glow before sharpen",
-            ),
+            composite_target: std::sync::Mutex::new(None),
             encoded_finish: make("finish_encoded", format.remove_srgb_suffix()),
             sharpen_finish: make("sharpen_finish", format),
             format,
@@ -351,16 +343,17 @@ impl PostGpu {
     /// Native renderer flag +6, 0x40fd69 -> 0x410970. Independent of bloom.
     pub fn set_sharpen(&mut self, enabled: bool) {
         self.sharpen = enabled;
+        if !enabled {
+            if let Ok(mut guard) = self.composite_target.lock() {
+                *guard = None;
+            }
+        }
     }
     pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) {
         self.scene = texture(device, self.format, w, h, "post scene");
-        self.composite_target = texture(
-            device,
-            self.format.remove_srgb_suffix(),
-            w,
-            h,
-            "encoded glow before sharpen",
-        );
+        if let Ok(mut guard) = self.composite_target.lock() {
+            *guard = None;
+        }
         self.fogged = texture(
             device,
             self.format.remove_srgb_suffix(),
@@ -368,13 +361,9 @@ impl PostGpu {
             h,
             "fogged scene",
         );
-        self.warped = texture(
-            device,
-            self.format.remove_srgb_suffix(),
-            w,
-            h,
-            "underwater warped scene",
-        );
+        if let Ok(mut guard) = self.warped.lock() {
+            *guard = None;
+        }
         self.downsample = texture(
             device,
             self.format.remove_srgb_suffix(),
@@ -475,9 +464,29 @@ impl PostGpu {
         let fogged = plan
             .fog
             .then(|| self.fogged.create_view(&Default::default()));
-        let warped = plan
-            .warp
-            .then(|| self.warped.create_view(&Default::default()));
+        let warped = plan.warp.then(|| {
+            let mut guard = self.warped.lock().unwrap();
+            let tex = guard.get_or_insert_with(|| {
+                texture(
+                    device,
+                    self.format.remove_srgb_suffix(),
+                    w,
+                    h,
+                    "underwater warped scene",
+                )
+            });
+            let sz = tex.size();
+            if sz.width != w.max(1) || sz.height != h.max(1) {
+                *tex = texture(
+                    device,
+                    self.format.remove_srgb_suffix(),
+                    w,
+                    h,
+                    "underwater warped scene",
+                );
+            }
+            tex.create_view(&Default::default())
+        });
         let downsample = plan
             .glow
             .then(|| self.downsample.create_view(&Default::default()));
@@ -600,9 +609,29 @@ impl PostGpu {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let composite_target = plan
-            .sharpen
-            .then(|| self.composite_target.create_view(&Default::default()));
+        let composite_target = plan.sharpen.then(|| {
+            let mut guard = self.composite_target.lock().unwrap();
+            let tex = guard.get_or_insert_with(|| {
+                texture(
+                    device,
+                    self.format.remove_srgb_suffix(),
+                    w,
+                    h,
+                    "encoded glow before sharpen",
+                )
+            });
+            let sz = tex.size();
+            if sz.width != w.max(1) || sz.height != h.max(1) {
+                *tex = texture(
+                    device,
+                    self.format.remove_srgb_suffix(),
+                    w,
+                    h,
+                    "encoded glow before sharpen",
+                );
+            }
+            tex.create_view(&Default::default())
+        });
         {
             let group = bind(input, &blur);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

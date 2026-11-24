@@ -322,6 +322,8 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
         }
         out
     };
+    let mut result = result;
+    result.shrink_to_fit();
     if let Some(key) = cache_key {
         if let Ok(mut guard) = dir_cache().lock() {
             // Cap cache to 32 distinct archives so tests creating temporary PCKs

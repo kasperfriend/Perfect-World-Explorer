@@ -224,6 +224,18 @@ impl TextureCache {
             self.stats.resident_bytes -= entry.bytes as u64;
         }
     }
+    /// Drops all decoded CPU textures and shrinks internal maps. Used once
+    /// whole-world preload owns scenery so local-streaming textures are not
+    /// kept resident in RAM alongside uploaded GPU pages.
+    pub fn clear(&mut self) {
+        self.by_name.clear();
+        self.by_name.shrink_to_fit();
+        self.by_hash.clear();
+        self.by_hash.shrink_to_fit();
+        self.aliases.clear();
+        self.aliases.shrink_to_fit();
+        self.stats.resident_bytes = 0;
+    }
 }
 /// One register row for a texture reference the client could not have
 /// loaded either, or that this renderer refuses by name.
@@ -993,6 +1005,18 @@ impl Objects {
     }
     pub fn resolver_stats(&self) -> crate::texture_resolution::ResolverStats {
         self.resolver.stats
+    }
+    /// Releases decoded CPU ornament models and RGBA textures when local
+    /// scenery streaming is superseded by whole-world GPU pages. Reloads
+    /// transparently on demand if whole-world mode is later disabled.
+    pub fn release_resident_caches(&mut self) {
+        if !self.models.is_empty() {
+            self.models.clear();
+            self.models.shrink_to_fit();
+        }
+        if self.cache.stats.resident_bytes > 0 {
+            self.cache.clear();
+        }
     }
 }
 #[cfg(test)]
