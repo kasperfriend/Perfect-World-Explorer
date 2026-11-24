@@ -695,9 +695,6 @@ mod tests {
                 contact_shadows: false,
                 moonlit_night: false,
                 twilight_sky: false,
-                valley_mist: false,
-                water_shore_foam: false,
-                interactive_grass: false,
                 volumetric_clouds: false,
                 realistic_water: false,
             };

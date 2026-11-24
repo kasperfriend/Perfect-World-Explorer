@@ -411,9 +411,6 @@ impl Raywatcher {
             ("Contact shadows", &mut effects.contact_shadows),
             ("Moonlit night sky", &mut effects.moonlit_night),
             ("Twilight sky scattering", &mut effects.twilight_sky),
-            ("Localized valley mist", &mut effects.valley_mist),
-            ("Water shore foam & ripples", &mut effects.water_shore_foam),
-            ("Interactive grass bending", &mut effects.interactive_grass),
             ("Volumetric clouds", &mut effects.volumetric_clouds),
             (
                 "Realistic water (waves & flow)",
@@ -658,9 +655,6 @@ impl Raywatcher {
             ("contact_shadows", effects.contact_shadows),
             ("moonlit_night", effects.moonlit_night),
             ("twilight_sky", effects.twilight_sky),
-            ("valley_mist", effects.valley_mist),
-            ("water_shore_foam", effects.water_shore_foam),
-            ("interactive_grass", effects.interactive_grass),
             ("volumetric_clouds", effects.volumetric_clouds),
             ("realistic_water", effects.realistic_water),
         ] {
@@ -746,9 +740,6 @@ impl Raywatcher {
             ("contact_shadows", &mut effects.contact_shadows),
             ("moonlit_night", &mut effects.moonlit_night),
             ("twilight_sky", &mut effects.twilight_sky),
-            ("valley_mist", &mut effects.valley_mist),
-            ("water_shore_foam", &mut effects.water_shore_foam),
-            ("interactive_grass", &mut effects.interactive_grass),
             ("volumetric_clouds", &mut effects.volumetric_clouds),
             ("realistic_water", &mut effects.realistic_water),
         ] {
@@ -1078,9 +1069,6 @@ mod tests {
             contact_shadows: false,
             moonlit_night: false,
             twilight_sky: false,
-            valley_mist: false,
-            water_shore_foam: false,
-            interactive_grass: false,
             volumetric_clouds: false,
             realistic_water: false,
         };

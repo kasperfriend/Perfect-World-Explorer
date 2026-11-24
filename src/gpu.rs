@@ -4930,19 +4930,6 @@ impl Renderer {
             Pass::Main
         };
         let mut main_frame = frame;
-        let (grass_bend_y, grass_bend_w) = if self.raywatcher_frame_plan.trace
-            && self.raywatcher_frame_plan.effects.interactive_grass
-        {
-            if let Some((wpos, flying)) = self.modules.walker_world_pos() {
-                main_frame.grass_wind[2] = wpos.x;
-                main_frame.grass_wind[3] = wpos.z;
-                (wpos.y, if flying { 2.0 } else { 1.0 })
-            } else {
-                (0., 0.)
-            }
-        } else {
-            (0., 0.)
-        };
         let normal = main_frame.uniform(
             matrix,
             [direction.x, direction.y, direction.z, daylight],
@@ -4955,8 +4942,8 @@ impl Renderer {
             [
                 crate::render_scale::mip_bias(),
                 crate::render_scale::mip_gradient_scale(),
-                grass_bend_y,
-                grass_bend_w,
+                0.,
+                0.,
             ],
         );
         self.queue

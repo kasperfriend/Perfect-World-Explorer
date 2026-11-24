@@ -531,17 +531,6 @@ float2 hash22(float2 p) {
     return frac((p3.xx + p3.yz) * p3.zy);
 }
 
-// Feature #10: Animated 3D world-space suspended underwater dust/plankton motes.
-float underwater_motes(float3 p, float t) {
-    float3 q = p * 0.62 + float3(sin(t * 0.35 + p.y * 0.25) * 0.4, -t * 0.18, cos(t * 0.31 + p.x * 0.22) * 0.4);
-    float3 cell = floor(q);
-    float3 f = frac(q);
-    float2 h = hash22(cell.xz + cell.y * 17.31);
-    float3 pt = float3(h.x, frac(h.x * 13.7 + h.y * 7.3), h.y) * 0.72 + 0.14;
-    float d2 = dot(f - pt, f - pt);
-    return exp(-d2 * 48.0) * step(0.45, h.x);
-}
-
 float3 sample_sky_reflection(float3 dir) {
     return sample_sky_env(dir);
 }
@@ -1140,12 +1129,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     bool bits_moonlit_night = (effects & 512u) != 0u;
     bool bits_weather = (effects & 2048u) != 0u;
     bool bits_twilight_sky = (effects & 4096u) != 0u;
-    bool bits_valley_mist = (effects & 8192u) != 0u;
-    bool bits_water_shore_foam = (effects & 16384u) != 0u;
     bool bits_volumetric_clouds = (effects & 65536u) != 0u;
     bool bits_realistic_water = (effects & 131072u) != 0u;
-    bool walker_active = params.fog_colour.w > 0.5;
-    float3 walker_pos = float3(params.sun_dir.w, params.sun_colour.w, params.ambient.w);
 
     // Feature #6: True metallic PBR material separation for armor, weapons & gold roofs
     // (Opt: skip metallic classification completely on water pixels).
@@ -1371,19 +1356,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     refl_base_n = water_wave_normal(world_pos.xz, params.frame.x * 0.03, dist);
                 }
             }
-            float walker_ripple_crest = 0.0;
-            if (is_water && bits_water_shore_foam && walker_active && abs(walker_pos.y - world_pos.y) < 2.2) {
-                float2 w_d = world_pos.xz - walker_pos.xz;
-                float w_r = length(w_d);
-                if (w_r > 0.15 && w_r < 6.8) {
-                    float r_fade = (1.0 - smoothstep(0.8, 6.8, w_r)) * smoothstep(0.15, 0.45, w_r);
-                    float phase_r = w_r * 7.2 - params.frame.x * 0.14;
-                    float wave_r = sin(phase_r) * r_fade;
-                    float2 dir_r = w_d / max(w_r, 1e-4);
-                    refl_base_n = normalize(refl_base_n + float3(dir_r.x, 0.0, dir_r.y) * (wave_r * 0.22));
-                    walker_ripple_crest = saturate(cos(phase_r) * 0.5 + 0.5) * r_fade * 0.35;
-                }
-            }
             float3 h = ggx_sample(refl_base_n, eff_roughness, rand01(state), rand01(state));
             float3 reflect_dir = reflect(view_dir, h);
             if (dot(reflect_dir, refl_base_n) <= 0.0) {
@@ -1523,25 +1495,16 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float sss_c = (back_c * back_c * 0.65 + 0.35) * smoothstep(0.35, 0.92, rw_wave_h);
                     refl_col += float3(0.08, 0.54, 0.50) * params.sun_colour.xyz * (sss_c * shadow * sun_strength * refract_w * 0.26);
                 }
-                // Animated shoreline/object foam + Walker wading ripples (#4) + realistic water whitecaps & flow foam.
-                if ((bits_water_shore_foam || bits_realistic_water) && dist < 210.0) {
+                // Realistic water whitecaps & flow foam.
+                if (bits_realistic_water && dist < 210.0) {
                     float foam_mask = 0.0;
-                    if (bits_water_shore_foam && wdepth < 1.35) {
-                        float t_f = params.frame.x * 0.045;
-                        float lap = sin(wdepth * 14.0 - t_f * 2.4 + sin(world_pos.x * 0.55 + world_pos.z * 0.48) * 1.8) * 0.5 + 0.5;
-                        float cell_f = voronoi_ridge(world_pos.xz * 0.85, t_f * 0.6);
-                        float edge_band = (1.0 - smoothstep(0.06, 1.35, wdepth));
-                        float contact_ring = 1.0 - smoothstep(0.02, 0.28, wdepth);
-                        foam_mask = saturate(edge_band * (0.35 + 0.65 * lap) * smoothstep(0.28, 0.78, cell_f) + contact_ring * 0.72);
-                    }
                     if (bits_realistic_water) {
                         float t_rw = params.frame.x * 0.04;
                         float wc_cell = (rw_crest_foam + rw_flow_foam > 0.02)
                             ? smoothstep(0.22, 0.78, voronoi_ridge(world_pos.xz * 0.55 + float2(t_rw * 0.45, t_rw * 0.25), t_rw * 0.5))
                             : 0.0;
-                        foam_mask = saturate(foam_mask + (rw_crest_foam * 0.85 + rw_flow_foam) * (0.45 + 0.55 * wc_cell));
+                        foam_mask = saturate((rw_crest_foam * 0.85 + rw_flow_foam) * (0.45 + 0.55 * wc_cell));
                     }
-                    foam_mask = saturate(foam_mask + walker_ripple_crest);
                     if (foam_mask > 0.01) {
                         float3 foam_lit = lerp(float3(0.18, 0.24, 0.32), params.sun_colour.xyz * 0.88 + params.ambient.xyz * 0.48, sun_strength);
                         float dist_f = 1.0 - smoothstep(105.0, 210.0, dist);
@@ -1852,68 +1815,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float3 uw_tint = lerp(night_uw, day_uw, sun_strength);
             float uw_gain = is_submerged ? 0.34 : 0.18;
             god_rays += uw_tint * (uw_vis * uw_phase * uw_contrast * uw_gain * (1.0 - fog_t * 0.25));
-            // Feature #10: Depth-layered underwater volumetric grading + suspended plankton/dust motes
-            // + animated light-beam shimmer on submerged ruins.
-            if (is_submerged) {
-                float eye_sub = max(water_y - params.eye.y, 0.05);
-                float3 shallow_aqua = float3(0.05, 0.28, 0.34);
-                float3 deep_abyss = float3(0.015, 0.075, 0.16);
-                float depth_t = saturate(eye_sub / 22.0);
-                float3 vol_grade = lerp(shallow_aqua, deep_abyss, depth_t) * lerp(0.18, 1.0, sun_strength);
-                float vol_w = (1.0 - exp(-uw_march * 0.022)) * 0.32;
-                god_rays += vol_grade * vol_w;
-                // 3D suspended sun-lit plankton/dust motes along the underwater camera ray
-                float mote_acc = 0.0;
-                float t_mote = params.frame.x * 0.035;
-                for (uint mi = 0u; mi < 4u; mi = mi + 1u) {
-                    float t_m = 1.2 + (float(mi) + ign_v) * min(uw_march * 0.22, 5.5);
-                    if (t_m < dist - 0.5) {
-                        float3 pm = params.eye.xyz + view_dir * t_m;
-                        if (pm.y < water_y - 0.1) {
-                            mote_acc += underwater_motes(pm, t_mote) * exp(-t_m * 0.08);
-                        }
-                    }
-                }
-                god_rays += lerp(float3(0.18, 0.38, 0.52), float3(0.68, 0.96, 0.92) * max(params.sun_colour.xyz, float3(0.35, 0.35, 0.35)), sun_strength)
-                    * (mote_acc * (0.28 + 0.72 * uw_vis) * 0.38);
-            }
-        }
-    }
-
-    // Feature #3: Ray-traced localized height-based valley mist (strictly zero within 18u of camera!).
-    if (bits_valley_mist && !is_submerged && dist > 18.0 && fog_t < 0.96) {
-        float mist_base_y = (water_y > -1e5) ? (water_y + 2.5) : (params.eye.y - 16.0);
-        float mist_len = min(dist, 220.0) - 18.0;
-        if (mist_len > 4.0) {
-            float mist_acc = 0.0;
-            float mist_lit = 0.0;
-            for (uint vi = 0u; vi < 4u; vi = vi + 1u) {
-                float u = (float(vi) + ign_v) * 0.25;
-                float t_m = 18.0 + u * mist_len;
-                float3 pm = params.eye.xyz + view_dir * t_m;
-                float h_above = max(pm.y - mist_base_y, 0.0);
-                float h_dens = exp(-h_above * 0.075);
-                if (h_dens > 0.04) {
-                    // Subtle wispy modulation so valley mist looks organic rather than a flat slab
-                    float wisp = 0.65 + 0.35 * sin(pm.x * 0.035 + params.frame.x * 0.006) * cos(pm.z * 0.031 - params.frame.x * 0.005);
-                    float step_d = h_dens * wisp;
-                    mist_acc += step_d;
-                    bool m_occ = (bits_shadows && params.sun_dir.y > 0.04)
-                        ? occluded_fast(pm, params.sun_dir.xyz, 0.5, 220.0)
-                        : false;
-                    if (!m_occ) {
-                        mist_lit += step_d;
-                    }
-                }
-            }
-            float mist_opt = saturate((mist_acc * 0.25) * smoothstep(18.0, 95.0, dist) * 0.36);
-            if (mist_opt > 1e-3) {
-                float sun_frac = (mist_acc > 1e-4) ? saturate(mist_lit / mist_acc) : 0.0;
-                float3 mist_day = lerp(params.ambient.xyz * 0.55, params.sun_colour.xyz * 0.72 + float3(0.10, 0.14, 0.18), sun_frac);
-                float3 mist_night = float3(0.025, 0.045, 0.085);
-                float3 mist_col = lerp(mist_night, mist_day, sun_strength);
-                god_rays += mist_col * (mist_opt * (1.0 - fog_t * 0.75) * 0.45);
-            }
         }
     }
 

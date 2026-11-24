@@ -276,12 +276,6 @@ pub struct Effects {
     pub moonlit_night: bool,
     /// Physical sunset/twilight sky & horizon scattering (Rayleigh/Mie) feeding RT reflections & GI.
     pub twilight_sky: bool,
-    /// Ray-traced localized height-based valley mist lit by sunbeams & lanterns (zero camera sphere).
-    pub valley_mist: bool,
-    /// Water shoreline foam, object-intersection rings, and Walker wading ripples.
-    pub water_shore_foam: bool,
-    /// Interactive wind-driven grass & foliage bending around the Walker character.
-    pub interactive_grass: bool,
     /// Deep 3D ray-marched volumetric clouds that drift and evolve over time.
     pub volumetric_clouds: bool,
     /// Realistic flowing water with wind-driven ripples, multi-directional waves, and crest/shore foam.
@@ -305,9 +299,6 @@ impl Default for Effects {
             contact_shadows: true,
             moonlit_night: true,
             twilight_sky: true,
-            valley_mist: true,
-            water_shore_foam: true,
-            interactive_grass: true,
             volumetric_clouds: true,
             realistic_water: true,
         }
@@ -329,9 +320,6 @@ impl Effects {
             self.contact_shadows,
             self.moonlit_night,
             self.twilight_sky,
-            self.valley_mist,
-            self.water_shore_foam,
-            self.interactive_grass,
             self.volumetric_clouds,
             self.realistic_water,
         ]
@@ -545,9 +533,6 @@ impl Plan {
             contact_shadows: false,
             moonlit_night: false,
             twilight_sky: false,
-            valley_mist: false,
-            water_shore_foam: false,
-            interactive_grass: false,
             volumetric_clouds: false,
             realistic_water: false,
         },
@@ -741,9 +726,6 @@ mod tests {
             contact_shadows: false,
             moonlit_night: false,
             twilight_sky: false,
-            valley_mist: false,
-            water_shore_foam: false,
-            interactive_grass: false,
             volumetric_clouds: false,
             realistic_water: false,
         };
@@ -766,9 +748,6 @@ mod tests {
                 contact_shadows: false,
                 moonlit_night: false,
                 twilight_sky: false,
-                valley_mist: false,
-                water_shore_foam: false,
-                interactive_grass: false,
                 volumetric_clouds: false,
                 realistic_water: false,
             };

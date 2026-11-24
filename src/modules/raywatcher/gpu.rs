@@ -128,15 +128,6 @@ impl RayParams {
         if effects.twilight_sky {
             bits |= 4096;
         }
-        if effects.valley_mist {
-            bits |= 8192;
-        }
-        if effects.water_shore_foam {
-            bits |= 16384;
-        }
-        if effects.interactive_grass {
-            bits |= 32768;
-        }
         if effects.volumetric_clouds {
             bits |= 65536;
         }
