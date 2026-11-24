@@ -5782,6 +5782,36 @@ pub fn run(
                     keys.clear();
                     return;
                 }
+                if renderer.modules.architect_active() {
+                    if captured {
+                        let _ = window.set_cursor_grab(CursorGrabMode::None);
+                        window.set_cursor_visible(true);
+                        captured = false;
+                    }
+                    if window_focused {
+                        if let WindowEvent::KeyboardInput { ref event, .. } = event {
+                            if let PhysicalKey::Code(k) = event.physical_key {
+                                if event.state == ElementState::Pressed {
+                                    keys.insert(k);
+                                } else {
+                                    keys.remove(&k);
+                                }
+                            }
+                        }
+                    } else {
+                        keys.clear();
+                    }
+                    let _ = egui_state.on_window_event(&window, &event);
+                    if !matches!(
+                        event,
+                        WindowEvent::RedrawRequested
+                            | WindowEvent::Resized(_)
+                            | WindowEvent::CloseRequested
+                            | WindowEvent::Focused(_)
+                    ) {
+                        return;
+                    }
+                }
                 if let WindowEvent::KeyboardInput {ref event,..}=event {
                     if event.physical_key == PhysicalKey::Code(KeyCode::Escape) && event.state == ElementState::Pressed && !event.repeat && !world_loading_active {
                         menu_page=menu_page.escape();keys.clear();
@@ -5882,6 +5912,119 @@ pub fn run(
                     if let Some(encode)=present_encode.as_mut() {encode.resize(&renderer.device,s.width,s.height);}
                 }
                 WindowEvent::RedrawRequested => {
+                    if renderer.modules.architect_active() {
+                        if captured {
+                            let _ = window.set_cursor_grab(CursorGrabMode::None);
+                            window.set_cursor_visible(true);
+                            captured = false;
+                        }
+                        if surface.is_none() {
+                            framegen = None;
+                            xess_framegen = None;
+                            dlss_framegen = None;
+                            if let Ok(s) = recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                surface = Some(s);
+                            }
+                        }
+                        let dt = last.elapsed().as_secs_f32().min(0.1);
+                        last = Instant::now();
+                        renderer.modules.architect_update(dt, &keys);
+                        renderer.modules.architect_prepare_viewport(
+                            &renderer.device,
+                            &renderer.queue,
+                            &mut egui_renderer,
+                        );
+                        if let Some(active_surface) = surface.as_ref() {
+                            match active_surface.get_current_texture() {
+                                Ok(frame) => {
+                                    let view = frame.texture.create_view(&Default::default());
+                                    let input = egui_state.take_egui_input(&window);
+                                    let output = egui_ctx.run(input, |ctx| {
+                                        renderer.modules.architect_ui(ctx);
+                                    });
+                                    egui_state.handle_platform_output(&window, output.platform_output);
+                                    let jobs = egui_ctx.tessellate(output.shapes, output.pixels_per_point);
+                                    let screen = egui_wgpu::ScreenDescriptor {
+                                        size_in_pixels: [config.width, config.height],
+                                        pixels_per_point: output.pixels_per_point,
+                                    };
+                                    for (id, delta) in &output.textures_delta.set {
+                                        egui_renderer.update_texture(&renderer.device, &renderer.queue, *id, delta);
+                                    }
+                                    let mut encoder = renderer.device.create_command_encoder(&Default::default());
+                                    let cmd = egui_renderer.update_buffers(
+                                        &renderer.device,
+                                        &renderer.queue,
+                                        &mut encoder,
+                                        &jobs,
+                                        &screen,
+                                    );
+                                    {
+                                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                            label: Some("architect editor"),
+                                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                                view: &view,
+                                                resolve_target: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                                                        r: 0.11,
+                                                        g: 0.12,
+                                                        b: 0.14,
+                                                        a: 1.0,
+                                                    }),
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                            })],
+                                            depth_stencil_attachment: None,
+                                            timestamp_writes: None,
+                                            occlusion_query_set: None,
+                                        });
+                                        egui_renderer.render(&mut pass, &jobs, &screen);
+                                    }
+                                    renderer.queue.submit(cmd.into_iter().chain(std::iter::once(encoder.finish())));
+                                    for id in &output.textures_delta.free {
+                                        egui_renderer.free_texture(id);
+                                    }
+                                    frame.present();
+                                }
+                                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                                    active_surface.configure(&renderer.device, &config);
+                                }
+                                Err(wgpu::SurfaceError::OutOfMemory) => {
+                                    target.exit();
+                                }
+                                Err(e) => {
+                                    eprintln!("architect surface: {e}");
+                                }
+                            }
+                        }
+                        if let Some(action) = renderer.modules.take_architect_action() {
+                            catalog = crate::world_catalog::discover(&whole_element);
+                            catalog.maps.retain(|map| crate::world_catalog::valid_world_id(&map.id));
+                            if let crate::modules::architect::ArchitectAction::TravelToMap(map_id) = action {
+                                menu_page = MenuPage::Closed;
+                                match spawn_world_handoff(&client_root, &map_id, window_focused) {
+                                    Ok((_handoff_files, rx)) => {
+                                        settings.selected_world = map_id.to_ascii_lowercase();
+                                        let _ = settings.save();
+                                        saved_settings = settings.clone();
+                                        selected_world_ui = map_id.clone();
+                                        world_loading_status = format!("Opening {map_id}...");
+                                        world_loading_active = true;
+                                        world_change_error = None;
+                                        handoff_rx = Some(rx);
+                                    }
+                                    Err(err) => {
+                                        world_change_error = Some(err);
+                                    }
+                                }
+                            }
+                        }
+                        if !renderer.modules.architect_active() {
+                            menu_page = MenuPage::Closed;
+                        }
+                        return;
+                    }
                     // Reflex pacing first: everything below belongs to the
                     // frame the CPU is only allowed to start now.
                     if let Some(pacer) = reflex.as_mut() {

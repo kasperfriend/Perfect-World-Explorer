@@ -2,6 +2,7 @@
 //! GPU resources. The host only supplies narrow input/camera, terrain and draw
 //! hooks; a disabled module has no effect on core features.
 
+pub mod architect;
 mod designer;
 mod librarian;
 mod package;
@@ -29,6 +30,7 @@ fn extend_fonts(ctx: &egui::Context, extend: impl FnOnce(&mut egui::FontDefiniti
 }
 
 pub struct Modules {
+    architect: architect::Architect,
     walker: Walker,
     librarian: librarian::Librarian,
     populator: Populator,
@@ -45,6 +47,7 @@ pub struct Modules {
 impl Default for Modules {
     fn default() -> Self {
         Self {
+            architect: architect::Architect::default(),
             walker: Walker::default(),
             librarian: librarian::Librarian::new(PathBuf::new()),
             populator: Populator::default(),
@@ -68,6 +71,7 @@ impl Modules {
         // handles they need (client root and the loaded world space).
         let populator = Populator::new(element.clone(), map.clone(), map_dir);
         Self {
+            architect: architect::Architect::new(element.clone()),
             walker: Walker::with_host(element.clone(), map, water, scene, ornaments),
             librarian: librarian::Librarian::new(element),
             populator,
@@ -93,11 +97,37 @@ impl Modules {
     /// currently enabled.
     fn module_enabled(&self, id: &str) -> bool {
         match id {
+            "architect" => self.architect.is_active(),
             "walker" => self.walker.is_active(),
             "populator" => self.populator.is_active(),
             "librarian" => self.librarian.active(),
             _ => false,
         }
+    }
+
+    pub fn architect_active(&self) -> bool {
+        self.architect.is_active()
+    }
+
+    pub fn architect_update(&mut self, delta: f32, keys: &HashSet<KeyCode>) {
+        self.architect.update(delta, keys);
+    }
+
+    pub fn architect_prepare_viewport(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut egui_wgpu::Renderer,
+    ) {
+        self.architect.prepare_viewport(device, queue, renderer);
+    }
+
+    pub fn architect_ui(&mut self, ctx: &egui::Context) {
+        self.architect.ui(ctx);
+    }
+
+    pub fn take_architect_action(&mut self) -> Option<architect::ArchitectAction> {
+        self.architect.take_action()
     }
 
     pub fn walker_active(&self) -> bool {
@@ -258,6 +288,33 @@ impl Modules {
         );
         ui.add_space(8.);
         match installed.id.as_str() {
+            "architect" => {
+                let active = self.architect.is_active();
+                let label = if active {
+                    "Turn off Architect"
+                } else {
+                    "Enable Architect"
+                };
+                if ui
+                    .add_sized([180., 32.], egui::Button::new(label))
+                    .clicked()
+                {
+                    self.architect.set_active(!active);
+                }
+                let status = self.architect.status();
+                if active {
+                    ui.label(egui::RichText::new(status).color(egui::Color32::LIGHT_GREEN));
+                } else {
+                    ui.label(egui::RichText::new(status).weak());
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Switches the app into a standalone Blender-style 3D world editor with movable/pinnable tabs, terrain sculpting, snapping, full client asset explorer with quick-bar pinning, custom world saving, and export to playable Perfect World game maps. Use the red 'Turn off Architect' button in the upper bar to return to the viewer.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
             "walker" => self.walker_module_ui(ui, spawn, yaw),
             "populator" => self.populator_module_ui(ui, spawn),
             "librarian" => {

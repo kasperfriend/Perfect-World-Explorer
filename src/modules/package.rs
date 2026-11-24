@@ -285,4 +285,18 @@ mod tests {
         assert_eq!(walker.name, "Walker");
         assert!(!walker.description.is_empty());
     }
+
+    #[test]
+    fn shipped_architect_manifest_is_discoverable() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(MODULES_DIRECTORY);
+        let registry = Registry::discover(root);
+        assert!(registry.errors.is_empty(), "{:?}", registry.errors);
+        let architect = registry
+            .packages
+            .iter()
+            .find(|package| package.id == "architect")
+            .expect("Modules/Architect must be shipped");
+        assert_eq!(architect.name, "Architect");
+        assert!(!architect.description.is_empty());
+    }
 }
