@@ -902,6 +902,12 @@ impl World {
                 .as_deref()
                 .map(|f| f as crate::gfx_player::GroundHeightQuery<'_>);
             owners.effect_quads_with_ground_into(delta_ms, &view, sampler, effect_quads);
+            const EFFECT_QUAD_TRIM_THRESHOLD: usize = 4096;
+            if effect_quads.capacity() > EFFECT_QUAD_TRIM_THRESHOLD
+                && effect_quads.len() < effect_quads.capacity() / 8
+            {
+                effect_quads.shrink_to(effect_quads.len().max(EFFECT_QUAD_TRIM_THRESHOLD));
+            }
         }
         // Say once, on stderr, what the invisible pipeline is doing. Nothing in
         // the world told a user *which* stage was empty when no effect appeared:
@@ -1020,7 +1026,9 @@ impl World {
     pub fn set_effects_enabled(&mut self, enabled: bool) {
         self.owners.set_effects_enabled(enabled);
         if !enabled {
+            self.effects = None;
             self.effect_quads.clear();
+            self.effect_quads.shrink_to_fit();
         }
     }
 

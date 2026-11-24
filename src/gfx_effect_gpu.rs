@@ -182,6 +182,7 @@ pub struct Draw {
     /// once per pass instead of once per bucket.
     shared_vertex_buffer: wgpu::Buffer,
     shared_vertex_capacity: usize,
+    low_usage_frames: u32,
     staging_vertices: Vec<Vertex>,
     uniform: wgpu::Buffer,
     sampler_repeat: wgpu::Sampler,
@@ -454,6 +455,7 @@ impl Draw {
             buckets: HashMap::new(),
             shared_vertex_buffer,
             shared_vertex_capacity: INITIAL_SHARED_VERTICES,
+            low_usage_frames: 0,
             staging_vertices: Vec::with_capacity(INITIAL_SHARED_VERTICES),
             uniform,
             last_params: None,
@@ -789,16 +791,33 @@ impl Draw {
             self.staging_vertices.extend_from_slice(vertices);
             self.order.push((*key, first_vertex, vertices.len() as u32));
         }
-        if !self.staging_vertices.is_empty() {
-            if self.staging_vertices.len() > self.shared_vertex_capacity {
-                self.shared_vertex_capacity = self.staging_vertices.len().next_power_of_two();
+        let vert_len = self.staging_vertices.len();
+        if vert_len > self.shared_vertex_capacity {
+            self.shared_vertex_capacity = vert_len.next_power_of_two();
+            self.shared_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GFX effect shared vertex buffer"),
+                size: (self.shared_vertex_capacity * std::mem::size_of::<Vertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.low_usage_frames = 0;
+        } else if self.shared_vertex_capacity > 65_536 && vert_len < self.shared_vertex_capacity / 8
+        {
+            self.low_usage_frames = self.low_usage_frames.saturating_add(1);
+            if self.low_usage_frames >= 120 {
+                self.shared_vertex_capacity = vert_len.max(32_768).next_power_of_two();
                 self.shared_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("GFX effect shared vertex buffer"),
                     size: (self.shared_vertex_capacity * std::mem::size_of::<Vertex>()) as u64,
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
+                self.low_usage_frames = 0;
             }
+        } else {
+            self.low_usage_frames = 0;
+        }
+        if vert_len > 0 {
             queue.write_buffer(
                 &self.shared_vertex_buffer,
                 0,
@@ -828,6 +847,10 @@ impl Draw {
     }
 
     fn note_failure(&mut self, texture: &str, error: &str) {
+        const MAX_FAILED_DIAGNOSTICS: usize = 512;
+        if self.failed.len() >= MAX_FAILED_DIAGNOSTICS {
+            return;
+        }
         let message = format!("{texture}: {error}");
         if self.failed_set.insert(message.clone()) {
             self.failed.push(message);

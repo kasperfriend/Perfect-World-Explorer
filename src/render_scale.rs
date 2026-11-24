@@ -120,7 +120,7 @@ fn target_texture(
 /// Offscreen world target plus the fullscreen bilinear upscale pipeline.
 pub struct RenderScale {
     format: wgpu::TextureFormat,
-    frame: wgpu::Texture,
+    frame: Option<wgpu::Texture>,
     sampler: wgpu::Sampler,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
@@ -202,7 +202,7 @@ impl RenderScale {
         });
         Self {
             format,
-            frame: target_texture(device, format, w, h),
+            frame: None,
             sampler,
             pipeline,
             layout,
@@ -212,12 +212,29 @@ impl RenderScale {
         }
     }
 
+    /// Ensure the offscreen render target is allocated at `self.input_extent`.
+    pub fn ensure_frame(&mut self, device: &wgpu::Device) {
+        if self.frame.is_none() {
+            let (w, h) = self.input_extent;
+            self.frame = Some(target_texture(device, self.format, w, h));
+        }
+    }
+
+    /// Drop the offscreen render target (and any FSR 1 intermediate) when the
+    /// frame loop renders directly into the native composition view.
+    pub fn release_frame(&mut self) {
+        self.frame = None;
+        self.fsr1 = None;
+    }
+
     /// Reallocate the offscreen target when the window or the scale changes.
     /// The pipeline, layout and sampler are size-independent and are reused.
     pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32, output_w: u32, output_h: u32) {
         if self.input_extent != (w, h) {
-            self.frame = target_texture(device, self.format, w, h);
             self.input_extent = (w, h);
+            if self.frame.is_some() {
+                self.frame = Some(target_texture(device, self.format, w, h));
+            }
         }
         if self.output_extent != (output_w, output_h) {
             self.output_extent = (output_w, output_h);
@@ -230,7 +247,9 @@ impl RenderScale {
     /// The raw texture; used by the FSR path to copy the world frame into
     /// its native target.
     pub fn texture(&self) -> &wgpu::Texture {
-        &self.frame
+        self.frame
+            .as_ref()
+            .expect("RenderScale::ensure_frame must be called before texture()")
     }
 
     /// Extent the world is currently rendered at. The frame loop compares this
@@ -243,13 +262,13 @@ impl RenderScale {
 
     /// sRGB view the world is rendered into.
     pub fn view(&self) -> wgpu::TextureView {
-        self.frame.create_view(&Default::default())
+        self.texture().create_view(&Default::default())
     }
 
     /// Raw (encoded-space) view for legacy alpha-blended scenery passes; must
     /// alias the same texture as [`Self::view`].
     pub fn raw_view(&self) -> wgpu::TextureView {
-        self.frame.create_view(&wgpu::TextureViewDescriptor {
+        self.texture().create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.format.remove_srgb_suffix()),
             ..Default::default()
         })
@@ -287,6 +306,7 @@ impl RenderScale {
             );
             return;
         }
+        self.fsr1 = None;
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("resolution scale source"),
             layout: &self.layout,

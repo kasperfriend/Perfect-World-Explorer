@@ -1852,6 +1852,7 @@ struct Renderer {
     #[allow(dead_code)]
     object_mv: wgpu::Texture,
     object_mv_view: wgpu::TextureView,
+    object_mv_enabled: bool,
     center: (isize, isize),
 }
 
@@ -1983,15 +1984,27 @@ pub fn ten_class_placements(t: &Terrain) -> Vec<crate::scenery_visibility::Place
 /// intermediates stay at the full window size and are resized separately.
 fn resize_world_targets(renderer: &mut Renderer, w: u32, h: u32) {
     renderer.depth = depth(&renderer.device, w, h);
-    let (object_mv, object_mv_view) = object_mv_target(&renderer.device, w, h);
-    renderer.object_mv = object_mv;
-    renderer.object_mv_view = object_mv_view;
+    if renderer.object_mv_enabled {
+        let (object_mv, object_mv_view) = object_mv_target(&renderer.device, w, h);
+        renderer.object_mv = object_mv;
+        renderer.object_mv_view = object_mv_view;
+    }
     // Sky keeps its dummy depth — sampling the real depth in the same
     // pass that writes it is a feedback hazard.
     renderer.water.resize(&renderer.device, w, h);
     renderer.post.resize(&renderer.device, w, h);
 }
 impl Renderer {
+    fn set_object_mv_enabled(&mut self, enabled: bool, w: u32, h: u32) {
+        if self.object_mv_enabled == enabled {
+            return;
+        }
+        self.object_mv_enabled = enabled;
+        let (ow, oh) = if enabled { (w, h) } else { (1, 1) };
+        let (object_mv, object_mv_view) = object_mv_target(&self.device, ow, oh);
+        self.object_mv = object_mv;
+        self.object_mv_view = object_mv_view;
+    }
     fn resident_bounds(&self) -> Option<[f32; 4]> {
         let win = self.lod.window;
         self.detail.terrain_cutoff.then(|| {
@@ -2578,7 +2591,7 @@ impl Renderer {
             Some(&terrain_gpu.grass_light_layout),
         );
         let d = depth_tex;
-        let (object_mv, object_mv_view) = object_mv_target(&device, w, h);
+        let (object_mv, object_mv_view) = object_mv_target(&device, 1, 1);
         // Install the day/night pair the client's own `autoscene.cfg` names
         // (`sky_id_day = 0`, `sky_id_night = 1` for this build) after the
         // `sky.lst` rows have been loaded. The machine starts on the day set;
@@ -2663,6 +2676,7 @@ impl Renderer {
             depth: d,
             object_mv,
             object_mv_view,
+            object_mv_enabled: false,
             center: m.center,
             lod: m.lod,
             spans: m.spans,
@@ -3559,37 +3573,39 @@ impl Renderer {
                 self.modules.render_walker_effects(&mut pass);
             }
         }
-        if let Some(models) = &mut self.models {
-            if models.has_effect_quads() {
-                let size = self.object_mv.size();
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("world effect sheet motion"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.object_mv_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    // Tested against full scene+water depth, never written.
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: depth,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
+        if self.object_mv_enabled {
+            if let Some(models) = &mut self.models {
+                if models.has_effect_quads() {
+                    let size = self.object_mv.size();
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("world effect sheet motion"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &self.object_mv_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        // Tested against full scene+water depth, never written.
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: depth,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
                         }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                models.draw_effect_motion(
-                    &self.queue,
-                    &mut pass,
-                    unjittered_vp.to_cols_array_2d(),
-                    (size.width, size.height),
-                );
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    models.draw_effect_motion(
+                        &self.queue,
+                        &mut pass,
+                        unjittered_vp.to_cols_array_2d(),
+                        (size.width, size.height),
+                    );
+                }
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -3878,6 +3894,9 @@ impl Renderer {
             camera.underwater_depth > 0.,
             camera.client_gamma,
         );
+        self.post.set_scene_active(&self.device, w, h, use_post);
+        self.water
+            .set_reflections(&self.device, w, h, camera.water_reflections);
         let post_view = if use_post {
             Some(self.post.scene_view())
         } else {
@@ -3961,7 +3980,7 @@ impl Renderer {
         // The object-motion attachment is cleared here, before any pass that may
         // write it, so a frame with no producer still hands the motion-vector
         // pass a zeroed surface instead of the previous frame's vectors.
-        {
+        if self.object_mv_enabled {
             let _ = e.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("object motion clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4063,7 +4082,7 @@ impl Renderer {
             camera.active_fog(),
             normal.clip,
             main_weather,
-            true,
+            self.object_mv_enabled,
             reset_history,
         );
         // Two full-resolution copies that only the water and the post chain can
@@ -5917,28 +5936,7 @@ pub fn run(
             1408u32,
         )
     };
-    let full_map_texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("selected-world overhead map"),
-        size: wgpu::Extent3d {
-            width: full_map_width,
-            height: full_map_height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let full_map_view = full_map_texture.create_view(&Default::default());
-    let full_depth_tex = depth(&renderer.device, full_map_width, full_map_height);
-    let full_map_depth = full_depth_tex.create_view(&Default::default());
-    let full_map_id = egui_renderer.register_native_texture(
-        &renderer.device,
-        &full_map_view,
-        wgpu::FilterMode::Linear,
-    );
+    let mut full_map_target: Option<(wgpu::Texture, wgpu::TextureView, egui::TextureId)> = None;
     // Client map artwork, loaded on demand in a worker thread. The world map and
     // the minimap come from different asset sets (`surfaces/maps/` and
     // `surfaces/minimaps/world/`), so each keeps its own texture and its own
@@ -7090,10 +7088,20 @@ pub fn run(
                             // stay sharp regardless of the 3D resolution scale.
                             let composed_view=if whole_frame_gamma {Some(display_gamma.as_ref().unwrap().view())} else if let Some(encode)=present_encode.as_ref() {Some(encode.view())} else {None};
                             let scene_view=composed_view.as_ref().unwrap_or(final_view);
-                            // Draw the world into the scaled offscreen target, then bilinearly
-                            // present it into `scene_view` before the UI pass loads that result.
-                            let world_view = render_scale.view();
-                            let world_raw_view = render_scale.raw_view();
+                            let need_object_mv = fsr_upscaler.is_some()
+                                || xess_upscaler.is_some()
+                                || dlss_upscaler.is_some()
+                                || framegen.is_some()
+                                || xess_framegen.is_some()
+                                || dlss_framegen.is_some();
+                            renderer.set_object_mv_enabled(need_object_mv, world_extent.0, world_extent.1);
+                            let direct_native_render = fg_views.is_none()
+                                && world_extent == (config.width, config.height)
+                                && fsr_upscaler.is_none()
+                                && xess_upscaler.is_none()
+                                && dlss_upscaler.is_none()
+                                && !(settings.upscaling == crate::UpscaleMethod::Fsr1
+                                    && crate::fsr1_eligible(world_extent, (config.width, config.height)));
                             // XeLL: the frame's render-submit phase opens before
                             // the first command list (world) is submitted.
                             if let Some(session) = latency.as_mut() {
@@ -7138,57 +7146,89 @@ pub fn run(
                                 .or_else(|| xess_upscaler.as_ref().map(|xess| xess.jitter()))
                                 .or_else(|| dlss_upscaler.as_ref().map(|dlss| dlss.jitter()))
                                 .unwrap_or((0.0, 0.0));
-                            renderer.render(
-                                &world_view,
-                                &world_raw_view,
-                                world_matrix,
-                                &camera,
-                                world_extent.0,
-                                world_extent.1,
-                                camera_jumped,
-                            );
-                            if let Some(fsr) = fsr_upscaler.as_mut() {
-                                match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
-                                    Ok(()) => fsr.composite(&renderer.device, &renderer.queue, scene_view),
-                                    Err(error) => {
-                                        crate::fsr::diag(&format!("FSR failed, rendering at native resolution instead: {error}"));
-                                        fsr_fail_reason = Some(error);
-                                        fsr_upscaler = None;
-                                        fsr_failed = true;
-                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
-                                    }
-                                }
-                            } else if let Some(xess) = xess_upscaler.as_mut() {
-                                match xess.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp) {
-                                    Ok(()) => xess.composite(&renderer.device, &renderer.queue, scene_view, settings.xess_sharpness),
-                                    Err(error) => {
-                                        crate::xess::diag(&format!("XeSS failed, rendering at native resolution instead: {error}"));
-                                        xess_fail_reason = Some(error);
-                                        xess_upscaler = None;
-                                        xess_failed = true;
-                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
-                                    }
-                                }
-                            } else if let Some(dlss) = dlss_upscaler.as_mut() {
-                                match dlss.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp) {
-                                    Ok(()) => {
-                                        // A frame that evaluated proves the feature
-                                        // works, so the transient-failure budget is
-                                        // replenished instead of staying spent for
-                                        // the rest of the session.
-                                        dlss_retries = 0;
-                                        dlss.composite(&renderer.device, &renderer.queue, scene_view, settings.dlss_sharpness);
-                                    }
-                                    Err(error) => {
-                                        crate::dlss::diag(&format!("DLSS failed, rendering at native resolution instead: {error}"));
-                                        dlss_fail_reason = Some(error);
-                                        dlss_upscaler = None;
-                                        dlss_failed = true;
-                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
-                                    }
-                                }
+                            if direct_native_render {
+                                render_scale.release_frame();
+                                let scene_raw_view = if whole_frame_gamma {
+                                    display_gamma.as_ref().unwrap().raw_view()
+                                } else if let Some(encode) = present_encode.as_ref() {
+                                    encode.raw_view()
+                                } else {
+                                    frame
+                                        .as_ref()
+                                        .expect("a frame exists whenever the frame generation pipeline does not")
+                                        .texture
+                                        .create_view(&wgpu::TextureViewDescriptor {
+                                            format: Some(format.remove_srgb_suffix()),
+                                            ..Default::default()
+                                        })
+                                };
+                                renderer.render(
+                                    scene_view,
+                                    &scene_raw_view,
+                                    world_matrix,
+                                    &camera,
+                                    world_extent.0,
+                                    world_extent.1,
+                                    camera_jumped,
+                                );
                             } else {
-                                render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                // Draw the world into the scaled offscreen target, then present
+                                // it into `scene_view` before the UI pass loads that result.
+                                render_scale.ensure_frame(&renderer.device);
+                                let world_view = render_scale.view();
+                                let world_raw_view = render_scale.raw_view();
+                                renderer.render(
+                                    &world_view,
+                                    &world_raw_view,
+                                    world_matrix,
+                                    &camera,
+                                    world_extent.0,
+                                    world_extent.1,
+                                    camera_jumped,
+                                );
+                                if let Some(fsr) = fsr_upscaler.as_mut() {
+                                    match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
+                                        Ok(()) => fsr.composite(&renderer.device, &renderer.queue, scene_view),
+                                        Err(error) => {
+                                            crate::fsr::diag(&format!("FSR failed, rendering at native resolution instead: {error}"));
+                                            fsr_fail_reason = Some(error);
+                                            fsr_upscaler = None;
+                                            fsr_failed = true;
+                                            render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                        }
+                                    }
+                                } else if let Some(xess) = xess_upscaler.as_mut() {
+                                    match xess.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp) {
+                                        Ok(()) => xess.composite(&renderer.device, &renderer.queue, scene_view, settings.xess_sharpness),
+                                        Err(error) => {
+                                            crate::xess::diag(&format!("XeSS failed, rendering at native resolution instead: {error}"));
+                                            xess_fail_reason = Some(error);
+                                            xess_upscaler = None;
+                                            xess_failed = true;
+                                            render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                        }
+                                    }
+                                } else if let Some(dlss) = dlss_upscaler.as_mut() {
+                                    match dlss.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp) {
+                                        Ok(()) => {
+                                            // A frame that evaluated proves the feature
+                                            // works, so the transient-failure budget is
+                                            // replenished instead of staying spent for
+                                            // the rest of the session.
+                                            dlss_retries = 0;
+                                            dlss.composite(&renderer.device, &renderer.queue, scene_view, settings.dlss_sharpness);
+                                        }
+                                        Err(error) => {
+                                            crate::dlss::diag(&format!("DLSS failed, rendering at native resolution instead: {error}"));
+                                            dlss_fail_reason = Some(error);
+                                            dlss_upscaler = None;
+                                            dlss_failed = true;
+                                            render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                        }
+                                    }
+                                } else {
+                                    render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                }
                             }
                             // When frame generation separates the UI from the scene,
                             // finish any gamma ramp / UNORM encode into `final_view`
@@ -7327,9 +7367,40 @@ pub fn run(
                                     last_minimap_key = Some(minimap_key);
                               }
                             }
-                            if menu_page==MenuPage::WorldMap && settings.world_map_style==MapStyle::Realistic && map_refresh.elapsed()>=std::time::Duration::from_secs(2) {
-                                renderer.render_minimap(&full_map_view,&full_map_depth,&camera,0.,true);
-                                map_refresh=Instant::now();
+                            if menu_page==MenuPage::WorldMap && settings.world_map_style==MapStyle::Realistic {
+                                let mut needs_refresh = map_refresh.elapsed()>=std::time::Duration::from_secs(2);
+                                if full_map_target.is_none() {
+                                    let tex = renderer.device.create_texture(&wgpu::TextureDescriptor {
+                                        label: Some("selected-world overhead map"),
+                                        size: wgpu::Extent3d {
+                                            width: full_map_width,
+                                            height: full_map_height,
+                                            depth_or_array_layers: 1,
+                                        },
+                                        mip_level_count: 1,
+                                        sample_count: 1,
+                                        dimension: wgpu::TextureDimension::D2,
+                                        format,
+                                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                                        view_formats: &[],
+                                    });
+                                    let view = tex.create_view(&Default::default());
+                                    let id = egui_renderer.register_native_texture(
+                                        &renderer.device,
+                                        &view,
+                                        wgpu::FilterMode::Linear,
+                                    );
+                                    full_map_target = Some((tex, view, id));
+                                    needs_refresh = true;
+                                }
+                                if needs_refresh {
+                                    if let Some((_, ref full_map_view, _)) = full_map_target {
+                                        let full_depth_tex = depth(&renderer.device, full_map_width, full_map_height);
+                                        let full_map_depth = full_depth_tex.create_view(&Default::default());
+                                        renderer.render_minimap(full_map_view, &full_map_depth, &camera, 0., true);
+                                        map_refresh = Instant::now();
+                                    }
+                                }
                             }
                             renderer.modules.prepare_librarian_preview(&renderer.device, &renderer.queue, &mut egui_renderer, format, menu_page==MenuPage::Modules);
                             // On-screen mark: the active upscaler / frame-generation
@@ -7774,7 +7845,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                             ui.label(egui::RichText::new("North: up  |  East: right  |  Mouse wheel: zoom").small().strong());
                                             if settings.world_map_style==MapStyle::Realistic && !renderer.world_done {ui.horizontal_wrapped(|ui|{ui.label(egui::RichText::new("Distant scenery: ").small().weak());if settings.detail.terrain_cutoff {ui.label("Scenery follows the resident window");}else if settings.whole_world {ui.label(egui::RichText::new(&world_status).small().weak());}else if ui.button("Load whole world scenery").clicked(){settings.whole_world=true;}});}
                                             let remaining=(ui.available_height()-78.).max(100.);let visible_width=ui.available_width();let base_width=visible_width.min(remaining*map_aspect).max(120.);let image_size=egui::vec2(base_width*map_zoom,base_width*map_zoom/map_aspect);
-                                            let texture=if settings.world_map_style==MapStyle::Original {original_map_id.as_ref().map(|t|t.id())} else {Some(full_map_id)};
+                                            let texture=if settings.world_map_style==MapStyle::Original {original_map_id.as_ref().map(|t|t.id())} else {full_map_target.as_ref().map(|(_,_,id)|*id)};
                                             let mut zoom_anchor=None;
                                             let scroll=egui::ScrollArea::both().max_height(remaining).auto_shrink([false,false]).show(ui,|ui|{
                                                 if let Some(id)=texture {let response=ui.add(egui::Image::new((id,image_size)).sense(egui::Sense::click()));let rect=response.rect;
