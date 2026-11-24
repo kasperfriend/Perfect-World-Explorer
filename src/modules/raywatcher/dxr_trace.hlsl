@@ -387,6 +387,29 @@ bool occluded_fast(float3 origin, float3 dir, float t_min, float t_max) {
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
+// Opacity-aware occlusion: respects alpha-tested foliage so leaf canopies cast
+// shadows on reflected and GI-lit surfaces. Uses the same accept_opacity check
+// as closest_hit so leaves block light where their alpha mask is set.
+bool occluded_opacity(float3 origin, float3 dir, float t_min, float t_max, uint opaque_offset, uint tri_count) {
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = dir;
+    ray.TMin = t_min;
+    ray.TMax = t_max;
+
+    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(scene_tlas, RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
+    while (q.Proceed()) {
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
+            uint cand_prim = q.CandidatePrimitiveIndex() + (q.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
+            if (accept_opacity(cand_prim, q.CandidateTriangleBarycentrics(), 0u, tri_count)) {
+                q.CommitNonOpaqueTriangleHit();
+            }
+        }
+    }
+    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+
 bool occluded_point_light(float3 origin, float3 dir, float t_min, float t_max, float terrain_skip, float dyn_skip, uint opaque_offset, uint tri_count) {
     RayDesc ray;
     ray.Origin = origin;
@@ -1045,8 +1068,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         accum_trans += trans_tint;
 
         // Feature #4: Distance-attenuated RT Ambient Occlusion (RTAO) contact shadows.
-        // Uses closest_hit_fast so tight crevices under bridges, stairs, statues, rock seams,
-        // and grass tufts darken crisply while distant blockers fade smoothly with zero halos.
+        // Uses opacity-aware closest_hit so alpha-tested foliage (tree leaves, grass
+        // tufts) occludes correctly, giving the ground under canopies proper AO.
         float open = 1.0;
         if (bits_ao && ao_fade > 0.01 && !is_water) {
             float occ_sum = 0.0;
@@ -1060,7 +1083,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 sincos(phi, s_phi, c_phi);
                 float z = sqrt(max(0.0, 1.0 - u1));
                 float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + normal * z;
-                Hit ao_hit = closest_hit_fast(ray_origin, d, ao_t_min, ao_radius, opaque_offset, tri_count);
+                Hit ao_hit = closest_hit(ray_origin, d, ao_t_min, ao_radius, opaque_offset, tri_count);
                 if (ao_hit.index != 0xffffffffu) {
                     float t_norm = saturate(ao_hit.t * inv_ao_r);
                     float w_close = 1.0 - t_norm;
@@ -1100,10 +1123,13 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float trim_scale = is_water
                 ? 1.0
                 : (metalness > 0.1 ? (0.48 * metalness) : (0.28 * (1.0 - smoothstep(0.24, 0.37, eff_roughness))));
-            // Opt #9: Use fast opaque RT traversal for blurry glossy trims & distant water (> 140u).
+            // Opt #9: Use opacity-aware RT traversal so alpha-tested foliage (tree
+            // leaves) is reflected correctly. closest_hit_fast forces opaque and
+            // skips leaves, producing broken leaf reflections. Water needs no
+            // alpha test, so the fast path stays for distant water rays.
             float refl_max_t = is_water ? min(params.lens.y, 750.0) : min(params.lens.y, 140.0);
             Hit rhit;
-            if (!is_water || dist > 560.0) {
+            if (is_water && dist > 560.0) {
                 rhit = closest_hit_fast(ray_origin, reflect_dir, bias, refl_max_t, opaque_offset, tri_count);
             } else {
                 rhit = closest_hit(ray_origin, reflect_dir, bias, refl_max_t, opaque_offset, tri_count);
@@ -1132,7 +1158,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     float r_shadow = 1.0;
                     if (bits_shadows && r_ndl > 0.02 && rhit.t < 260.0) {
                         float3 rhit_pos = hit_pos + rhit.normal * bias;
-                        if (occluded_fast(rhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y)) {
+                        if (occluded_opacity(rhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y, opaque_offset, tri_count)) {
                             r_shadow = 0.0;
                         }
                     }
@@ -1248,7 +1274,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 sincos(phi, s_phi, c_phi);
                 float z = sqrt(max(0.0, 1.0 - u1));
                 float3 d = cur_t * (r * c_phi) + cur_b * (r * s_phi) + cur_normal * z;
-                Hit bhit = closest_hit_fast(cur_origin, d, cur_bias, bounce_max_t, opaque_offset, tri_count);
+                Hit bhit = closest_hit(cur_origin, d, cur_bias, bounce_max_t, opaque_offset, tri_count);
                 if (bhit.index != 0xffffffffu && bhit.index != 0xfffffffeu) {
                     float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
                     float3 bhit_world = cur_origin + d * bhit.t;
@@ -1258,7 +1284,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     // Opt: skip sun shadow rays at night when sun_strength <= 0.02.
                     if (bits_shadows && sun_strength > 0.02 && b_ndl > 0.04) {
                         float3 bhit_pos = bhit_world + bhit.normal * b_bias;
-                        if (occluded_fast(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, gi_shadow_max_t)) {
+                        if (occluded_opacity(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, gi_shadow_max_t, opaque_offset, tri_count)) {
                             b_shadow = 0.0;
                         }
                     }
