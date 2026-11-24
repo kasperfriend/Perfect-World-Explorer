@@ -883,12 +883,10 @@ fn terrain(
                 material::Materials::load(&dir, &t, &names, w, h, grid_spacing)
                     .map_err(|e| e.to_string())
             });
-            let water_frames_task = s.spawn(|| -> Result<_, String> {
-                Ok((
-                    water::load_normals(element).map_err(|e| e.to_string())?,
-                    water::load_simple_frames(element).map_err(|e| e.to_string())?,
-                ))
-            });
+            let water_normals_task =
+                s.spawn(|| water::load_normals(element).map_err(|e| e.to_string()));
+            let water_simple_task =
+                s.spawn(|| water::load_simple_frames(element).map_err(|e| e.to_string()));
             let objects_task =
                 s.spawn(|| objects::Objects::open(element, ornaments).map_err(|e| e.to_string()));
             let models_task =
@@ -908,7 +906,10 @@ fn terrain(
             Ok::<_, String>((
                 water_task.join().unwrap()?,
                 materials_task.join().unwrap()?,
-                water_frames_task.join().unwrap()?,
+                (
+                    water_normals_task.join().unwrap()?,
+                    water_simple_task.join().unwrap()?,
+                ),
                 objects_task.join().unwrap()?,
                 models_task.join().unwrap(),
                 grass_task.join().unwrap()?,

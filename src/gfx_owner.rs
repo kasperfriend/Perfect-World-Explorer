@@ -288,6 +288,9 @@ struct Owner {
     /// stays *loaded* through the fade — `Release()` runs only in the
     /// time-of-day branch — so this is an alpha ramp, not activation.
     attenuation: f32,
+    /// Cached terrain height/normal for static world effects so we don't
+    /// perform 5 terrain height lookups per active effect on every frame.
+    cached_ground: Option<([f32; 2], Option<crate::gfx_player::GroundHit>)>,
 }
 
 /// Publication identity: owner serial in the high half, element index in the
@@ -648,6 +651,7 @@ impl Manager {
             player: None,
             player_failed: false,
             attenuation: 1.,
+            cached_ground: None,
         });
         self.index.insert(identity, index);
         Ok(())
@@ -921,10 +925,24 @@ impl Manager {
         view: &View,
         terrain: Option<crate::gfx_player::GroundHeightQuery<'_>>,
     ) -> Vec<EffectQuad> {
-        if !self.effects {
-            return Vec::new();
-        }
         let mut out = Vec::with_capacity(self.owners.len().min(64) * 8);
+        self.effect_quads_with_ground_into(delta_ms, view, terrain, &mut out);
+        out
+    }
+
+    /// Reusable-buffer variant of [`Self::effect_quads_with_ground`] that
+    /// avoids reallocating the outer `Vec<EffectQuad>` every frame.
+    pub fn effect_quads_with_ground_into(
+        &mut self,
+        delta_ms: u32,
+        view: &View,
+        terrain: Option<crate::gfx_player::GroundHeightQuery<'_>>,
+        out: &mut Vec<EffectQuad>,
+    ) {
+        out.clear();
+        if !self.effects {
+            return;
+        }
         // Report only when one is due; the rows themselves allocate, so nothing
         // is collected on the frames between reports.
         let mut rows = match self.census.as_mut() {
@@ -971,6 +989,9 @@ impl Manager {
             // `max_alpha * fAlpha` and then holds it there, so the drawn alpha is
             // `fAlpha * fade`. An owner with no `outer` colour draws at the
             // fade alone (full alpha when nothing attenuates it).
+            if owner.player.is_none() {
+                continue;
+            }
             let alpha = owner.request.outer.map_or(1., |outer| outer[3]) * owner.attenuation;
             let world = match owner.request.world_transform() {
                 Ok(columns) => columns,
@@ -981,15 +1002,6 @@ impl Manager {
                 }
             };
             let transform = Mat4::from_cols_array(&world);
-            // `0x5b3700` bakes the record's scale into the placement, but
-            // `Player::advance` normalizes that basis before it fans anything
-            // out — the client does the same in `A3DGFXEx::SetParentTM`
-            // (A3DGFXEx.cpp:1589-1595) and carries the scale separately, as
-            // `SetScale(record scale)` right after the placement
-            // (EC_ManOrnament.cpp:950-952). So the scale has to be handed over
-            // on its own or it is lost. Measured against the 9 November census:
-            // the roof bagua is authored 0.304 and came out 44.8 units wide
-            // instead of 13.6, and `水门_瀑布` is authored 2.736.
             let authored_scale = placement_scale(&world);
             crate::diag_keyed!(
                 EffectCulling,
@@ -1016,36 +1028,43 @@ impl Manager {
                 world[9],
                 world[10]
             );
+            // Cache terrain height + gradient normal for static effect origins
+            // (eliminates 5 terrain height queries per active effect per frame).
+            let ground = if let Some(height_at) = terrain {
+                let ox = world[12];
+                let oz = world[14];
+                match owner.cached_ground {
+                    Some((pos, hit)) if pos[0] == ox && pos[1] == oz => hit,
+                    _ => {
+                        let hit = height_at(ox, oz).map(|h| {
+                            const STEP: f32 = 0.5;
+                            let hx_p = height_at(ox + STEP, oz).unwrap_or(h);
+                            let hx_m = height_at(ox - STEP, oz).unwrap_or(h);
+                            let hz_p = height_at(ox, oz + STEP).unwrap_or(h);
+                            let hz_m = height_at(ox, oz - STEP).unwrap_or(h);
+                            let dx = (hx_p - hx_m) / (2. * STEP);
+                            let dz = (hz_p - hz_m) / (2. * STEP);
+                            let normal = glam::Vec3::new(-dx, 1., -dz).normalize_or_zero();
+                            crate::gfx_player::GroundHit {
+                                height: h,
+                                normal: if normal == glam::Vec3::ZERO {
+                                    glam::Vec3::Y
+                                } else {
+                                    normal
+                                },
+                            }
+                        });
+                        owner.cached_ground = Some(([ox, oz], hit));
+                        hit
+                    }
+                }
+            } else {
+                None
+            };
             let stepped = {
                 let Some(player) = owner.player.as_mut() else {
                     continue;
                 };
-                // The player carries the placement's speed itself
-                // (`A3DGFXEx::SetPlaySpeed` is handed the record's `fSpeed`), so
-                // it is advanced by the *frame* delta. `scaled` above is for the
-                // owner clock, the lifetime window and the light emitters, all of
-                // which are in the record's own time base.
-                let ground = terrain.and_then(|height_at| {
-                    let ox = world[12];
-                    let oz = world[14];
-                    let h = height_at(ox, oz)?;
-                    const STEP: f32 = 0.5;
-                    let hx_p = height_at(ox + STEP, oz).unwrap_or(h);
-                    let hx_m = height_at(ox - STEP, oz).unwrap_or(h);
-                    let hz_p = height_at(ox, oz + STEP).unwrap_or(h);
-                    let hz_m = height_at(ox, oz - STEP).unwrap_or(h);
-                    let dx = (hx_p - hx_m) / (2. * STEP);
-                    let dz = (hz_p - hz_m) / (2. * STEP);
-                    let normal = glam::Vec3::new(-dx, 1., -dz).normalize_or_zero();
-                    Some(crate::gfx_player::GroundHit {
-                        height: h,
-                        normal: if normal == glam::Vec3::ZERO {
-                            glam::Vec3::Y
-                        } else {
-                            normal
-                        },
-                    })
-                });
                 let res = player.advance_with_terrain(
                     delta_ms as f32,
                     view,
@@ -1060,7 +1079,11 @@ impl Manager {
                     if let Some(rows) = rows.as_mut() {
                         rows.push(census_row(&owner.request.path, quads, player.clock_ms()));
                     }
-                    out.extend(quads.iter().cloned());
+                    // Skip emitting quads when the effect is completely faded out
+                    // by distance attenuation so invisible sheets cost zero GPU work.
+                    if alpha > 0.0 {
+                        out.extend(quads.iter().cloned());
+                    }
                 })
             };
             match stepped {
@@ -1086,7 +1109,6 @@ impl Manager {
                     .push(format!("effect census not written: {error}"));
             }
         }
-        out
     }
 
     /// Build the animated root for one visible owner, at most one per call, and

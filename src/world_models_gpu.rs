@@ -889,11 +889,18 @@ impl World {
             }
         };
         // The field and the owner manager are separate places, so the sampler
-        // borrows one and the pass advances the other.
-        let sampler: Option<crate::gfx_player::GroundHeightQuery<'_>> = self.terrain.as_deref();
-        let quads = self
-            .owners
-            .effect_quads_with_ground(delta_ms, &view, sampler);
+        // borrows one and the pass advances the other. Reuse `self.effect_quads`
+        // directly to avoid reallocating and copying every frame.
+        {
+            let Self {
+                owners,
+                terrain,
+                effect_quads,
+                ..
+            } = self;
+            let sampler: Option<crate::gfx_player::GroundHeightQuery<'_>> = terrain.as_deref();
+            owners.effect_quads_with_ground_into(delta_ms, &view, sampler, effect_quads);
+        }
         // Say once, on stderr, what the invisible pipeline is doing. Nothing in
         // the world told a user *which* stage was empty when no effect appeared:
         // the roots could be unloaded, out of radius, failed to parse, or drawing
@@ -910,7 +917,7 @@ impl World {
                 status.pending,
                 status.players,
                 status.frames,
-                quads.len(),
+                self.effect_quads.len(),
                 view.position.x,
                 view.position.y,
                 view.position.z,
@@ -934,8 +941,7 @@ impl World {
             reported,
             ..
         } = self;
-        effect_quads.clear();
-        effect_quads.extend(quads);
+
         if effects.is_none() {
             // The same reverse-Z depth buffer the world's models use, so an
             // effect in front of a wall is occluded by nothing and one behind it
@@ -1454,12 +1460,9 @@ impl World {
         ) else {
             return;
         };
+        let _ = device;
         let Self {
-            effects,
-            effect_quads,
-            read,
-            reported,
-            ..
+            effects, reported, ..
         } = self;
         let Some(draw) = effects.as_mut() else {
             return;
@@ -1472,15 +1475,15 @@ impl World {
             directional_specular: frame.directional_specular,
             eye_direction: frame.eye_direction,
         };
-        if let Err(error) = draw.update(
-            device,
+        // Only the frame uniform constants changed after reflection/refraction;
+        // reuse the already-uploaded vertex buffer and bucket order instead of
+        // re-bucketing and re-uploading every effect quad a second time.
+        if let Err(error) = draw.update_params(
             queue,
-            effect_quads,
             frame.matrix,
             frame.clip_plane,
             [view.position.x, view.position.y, view.position.z, 0.],
             Some(light),
-            &mut |path| read(path),
         ) {
             reported.push(format!("world effects: {error}"));
         }
