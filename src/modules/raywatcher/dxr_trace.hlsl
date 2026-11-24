@@ -1724,12 +1724,16 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     }
 
     // Feature #3: Warm Subsurface Scattering (SSS) for tree foliage, blossoms & grass.
-    // Opt: only classify foliage colors on daytime non-water pixels within fog range.
+    // Opt: only classify foliage colors on non-water pixels within fog range.
     float3 sss_light = float3(0.0, 0.0, 0.0);
-    if (bits_shadows && !is_water && fog_t < 0.92 && sun_strength > 0.05) {
-        bool is_green_foliage = (raster_rgb.g > raster_rgb.b * 1.12 && raster_rgb.g >= raster_rgb.r * 0.90 && raster_rgb.g > 0.06);
+    bool is_green_foliage = false;
+    bool is_foliage_surf = false;
+    if (!is_water && fog_t < 0.92) {
+        is_green_foliage = (raster_rgb.g > raster_rgb.b * 1.12 && raster_rgb.g >= raster_rgb.r * 0.90 && raster_rgb.g > 0.06);
         bool is_blossom_foliage = (raster_rgb.r > raster_rgb.g * 1.16 && raster_rgb.b > raster_rgb.g * 1.02 && raster_rgb.r > 0.10);
-        bool is_foliage_surf = is_green_foliage || is_blossom_foliage;
+        is_foliage_surf = is_green_foliage || is_blossom_foliage;
+    }
+    if (bits_shadows && !is_water && fog_t < 0.92 && sun_strength > 0.05) {
         float3 avg_trans = accum_trans / float(samples);
         if (dot(avg_trans, float3(1.0, 1.0, 1.0)) > 1e-4) {
             sss_light += avg_trans * params.sun_colour.xyz * (max(n_dot_l, 0.20) * 0.65 * (1.0 - fog_t));
