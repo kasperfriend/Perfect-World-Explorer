@@ -1564,7 +1564,9 @@ impl FarTrees {
         }
         for (_, _, _, sp) in &rows {
             for (li, ld) in sp.lod_diags.iter().enumerate() {
-                if li > 0 { continue; }
+                if li > 0 {
+                    continue;
+                }
                 let leaf_tris = ld.fixed_3d_leaves + ld.billboard_leaves + ld.frond_tris;
                 if leaf_tris > 0 {
                     // Count triangles with zero alpha coverage (fully transparent
@@ -1601,8 +1603,12 @@ impl FarTrees {
             } else {
                 ""
             };
-            let leaf_cov_warn = if d0.leaves_skipped > 0 && (d0.fixed_3d_leaves + d0.billboard_leaves) > 0 {
-                let skip_pct = (d0.leaves_skipped as f64 / (d0.fixed_3d_leaves + d0.billboard_leaves + d0.frond_tris) as f64) * 100.0;
+            let has_skipped_leaves = d0.leaves_skipped > 0;
+            let has_leaf_tris = (d0.fixed_3d_leaves + d0.billboard_leaves) > 0;
+            let leaf_cov_warn = if has_skipped_leaves && has_leaf_tris {
+                let denom =
+                    (d0.fixed_3d_leaves + d0.billboard_leaves + d0.frond_tris) as f64;
+                let skip_pct = (d0.leaves_skipped as f64 / denom) * 100.0;
                 if skip_pct > 30.0 {
                     format!(" [WARN: LEAF_PATCHES_SPARSE_MASK {:.0}%_SKIPPED]", skip_pct)
                 } else {
