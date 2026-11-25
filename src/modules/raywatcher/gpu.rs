@@ -4401,9 +4401,13 @@ impl RaywatcherGpu {
             self.traced_last_frame = false;
             return;
         }
+        // Compare against the backend that can actually be used this frame.
+        // Once DXR initialization has failed, a hardware-mode setting must not
+        // keep invalidating the software path's history on every frame.
+        let requested_hardware = hardware_mode && !self.dxr_failed;
         if self
             .last_traced_hardware
-            .is_some_and(|previous| previous != hardware_mode)
+            .is_some_and(|previous| previous != requested_hardware)
         {
             self.frames = 0;
             self.prev_view_projection = None;
