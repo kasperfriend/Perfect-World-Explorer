@@ -1215,7 +1215,7 @@ mod tests {
             "moonlight should be cool-tinted"
         );
     }
-    
+
     #[test]
     fn ray_fog_range_respects_the_original_enable_gate() {
         assert_eq!(effective_fog_range(false, 0.0, 400.0), (0.0, 0.0));
@@ -1224,5 +1224,4 @@ mod tests {
         assert_eq!(effective_fog_range(true, 20.0, 20.0), (0.0, 0.0));
         assert_eq!(effective_fog_range(true, f32::NAN, 64.0), (0.0, 0.0));
     }
-
 }
