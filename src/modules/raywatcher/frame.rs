@@ -35,9 +35,6 @@ pub struct RasterOverrides {
     /// Skip the screen-space ambient-occlusion-style darkening (the fog
     /// occlusion term the raster path applies to the sky and terrain).
     pub occlusion: bool,
-    /// Skip the raster cloud/atmosphere glow that would double the ray-traced
-    /// sky lighting.
-    pub atmosphere_fog: bool,
     /// Phase 5 (single shadow source): suppress baked terrain & grass lightmap
     /// shadows when RT sun visibility is active so each building/tree shadow
     /// darkens the surface once instead of stacking baked + RT shadows.
@@ -52,7 +49,6 @@ impl RasterOverrides {
         ambient: false,
         reflection_pass: false,
         occlusion: false,
-        atmosphere_fog: false,
         suppress_baked_shadows: false,
     };
 
@@ -99,7 +95,6 @@ impl RasterOverrides {
             ambient: effects.lighting || effects.ambient_occlusion || effects.global_illumination,
             reflection_pass: false,
             occlusion: effects.ambient_occlusion,
-            atmosphere_fog: effects.shadows,
             suppress_baked_shadows: effects.shadows,
         }
     }
@@ -109,7 +104,6 @@ impl RasterOverrides {
             || self.ambient
             || self.reflection_pass
             || self.occlusion
-            || self.atmosphere_fog
             || self.suppress_baked_shadows
     }
 
@@ -128,9 +122,6 @@ impl RasterOverrides {
         }
         if self.occlusion {
             parts.push("occlusion");
-        }
-        if self.atmosphere_fog {
-            parts.push("atmosphere");
         }
         if self.suppress_baked_shadows {
             parts.push("baked shadows");
@@ -671,7 +662,6 @@ mod tests {
         assert!(!on_ov.directional_light);
         assert!(!on_ov.ambient);
         assert!(!on_ov.reflection_pass);
-        assert!(!on_ov.atmosphere_fog);
 
         s.effects.shadows = false;
         let no_sh_plan = Plan::decide(&s, (1920, 1080), true, |_| false);

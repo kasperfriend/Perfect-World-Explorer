@@ -553,7 +553,9 @@ float3 apply_twilight_scattering(float3 base_sky, float3 dir, float3 sun_dir, fl
     float horiz = exp(-abs(dir.y) * 4.8);
     float zenith = saturate(dir.y * 1.4);
     float sun_cos = saturate(dot(normalize(dir), normalize(sun_dir)));
-    float mie_glow = pow(sun_cos, 6.0) * 0.85 + pow(sun_cos, 2.0) * 0.35;
+    float sun_cos2 = sun_cos * sun_cos;
+    float sun_cos4 = sun_cos2 * sun_cos2;
+    float mie_glow = sun_cos4 * sun_cos2 * 0.85 + sun_cos2 * 0.35;
     float3 warm_horizon = lerp(float3(0.95, 0.34, 0.14), float3(1.18, 0.56, 0.22), sun_strength);
     float3 cool_zenith = float3(0.12, 0.20, 0.44);
     float3 scattered = lerp(base_sky, cool_zenith, zenith * twi_w * 0.45)
@@ -1650,8 +1652,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 uint idx = exact_idxs[ci];
                 float4 pl_pr = params.point_lights_pos_rad[idx];
                 float3 to_l = pl_pr.xyz - world_pos;
-                float pl_dist = length(to_l);
-                float3 l_dir = to_l / max(pl_dist, 1e-5);
+                float pl_d2 = dot(to_l, to_l);
+                float inv_pl_dist = rsqrt(max(pl_d2, 1e-10));
+                float pl_dist = pl_d2 * inv_pl_dist;
+                float3 l_dir = to_l * inv_pl_dist;
                 float pl_vis = 1.0;
                 if (bits_shadows && pl_dist > 1.8 && exact_ws[ci] > 0.025) {
                     // Feature #8: Large world effects & portals (`radius >= 14u`) use 3D area emitter
@@ -1701,8 +1705,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 }
                 float4 pl_pr = params.point_lights_pos_rad[idx];
                 float3 to_l = pl_pr.xyz - world_pos;
-                float pl_dist = length(to_l);
-                float3 l_dir = to_l / max(pl_dist, 1e-5);
+                float pl_d2 = dot(to_l, to_l);
+                float inv_pl_dist = rsqrt(max(pl_d2, 1e-10));
+                float pl_dist = pl_d2 * inv_pl_dist;
+                float3 l_dir = to_l * inv_pl_dist;
                 float pl_vis = 1.0;
                 if (bits_shadows && pl_dist > 1.8) {
                     float r_emit = clamp(pl_pr.w * 0.032, 0.16, 1.35);

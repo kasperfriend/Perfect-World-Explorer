@@ -930,10 +930,6 @@ mod tests {
         assert!(!enabled.overrides.reflection_pass);
         assert!(!disabled.overrides.reflection_pass);
         assert_eq!(enabled.overrides.occlusion, disabled.overrides.occlusion);
-        assert_eq!(
-            enabled.overrides.atmosphere_fog,
-            disabled.overrides.atmosphere_fog
-        );
         assert!(
             enabled.overrides.suppress_baked_shadows,
             "Phase 5 single shadow source suppresses baked lightmaps when RT shadows are active"
@@ -955,7 +951,6 @@ mod tests {
         assert!(!layered.overrides.ambient);
         assert!(!layered.overrides.reflection_pass);
         assert!(!layered.overrides.occlusion);
-        assert!(!layered.overrides.atmosphere_fog);
         assert!(layered.overrides.suppress_baked_shadows);
         assert_eq!(layered.plan.render, (1920, 1080));
         assert_eq!(layered.plan.grid, (960, 540));

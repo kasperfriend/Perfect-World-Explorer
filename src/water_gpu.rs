@@ -81,6 +81,10 @@ fn present_encoded(c:vec3<f32>)->vec3<f32>{
  let v=max(c,vec3<f32>(0.));
  return select(v/12.92,pow((v+0.055)/1.055,vec3<f32>(2.4)),v>vec3<f32>(0.04045));
 }
+fn pow5(x:f32)->f32{
+ let x2=x*x;
+ return x2*x2*x;
+}
 // The client binds its water-surface fog triple with D3DRS_FOGSTART/END/COLOR
 // right before the water draw (0x7cb444, 0x7cb502, 0x7cb94e) and D3D applies
 // the fixed-function fog stage to the source colour. The water shaders carry
@@ -113,7 +117,7 @@ fn surface_fog(c:vec3<f32>, reciprocal_w:f32)->vec3<f32>{
    let uv_under=clamp(screen+n.xz*0.25,vec2<f32>(0.001),vec2<f32>(0.999));
    let refr=textureSample(refraction,screen_sampler,uv_under).rgb;
    let facing=clamp(dot(w.eye_time.xyz-i.world,-n),0.0,1.0);
-   let fresnel=pow(1.0-facing,5.0);
+   let fresnel=pow5(1.0-facing);
    let tint=mix(vec3<f32>(1.0),vec3<f32>(0.0,0.3,0.3),fresnel);
    return vec4<f32>(present_encoded(surface_fog(refr*0.85*tint,i.pos.w)),1.0);
  }
@@ -156,7 +160,7 @@ fn surface_fog(c:vec3<f32>, reciprocal_w:f32)->vec3<f32>{
  // The simple and cheap variants instead use their own literal `c1.a` (0.8 and
  // 0.6) as that identity term, so this camera-derived value is the expensive
  // path only.
- let quintic=pow(1.0-facing,5.0);
+ let quintic=pow5(1.0-facing);
  let fresnel=clamp(min_reflect+(1.0-min_reflect)*quintic,0.0,1.0);
  // The paired water_vs shader writes a zero secondary diffuse/specular color.
  let color=mix(refract_color*0.95,reflect_color,fresnel);
@@ -1039,5 +1043,16 @@ mod animation_tests {
         assert_eq!(normal_frame_index(f64::NAN), 0);
         assert!(WATER_SHADER.contains("let frame=i32(w.animation.x)%29;"));
         assert!(!WATER_SHADER.contains("mix(n0,n1,fract(phase))"));
+    }
+
+    #[test]
+    fn water_fifth_power_helper_is_used_for_both_paths_and_is_exact() {
+        assert!(WATER_SHADER.contains("fn pow5(x:f32)->f32"));
+        assert_eq!(WATER_SHADER.matches("pow5(1.0-facing)").count(), 2);
+        for x in [0.0_f32, 0.1, 0.5, 0.9, 1.0] {
+            let x2 = x * x;
+            let expanded = x2 * x2 * x;
+            assert!((expanded - x.powi(5)).abs() < 1e-6);
+        }
     }
 }

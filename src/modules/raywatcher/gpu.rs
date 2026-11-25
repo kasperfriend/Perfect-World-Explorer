@@ -912,7 +912,9 @@ fn sample_screen_radiance(world_pos: vec3<f32>, ray_t: f32) -> vec4<f32> {
     let gdim = vec2<i32>(i32(params.extents.x), i32(params.extents.y));
     let hp = clamp(vec2<i32>(uv * params.extents.xy), vec2<i32>(0), gdim - vec2<i32>(1));
     let gpos = textureLoad(src_gbuf_pos, hp, 0);
-    if (gpos.w > 0.0 && length(gpos.xyz - world_pos) < max(2.5, ray_t * 0.08)) {
+    let separation = gpos.xyz - world_pos;
+    let tolerance = max(2.5, ray_t * 0.08);
+    if (gpos.w > 0.0 && dot(separation, separation) < tolerance * tolerance) {
         return vec4<f32>(textureLoad(src_gbuf_raster, hp, 0).rgb, 1.0);
     }
     return vec4<f32>(0.0);
@@ -1857,8 +1859,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let idx = exact_idxs[ci];
                 let pl_pr = params.point_lights_pos_rad[idx];
                 let to_l = pl_pr.xyz - point;
-                let pl_dist = length(to_l);
-                let l_dir = to_l / max(pl_dist, 1e-5);
+                let pl_d2 = dot(to_l, to_l);
+                let inv_pl_dist = inverseSqrt(max(pl_d2, 1e-10));
+                let pl_dist = pl_d2 * inv_pl_dist;
+                let l_dir = to_l * inv_pl_dist;
                 var pl_vis = 1.0;
                 if (bits_shadows && pl_dist > 1.8 && exact_ws[ci] > 0.025) {
                     let r_emit = clamp(pl_pr.w * 0.032, 0.16, 1.35);
@@ -1891,8 +1895,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
                 let pl_pr = params.point_lights_pos_rad[idx];
                 let to_l = pl_pr.xyz - point;
-                let pl_dist = length(to_l);
-                let l_dir = to_l / max(pl_dist, 1e-5);
+                let pl_d2 = dot(to_l, to_l);
+                let inv_pl_dist = inverseSqrt(max(pl_d2, 1e-10));
+                let pl_dist = pl_d2 * inv_pl_dist;
+                let l_dir = to_l * inv_pl_dist;
                 var pl_vis = 1.0;
                 if (bits_shadows && pl_dist > 1.8) {
                     let r_emit = clamp(pl_pr.w * 0.032, 0.16, 1.35);
@@ -5605,5 +5611,41 @@ mod phase_r1_tests {
                 )
             });
         }
+    }
+}
+
+
+#[cfg(test)]
+mod shader_optimization_regression_tests {
+    use super::RAY_SHADER;
+
+    #[test]
+    fn software_and_dxr_point_lights_reuse_one_inverse_square_root() {
+        let dxr = include_str!("dxr_trace.hlsl");
+        assert_eq!(
+            RAY_SHADER.matches("let inv_pl_dist = inverseSqrt(max(pl_d2, 1e-10));").count(),
+            2
+        );
+        assert_eq!(
+            dxr.matches("float inv_pl_dist = rsqrt(max(pl_d2, 1e-10));").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn software_screen_radiance_uses_squared_distance_like_dxr() {
+        let dxr = include_str!("dxr_trace.hlsl");
+        assert!(RAY_SHADER.contains("dot(separation, separation) < tolerance * tolerance"));
+        assert!(dxr.contains("dot(screen_delta, screen_delta) < screen_tolerance * screen_tolerance"));
+    }
+
+    #[test]
+    fn dxr_integer_sky_powers_use_multiplication_chains() {
+        let dxr = include_str!("dxr_trace.hlsl");
+        assert!(dxr.contains("float sun_cos2 = sun_cos * sun_cos;"));
+        assert!(dxr.contains("float sun_cos4 = sun_cos2 * sun_cos2;"));
+        assert!(dxr.contains("float mie_glow = sun_cos4 * sun_cos2 * 0.85 + sun_cos2 * 0.35;"));
+        assert!(!dxr.contains("pow(sun_cos, 6.0)"));
+        assert!(!dxr.contains("pow(sun_cos, 2.0)"));
     }
 }

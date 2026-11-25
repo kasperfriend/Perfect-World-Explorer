@@ -179,14 +179,6 @@ impl FrameSnapshot {
         } else {
             self.light
         };
-        // Fog is one range for every material, so the atmosphere override turns
-        // the range off rather than tinting it (the ray pass has its own
-        // Beer-Lambert extinction, applied per pixel at the distance it knows).
-        let fog_range = if self.overrides.atmosphere_fog {
-            [0.; 4]
-        } else {
-            fog_range
-        };
         Uniform {
             matrix: matrix.to_cols_array_2d(),
             direction,
@@ -9874,5 +9866,44 @@ mod handoff_exit_tests {
         assert!(src.contains("window.set_visible(false);"));
         assert!(src.contains("target.set_control_flow(winit::event_loop::ControlFlow::Poll);"));
         assert!(src.contains("close_old_window_after_handoff_ready(target, &window);"));
+    }
+}
+
+
+#[cfg(test)]
+mod raywatcher_fog_preservation_tests {
+    use super::*;
+
+    #[test]
+    fn raywatcher_shadow_replacement_preserves_the_native_fog_enable_bit() {
+        let effects = crate::modules::raywatcher::plan::Effects {
+            shadows: true,
+            lighting: false,
+            reflections: false,
+            ambient_occlusion: false,
+            global_illumination: false,
+            contact_shadows: false,
+            moonlit_night: false,
+            twilight_sky: false,
+        };
+        let mut snapshot = FrameSnapshot::default();
+        snapshot.overrides =
+            crate::modules::raywatcher::frame::RasterOverrides::for_effects(effects, true);
+
+        for fog_range in [[60., 400., 1., 0.], [60., 400., 0., 0.]] {
+            let uniform = snapshot.uniform(
+                Mat4::IDENTITY,
+                [0.; 4],
+                [0.; 4],
+                fog_range,
+                [0.2, 0.3, 0.4, 1.],
+                [0.; 4],
+            );
+            assert_eq!(
+                uniform.fog_range,
+                fog_range,
+                "Raywatcher may replace lighting, never the client's fog range or enable flag"
+            );
+        }
     }
 }
