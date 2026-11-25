@@ -1204,12 +1204,12 @@ fn adaptive_ray_samples(pixel: vec2<i32>, dist: f32, normal: vec3<f32>, roughnes
     var normal_edge = 0.0;
     var depth_edge = 0.0;
     var colour_edge = 0.0;
-    let offsets = array<vec2<i32>, 4>(
-        vec2<i32>(1, 0), vec2<i32>(-1, 0),
-        vec2<i32>(0, 1), vec2<i32>(0, -1)
-    );
     for (var i = 0u; i < 4u; i = i + 1u) {
-        let q = clamp(pixel + offsets[i], vec2<i32>(0), dimensions - vec2<i32>(1));
+        var offset = vec2<i32>(1, 0);
+        if (i == 1u) { offset = vec2<i32>(-1, 0); }
+        if (i == 2u) { offset = vec2<i32>(0, 1); }
+        if (i == 3u) { offset = vec2<i32>(0, -1); }
+        let q = clamp(pixel + offset, vec2<i32>(0), dimensions - vec2<i32>(1));
         let neighbour_pos = textureLoad(src_gbuf_pos, q, 0);
         if (neighbour_pos.w <= 0.0) {
             depth_edge = max(depth_edge, 1.0);
@@ -1343,13 +1343,13 @@ fn restir_reuse_history(
         point, normal, ray_origin, bias, distance, false, state
     );
 
-    let offsets = array<vec2<i32>, 4>(
-        vec2<i32>(1, 0), vec2<i32>(-1, 0),
-        vec2<i32>(0, 1), vec2<i32>(0, -1)
-    );
     let reuse_count = min(u32(params.restir.z), 4u);
     for (var i = 0u; i < reuse_count; i = i + 1u) {
-        let neighbour = previous_pixel + offsets[i];
+        var offset = vec2<i32>(1, 0);
+        if (i == 1u) { offset = vec2<i32>(-1, 0); }
+        if (i == 2u) { offset = vec2<i32>(0, 1); }
+        if (i == 3u) { offset = vec2<i32>(0, -1); }
+        let neighbour = previous_pixel + offset;
         if (neighbour.x < 0 || neighbour.y < 0 || neighbour.x >= i32(extent.x) || neighbour.y >= i32(extent.y)) {
             continue;
         }
