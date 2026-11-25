@@ -25,6 +25,8 @@ struct Params {
     float4 point_lights_pos_rad[128];   // xyz: world pos, w: radius
     float4 point_lights_col_int[128];   // rgb: colour, w: intensity
     float4 terrain_map_bounds;          // x: min_x, y: max_z, z: inv_diameter, w: valid (>0.5)
+    column_major float4x4 prev_vp;
+    float4 restir; // x=reservoir buffer enabled, y=max adaptive samples, z=spatial reuse count, w=history parity
 };
 
 struct Tri {
@@ -37,6 +39,13 @@ struct Tri {
 struct Material {
     float4 albedo;  // .rgb diffuse albedo
     float4 surface; // .x roughness, .y metallic, .w opacity
+};
+
+struct RestirReservoir {
+    float4 sample_pos_weight;
+    float4 radiance_m;
+    float4 receiver_pos_target;
+    float4 receiver_normal_flags;
 };
 
 cbuffer ParamsBuffer : register(b0) {
@@ -65,6 +74,7 @@ RWTexture2D<float4> out_normals : register(u3);
 RWTexture2D<float4> out_albedo : register(u4);
 // Feature #6: Persistent 65,536-cell 3D World-Space Radiance Cache (1 MB VRAM).
 RWStructuredBuffer<float4> radiance_cache : register(u5);
+RWStructuredBuffer<RestirReservoir> restir_reservoirs : register(u6);
 
 static const float PI = 3.14159265;
 static const float SKY_ENV_FACE_F = 128.0;
@@ -765,6 +775,159 @@ float3 kind_colour(float kind) {
     return float3(0.95, 0.15, 0.85);                 // magenta: instance proxy
 }
 
+uint adaptive_ray_samples(uint2 pixel, float dist, float3 normal, float roughness, uint base) {
+    uint max_samples = clamp(uint(params.restir.y + 0.5), base, 8u);
+    if (max_samples <= base) return base;
+    uint width, height;
+    src_gbuf_pos.GetDimensions(width, height);
+    float centre_luma = luma(src_gbuf_raster.Load(int3(pixel, 0)).rgb);
+    float normal_edge = 0.0;
+    float depth_edge = 0.0;
+    float colour_edge = 0.0;
+    const int2 offsets[4] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1) };
+    for (uint i = 0u; i < 4u; ++i) {
+        int2 q = clamp(int2(pixel) + offsets[i], int2(0, 0), int2(width - 1u, height - 1u));
+        float4 neighbour_pos = src_gbuf_pos.Load(int3(q, 0));
+        if (neighbour_pos.w <= 0.0) {
+            depth_edge = max(depth_edge, 1.0);
+            continue;
+        }
+        float3 raw_n = src_gbuf_norm.Load(int3(q, 0)).xyz;
+        float3 neighbour_n = (dot(raw_n, raw_n) > 1e-8) ? normalize(raw_n) : float3(0.0, 1.0, 0.0);
+        normal_edge = max(normal_edge, 1.0 - saturate(dot(normal, neighbour_n)));
+        depth_edge = max(depth_edge, abs(neighbour_pos.w - dist) / max(dist, 1.0));
+        float neighbour_luma = luma(src_gbuf_raster.Load(int3(q, 0)).rgb);
+        colour_edge = max(colour_edge, abs(neighbour_luma - centre_luma));
+    }
+    float complexity = max(normal_edge * 2.0, max(depth_edge * 5.0, colour_edge * 2.0));
+    complexity = max(complexity, (1.0 - smoothstep(0.0, 320.0, dist)) * 0.20);
+    complexity = max(complexity, saturate((0.36 - roughness) / 0.36) * 0.20);
+    uint extra = uint(ceil(saturate(complexity) * float(max_samples - base)));
+    return clamp(base + extra, base, max_samples);
+}
+
+RestirReservoir restir_empty() {
+    RestirReservoir r = (RestirReservoir)0;
+    return r;
+}
+
+void restir_clear(uint index) {
+    if (params.restir.x > 0.5) {
+        restir_reservoirs[index] = restir_empty();
+    }
+}
+
+void restir_update(
+    inout RestirReservoir reservoir,
+    float3 sample_pos,
+    float3 radiance,
+    float target,
+    float weight,
+    float represented,
+    bool is_sky,
+    float3 receiver_pos,
+    float3 receiver_normal,
+    inout uint state
+) {
+    if (weight <= 0.0 || represented <= 0.0) return;
+    float sum = reservoir.sample_pos_weight.w + weight;
+    if (rand01(state) * sum < weight) {
+        reservoir.sample_pos_weight = float4(sample_pos, 0.0);
+        reservoir.radiance_m = float4(radiance, reservoir.radiance_m.w);
+        reservoir.receiver_pos_target = float4(receiver_pos, max(target, 1e-5));
+        reservoir.receiver_normal_flags = float4(receiver_normal, is_sky ? -1.0 : 1.0);
+    }
+    reservoir.sample_pos_weight.w = sum;
+    reservoir.radiance_m.w += represented;
+}
+
+void restir_reuse_one(
+    inout RestirReservoir reservoir,
+    RestirReservoir source,
+    float3 receiver_pos,
+    float3 receiver_normal,
+    float3 ray_origin,
+    float bias,
+    float camera_distance,
+    bool spatial,
+    uint opaque_offset,
+    uint tri_count,
+    inout uint state
+) {
+    if (source.sample_pos_weight.w <= 0.0 || source.radiance_m.w <= 0.0 || source.receiver_pos_target.w <= 1e-5) return;
+    float3 delta = source.receiver_pos_target.xyz - receiver_pos;
+    float signed_plane = dot(delta, receiver_normal);
+    float plane_error = abs(signed_plane);
+    float lateral = length(delta - receiver_normal * signed_plane);
+    float max_lateral = spatial ? max(1.25, camera_distance * 0.012) : max(0.25, camera_distance * 0.003);
+    float max_plane = spatial ? max(0.16, camera_distance * 0.003) : max(0.08, camera_distance * 0.001);
+    if (dot(normalize(source.receiver_normal_flags.xyz), receiver_normal) < 0.90 ||
+        plane_error > max_plane || lateral > max_lateral) return;
+
+    bool is_sky = source.receiver_normal_flags.w < 0.0;
+    float3 direction = float3(0.0, 1.0, 0.0);
+    float sample_distance = 0.0;
+    if (is_sky) {
+        direction = normalize(source.sample_pos_weight.xyz);
+    } else {
+        float3 to_sample = source.sample_pos_weight.xyz - receiver_pos;
+        sample_distance = length(to_sample);
+        if (sample_distance <= bias) return;
+        direction = to_sample / sample_distance;
+    }
+    float cosine = max(dot(receiver_normal, direction), 0.0);
+    if (cosine <= 0.01) return;
+    if (!is_sky) {
+        float tolerance = max(0.35, sample_distance * 0.02);
+        Hit visible = closest_hit(ray_origin, direction, max(0.05, bias * 0.25),
+            sample_distance + tolerance, opaque_offset, tri_count);
+        if (visible.index == 0xffffffffu || abs(visible.t - sample_distance) > tolerance) return;
+    }
+    float target = max(luma(source.radiance_m.xyz) * cosine, 1e-5);
+    float represented = clamp(source.radiance_m.w, 1.0, 32.0);
+    float weight = source.sample_pos_weight.w * target / max(source.receiver_pos_target.w, 1e-5);
+    restir_update(reservoir, source.sample_pos_weight.xyz, source.radiance_m.xyz,
+        target, weight, represented, is_sky, receiver_pos, receiver_normal, state);
+}
+
+void restir_reuse_history(
+    inout RestirReservoir reservoir,
+    float3 point,
+    float3 normal,
+    float3 ray_origin,
+    float bias,
+    float distance,
+    uint2 pixel,
+    uint2 extent,
+    uint previous_base,
+    uint opaque_offset,
+    uint tri_count,
+    inout uint state
+) {
+    if (params.frame.w <= 0.5) return;
+    float4 clip = mul(params.prev_vp, float4(point, 1.0));
+    if (clip.w <= 1e-5) return;
+    float2 ndc = clip.xy / clip.w;
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (any(uv < 0.0) || any(uv >= 1.0)) return;
+    int2 previous_pixel = int2(uv * float2(extent));
+    uint linear = uint(previous_pixel.y) * extent.x + uint(previous_pixel.x);
+    restir_reuse_one(reservoir, restir_reservoirs[previous_base + linear],
+        point, normal, ray_origin, bias, distance, false,
+        opaque_offset, tri_count, state);
+    const int2 offsets[4] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1) };
+    uint reuse_count = min(uint(params.restir.z + 0.5), 4u);
+    for (uint i = 0u; i < reuse_count; ++i) {
+        int2 neighbour = previous_pixel + offsets[i];
+        if (neighbour.x < 0 || neighbour.y < 0 ||
+            neighbour.x >= int(extent.x) || neighbour.y >= int(extent.y)) continue;
+        uint index = previous_base + uint(neighbour.y) * extent.x + uint(neighbour.x);
+        restir_reuse_one(reservoir, restir_reservoirs[index],
+            point, normal, ray_origin, bias, distance, true,
+            opaque_offset, tri_count, state);
+    }
+}
+
 [numthreads(8, 8, 1)] // Opt #13: square 8x8 tile for L1/wave64 coherence
 void trace_pass(uint3 id : SV_DispatchThreadID) {
     uint2 extent = uint2(uint(params.extents.x), uint(params.extents.y));
@@ -772,6 +935,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         return;
     }
 
+    uint pixel_count = extent.x * extent.y;
+    uint parity = uint(params.restir.w + 0.5) & 1u;
+    uint reservoir_index = parity * pixel_count + id.y * extent.x + id.x;
+    uint previous_base = (1u - parity) * pixel_count;
     float4 pos_d = src_gbuf_pos.Load(int3(id.xy, 0));
     float dist = pos_d.w;
     if (dist <= 0.0) {
@@ -787,6 +954,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         if (params.point_light_meta.z > 0.5) {
             out_albedo[id.xy] = float4(0.0, 0.0, 0.0, 0.04);
         }
+        restir_clear(reservoir_index);
         return;
     }
 
@@ -814,6 +982,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         if (params.point_light_meta.z > 0.5) {
             out_albedo[id.xy] = float4(raster_rgb, 0.0);
         }
+        restir_clear(reservoir_index);
         return;
     }
     uint effects = uint(round(params.effects.y));
@@ -893,10 +1062,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         if (params.point_light_meta.z > 0.5) {
             out_albedo[id.xy] = float4(raster_rgb, roughness);
         }
+        restir_clear(reservoir_index);
         return;
     }
 
-    uint samples = max(uint(params.frame.y), 1u);
+    uint base_samples = max(uint(params.frame.y), 1u);
+    uint samples = adaptive_ray_samples(id.xy, dist, normal, roughness, base_samples);
     uint max_bounces = min(uint(round(params.frame.z)), 6u);
     uint opaque_offset = uint(round(params.fog.w));
     uint tri_count = uint(params.counts.x);
@@ -912,6 +1083,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float3 accum_reflection = float3(0.0, 0.0, 0.0);
     float accum_refl_dist = 0.0;
     float3 accum_gi = float3(0.0, 0.0, 0.0);
+    RestirReservoir restir_current = restir_empty();
 
     // Opt #7: Distance-scaled AO ray budget (2 rays < 40u, 1 ray < 160u) — 40-50% fewer AO rays.
     float ao_radius = clamp(params.fog.z, 2.0, 6.0);
@@ -1121,6 +1293,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float path_dist = dist;
             float3 throughput = float3(1.0, 1.0, 1.0);
             float3 gi_sample = float3(0.0, 0.0, 0.0);
+            float3 gi_first_direction = float3(0.0, 1.0, 0.0);
+            float3 gi_first_position = float3(0.0, 0.0, 0.0);
+            bool gi_first_is_sky = false;
             bool has_b0 = false;
             float3 b0_world = float3(0.0, 0.0, 0.0);
             float3 b0_normal = float3(0.0, 1.0, 0.0);
@@ -1136,8 +1311,13 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 sincos(phi, s_phi, c_phi);
                 float z = sqrt(max(0.0, 1.0 - u1));
                 float3 d = cur_t * (r * c_phi) + cur_b * (r * s_phi) + cur_normal * z;
+                if (bounce == 0u) gi_first_direction = d;
                 Hit bhit = closest_hit(cur_origin, d, cur_bias, bounce_max_t, opaque_offset, tri_count);
                 if (bhit.index != 0xffffffffu && bhit.index != 0xfffffffeu) {
+                    if (bounce == 0u) {
+                        gi_first_position = cur_origin + d * bhit.t;
+                        gi_first_is_sky = false;
+                    }
                     float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
                     float3 bhit_world = cur_origin + d * bhit.t;
                     path_dist += bhit.t;
@@ -1250,6 +1430,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 } else {
                     if (bounce == 0u) {
                         gi_sky_hits += 1.0;
+                        gi_first_position = d;
+                        gi_first_is_sky = true;
                     }
                     // True directional sky-dome hemisphere irradiance + golden-hour color grading.
                     // Rays escaping shadowed overhangs/alleys into open sky on bounce 1..5 smoothly
@@ -1272,7 +1454,17 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 rc_update(b0_world, b0_normal, b0_dist, min(gi_sample, float3(2.8, 2.8, 2.8)));
             }
             gi_sample *= (params.tuning.w * 1.25 * (1.0 - fog_t));
-            accum_gi += min(gi_sample * gi_fade, float3(4.0, 4.0, 4.0));
+            float3 gi_candidate = min(gi_sample * gi_fade, float3(4.0, 4.0, 4.0));
+            if (params.restir.x > 0.5) {
+                float candidate_cosine = max(dot(normal, gi_first_direction), 0.001);
+                float candidate_target = max(luma(gi_candidate) * candidate_cosine, 1e-5);
+                float candidate_weight = candidate_target / candidate_cosine;
+                restir_update(restir_current, gi_first_position, gi_candidate,
+                    candidate_target, candidate_weight, 1.0, gi_first_is_sky,
+                    world_pos, normal, state);
+            } else {
+                accum_gi += gi_candidate;
+            }
         }
     }
 
@@ -1760,6 +1952,27 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float point_shadow_mod = (pl_shadows_enabled && pl_w_total > 1e-4)
         ? (1.0 - clamp(pl_w_total, 0.0, 0.5) * (1.0 - point_vis))
         : 1.0;
+
+    if (params.restir.x > 0.5 && bits_gi) {
+        restir_reuse_history(restir_current, world_pos, normal, ray_origin, bias, dist,
+            id.xy, extent, previous_base, opaque_offset, tri_count, state);
+        bool selected_sky = restir_current.receiver_normal_flags.w < 0.0;
+        float3 selected_dir = selected_sky
+            ? normalize(restir_current.sample_pos_weight.xyz)
+            : normalize(restir_current.sample_pos_weight.xyz - world_pos);
+        float selected_cosine = max(dot(normal, selected_dir), 0.0);
+        float selected_target = luma(restir_current.radiance_m.xyz) * selected_cosine;
+        if (restir_current.radiance_m.w > 0.0 && selected_target > 1e-5) {
+            float normalisation = restir_current.sample_pos_weight.w
+                / max(restir_current.radiance_m.w * selected_target, 1e-5);
+            accum_gi = restir_current.radiance_m.xyz * (selected_cosine * normalisation * float(samples));
+        } else {
+            accum_gi = float3(0.0, 0.0, 0.0);
+        }
+        restir_reservoirs[reservoir_index] = restir_current;
+    } else {
+        restir_clear(reservoir_index);
+    }
 
     float inv = 1.0 / float(samples);
     float avg_shadow = accum_shadow * inv;
