@@ -1218,6 +1218,171 @@ fn kind_colour(kind: f32) -> vec3<f32> {
     return vec3<f32>(0.95, 0.15, 0.85);                     // magenta: instance proxy
 }
 
+fn adaptive_ray_samples(pixel: vec2<i32>, dist: f32, normal: vec3<f32>, roughness: f32, base: u32) -> u32 {
+    let maximum = clamp(u32(params.restir.y), base, 8u);
+    if (maximum <= base) { return base; }
+    let dimensions = vec2<i32>(textureDimensions(src_gbuf_pos));
+    let centre_luma = luminance(textureLoad(src_gbuf_raster, pixel, 0).rgb);
+    var normal_edge = 0.0;
+    var depth_edge = 0.0;
+    var colour_edge = 0.0;
+    let offsets = array<vec2<i32>, 4>(
+        vec2<i32>(1, 0), vec2<i32>(-1, 0),
+        vec2<i32>(0, 1), vec2<i32>(0, -1)
+    );
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let q = clamp(pixel + offsets[i], vec2<i32>(0), dimensions - vec2<i32>(1));
+        let neighbour_pos = textureLoad(src_gbuf_pos, q, 0);
+        if (neighbour_pos.w <= 0.0) {
+            depth_edge = max(depth_edge, 1.0);
+            continue;
+        }
+        let neighbour_raw_n = textureLoad(src_gbuf_norm, q, 0).xyz;
+        let neighbour_n = select(vec3<f32>(0.0, 1.0, 0.0), normalize(neighbour_raw_n), length(neighbour_raw_n) > 1e-4);
+        normal_edge = max(normal_edge, 1.0 - clamp(dot(normal, neighbour_n), -1.0, 1.0));
+        depth_edge = max(depth_edge, abs(neighbour_pos.w - dist) / max(dist, 1.0));
+        let neighbour_luma = luminance(textureLoad(src_gbuf_raster, q, 0).rgb);
+        colour_edge = max(colour_edge, abs(neighbour_luma - centre_luma));
+    }
+    var complexity = max(normal_edge * 2.0, max(depth_edge * 5.0, colour_edge * 2.0));
+    complexity = max(complexity, (1.0 - smoothstep(0.0, 320.0, dist)) * 0.20);
+    complexity = max(complexity, clamp((0.36 - roughness) / 0.36, 0.0, 1.0) * 0.20);
+    let extra = u32(ceil(clamp(complexity, 0.0, 1.0) * f32(maximum - base)));
+    return clamp(base + extra, base, maximum);
+}
+
+fn restir_empty() -> RestirReservoir {
+    return RestirReservoir(
+        vec4<f32>(0.0), vec4<f32>(0.0),
+        vec4<f32>(0.0), vec4<f32>(0.0)
+    );
+}
+
+fn restir_clear(index: u32) {
+    if (params.restir.x >= 0.0) {
+        restir_reservoirs[index] = restir_empty();
+    }
+}
+
+fn restir_update(
+    reservoir: ptr<function, RestirReservoir>,
+    sample_pos: vec3<f32>,
+    radiance: vec3<f32>,
+    target: f32,
+    weight: f32,
+    represented: f32,
+    is_sky: bool,
+    receiver_pos: vec3<f32>,
+    receiver_normal: vec3<f32>,
+    state: ptr<function, u32>
+) {
+    if (weight <= 0.0 || represented <= 0.0) { return; }
+    var value = *reservoir;
+    let sum = value.sample_pos_weight.w + weight;
+    if (next_f32(state) * sum < weight) {
+        value.sample_pos_weight = vec4<f32>(sample_pos, 0.0);
+        value.radiance_m = vec4<f32>(radiance, value.radiance_m.w);
+        value.receiver_pos_target = vec4<f32>(receiver_pos, max(target, 1e-5));
+        value.receiver_normal_flags = vec4<f32>(receiver_normal, select(1.0, -1.0, is_sky));
+    }
+    value.sample_pos_weight.w = sum;
+    value.radiance_m.w = value.radiance_m.w + represented;
+    *reservoir = value;
+}
+
+fn restir_reuse_one(
+    reservoir: ptr<function, RestirReservoir>,
+    source: RestirReservoir,
+    receiver_pos: vec3<f32>,
+    receiver_normal: vec3<f32>,
+    ray_origin: vec3<f32>,
+    bias: f32,
+    camera_distance: f32,
+    spatial: bool,
+    state: ptr<function, u32>
+) {
+    if (source.sample_pos_weight.w <= 0.0 || source.radiance_m.w <= 0.0 || source.receiver_pos_target.w <= 1e-5) { return; }
+    let receiver_delta = source.receiver_pos_target.xyz - receiver_pos;
+    let receiver_plane = dot(receiver_delta, receiver_normal);
+    let plane_error = abs(receiver_plane);
+    let lateral = length(receiver_delta - receiver_normal * receiver_plane);
+    let max_lateral = select(max(0.25, camera_distance * 0.003), max(1.25, camera_distance * 0.012), spatial);
+    let max_plane = select(max(0.08, camera_distance * 0.001), max(0.16, camera_distance * 0.003), spatial);
+    let normal_match = dot(normalize(source.receiver_normal_flags.xyz), receiver_normal);
+    if (normal_match < 0.90 || plane_error > max_plane || lateral > max_lateral) { return; }
+
+    let is_sky = source.receiver_normal_flags.w < 0.0;
+    var direction = vec3<f32>(0.0, 1.0, 0.0);
+    var sample_distance = 0.0;
+    if (is_sky) {
+        direction = normalize(source.sample_pos_weight.xyz);
+    } else {
+        let to_sample = source.sample_pos_weight.xyz - receiver_pos;
+        sample_distance = length(to_sample);
+        if (sample_distance <= bias) { return; }
+        direction = to_sample / sample_distance;
+    }
+    let cosine = max(dot(receiver_normal, direction), 0.0);
+    if (cosine <= 0.01) { return; }
+    if (!is_sky) {
+        let tolerance = max(0.35, sample_distance * 0.02);
+        let visible = closest_hit(ray_origin, direction, max(0.05, bias * 0.25), sample_distance + tolerance);
+        if (visible.index == 0xffffffffu || abs(visible.t - sample_distance) > tolerance) { return; }
+    }
+    let target = max(luminance(source.radiance_m.xyz) * cosine, 1e-5);
+    let represented = clamp(source.radiance_m.w, 1.0, 32.0);
+    let age_scale = represented / max(source.radiance_m.w, 1.0);
+    let weight = source.sample_pos_weight.w * age_scale * target / max(source.receiver_pos_target.w, 1e-5);
+    restir_update(
+        reservoir, source.sample_pos_weight.xyz, source.radiance_m.xyz,
+        target, weight, represented, is_sky,
+        receiver_pos, receiver_normal, state
+    );
+}
+
+fn restir_reuse_history(
+    reservoir: ptr<function, RestirReservoir>,
+    point: vec3<f32>,
+    normal: vec3<f32>,
+    ray_origin: vec3<f32>,
+    bias: f32,
+    distance: f32,
+    pixel: vec2<u32>,
+    extent: vec2<u32>,
+    previous_base: u32,
+    state: ptr<function, u32>
+) {
+    if (params.frame.w <= 0.5) { return; }
+    let clip = params.prev_vp * vec4<f32>(point, 1.0);
+    if (clip.w <= 1e-5) { return; }
+    let ndc = clip.xy / clip.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (uv.x < 0.0 || uv.x >= 1.0 || uv.y < 0.0 || uv.y >= 1.0) { return; }
+    let previous_pixel = vec2<i32>(uv * vec2<f32>(extent));
+    let linear = u32(previous_pixel.y) * extent.x + u32(previous_pixel.x);
+    restir_reuse_one(
+        reservoir, restir_reservoirs[previous_base + linear],
+        point, normal, ray_origin, bias, distance, false, state
+    );
+
+    let offsets = array<vec2<i32>, 4>(
+        vec2<i32>(1, 0), vec2<i32>(-1, 0),
+        vec2<i32>(0, 1), vec2<i32>(0, -1)
+    );
+    let reuse_count = min(u32(params.restir.z), 4u);
+    for (var i = 0u; i < reuse_count; i = i + 1u) {
+        let neighbour = previous_pixel + offsets[i];
+        if (neighbour.x < 0 || neighbour.y < 0 || neighbour.x >= i32(extent.x) || neighbour.y >= i32(extent.y)) {
+            continue;
+        }
+        let neighbour_index = previous_base + u32(neighbour.y) * extent.x + u32(neighbour.x);
+        restir_reuse_one(
+            reservoir, restir_reservoirs[neighbour_index],
+            point, normal, ray_origin, bias, distance, true, state
+        );
+    }
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let extent = vec2<u32>(u32(params.extents.x), u32(params.extents.y));
@@ -1225,6 +1390,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let ip = vec2<i32>(id.xy);
+    let pixel_count = extent.x * extent.y;
+    let parity = u32(round(params.restir.w)) & 1u;
+    let reservoir_index = parity * pixel_count + id.y * extent.x + id.x;
+    let previous_base = (1u - parity) * pixel_count;
     let pos_d = textureLoad(src_gbuf_pos, ip, 0);
     let dist = pos_d.w;
     let layered = params.effects.w > 0.5;
@@ -1235,6 +1404,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(out_reflection, ip, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         textureStore(out_normals, ip, vec4<f32>(0.0, 1.0, 0.0, 1.0));
         textureStore(out_albedo, ip, vec4<f32>(0.0, 0.0, 0.0, 0.04));
+        restir_clear(reservoir_index);
         return;
     }
 
@@ -1257,6 +1427,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(out_reflection, ip, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         textureStore(out_normals, ip, vec4<f32>(normal, roughness));
         textureStore(out_albedo, ip, vec4<f32>(raster_rgb, 0.0));
+        restir_clear(reservoir_index);
         return;
     }
     let effects = u32(round(params.effects.y));
@@ -1293,10 +1464,12 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(out_reflection, ip, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         textureStore(out_normals, ip, vec4<f32>(normal, roughness));
         textureStore(out_albedo, ip, vec4<f32>(raster_rgb, roughness));
+        restir_clear(reservoir_index);
         return;
     }
 
-    let samples = max(u32(params.frame.y), 1u);
+    let base_samples = max(u32(params.frame.y), 1u);
+    let samples = adaptive_ray_samples(ip, dist, normal, roughness, base_samples);
     let max_bounces = min(u32(round(params.frame.z)), 6u);
     let pl_count = min(u32(round(params.point_light_meta.x)), 128u);
     var state = id.x * 0x9e3779b9u ^ id.y * 0x85ebca6bu ^ u32(params.frame.x) * 0xc2b2ae35u;
@@ -1309,6 +1482,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var accum_reflection = vec3<f32>(0.0);
     var accum_refl_dist = 0.0;
     var accum_gi = vec3<f32>(0.0);
+    var restir_current = restir_empty();
 
     let ao_radius = clamp(params.fog.z, 2.0, 6.0);
     let ao_samples = select(select(1u, 2u, dist < 140.0), 3u, dist < 48.0);
@@ -1471,6 +1645,9 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             var path_dist = dist;
             var throughput = vec3<f32>(1.0);
             var gi_sample = vec3<f32>(0.0);
+            var gi_first_direction = vec3<f32>(0.0, 1.0, 0.0);
+            var gi_first_position = vec3<f32>(0.0);
+            var gi_first_is_sky = false;
             gi_total_rays = gi_total_rays + 1.0;
 
             for (var bounce = 0u; bounce < max_bounces; bounce = bounce + 1u) {
@@ -1479,8 +1656,13 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                     + f32(bounce) * 1.9132 + next_f32(&state) * 0.65;
                 let r = sqrt(u1);
                 let d = cur_onb * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
+                if (bounce == 0u) { gi_first_direction = d; }
                 let bhit = closest_hit(cur_origin, d, cur_bias, bounce_max_t);
                 if (bhit.index != 0xffffffffu) {
+                    if (bounce == 0u) {
+                        gi_first_position = cur_origin + d * bhit.t;
+                        gi_first_is_sky = false;
+                    }
                     let b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
                     let bhit_world = cur_origin + d * bhit.t;
                     path_dist = path_dist + bhit.t;
@@ -1559,6 +1741,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 } else {
                     if (bounce == 0u) {
                         gi_sky_hits = gi_sky_hits + 1.0;
+                        gi_first_position = d;
+                        gi_first_is_sky = true;
                     }
                     let raw_sky = min(sample_sky_env(d), vec3<f32>(1.25));
                     var vivid_sky = raw_sky;
@@ -1577,7 +1761,19 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
             gi_sample = gi_sample * (params.tuning.w * 1.25 * (1.0 - fog_t));
-            accum_gi = accum_gi + min(gi_sample * gi_fade, vec3<f32>(3.2));
+            let gi_candidate = min(gi_sample * gi_fade, vec3<f32>(3.2));
+            if (params.restir.x > 0.5) {
+                let candidate_cosine = max(dot(normal, gi_first_direction), 0.001);
+                let candidate_target = max(luminance(gi_candidate) * candidate_cosine, 1e-5);
+                let candidate_weight = candidate_target / candidate_cosine;
+                restir_update(
+                    &restir_current, gi_first_position, gi_candidate,
+                    candidate_target, candidate_weight, 1.0, gi_first_is_sky,
+                    point, normal, &state
+                );
+            } else {
+                accum_gi = accum_gi + gi_candidate;
+            }
         }
     }
 
@@ -1991,6 +2187,33 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let point_vis = select(1.0, pl_w_lit / max(pl_w_total, 1e-5), pl_w_total > 1e-4);
     let point_shadow_mod = select(1.0, 1.0 - clamp(pl_w_total, 0.0, 0.5) * (1.0 - point_vis), pl_shadows_enabled && pl_w_total > 1e-4);
+
+    if (params.restir.x > 0.5) {
+        restir_reuse_history(
+            &restir_current, point, normal, ray_origin, bias, dist,
+            id.xy, extent, previous_base, &state
+        );
+        let selected_sky = restir_current.receiver_normal_flags.w < 0.0;
+        var selected_dir = vec3<f32>(0.0, 1.0, 0.0);
+        if (selected_sky) {
+            selected_dir = normalize(restir_current.sample_pos_weight.xyz);
+        } else {
+            selected_dir = normalize(restir_current.sample_pos_weight.xyz - point);
+        }
+        let selected_cosine = max(dot(normal, selected_dir), 0.0);
+        let selected_target = luminance(restir_current.radiance_m.xyz) * selected_cosine;
+        if (restir_current.radiance_m.w > 0.0 && selected_target > 1e-5) {
+            let normalisation = restir_current.sample_pos_weight.w
+                / max(restir_current.radiance_m.w * selected_target, 1e-5);
+            let gi_estimate = restir_current.radiance_m.xyz * (selected_cosine * normalisation);
+            accum_gi = gi_estimate * f32(samples);
+        } else {
+            accum_gi = vec3<f32>(0.0);
+        }
+        restir_reservoirs[reservoir_index] = restir_current;
+    } else {
+        restir_clear(reservoir_index);
+    }
 
     let inv = 1.0 / f32(samples);
     let avg_shadow = accum_shadow * inv;
