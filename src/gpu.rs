@@ -4241,11 +4241,8 @@ impl Renderer {
         // passes. Reading camera.air_fog directly would ignore the user's
         // atmospheric-fog checkbox and leave RT fog enabled after it is turned off.
         let fog = camera.active_fog();
-        let fog_range = crate::modules::raywatcher::frame::effective_fog_range(
-            fog.enabled,
-            fog.start,
-            fog.end,
-        );
+        let fog_range =
+            crate::modules::raywatcher::frame::effective_fog_range(fog.enabled, fog.start, fog.end);
         let lighting = LightingRecord::derive(
             camera.time_of_day,
             crate::environment::daylight(camera.time_of_day),
