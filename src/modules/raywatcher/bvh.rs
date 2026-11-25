@@ -199,6 +199,16 @@ impl BvhNode {
     pub fn hit(&self, origin: Vec3, dir: Vec3, t_min: f32, t_max: f32) -> Option<f32> {
         self.bounds().hit(origin, dir, t_min, t_max)
     }
+
+    fn hit_with_slabs(
+        &self,
+        origin: Vec3,
+        slabs: RaySlabs,
+        t_min: f32,
+        t_max: f32,
+    ) -> Option<f32> {
+        self.bounds().hit_with_slabs(origin, slabs, t_min, t_max)
+    }
 }
 
 /// Bounds of a scene, kept as a pair of `Vec3` so the uploader can copy them
@@ -207,6 +217,32 @@ impl BvhNode {
 pub struct Bounds {
     pub min: Vec3,
     pub max: Vec3,
+}
+
+#[derive(Clone, Copy)]
+struct RaySlabs {
+    inv_dir: Vec3,
+    parallel: [bool; 3],
+}
+
+impl RaySlabs {
+    const PARALLEL_EPSILON: f32 = 1e-12;
+
+    fn new(dir: Vec3) -> Self {
+        let parallel = [
+            dir.x.abs() < Self::PARALLEL_EPSILON,
+            dir.y.abs() < Self::PARALLEL_EPSILON,
+            dir.z.abs() < Self::PARALLEL_EPSILON,
+        ];
+        Self {
+            inv_dir: Vec3::new(
+                if parallel[0] { 0.0 } else { dir.x.recip() },
+                if parallel[1] { 0.0 } else { dir.y.recip() },
+                if parallel[2] { 0.0 } else { dir.z.recip() },
+            ),
+            parallel,
+        }
+    }
 }
 
 impl Bounds {
@@ -237,27 +273,33 @@ impl Bounds {
         b
     }
 
-    /// Slab test. Returns the entry distance along `dir` when the ray hits the
-    /// box in front of its origin. Degenerate directions are handled by the
-    /// division-free epsilon form, which is what makes this safe for the
-    /// traverser's axis-aligned shadow rays.
+    /// Slab test. Public one-off callers build a cache for this ray; BVH walks
+    /// construct it once and reuse its reciprocals across every node test.
     pub fn hit(&self, origin: Vec3, dir: Vec3, t_min: f32, t_max: f32) -> Option<f32> {
+        self.hit_with_slabs(origin, RaySlabs::new(dir), t_min, t_max)
+    }
+
+    fn hit_with_slabs(
+        &self,
+        origin: Vec3,
+        slabs: RaySlabs,
+        t_min: f32,
+        t_max: f32,
+    ) -> Option<f32> {
         let mut t0 = t_min;
         let mut t1 = t_max;
         for axis in 0..3 {
             let o = origin[axis];
-            let d = dir[axis];
             let lo = self.min[axis];
             let hi = self.max[axis];
-            if d.abs() < 1e-12 {
+            if slabs.parallel[axis] {
                 if o < lo || o > hi {
                     return None;
                 }
                 continue;
             }
-            let inv = 1. / d;
-            let mut near = (lo - o) * inv;
-            let mut far = (hi - o) * inv;
+            let mut near = (lo - o) * slabs.inv_dir[axis];
+            let mut far = (hi - o) * slabs.inv_dir[axis];
             if near > far {
                 std::mem::swap(&mut near, &mut far);
             }
@@ -521,18 +563,22 @@ impl SceneGeometry {
         if self.nodes.is_empty() {
             return None;
         }
+        let slabs = RaySlabs::new(dir);
+        let root_entry = self.nodes[0].hit_with_slabs(origin, slabs, t_min, t_max)?;
         let mut best: Option<Hit> = None;
         let mut best_t = t_max;
-        let mut stack = [0u32; STACK_DEPTH];
+        // Stack entries retain the parent-tested AABB entry distance. This
+        // avoids repeating the same slab test when a child is popped.
+        let mut stack = [(0u32, 0.0f32); STACK_DEPTH];
         let mut sp = 1usize;
-        stack[0] = 0;
+        stack[0] = (0, root_entry);
         while sp > 0 {
             sp -= 1;
-            let node_index = stack[sp];
-            let node = &self.nodes[node_index as usize];
-            if node.hit(origin, dir, t_min, best_t).is_none() {
+            let (node_index, node_entry) = stack[sp];
+            if node_entry > best_t {
                 continue;
             }
+            let node = &self.nodes[node_index as usize];
             if let Some(count) = node.leaf_count() {
                 let first = node.max[3] as u32;
                 for i in 0..count {
@@ -553,31 +599,40 @@ impl SceneGeometry {
             } else {
                 let left = node_index + 1;
                 let right = node.max[3] as u32;
-                let lh = self.nodes[left as usize].hit(origin, dir, t_min, best_t);
-                let rh = self.nodes[right as usize].hit(origin, dir, t_min, best_t);
-                // Push the far child first so the near one is popped next. A box
-                // the ray misses is never pushed at all.
-                let (near, far) = match (lh, rh) {
+                let lh = self.nodes[left as usize]
+                    .hit_with_slabs(origin, slabs, t_min, best_t);
+                let rh = self.nodes[right as usize]
+                    .hit_with_slabs(origin, slabs, t_min, best_t);
+                // Push the far child first so the near one is popped next;
+                // preserve each already-tested entry distance on the stack.
+                match (lh, rh) {
                     (None, None) => continue,
-                    (Some(_), None) => (left, None),
-                    (None, Some(_)) => (right, None),
-                    (Some(lt), Some(rt)) => {
-                        if lt <= rt {
-                            (left, Some(right))
-                        } else {
-                            (right, Some(left))
+                    (Some(lt), None) => {
+                        if sp < STACK_DEPTH {
+                            stack[sp] = (left, lt);
+                            sp += 1;
                         }
                     }
-                };
-                if let Some(far) = far {
-                    if sp < STACK_DEPTH {
-                        stack[sp] = far;
-                        sp += 1;
+                    (None, Some(rt)) => {
+                        if sp < STACK_DEPTH {
+                            stack[sp] = (right, rt);
+                            sp += 1;
+                        }
                     }
-                }
-                if sp < STACK_DEPTH {
-                    stack[sp] = near;
-                    sp += 1;
+                    (Some(lt), Some(rt)) if lt <= rt => {
+                        if sp + 2 <= STACK_DEPTH {
+                            stack[sp] = (right, rt);
+                            stack[sp + 1] = (left, lt);
+                            sp += 2;
+                        }
+                    }
+                    (Some(lt), Some(rt)) => {
+                        if sp + 2 <= STACK_DEPTH {
+                            stack[sp] = (left, lt);
+                            stack[sp + 1] = (right, rt);
+                            sp += 2;
+                        }
+                    }
                 }
             }
         }
@@ -590,16 +645,19 @@ impl SceneGeometry {
         if self.nodes.is_empty() {
             return false;
         }
-        let mut stack = [0u32; STACK_DEPTH];
+        let slabs = RaySlabs::new(dir);
+        let Some(root_entry) = self.nodes[0].hit_with_slabs(origin, slabs, t_min, t_max) else {
+            return false;
+        };
+        // Visit the nearer candidate subtree first so an opaque leaf can end
+        // the boolean visibility query before the farther branch is traversed.
+        let mut stack = [(0u32, 0.0f32); STACK_DEPTH];
         let mut sp = 1usize;
-        stack[0] = 0;
+        stack[0] = (0, root_entry);
         while sp > 0 {
             sp -= 1;
-            let node_index = stack[sp];
+            let (node_index, _node_entry) = stack[sp];
             let node = &self.nodes[node_index as usize];
-            if node.hit(origin, dir, t_min, t_max).is_none() {
-                continue;
-            }
             if let Some(count) = node.leaf_count() {
                 let first = node.max[3] as u32;
                 for i in 0..count {
@@ -619,15 +677,41 @@ impl SceneGeometry {
                     }
                 }
             } else {
-                if sp + 2 > STACK_DEPTH {
-                    // Overflow is impossible for a tree this shallow; returning
-                    // "occluded" would be a wrong shadow rather than a slow one,
-                    // so fall back to testing what still fits.
-                    continue;
+                let left = node_index + 1;
+                let right = node.max[3] as u32;
+                let lh = self.nodes[left as usize]
+                    .hit_with_slabs(origin, slabs, t_min, t_max);
+                let rh = self.nodes[right as usize]
+                    .hit_with_slabs(origin, slabs, t_min, t_max);
+                match (lh, rh) {
+                    (None, None) => {}
+                    (Some(lt), None) => {
+                        if sp < STACK_DEPTH {
+                            stack[sp] = (left, lt);
+                            sp += 1;
+                        }
+                    }
+                    (None, Some(rt)) => {
+                        if sp < STACK_DEPTH {
+                            stack[sp] = (right, rt);
+                            sp += 1;
+                        }
+                    }
+                    (Some(lt), Some(rt)) if lt <= rt => {
+                        if sp + 2 <= STACK_DEPTH {
+                            stack[sp] = (right, rt);
+                            stack[sp + 1] = (left, lt);
+                            sp += 2;
+                        }
+                    }
+                    (Some(lt), Some(rt)) => {
+                        if sp + 2 <= STACK_DEPTH {
+                            stack[sp] = (left, lt);
+                            stack[sp + 1] = (right, rt);
+                            sp += 2;
+                        }
+                    }
                 }
-                stack[sp] = node_index + 1;
-                stack[sp + 1] = node.max[3] as u32;
-                sp += 2;
             }
         }
         false
@@ -726,14 +810,14 @@ impl<'a> BuildState<'a> {
     }
 }
 
-/// Opt #27: Fast 8-bin Surface Area Heuristic (SAH) partitioner.
+/// Opt #28: 16-bin Surface Area Heuristic (SAH) partitioner for finer split placement.
 fn partition_sah(
     tri_bounds: &[(Vec3, Vec3)],
     centroids: &[Vec3],
     partition: &mut [u32],
     bounds: Bounds,
 ) -> usize {
-    const BINS: usize = 8;
+    const BINS: usize = 16;
     let ext = bounds.max - bounds.min;
     let mut best_axis = 0usize;
     let mut best_split = 0usize;
@@ -1198,6 +1282,56 @@ mod tests {
             .hit(Vec3::new(0., 0., 5.), -Vec3::Z, 0., 100.)
             .expect("hit");
         assert!((t - 4.).abs() < 1e-5, "t {t}");
+    }
+
+    #[test]
+    fn cached_ray_slabs_match_parallel_and_negative_direction_reference() {
+        let bounds = Bounds {
+            min: Vec3::new(-2.0, -1.0, -3.0),
+            max: Vec3::new(4.0, 5.0, 2.0),
+        };
+        let cases = [
+            (Vec3::new(0.0, 0.0, 8.0), Vec3::new(0.0, 0.0, -1.0)),
+            (Vec3::new(0.0, 8.0, 0.0), Vec3::new(0.0, -1.0, 0.0)),
+            (Vec3::new(8.0, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0)),
+            (Vec3::new(8.0, 8.0, 8.0), Vec3::new(-1.0, -1.0, -1.0)),
+            (Vec3::new(0.0, 0.0, 8.0), Vec3::new(1e-14, 0.0, -1.0)),
+            (Vec3::new(8.0, 0.0, 8.0), Vec3::new(0.0, 0.0, -1.0)),
+        ];
+        for (origin, dir) in cases {
+            let mut expected_near = 0.0f32;
+            let mut expected_far = 100.0f32;
+            let mut expected_hit = true;
+            for axis in 0..3 {
+                let o = origin[axis];
+                let d = dir[axis];
+                let lo = bounds.min[axis];
+                let hi = bounds.max[axis];
+                if d.abs() < 1e-12 {
+                    if o < lo || o > hi {
+                        expected_hit = false;
+                        break;
+                    }
+                    continue;
+                }
+                let mut near = (lo - o) / d;
+                let mut far = (hi - o) / d;
+                if near > far {
+                    std::mem::swap(&mut near, &mut far);
+                }
+                expected_near = expected_near.max(near);
+                expected_far = expected_far.min(far);
+                if expected_near > expected_far {
+                    expected_hit = false;
+                    break;
+                }
+            }
+            let actual = bounds.hit(origin, dir, 0.0, 100.0);
+            assert_eq!(actual.is_some(), expected_hit, "origin={origin:?} dir={dir:?}");
+            if let Some(actual) = actual {
+                assert!((actual - expected_near).abs() < 1e-5);
+            }
+        }
     }
 
     #[test]
