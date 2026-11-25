@@ -200,13 +200,7 @@ impl BvhNode {
         self.bounds().hit(origin, dir, t_min, t_max)
     }
 
-    fn hit_with_slabs(
-        &self,
-        origin: Vec3,
-        slabs: RaySlabs,
-        t_min: f32,
-        t_max: f32,
-    ) -> Option<f32> {
+    fn hit_with_slabs(&self, origin: Vec3, slabs: RaySlabs, t_min: f32, t_max: f32) -> Option<f32> {
         self.bounds().hit_with_slabs(origin, slabs, t_min, t_max)
     }
 }
@@ -599,10 +593,8 @@ impl SceneGeometry {
             } else {
                 let left = node_index + 1;
                 let right = node.max[3] as u32;
-                let lh = self.nodes[left as usize]
-                    .hit_with_slabs(origin, slabs, t_min, best_t);
-                let rh = self.nodes[right as usize]
-                    .hit_with_slabs(origin, slabs, t_min, best_t);
+                let lh = self.nodes[left as usize].hit_with_slabs(origin, slabs, t_min, best_t);
+                let rh = self.nodes[right as usize].hit_with_slabs(origin, slabs, t_min, best_t);
                 // Push the far child first so the near one is popped next;
                 // preserve each already-tested entry distance on the stack.
                 match (lh, rh) {
@@ -679,10 +671,8 @@ impl SceneGeometry {
             } else {
                 let left = node_index + 1;
                 let right = node.max[3] as u32;
-                let lh = self.nodes[left as usize]
-                    .hit_with_slabs(origin, slabs, t_min, t_max);
-                let rh = self.nodes[right as usize]
-                    .hit_with_slabs(origin, slabs, t_min, t_max);
+                let lh = self.nodes[left as usize].hit_with_slabs(origin, slabs, t_min, t_max);
+                let rh = self.nodes[right as usize].hit_with_slabs(origin, slabs, t_min, t_max);
                 match (lh, rh) {
                     (None, None) => {}
                     (Some(lt), None) => {
@@ -1327,7 +1317,11 @@ mod tests {
                 }
             }
             let actual = bounds.hit(origin, dir, 0.0, 100.0);
-            assert_eq!(actual.is_some(), expected_hit, "origin={origin:?} dir={dir:?}");
+            assert_eq!(
+                actual.is_some(),
+                expected_hit,
+                "origin={origin:?} dir={dir:?}"
+            );
             if let Some(actual) = actual {
                 assert!((actual - expected_near).abs() < 1e-5);
             }
