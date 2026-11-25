@@ -894,7 +894,7 @@ void restir_reuse_one(
 
 void restir_reuse_history(
     inout RestirReservoir reservoir,
-    float3 point,
+    float3 receiver_position,
     float3 normal,
     float3 ray_origin,
     float bias,
@@ -907,15 +907,15 @@ void restir_reuse_history(
     inout uint state
 ) {
     if (params.frame.w <= 0.5) return;
-    float4 clip = mul(params.prev_vp, float4(point, 1.0));
+    float4 clip = mul(params.prev_vp, float4(receiver_position, 1.0));
     if (clip.w <= 1e-5) return;
     float2 ndc = clip.xy / clip.w;
     float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     if (any(uv < 0.0) || any(uv >= 1.0)) return;
     int2 previous_pixel = int2(uv * float2(extent));
-    uint linear = uint(previous_pixel.y) * extent.x + uint(previous_pixel.x);
-    restir_reuse_one(reservoir, restir_reservoirs[previous_base + linear],
-        point, normal, ray_origin, bias, distance, false,
+    uint pixel_linear_index = uint(previous_pixel.y) * extent.x + uint(previous_pixel.x);
+    restir_reuse_one(reservoir, restir_reservoirs[previous_base + pixel_linear_index],
+        receiver_position, normal, ray_origin, bias, distance, false,
         opaque_offset, tri_count, state);
     const int2 offsets[4] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1) };
     uint reuse_count = min(uint(params.restir.z + 0.5), 4u);
@@ -925,7 +925,7 @@ void restir_reuse_history(
             neighbour.x >= int(extent.x) || neighbour.y >= int(extent.y)) continue;
         uint index = previous_base + uint(neighbour.y) * extent.x + uint(neighbour.x);
         restir_reuse_one(reservoir, restir_reservoirs[index],
-            point, normal, ray_origin, bias, distance, true,
+            receiver_position, normal, ray_origin, bias, distance, true,
             opaque_offset, tri_count, state);
     }
 }
