@@ -263,6 +263,61 @@ fn sample_rgba_uv(img: &image::RgbaImage, uv: [f32; 2]) -> ([f32; 3], f32) {
     )
 }
 
+/// Convert a SpeedTree leaf corner with the exact view-facing transform used by the raster vertex shader.
+/// SpeedTree's source coordinates are Z-up; the renderer's world is Y-up.
+fn speedtree_leaf_corner(corner: [f32; 3], view_direction: glam::Vec3, rho: f32) -> glam::Vec3 {
+    if rho > 1000.0 {
+        return glam::Vec3::new(corner[0], corner[2], corner[1]);
+    }
+    let d = view_direction.normalize_or_zero();
+    let azimuth = d.z.atan2(d.x);
+    let elevation = d.y.clamp(-1.0, 1.0).asin();
+    let (sin_elevation, cos_elevation) = elevation.sin_cos();
+    let q = glam::Vec3::new(
+        cos_elevation * corner[0] - sin_elevation * corner[2],
+        corner[1],
+        sin_elevation * corner[0] + cos_elevation * corner[2],
+    );
+    let (sin_angle, cos_angle) = (azimuth + rho).sin_cos();
+    let v = glam::Vec3::new(
+        cos_angle * q.x - sin_angle * q.y,
+        sin_angle * q.x + cos_angle * q.y,
+        q.z,
+    );
+    glam::Vec3::new(v.x, v.z, v.y)
+}
+
+#[inline]
+fn foliage_opacity(hits: u32) -> f32 {
+    if hits >= 49 {
+        // A fully covered 7x7 mask is encoded as unmasked; it must therefore be fully opaque too.
+        1.0
+    } else {
+        (0.45 + 0.48 * (hits as f32 / 49.0)).clamp(0.45, 0.92)
+    }
+}
+
+/// The primary SpeedTree LOD selected by the same distance/height/scale bands as the raster compute shader.
+fn raster_lod_index(distance: f32, height: f32, scale: f32, lod_count: usize) -> usize {
+    let count = lod_count.min(3);
+    if count <= 1 { return 0; }
+    let h = height.max(5.0);
+    let s = scale.clamp(0.25, 4.0);
+    let lod0 = h * 5.0 * s;
+    let lod1 = h * 16.0 * s;
+    for (index, boundary) in [lod0, lod1].into_iter().enumerate() {
+        if distance >= boundary * 0.9 && distance < boundary * 1.1 {
+            return index.min(count - 1);
+        }
+    }
+    if distance < lod0 { 0 } else if distance < lod1 { 1.min(count - 1) } else { 2.min(count - 1) }
+}
+
+#[inline]
+fn approximate_client_distance(d2: f32) -> f32 {
+    f32::from_bits((d2.to_bits() >> 1).wrapping_add(0x1fc0_0000))
+}
+
 /// Sample a real 7x7 (49-cell) barycentric alpha cutout bitmask and alpha-weighted
 /// linear albedo from `img` over triangle UVs `(u0, u1, u2)`.
 /// Matches the exact `(s, t)` barycentric mapping decoded by `accept_opacity` in HLSL/WGSL.
@@ -309,63 +364,6 @@ fn sample_tri_alpha_mask49(
         [0.14, 0.28, 0.11]
     };
     (mask, albedo, hits)
-}
-
-/// Emit a compact alpha-tested crossed-canopy + trunk fallback (NOT a box) when
-/// a distant tree exceeds the RT triangle budget.
-pub fn push_alpha_canopy_fallback(pos: glam::Vec3, height: f32, out: &mut Vec<RtTreeTriangle>) {
-    let h = height.max(4.0);
-    let trunk_h = h * 0.45;
-    let r = (h * 0.28).clamp(1.2, 4.5);
-    let c_bot = pos + glam::Vec3::new(0.0, trunk_h * 0.65, 0.0);
-    let c_top = pos + glam::Vec3::new(0.0, h, 0.0);
-    let c_mid = (c_bot + c_top) * 0.5;
-    // Two crossed vertical diamond cards for the alpha-tested foliage canopy.
-    for &(ax, az) in &[(r, 0.0f32), (0.0f32, r), (r * 0.707, r * 0.707)] {
-        let off = glam::Vec3::new(ax, 0.0, az);
-        let p_l = c_mid - off;
-        let p_r = c_mid + off;
-        let n = glam::Vec3::new(-az, 0.25, ax).normalize_or_zero();
-        // Organic perforated 49-bit foliage cluster mask so distant budget-fallback
-        // trees still cast leafy dappled shadows instead of solid diamond silhouettes.
-        const CANOPY_FALLBACK_MASK_A: u64 = 0x0001_5B6D_B6AD_556A;
-        const CANOPY_FALLBACK_MASK_B: u64 = 0x0000_B5AD_6B5B_2B54;
-        out.push(RtTreeTriangle {
-            a: c_bot,
-            b: p_r,
-            c: c_top,
-            normal: n,
-            albedo: [0.16, 0.28, 0.12],
-            roughness: 0.85,
-            opacity: 0.62,
-            alpha_mask: CANOPY_FALLBACK_MASK_A,
-        });
-        out.push(RtTreeTriangle {
-            a: c_bot,
-            b: c_top,
-            c: p_l,
-            normal: n,
-            albedo: [0.16, 0.28, 0.12],
-            roughness: 0.85,
-            opacity: 0.62,
-            alpha_mask: CANOPY_FALLBACK_MASK_B,
-        });
-    }
-    // Narrow trunk card.
-    let tr = (r * 0.14).clamp(0.18, 0.6);
-    let t0 = pos + glam::Vec3::new(-tr, 0.0, 0.0);
-    let t1 = pos + glam::Vec3::new(tr, 0.0, 0.0);
-    let t2 = pos + glam::Vec3::new(0.0, trunk_h, 0.0);
-    out.push(RtTreeTriangle {
-        a: t0,
-        b: t1,
-        c: t2,
-        normal: glam::Vec3::Z,
-        albedo: [0.22, 0.15, 0.09],
-        roughness: 0.90,
-        opacity: 1.0,
-        alpha_mask: 0,
-    });
 }
 
 pub struct FarTrees {
@@ -746,7 +744,7 @@ impl FarTrees {
                                     normal: norm,
                                     albedo,
                                     roughness: 0.85,
-                                    opacity: (0.45 + 0.48 * coverage).clamp(0.45, 0.92),
+                                    opacity: foliage_opacity(hits),
                                     alpha_mask: mask,
                                 });
                             } else {
@@ -810,130 +808,30 @@ impl FarTrees {
                             ldiag.leaves_skipped += 1;
                             continue;
                         }
-                        let n = leaf
-                            .normal
-                            .map(|n| glam::Vec3::new(n[0], n[2], n[1]).normalize_or_zero())
-                            .filter(|n| n.length_squared() > 0.25)
-                            .unwrap_or(glam::Vec3::Y);
                         if leaf.rho > 1000.0 {
-                            // Fixed-orientation 3D SpeedTree leaf (`rho > 1000` in raster VS):
-                            // `leaf.corners[j]` are exact 3D vertex offsets in SpeedTree Z-up space.
                             ldiag.fixed_3d_leaves += 1;
-                            let p = [0, 1, 2, 3].map(|j| {
-                                let v = leaf.corners[j];
-                                center + glam::Vec3::new(v[0], v[2], v[1])
-                            });
-                            if h0 > 0 && (p[1] - p[0]).cross(p[2] - p[0]).length_squared() > 1e-8 {
-                                if h0 < 49 {
-                                    ldiag.masked_tris += 1;
-                                } else {
-                                    ldiag.unmasked_foliage_tris += 1;
-                                }
-                                lod_tris.push(RtTreeTriangle {
-                                    a: p[0],
-                                    b: p[1],
-                                    c: p[2],
-                                    normal: n,
-                                    albedo: a0,
-                                    roughness: 0.84,
-                                    opacity: (0.45 + 0.48 * (h0 as f32 / 49.0)).clamp(0.45, 0.92),
-                                    alpha_mask: m0,
-                                });
-                            }
-                            if h1 > 0 && (p[2] - p[0]).cross(p[3] - p[0]).length_squared() > 1e-8 {
-                                if h1 < 49 {
-                                    ldiag.masked_tris += 1;
-                                } else {
-                                    ldiag.unmasked_foliage_tris += 1;
-                                }
-                                lod_tris.push(RtTreeTriangle {
-                                    a: p[0],
-                                    b: p[2],
-                                    c: p[3],
-                                    normal: n,
-                                    albedo: a1,
-                                    roughness: 0.84,
-                                    opacity: (0.45 + 0.48 * (h1 as f32 / 49.0)).clamp(0.45, 0.92),
-                                    alpha_mask: m1,
-                                });
-                            }
-                            continue;
-                        }
-                        ldiag.billboard_leaves += 1;
-                        let up = if n.y.abs() < 0.95 {
-                            glam::Vec3::Y
                         } else {
-                            glam::Vec3::X
-                        };
-                        let right = up.cross(n).normalize_or_zero();
-                        let bitan = n.cross(right).normalize_or_zero();
-                        // Preserve rectangular SpeedTree leaf aspect ratio (width vs height)
-                        // from `leaf.corners[0..4]` instead of forcing a square card.
-                        let edge_w = (glam::Vec3::from_array(leaf.corners[1])
-                            - glam::Vec3::from_array(leaf.corners[0]))
-                        .length()
-                        .max(
-                            (glam::Vec3::from_array(leaf.corners[2])
-                                - glam::Vec3::from_array(leaf.corners[3]))
-                            .length(),
-                        );
-                        let edge_h = (glam::Vec3::from_array(leaf.corners[3])
-                            - glam::Vec3::from_array(leaf.corners[0]))
-                        .length()
-                        .max(
-                            (glam::Vec3::from_array(leaf.corners[2])
-                                - glam::Vec3::from_array(leaf.corners[1]))
-                            .length(),
-                        );
-                        let w_half = (edge_w * 0.5).clamp(0.14, 2.4);
-                        let h_half = (edge_h * 0.5).clamp(0.14, 2.4);
-                        let phase = (center.x * 3.17 + center.y * 5.41 + center.z * 2.73).sin();
-                        let (s_a, c_a) = (phase * 1.1).sin_cos();
-                        let ax1 = (right * c_a + n * s_a).normalize_or_zero();
-                        let ax2 = (n * c_a - right * s_a).normalize_or_zero();
-                        let up_axis = (bitan * 0.90 + glam::Vec3::Y * 0.10).normalize_or_zero();
-                        // Emit 2 orthogonal crossed 3D leaf cards carrying the exact 49-bit
-                        // texture silhouette so foliage has true 3D volume and crisp leaf cutouts
-                        // from every shadow and reflection angle.
-                        for &(horiz, norm_dir) in &[(ax1, ax2), (ax2, ax1)] {
-                            let c0 = center - horiz * w_half - up_axis * h_half;
-                            let c1 = center + horiz * w_half - up_axis * h_half;
-                            let c2 = center + horiz * w_half + up_axis * h_half;
-                            let c3 = center - horiz * w_half + up_axis * h_half;
-                            if h0 > 0 && (c1 - c0).cross(c2 - c0).length_squared() > 1e-8 {
-                                if h0 < 49 {
-                                    ldiag.masked_tris += 1;
-                                } else {
-                                    ldiag.unmasked_foliage_tris += 1;
-                                }
-                                lod_tris.push(RtTreeTriangle {
-                                    a: c0,
-                                    b: c1,
-                                    c: c2,
-                                    normal: norm_dir,
-                                    albedo: a0,
-                                    roughness: 0.84,
-                                    opacity: (0.45 + 0.48 * (h0 as f32 / 49.0)).clamp(0.45, 0.92),
-                                    alpha_mask: m0,
-                                });
-                            }
-                            if h1 > 0 && (c2 - c0).cross(c3 - c0).length_squared() > 1e-8 {
-                                if h1 < 49 {
-                                    ldiag.masked_tris += 1;
-                                } else {
-                                    ldiag.unmasked_foliage_tris += 1;
-                                }
-                                lod_tris.push(RtTreeTriangle {
-                                    a: c0,
-                                    b: c2,
-                                    c: c3,
-                                    normal: norm_dir,
-                                    albedo: a1,
-                                    roughness: 0.84,
-                                    opacity: (0.45 + 0.48 * (h1 as f32 / 49.0)).clamp(0.45, 0.92),
-                                    alpha_mask: m1,
-                                });
-                            }
+                            ldiag.billboard_leaves += 1;
+                        }
+                        // The raster vertex shader emits one leaf quad (two triangles), facing the current camera.
+                        // Do not invent a second crossed card for RT shadows/reflections.
+                        let p = [0, 1, 2, 3].map(|j| {
+                            center + speedtree_leaf_corner(leaf.corners[j], view_direction, leaf.rho)
+                        });
+                        let leaf_normal = glam::Vec3::Y; // matches the raster leaf shader's forced normal
+                        if h0 > 0 && (p[1] - p[0]).cross(p[2] - p[0]).length_squared() > 1e-8 {
+                            if h0 < 49 { ldiag.masked_tris += 1; } else { ldiag.unmasked_foliage_tris += 1; }
+                            lod_tris.push(RtTreeTriangle {
+                                a: p[0], b: p[1], c: p[2], normal: leaf_normal,
+                                albedo: a0, roughness: 0.84, opacity: foliage_opacity(h0), alpha_mask: m0,
+                            });
+                        }
+                        if h1 > 0 && (p[2] - p[0]).cross(p[3] - p[0]).length_squared() > 1e-8 {
+                            if h1 < 49 { ldiag.masked_tris += 1; } else { ldiag.unmasked_foliage_tris += 1; }
+                            lod_tris.push(RtTreeTriangle {
+                                a: p[0], b: p[2], c: p[3], normal: leaf_normal,
+                                albedo: a1, roughness: 0.84, opacity: foliage_opacity(h1), alpha_mask: m1,
+                            });
                         }
                     }
                     species_rt_lods.push(lod_tris);
@@ -1504,10 +1402,11 @@ impl FarTrees {
     /// Falls back to an alpha-tested crossed canopy (never a box) only if the
     /// triangle budget cannot fit a distant tree.
     ///
-    /// Returns `(real_tree_instances, real_tree_tris, fallback_canopies)`.
+    /// Returns `(real_tree_instances, real_tree_tris, budget_skips)`.
     pub fn harvest_rt_triangles(
         &self,
         eye: glam::Vec3,
+        view_direction: glam::Vec3,
         max_dist: f32,
         lod_scale: f32,
         tri_budget: usize,
@@ -1515,7 +1414,7 @@ impl FarTrees {
     ) -> (usize, usize, usize) {
         // Opt #30: Pre-allocate RT tree triangle staging Vec to eliminate multi-MB reallocs during harvest.
         out.reserve(tri_budget.min(65_536));
-        harvest_rt_tree_species(&self.rt_species, eye, max_dist, lod_scale, tri_budget, out)
+        harvest_rt_tree_species(&self.rt_species, eye, view_direction, max_dist, lod_scale, tri_budget, out)
     }
 
     /// Build a human-readable diagnostic report of all SpeedTree species near `eye`
@@ -1967,13 +1866,14 @@ mod tests {
 pub fn harvest_rt_tree_species(
     species_list: &[RtTreeSpecies],
     eye: glam::Vec3,
+    view_direction: glam::Vec3,
     max_dist: f32,
     lod_scale: f32,
     tri_budget: usize,
     out: &mut Vec<RtTreeTriangle>,
 ) -> (usize, usize, usize) {
     let max_d2 = max_dist * max_dist;
-    let scale = lod_scale.max(0.25);
+    let scale = lod_scale.clamp(0.25, 4.0);
     // Boost #20: Fast XZ bounding reject before 3D distance + squared LOD thresholds (zero sqrt).
     let mut candidates: Vec<(f32, usize, [f32; 3])> = Vec::with_capacity(512);
     for (si, sp) in species_list.iter().enumerate() {
@@ -2000,47 +1900,47 @@ pub fn harvest_rt_tree_species(
 
     let mut real_instances = 0usize;
     let mut real_tris = 0usize;
-    let mut fallback_canopies = 0usize;
+    let mut budget_skips = 0usize;
     let start_len = out.len();
-    const LOD0_D2: f32 = 85.0 * 85.0;
-    const LOD1_D2: f32 = 220.0 * 220.0;
 
     for (d2, si, pos) in candidates {
         let sp = &species_list[si];
-        let _ = scale;
-        let mut lod_idx = if d2 < LOD0_D2 {
-            0
-        } else if d2 < LOD1_D2 {
-            1.min(sp.lods.len() - 1)
-        } else {
-            sp.lods.len() - 1
-        };
-        // Never pick a sparse/leaf-stripped outer SpeedTree LOD when a finer LOD has full foliage.
+        let distance = approximate_client_distance(d2);
+        let lod_count = sp.lods.len().min(3);
+        let mut lod_idx = raster_lod_index(distance, sp.height, scale, lod_count);
+        // Match the raster path's rule: don't use a leaf-stripped outer LOD when a finer full LOD exists.
         while lod_idx > 0 && sp.lods[lod_idx].len() < 12 && !sp.lods[lod_idx - 1].is_empty() {
             lod_idx -= 1;
         }
-        let src_tris = &sp.lods[lod_idx];
-        let used = out.len() - start_len;
-        if !src_tris.is_empty() && used + src_tris.len() <= tri_budget {
-            let offset = glam::Vec3::from_array(pos);
-            out.reserve(src_tris.len());
-            for t in src_tris {
-                let mut moved = *t;
-                moved.a += offset;
-                moved.b += offset;
-                moved.c += offset;
-                out.push(moved);
+        let remaining = tri_budget.saturating_sub(out.len() - start_len);
+        // Under pressure, try only progressively coarser *real* SpeedTree LODs.
+        // If none fits, omit the instance rather than injecting synthetic card geometry.
+        let mut chosen = None;
+        for candidate in lod_idx..lod_count {
+            let tris = &sp.lods[candidate];
+            let sparse_outer_lod = candidate > 0 && tris.len() < 12 && !sp.lods[candidate - 1].is_empty();
+            if !tris.is_empty() && !sparse_outer_lod && tris.len() <= remaining {
+                chosen = Some(tris);
+                break;
             }
-            real_instances += 1;
-            real_tris += src_tris.len();
-        } else if used + 7 <= tri_budget {
-            push_alpha_canopy_fallback(glam::Vec3::from_array(pos), sp.height, out);
-            fallback_canopies += 1;
-        } else {
-            break;
         }
+        let Some(src_tris) = chosen else {
+            budget_skips += 1;
+            continue;
+        };
+        let offset = glam::Vec3::from_array(pos);
+        out.reserve(src_tris.len());
+        for t in src_tris {
+            let mut moved = *t;
+            moved.a += offset;
+            moved.b += offset;
+            moved.c += offset;
+            out.push(moved);
+        }
+        real_instances += 1;
+        real_tris += src_tris.len();
     }
-    (real_instances, real_tris, fallback_canopies)
+    (real_instances, real_tris, budget_skips)
 }
 
 #[cfg(test)]
@@ -2080,9 +1980,10 @@ mod raywatcher_tree_tests {
             lod_diags: vec![RtTreeLodDiag::default(); 2],
         };
         let mut out = Vec::new();
-        let (real_inst, real_tris, fallbacks) = harvest_rt_tree_species(
+        let (real_inst, real_tris, budget_skips) = harvest_rt_tree_species(
             &[species],
             glam::Vec3::new(0.0, 2.0, 0.0),
+            glam::Vec3::X,
             200.0,
             1.0,
             10_000,
@@ -2090,7 +1991,7 @@ mod raywatcher_tree_tests {
         );
         assert_eq!(real_inst, 1);
         assert_eq!(real_tris, 2);
-        assert_eq!(fallbacks, 0);
+        assert_eq!(budget_skips, 0);
         assert!(
             out.iter().any(|t| t.opacity < 0.99),
             "leaves must carry per-material alpha"
@@ -2099,5 +2000,45 @@ mod raywatcher_tree_tests {
             out.iter().any(|t| (t.opacity - 1.0).abs() < 1e-4),
             "branches must stay opaque"
         );
+    }
+
+    #[test]
+    fn raster_lod_selection_uses_species_height_scale_and_transition_windows() {
+        assert_eq!(raster_lod_index(49.0, 10.0, 1.0, 3), 0);
+        assert_eq!(raster_lod_index(54.0, 10.0, 1.0, 3), 0);
+        assert_eq!(raster_lod_index(56.0, 10.0, 1.0, 3), 1);
+        assert_eq!(raster_lod_index(170.0, 10.0, 1.0, 3), 1);
+        assert_eq!(raster_lod_index(180.0, 10.0, 1.0, 3), 2);
+        assert_eq!(raster_lod_index(56.0, 10.0, 2.0, 3), 0);
+    }
+
+    #[test]
+    fn exhausted_tree_budget_skips_a_tree_instead_of_creating_proxy_cards() {
+        let tri = RtTreeTriangle {
+            a: glam::Vec3::ZERO, b: glam::Vec3::X, c: glam::Vec3::Y,
+            normal: glam::Vec3::Z, albedo: [0.2, 0.3, 0.1], roughness: 0.9,
+            opacity: 1.0, alpha_mask: 0,
+        };
+        let species = RtTreeSpecies {
+            species_id: 1, height: 8.0, composite_size: (64, 64),
+            composite_alpha_min: 0, composite_alpha_max: 255,
+            positions: vec![[5.0, 0.0, 5.0]],
+            lods: vec![vec![tri, tri], vec![tri, tri]],
+            lod_diags: vec![RtTreeLodDiag::default(); 2],
+        };
+        let mut out = Vec::new();
+        let (instances, triangles, skipped) = harvest_rt_tree_species(
+            &[species], glam::Vec3::ZERO, glam::Vec3::X, 100.0, 1.0, 1, &mut out,
+        );
+        assert_eq!((instances, triangles, skipped), (0, 0, 1));
+        assert!(out.is_empty(), "no synthetic geometry may be emitted when a LOD cannot fit");
+    }
+
+    #[test]
+    fn billboard_leaf_vertices_match_the_raster_shader_transform() {
+        let corner = [1.0, 2.0, 3.0];
+        let billboard = speedtree_leaf_corner(corner, glam::Vec3::Z, 0.0);
+        assert!((billboard - glam::Vec3::new(-2.0, 3.0, 1.0)).length() < 1e-5);
+        assert_eq!(speedtree_leaf_corner(corner, glam::Vec3::Z, 1001.0), glam::Vec3::new(1.0, 3.0, 2.0));
     }
 }

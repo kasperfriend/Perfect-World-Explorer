@@ -404,7 +404,6 @@ impl Raywatcher {
             ("Reflections", &mut effects.reflections),
             ("Ambient occlusion", &mut effects.ambient_occlusion),
             ("Global illumination", &mut effects.global_illumination),
-            ("Cloud shadows", &mut effects.cloud_shadows),
             ("Contact shadows", &mut effects.contact_shadows),
             ("Moonlit night sky", &mut effects.moonlit_night),
             ("Twilight sky scattering", &mut effects.twilight_sky),
@@ -641,7 +640,6 @@ impl Raywatcher {
             ("reflections", effects.reflections),
             ("ambient_occlusion", effects.ambient_occlusion),
             ("global_illumination", effects.global_illumination),
-            ("cloud_shadows", effects.cloud_shadows),
             ("contact_shadows", effects.contact_shadows),
             ("moonlit_night", effects.moonlit_night),
             ("twilight_sky", effects.twilight_sky),
@@ -722,7 +720,6 @@ impl Raywatcher {
             ("reflections", &mut effects.reflections),
             ("ambient_occlusion", &mut effects.ambient_occlusion),
             ("global_illumination", &mut effects.global_illumination),
-            ("cloud_shadows", &mut effects.cloud_shadows),
             ("contact_shadows", &mut effects.contact_shadows),
             ("moonlit_night", &mut effects.moonlit_night),
             ("twilight_sky", &mut effects.twilight_sky),
@@ -930,7 +927,7 @@ mod tests {
             disabled.overrides.directional_light
         );
         assert_eq!(enabled.overrides.ambient, disabled.overrides.ambient);
-        assert!(enabled.overrides.reflection_pass);
+        assert!(!enabled.overrides.reflection_pass);
         assert!(!disabled.overrides.reflection_pass);
         assert_eq!(enabled.overrides.occlusion, disabled.overrides.occlusion);
         assert_eq!(
@@ -956,7 +953,7 @@ mod tests {
         assert!(layered.active);
         assert!(!layered.overrides.directional_light);
         assert!(!layered.overrides.ambient);
-        assert!(layered.overrides.reflection_pass);
+        assert!(!layered.overrides.reflection_pass);
         assert!(!layered.overrides.occlusion);
         assert!(!layered.overrides.atmosphere_fog);
         assert!(layered.overrides.suppress_baked_shadows);
@@ -973,7 +970,7 @@ mod tests {
         assert!(replaced.active);
         assert!(replaced.overrides.directional_light);
         assert!(replaced.overrides.ambient);
-        assert!(replaced.overrides.reflection_pass);
+        assert!(!replaced.overrides.reflection_pass);
     }
 
     #[test]
@@ -1047,7 +1044,6 @@ mod tests {
             reflections: false,
             ambient_occlusion: false,
             global_illumination: false,
-            cloud_shadows: false,
             contact_shadows: false,
             moonlit_night: false,
             twilight_sky: false,
@@ -1070,7 +1066,6 @@ mod tests {
         s.samples = 2;
         s.denoise_iterations = 5;
         s.effects.reflections = false;
-        s.effects.cloud_shadows = false;
         s.effects.contact_shadows = false;
         s.effects.moonlit_night = false;
         s.sun_radius_degrees = 1.5;

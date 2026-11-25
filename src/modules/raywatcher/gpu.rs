@@ -92,7 +92,7 @@ pub fn compute_scene_albedo_gain(
 
 impl RayParams {
     /// Effect bits, mirroring [`super::plan::Effects`]:
-    /// 1 shadows, 2 lighting, 4 reflections, 8 AO, 16 GI, 128 cloud shadows.
+    /// 1 shadows, 2 lighting, 4 reflections, 8 AO, 16 GI
     pub fn effect_bits(effects: super::plan::Effects) -> u32 {
         let mut bits = 0;
         if effects.shadows {
@@ -109,9 +109,6 @@ impl RayParams {
         }
         if effects.global_illumination {
             bits |= 16;
-        }
-        if effects.cloud_shadows {
-            bits |= 128;
         }
         if effects.contact_shadows {
             bits |= 256;
@@ -137,10 +134,19 @@ impl RayParams {
         let fog = config.lighting.fog_range;
         let mut pl_pos_rad = [[0.0f32; 4]; MAX_RAY_LIGHTS];
         let mut pl_col_int = [[0.0f32; 4]; MAX_RAY_LIGHTS];
-        let pl_count = point_lights.len().min(MAX_RAY_LIGHTS);
-        for (i, l) in point_lights.iter().take(pl_count).enumerate() {
-            pl_pos_rad[i] = [l.position.x, l.position.y, l.position.z, l.radius.max(0.0)];
-            pl_col_int[i] = [l.colour.x, l.colour.y, l.colour.z, l.intensity.max(0.0)];
+        // A light can affect a visible receiver only when its influence sphere intersects
+        // the camera's far-distance sphere. This conservative test removes no contributing light.
+        let far = params.far.max(0.0);
+        let mut pl_count = 0usize;
+        for l in point_lights {
+            if pl_count == MAX_RAY_LIGHTS { break; }
+            if !l.position.is_finite() || !l.radius.is_finite() { continue; }
+            let radius = l.radius.max(0.0);
+            let reach = far + radius;
+            if (l.position - params.eye).length_squared() > reach * reach { continue; }
+            pl_pos_rad[pl_count] = [l.position.x, l.position.y, l.position.z, radius];
+            pl_col_int[pl_count] = [l.colour.x, l.colour.y, l.colour.z, l.intensity.max(0.0)];
+            pl_count += 1;
         }
         Self {
             inv_view_projection: params.inv_view_projection.to_cols_array_2d(),
@@ -1103,38 +1109,6 @@ fn trace_effect_light_reflections(origin: vec3<f32>, dir: vec3<f32>, max_t: f32,
     return min(glow_sum, vec3<f32>(2.2));
 }
 
-// Enhancement #1: Drifting Ray-Traced Cloud Shadows projected along sun direction.
-fn sample_cloud_shadow(world_pos: vec3<f32>, sun_dir: vec3<f32>, t_frame: f32) -> f32 {
-    if (sun_dir.y <= 0.08) {
-        return 1.0;
-    }
-    let t_cloud = 620.0 / max(sun_dir.y, 0.18);
-    var cp = (world_pos.xz + sun_dir.xz * min(t_cloud, 2400.0)) * 0.0022;
-    cp = cp + vec2<f32>(t_frame * 0.00055, -t_frame * 0.00032);
-    let i0 = floor(cp);
-    let f0 = fract(cp);
-    let u0 = f0 * f0 * (vec2<f32>(3.0) - 2.0 * f0);
-    let a0 = fract(sin(dot(i0, vec2<f32>(127.1, 311.7))) * 43758.5453);
-    let b0 = fract(sin(dot(i0 + vec2<f32>(1.0, 0.0), vec2<f32>(127.1, 311.7))) * 43758.5453);
-    let c0 = fract(sin(dot(i0 + vec2<f32>(0.0, 1.0), vec2<f32>(127.1, 311.7))) * 43758.5453);
-    let d0 = fract(sin(dot(i0 + vec2<f32>(1.0, 1.0), vec2<f32>(127.1, 311.7))) * 43758.5453);
-    let n0 = mix(mix(a0, b0, u0.x), mix(c0, d0, u0.x), u0.y);
-
-    let cp1 = cp * 2.15 + vec2<f32>(11.3, 5.7);
-    let i1 = floor(cp1);
-    let f1 = fract(cp1);
-    let u1 = f1 * f1 * (vec2<f32>(3.0) - 2.0 * f1);
-    let a1 = fract(sin(dot(i1, vec2<f32>(127.1, 311.7))) * 43758.5453);
-    let b1 = fract(sin(dot(i1 + vec2<f32>(1.0, 0.0), vec2<f32>(127.1, 311.7))) * 43758.5453);
-    let c1 = fract(sin(dot(i1 + vec2<f32>(0.0, 1.0), vec2<f32>(127.1, 311.7))) * 43758.5453);
-    let d1 = fract(sin(dot(i1 + vec2<f32>(1.0, 1.0), vec2<f32>(127.1, 311.7))) * 43758.5453);
-    let n1 = mix(mix(a1, b1, u1.x), mix(c1, d1, u1.x), u1.y);
-
-    let fbm = n0 * 0.68 + n1 * 0.32;
-    let cover = smoothstep(0.50, 0.80, fbm);
-    return mix(1.0, 0.62, cover);
-}
-
 // Enhancement #4: High-Precision Micro-Contact Shadows (4-step depth-anchored screen-space ray).
 fn trace_contact_shadow(world_pos: vec3<f32>, sun_dir: vec3<f32>, cam_dist: f32, jitter: f32) -> f32 {
     if (cam_dist > 42.0) {
@@ -1209,13 +1183,22 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let is_water = roughness <= 0.12;
     let is_glossy_trim = !is_water && roughness <= 0.36;
 
+    // Water is owned entirely by the original game renderer: no RT lighting,
+    // reflection, denoising signal or reconstruction is allowed to alter it.
+    if (is_water && u32(round(params.counts.w)) == 0u) {
+        textureStore(out_colour, ip, vec4<f32>(select(raster_rgb, vec3<f32>(0.0), layered), 1.0));
+        textureStore(out_guide, ip, vec4<f32>(1.0, dist / max(params.lens.y, 1e-4), 1.0, roughness));
+        textureStore(out_reflection, ip, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        textureStore(out_normals, ip, vec4<f32>(normal, roughness));
+        textureStore(out_albedo, ip, vec4<f32>(raster_rgb, 0.0));
+        return;
+    }
     let effects = u32(round(params.effects.y));
     let bits_shadows = (effects & 1u) != 0u;
     let bits_lighting = (effects & 2u) != 0u;
     let bits_reflections = (effects & 4u) != 0u;
     let bits_ao = (effects & 8u) != 0u;
     let bits_gi = (effects & 16u) != 0u;
-    let bits_cloud_shadows = (effects & 128u) != 0u;
     let bits_contact_shadows = (effects & 256u) != 0u;
     let bits_moonlit_night = (effects & 512u) != 0u;
     let bits_weather = (effects & 2048u) != 0u;
@@ -1324,11 +1307,6 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             // Enhancement #4: High-precision micro-contact shadows for fine grounding.
             if (bits_contact_shadows && !is_water && shadow > 0.05 && dist < 42.0) {
                 shadow = shadow * trace_contact_shadow(point, params.sun_dir.xyz, dist, ign_v);
-            }
-            // Enhancement #1: Drifting ray-traced cloud shadows across plains, mountains & cities.
-            if (bits_cloud_shadows && shadow > 0.05 && sun_strength > 0.05) {
-                let c_vis = sample_cloud_shadow(point, params.sun_dir.xyz, params.frame.x);
-                shadow = shadow * mix(1.0, c_vis, sun_strength * (1.0 - fog_t * 0.6));
             }
         }
         accum_shadow = accum_shadow + shadow;
@@ -2582,6 +2560,10 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
     let n_len = length(norm_raw.xyz);
     let n_center = select(vec3<f32>(0.0, 1.0, 0.0), norm_raw.xyz / n_len, n_len > 1e-4);
     let center_roughness = norm_raw.w;
+    // Preserve original game water pixels exactly and avoid the RT upsample for them.
+    if (center_roughness <= 0.12) {
+        return raster;
+    }
 
     // Boost #13: When src_rt is already full-resolution (1:1 with raster), skip the
     // 9-tap bilateral upsample (saves 27 texture fetches + 18 transcendentals per pixel!).
@@ -5530,6 +5512,30 @@ mod phase_r1_tests {
         assert_eq!(packed.point_light_meta[0] as usize, MAX_RAY_LIGHTS);
         assert_eq!(packed.point_lights_pos_rad[127][0], 127.0);
         assert_eq!(packed.point_lights_col_int[127][3], 3.0);
+    }
+
+    #[test]
+    fn point_light_pack_culls_only_lights_outside_the_far_influence_sphere() {
+        let lighting = super::super::frame::LightingRecord::default();
+        let params = super::super::frame::FrameParams {
+            eye: glam::Vec3::ZERO,
+            inv_view_projection: glam::Mat4::IDENTITY,
+            view_projection: glam::Mat4::IDENTITY,
+            extent: (64, 64), grid: (64, 64), near: 0.1, far: 100.0,
+            jitter: (0.0, 0.0), frame: 0, history_valid: 0,
+            sun: super::super::frame::Sun::from_lighting(&lighting), lighting,
+            bounces: 1, samples: 1,
+        };
+        let lights = vec![
+            super::super::frame::PointLight { position: glam::Vec3::new(1000.0,0.0,0.0), colour: glam::Vec3::ONE, radius: 10.0, intensity: 1.0, casts_shadow: true },
+            super::super::frame::PointLight { position: glam::Vec3::new(50.0,0.0,0.0), colour: glam::Vec3::ONE, radius: 5.0, intensity: 2.0, casts_shadow: true },
+            super::super::frame::PointLight { position: glam::Vec3::new(108.0,0.0,0.0), colour: glam::Vec3::ONE, radius: 10.0, intensity: 3.0, casts_shadow: true },
+        ];
+        let plan = super::super::plan::Plan::decide(&super::super::plan::Settings::default(), (64,64), false, |_| false);
+        let packed = RayParams::pack(&params, &plan, &super::super::shade::TransportConfig::default(), [1,1,1], &lights);
+        assert_eq!(packed.point_light_meta[0], 2.0);
+        assert_eq!(packed.point_lights_pos_rad[0][0], 50.0);
+        assert_eq!(packed.point_lights_pos_rad[1][0], 108.0);
     }
 
     #[test]

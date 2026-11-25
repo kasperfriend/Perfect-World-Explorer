@@ -4047,17 +4047,18 @@ impl Renderer {
             // Do not emit coarse axis-aligned bounding boxes (`InstanceProxy`):
             // solid boxes create rectangular shadow blocks and boxy water
             // reflections. Real meshes already cover the full detail bubble.
-            // Phase 4: Harvest the same runtime SpeedTree LOD geometry the
-            // raster draws (branches, fronds, alpha-tested leaves) matching
-            // view distance, falling back to an alpha-tested crossed canopy
-            // (never a box) only when the triangle budget is exhausted.
+            // Phase 4: Harvest the runtime SpeedTree LOD geometry the raster draws,
+            // with the same camera-facing leaf transform and height/scale LOD bands.
+            // Under the RT triangle budget, only real coarser SpeedTree LODs are used;
+            // no synthetic crossed-card proxy is injected.
             let tree_lod_scale =
                 self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees);
             let tree_tri_budget = 420_000usize;
             let mut tree_tris = Vec::with_capacity(65_536);
-            let (real_tree_instances, real_tree_tris, tree_canopy_fallbacks) =
+            let (real_tree_instances, real_tree_tris, tree_budget_skips) =
                 self.far_trees.harvest_rt_triangles(
                     camera.pos,
+                    camera.direction(),
                     detail_radius.min(640.0),
                     tree_lod_scale,
                     tree_tri_budget,
@@ -4078,13 +4079,13 @@ impl Renderer {
             }
             if std::env::var_os("PWE_RT_DEBUG").is_some() {
                 eprintln!(
-                    "[Raywatcher] harvest: {} real-mesh pages ({} total tris), {} proxy fallbacks, trees(real_inst={}, real_tris={}, canopy_fallbacks={}) (detail_radius={:.0})",
+                    "[Raywatcher] harvest: {} real-mesh pages ({} total tris), {} proxy fallbacks, trees(real_inst={}, real_tris={}, budget_skips={}) (detail_radius={:.0})",
                     real_mesh_pages,
                     real_meshes.len(),
                     proxy_fallback_models,
                     real_tree_instances,
                     real_tree_tris,
-                    tree_canopy_fallbacks,
+                    tree_budget_skips,
                     detail_radius,
                 );
             }

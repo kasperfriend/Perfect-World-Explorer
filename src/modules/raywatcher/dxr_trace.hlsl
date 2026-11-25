@@ -387,9 +387,8 @@ bool occluded_fast(float3 origin, float3 dir, float t_min, float t_max) {
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
-// Opacity-aware occlusion: respects alpha-tested foliage so leaf canopies cast
-// shadows on reflected and GI-lit surfaces. Uses the same accept_opacity check
-// as closest_hit so leaves block light where their alpha mask is set.
+// Opacity-aware boolean occlusion. A visibility query needs only the first accepted blocker,
+// not the closest hit; terminate traversal immediately while preserving alpha testing.
 bool occluded_opacity(float3 origin, float3 dir, float t_min, float t_max, uint opaque_offset, uint tri_count) {
     RayDesc ray;
     ray.Origin = origin;
@@ -400,10 +399,14 @@ bool occluded_opacity(float3 origin, float3 dir, float t_min, float t_max, uint 
     RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
     q.TraceRayInline(scene_tlas, RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
     while (q.Proceed()) {
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            return true; // Opaque geometry was auto-committed.
+        }
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
             uint cand_prim = q.CandidatePrimitiveIndex() + (q.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
             if (accept_opacity(cand_prim, q.CandidateTriangleBarycentrics(), 0u, tri_count)) {
                 q.CommitNonOpaqueTriangleHit();
+                return true; // Any accepted blocker is sufficient for boolean occlusion.
             }
         }
     }
@@ -703,39 +706,6 @@ float3 trace_effect_light_reflections(float3 origin, float3 dir, float max_t, ui
 }
 
 
-// Enhancement #1: Drifting Ray-Traced Cloud Shadows projected along sun direction.
-float sample_cloud_shadow(float3 world_pos, float3 sun_dir, float t_frame) {
-    if (sun_dir.y <= 0.08) {
-        return 1.0;
-    }
-    float t_cloud = 620.0 / max(sun_dir.y, 0.18);
-    float2 cp = (world_pos.xz + sun_dir.xz * min(t_cloud, 2400.0)) * 0.0022;
-    cp += float2(t_frame * 0.00055, -t_frame * 0.00032);
-    // Smooth 2-octave value noise for broad natural drifting cloud patches.
-    float2 i0 = floor(cp);
-    float2 f0 = frac(cp);
-    float2 u0 = f0 * f0 * (3.0 - 2.0 * f0);
-    float a0 = frac(sin(dot(i0, float2(127.1, 311.7))) * 43758.5453);
-    float b0 = frac(sin(dot(i0 + float2(1.0, 0.0), float2(127.1, 311.7))) * 43758.5453);
-    float c0 = frac(sin(dot(i0 + float2(0.0, 1.0), float2(127.1, 311.7))) * 43758.5453);
-    float d0 = frac(sin(dot(i0 + float2(1.0, 1.0), float2(127.1, 311.7))) * 43758.5453);
-    float n0 = lerp(lerp(a0, b0, u0.x), lerp(c0, d0, u0.x), u0.y);
-
-    float2 cp1 = cp * 2.15 + float2(11.3, 5.7);
-    float2 i1 = floor(cp1);
-    float2 f1 = frac(cp1);
-    float2 u1 = f1 * f1 * (3.0 - 2.0 * f1);
-    float a1 = frac(sin(dot(i1, float2(127.1, 311.7))) * 43758.5453);
-    float b1 = frac(sin(dot(i1 + float2(1.0, 0.0), float2(127.1, 311.7))) * 43758.5453);
-    float c1 = frac(sin(dot(i1 + float2(0.0, 1.0), float2(127.1, 311.7))) * 43758.5453);
-    float d1 = frac(sin(dot(i1 + float2(1.0, 1.0), float2(127.1, 311.7))) * 43758.5453);
-    float n1 = lerp(lerp(a1, b1, u1.x), lerp(c1, d1, u1.x), u1.y);
-
-    float fbm = n0 * 0.68 + n1 * 0.32;
-    float cover = smoothstep(0.50, 0.80, fbm);
-    return lerp(1.0, 0.62, cover);
-}
-
 // Enhancement #4: High-Precision Micro-Contact Shadows (4-step depth-anchored screen-space ray).
 float trace_contact_shadow(float3 world_pos, float3 sun_dir, float cam_dist, float jitter) {
     if (cam_dist > 42.0) {
@@ -821,13 +791,25 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     bool is_glossy_trim = !is_water && roughness <= 0.36;
 
     bool layered = params.effects.w > 0.5;
+    // Keep native PW water (including its original planar reflection pass) completely out of DXR.
+    if (is_water && uint(round(params.counts.w)) == 0u) {
+        out_colour[id.xy] = float4(layered ? float3(0.0, 0.0, 0.0) : raster_rgb, 1.0);
+        if (params.point_light_meta.w > 0.5) {
+            out_guide[id.xy] = float4(1.0, dist / max(params.lens.y, 1e-4), 1.0, roughness);
+        }
+        out_reflection[id.xy] = float4(0.0, 0.0, 0.0, 1.0);
+        out_normals[id.xy] = float4(normal, roughness);
+        if (params.point_light_meta.z > 0.5) {
+            out_albedo[id.xy] = float4(raster_rgb, 0.0);
+        }
+        return;
+    }
     uint effects = uint(round(params.effects.y));
     bool bits_shadows = (effects & 1u) != 0u;
     bool bits_lighting = (effects & 2u) != 0u;
     bool bits_reflections = (effects & 4u) != 0u;
     bool bits_ao = (effects & 8u) != 0u;
     bool bits_gi = (effects & 16u) != 0u;
-    bool bits_cloud_shadows = (effects & 128u) != 0u;
     bool bits_contact_shadows = (effects & 256u) != 0u;
     bool bits_moonlit_night = (effects & 512u) != 0u;
     bool bits_weather = (effects & 2048u) != 0u;
@@ -992,11 +974,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             // Enhancement #4: High-precision micro-contact shadows for fine grounding.
             if (bits_contact_shadows && !is_water && shadow > 0.05 && dist < 42.0) {
                 shadow *= trace_contact_shadow(world_pos, params.sun_dir.xyz, dist, ign_v);
-            }
-            // Enhancement #1: Drifting ray-traced cloud shadows across plains, mountains & cities.
-            if (bits_cloud_shadows && shadow > 0.05 && sun_strength > 0.05) {
-                float c_vis = sample_cloud_shadow(world_pos, params.sun_dir.xyz, params.frame.x);
-                shadow *= lerp(1.0, c_vis, sun_strength * (1.0 - fog_t * 0.6));
             }
         }
         accum_shadow += shadow;

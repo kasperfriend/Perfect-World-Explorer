@@ -30,7 +30,7 @@ pub struct RasterOverrides {
     /// Stop the sky's ambient contribution to the raster scene (the ray pass
     /// reconstructs it from its own hemisphere samples).
     pub ambient: bool,
-    /// Skip the screen-space water/terrain reflection submissions.
+    /// Skip the native screen-space water/terrain reflection pass (never set by RT).
     pub reflection_pass: bool,
     /// Skip the screen-space ambient-occlusion-style darkening (the fog
     /// occlusion term the raster path applies to the sky and terrain).
@@ -81,7 +81,7 @@ impl RasterOverrides {
         }
         if !plan.replace_raster {
             return Self {
-                reflection_pass: plan.effects.reflections,
+                reflection_pass: false,
                 suppress_baked_shadows: plan.effects.shadows,
                 ..Self::NONE
             };
@@ -97,7 +97,7 @@ impl RasterOverrides {
         Self {
             directional_light: effects.lighting || effects.shadows,
             ambient: effects.lighting || effects.ambient_occlusion || effects.global_illumination,
-            reflection_pass: effects.reflections,
+            reflection_pass: false,
             occlusion: effects.ambient_occlusion,
             atmosphere_fog: effects.shadows,
             suppress_baked_shadows: effects.shadows,
@@ -659,7 +659,7 @@ mod tests {
         assert!(on_ov.suppress_baked_shadows);
         assert!(!on_ov.directional_light);
         assert!(!on_ov.ambient);
-        assert!(on_ov.reflection_pass);
+        assert!(!on_ov.reflection_pass);
         assert!(!on_ov.atmosphere_fog);
 
         s.effects.shadows = false;
@@ -689,7 +689,6 @@ mod tests {
                 reflections: false,
                 ambient_occlusion: false,
                 global_illumination: false,
-                cloud_shadows: false,
                 contact_shadows: false,
                 moonlit_night: false,
                 twilight_sky: false,
@@ -701,10 +700,9 @@ mod tests {
         // term *is* the raster shadowed lighting.
         assert!(only(|e| e.shadows = true).directional_light);
         assert!(only(|e| e.lighting = true).directional_light);
-        // Reflections remove exactly the reflection submissions and nothing
-        // else...
+        // RT reflections never suppress the native game water reflection pass.
         let r = only(|e| e.reflections = true);
-        assert!(r.reflection_pass);
+        assert!(!r.reflection_pass);
         assert!(!r.directional_light && !r.occlusion);
         // ...and ambient occlusion removes the fog occlusion term.
         let o = only(|e| e.ambient_occlusion = true);
@@ -1178,7 +1176,7 @@ mod tests {
         );
         assert!(
             surface_qualifies_for_reflection(0.06, cutoff),
-            "water surfaces (0.06) must still qualify for reflections"
+            "the roughness classifier remains unchanged; the RT shader now bypasses water entirely"
         );
     }
 

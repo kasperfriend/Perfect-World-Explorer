@@ -273,8 +273,6 @@ pub struct Effects {
     /// One or more diffuse bounce rays, i.e. colour bleeding. The bounce count
     /// is [`Plan::bounces`]; this is the on/off gate the UI owns.
     pub global_illumination: bool,
-    /// Drifting ray-traced cloud shadows projected from the live sky-dome cloud cover.
-    pub cloud_shadows: bool,
     /// High-precision short-range screen-space/RT micro-contact shadows for fine grounding.
     pub contact_shadows: bool,
     /// Directional moonlit night sky & starlight hemispherical bounce (pitch black in deep shade).
@@ -294,7 +292,6 @@ impl Default for Effects {
             reflections: true,
             ambient_occlusion: true,
             global_illumination: true,
-            cloud_shadows: true,
             contact_shadows: true,
             moonlit_night: true,
             twilight_sky: true,
@@ -311,7 +308,6 @@ impl Effects {
             self.reflections,
             self.ambient_occlusion,
             self.global_illumination,
-            self.cloud_shadows,
             self.contact_shadows,
             self.moonlit_night,
             self.twilight_sky,
@@ -520,7 +516,6 @@ impl Plan {
             reflections: false,
             ambient_occlusion: false,
             global_illumination: false,
-            cloud_shadows: false,
             contact_shadows: false,
             moonlit_night: false,
             twilight_sky: false,
@@ -709,7 +704,6 @@ mod tests {
             reflections: false,
             ambient_occlusion: false,
             global_illumination: false,
-            cloud_shadows: false,
             contact_shadows: false,
             moonlit_night: false,
             twilight_sky: false,
@@ -727,7 +721,6 @@ mod tests {
                 reflections: false,
                 ambient_occlusion: false,
                 global_illumination: false,
-                cloud_shadows: false,
                 contact_shadows: false,
                 moonlit_night: false,
                 twilight_sky: false,
