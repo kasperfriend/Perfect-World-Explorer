@@ -509,7 +509,6 @@ impl SceneGeometry {
     pub fn order(&self) -> &[u32] {
         &self.order
     }
-
     /// Traverse one ray. This is the reference implementation the compute
     /// shader mirrors signature for signature.
     ///

@@ -1606,8 +1606,7 @@ impl FarTrees {
             let has_skipped_leaves = d0.leaves_skipped > 0;
             let has_leaf_tris = (d0.fixed_3d_leaves + d0.billboard_leaves) > 0;
             let leaf_cov_warn = if has_skipped_leaves && has_leaf_tris {
-                let denom =
-                    (d0.fixed_3d_leaves + d0.billboard_leaves + d0.frond_tris) as f64;
+                let denom = (d0.fixed_3d_leaves + d0.billboard_leaves + d0.frond_tris) as f64;
                 let skip_pct = (d0.leaves_skipped as f64 / denom) * 100.0;
                 if skip_pct > 30.0 {
                     format!(" [WARN: LEAF_PATCHES_SPARSE_MASK {:.0}%_SKIPPED]", skip_pct)

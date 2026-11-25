@@ -354,7 +354,6 @@ impl Raywatcher {
         self.last = status.clone();
         status
     }
-
     /// The module's settings tab, drawn in the Modules page beside Walker and
     /// Populator. It edits `self.settings` in place and reports what the last
     /// frame actually did, so a provider that silently fell back is visible
