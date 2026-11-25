@@ -2028,10 +2028,7 @@ mod tests {
         fs::remove_file(root.join("element/data/tasks.data")).unwrap();
         let scan = scan(&root);
         assert!(scan.loadable(), "{}", scan.report());
-        assert_eq!(
-            scan.data_versions(),
-            (Some("v27".into()), None)
-        );
+        assert_eq!(scan.data_versions(), (Some("v27".into()), None));
         assert!(scan.data_version_summary().contains("tasks.data absent"));
         fs::remove_dir_all(root).unwrap();
     }
