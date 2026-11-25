@@ -837,7 +837,13 @@ impl FarTrees {
                             let c = leaf.corners[j];
                             center + glam::Vec3::new(c[0], c[2], c[1])
                         });
-                        let leaf_normal = glam::Vec3::Y; // matches the raster leaf shader's forced normal
+                        // Match the raster vertex shader: it uses the source leaf normal when present,
+                        // otherwise its forced world-up normal.
+                        let leaf_normal = leaf
+                            .normal
+                            .map(|n| glam::Vec3::new(n[0], n[2], n[1]).normalize_or_zero())
+                            .filter(|n| n.length_squared() > 0.25)
+                            .unwrap_or(glam::Vec3::Y);
                         if h0 > 0 && (p[1] - p[0]).cross(p[2] - p[0]).length_squared() > 1e-8 {
                             if h0 < 49 {
                                 ldiag.masked_tris += 1;
