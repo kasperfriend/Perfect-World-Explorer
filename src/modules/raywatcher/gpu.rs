@@ -139,11 +139,17 @@ impl RayParams {
         let far = params.far.max(0.0);
         let mut pl_count = 0usize;
         for l in point_lights {
-            if pl_count == MAX_RAY_LIGHTS { break; }
-            if !l.position.is_finite() || !l.radius.is_finite() { continue; }
+            if pl_count == MAX_RAY_LIGHTS {
+                break;
+            }
+            if !l.position.is_finite() || !l.radius.is_finite() {
+                continue;
+            }
             let radius = l.radius.max(0.0);
             let reach = far + radius;
-            if (l.position - params.eye).length_squared() > reach * reach { continue; }
+            if (l.position - params.eye).length_squared() > reach * reach {
+                continue;
+            }
             pl_pos_rad[pl_count] = [l.position.x, l.position.y, l.position.z, radius];
             pl_col_int[pl_count] = [l.colour.x, l.colour.y, l.colour.z, l.intensity.max(0.0)];
             pl_count += 1;
@@ -5521,18 +5527,54 @@ mod phase_r1_tests {
             eye: glam::Vec3::ZERO,
             inv_view_projection: glam::Mat4::IDENTITY,
             view_projection: glam::Mat4::IDENTITY,
-            extent: (64, 64), grid: (64, 64), near: 0.1, far: 100.0,
-            jitter: (0.0, 0.0), frame: 0, history_valid: 0,
-            sun: super::super::frame::Sun::from_lighting(&lighting), lighting,
-            bounces: 1, samples: 1,
+            extent: (64, 64),
+            grid: (64, 64),
+            near: 0.1,
+            far: 100.0,
+            jitter: (0.0, 0.0),
+            frame: 0,
+            history_valid: 0,
+            sun: super::super::frame::Sun::from_lighting(&lighting),
+            lighting,
+            bounces: 1,
+            samples: 1,
         };
         let lights = vec![
-            super::super::frame::PointLight { position: glam::Vec3::new(1000.0,0.0,0.0), colour: glam::Vec3::ONE, radius: 10.0, intensity: 1.0, casts_shadow: true },
-            super::super::frame::PointLight { position: glam::Vec3::new(50.0,0.0,0.0), colour: glam::Vec3::ONE, radius: 5.0, intensity: 2.0, casts_shadow: true },
-            super::super::frame::PointLight { position: glam::Vec3::new(108.0,0.0,0.0), colour: glam::Vec3::ONE, radius: 10.0, intensity: 3.0, casts_shadow: true },
+            super::super::frame::PointLight {
+                position: glam::Vec3::new(1000.0, 0.0, 0.0),
+                colour: glam::Vec3::ONE,
+                radius: 10.0,
+                intensity: 1.0,
+                casts_shadow: true,
+            },
+            super::super::frame::PointLight {
+                position: glam::Vec3::new(50.0, 0.0, 0.0),
+                colour: glam::Vec3::ONE,
+                radius: 5.0,
+                intensity: 2.0,
+                casts_shadow: true,
+            },
+            super::super::frame::PointLight {
+                position: glam::Vec3::new(108.0, 0.0, 0.0),
+                colour: glam::Vec3::ONE,
+                radius: 10.0,
+                intensity: 3.0,
+                casts_shadow: true,
+            },
         ];
-        let plan = super::super::plan::Plan::decide(&super::super::plan::Settings::default(), (64,64), false, |_| false);
-        let packed = RayParams::pack(&params, &plan, &super::super::shade::TransportConfig::default(), [1,1,1], &lights);
+        let plan = super::super::plan::Plan::decide(
+            &super::super::plan::Settings::default(),
+            (64, 64),
+            false,
+            |_| false,
+        );
+        let packed = RayParams::pack(
+            &params,
+            &plan,
+            &super::super::shade::TransportConfig::default(),
+            [1, 1, 1],
+            &lights,
+        );
         assert_eq!(packed.point_light_meta[0], 2.0);
         assert_eq!(packed.point_lights_pos_rad[0][0], 50.0);
         assert_eq!(packed.point_lights_pos_rad[1][0], 108.0);

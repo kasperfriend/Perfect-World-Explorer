@@ -1332,23 +1332,28 @@ mod imp {
             }
         }
 
-        fn write_scene_descriptors(&self) {
+        /// Update only the changing TLAS SRV at descriptor slot 0.
+        /// The static triangle/material SRVs at slots 1 and 2 are unchanged by actor updates.
+        fn write_tlas_descriptor(&self) {
             unsafe {
-                let dev = self.raw_device.as_mut_ptr();
-                // Slot 0: TLAS SRV (prefers active 2-instance dynamic TLAS when present).
                 let active_tlas_va = self.dyn_active_tlas_va.unwrap_or(self.scene.tlas.gpu_va);
                 let tlas_srv = RawSrvDesc {
                     format: DXGI_FORMAT_UNKNOWN,
                     view_dimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
-                    shader4_component_mapping: 0x0000_1688, // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+                    shader4_component_mapping: 0x0000_1688,
                     u: [active_tlas_va, 0, 0],
                 };
-                (*dev).CreateShaderResourceView(
+                (*self.raw_device.as_mut_ptr()).CreateShaderResourceView(
                     null_mut(),
                     &tlas_srv as *const RawSrvDesc as *const d12::D3D12_SHADER_RESOURCE_VIEW_DESC,
                     self.cpu_handle(0),
                 );
+            }
+        }
 
+        fn write_scene_descriptors(&self) {
+            unsafe {
+                let dev = self.raw_device.as_mut_ptr();
                 // Slot 1: tris StructuredBuffer SRV.
                 let mut tri_srv: d12::D3D12_SHADER_RESOURCE_VIEW_DESC = zeroed();
                 tri_srv.Format = DXGI_FORMAT_UNKNOWN;
@@ -1572,7 +1577,7 @@ mod imp {
                     self.has_dyn_instance = false;
                     self.dyn_active_tlas_va = None;
                     self.dyn_last_hash = 0;
-                    self.write_scene_descriptors();
+                    self.write_tlas_descriptor();
                 }
                 return Ok(());
             }
@@ -1805,7 +1810,7 @@ mod imp {
                 self.has_dyn_instance = true;
                 self.dyn_active_tlas_va = Some(tlas_gpu_va);
                 self.dyn_last_hash = h;
-                self.write_scene_descriptors();
+                self.write_tlas_descriptor();
             }
             Ok(())
         }

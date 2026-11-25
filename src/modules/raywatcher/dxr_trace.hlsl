@@ -396,8 +396,12 @@ bool occluded_opacity(float3 origin, float3 dir, float t_min, float t_max, uint 
     ray.TMin = t_min;
     ray.TMax = t_max;
 
-    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-    q.TraceRayInline(scene_tlas, RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(
+        scene_tlas,
+        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
+        0xffu,
+        ray);
     while (q.Proceed()) {
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
             return true; // Opaque geometry was auto-committed.
@@ -420,8 +424,12 @@ bool occluded_point_light(float3 origin, float3 dir, float t_min, float t_max, f
     ray.TMin = t_min;
     ray.TMax = t_max;
 
-    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-    q.TraceRayInline(scene_tlas, RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(
+        scene_tlas,
+        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
+        0xffu,
+        ray);
     q.Proceed();
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
         return false;
@@ -482,7 +490,9 @@ float4 sample_screen_radiance(float3 world_pos, float ray_t) {
     int2 gdim = int2(int(params.extents.x), int(params.extents.y));
     int2 hp = clamp(int2(uv * params.extents.xy), int2(0, 0), gdim - int2(1, 1));
     float4 gpos = src_gbuf_pos.Load(int3(hp, 0));
-    if (gpos.w > 0.0 && length(gpos.xyz - world_pos) < max(2.5, ray_t * 0.08)) {
+    float3 screen_delta = gpos.xyz - world_pos;
+    float screen_tolerance = max(2.5, ray_t * 0.08);
+    if (gpos.w > 0.0 && dot(screen_delta, screen_delta) < screen_tolerance * screen_tolerance) {
         return float4(src_gbuf_raster.Load(int3(hp, 0)).rgb, 1.0);
     }
     return float4(0.0, 0.0, 0.0, 0.0);
