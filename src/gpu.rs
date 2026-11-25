@@ -4237,13 +4237,21 @@ impl Renderer {
             return;
         };
         // --- The frame parameters.
-        let fog = camera.air_fog;
+        // Share the same effective fog gate as the raster, water and shoreline
+        // passes. Reading camera.air_fog directly would ignore the user's
+        // atmospheric-fog checkbox and leave RT fog enabled after it is turned off.
+        let fog = camera.active_fog();
+        let fog_range = crate::modules::raywatcher::frame::effective_fog_range(
+            fog.enabled,
+            fog.start,
+            fog.end,
+        );
         let lighting = LightingRecord::derive(
             camera.time_of_day,
             crate::environment::daylight(camera.time_of_day),
             camera.regional_light.as_ref(),
             Vec3::from_array(fog.color),
-            (fog.start, fog.end),
+            fog_range,
         );
         let region_light_rw = camera.regional_light.or(self.retained_regional_light);
         let authored_rw = region_light_rw
@@ -4966,7 +4974,7 @@ impl Renderer {
                     },
                 ],
                 animation: [
-                    crate::water_gpu::normal_phase(frame.elapsed64),
+                    crate::water_gpu::normal_frame_index(frame.elapsed64) as f32,
                     camera.underwater_fog.end,
                     0.,
                     crate::water_gpu::normal_offset_angle(frame.elapsed64),
