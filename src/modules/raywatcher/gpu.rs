@@ -1246,7 +1246,7 @@ fn restir_update(
     reservoir: ptr<function, RestirReservoir>,
     sample_pos: vec3<f32>,
     radiance: vec3<f32>,
-    target: f32,
+    target_density: f32,
     weight: f32,
     represented: f32,
     is_sky: bool,
@@ -1260,7 +1260,7 @@ fn restir_update(
     if (next_f32(state) * sum < weight) {
         value.sample_pos_weight = vec4<f32>(sample_pos, 0.0);
         value.radiance_m = vec4<f32>(radiance, value.radiance_m.w);
-        value.receiver_pos_target = vec4<f32>(receiver_pos, max(target, 1e-5));
+        value.receiver_pos_target = vec4<f32>(receiver_pos, max(target_density, 1e-5));
         value.receiver_normal_flags = vec4<f32>(receiver_normal, select(1.0, -1.0, is_sky));
     }
     value.sample_pos_weight.w = sum;
@@ -1307,13 +1307,13 @@ fn restir_reuse_one(
         let visible = closest_hit(ray_origin, direction, max(0.05, bias * 0.25), sample_distance + tolerance);
         if (visible.index == 0xffffffffu || abs(visible.t - sample_distance) > tolerance) { return; }
     }
-    let target = max(luminance(source.radiance_m.xyz) * cosine, 1e-5);
+    let target_density = max(luminance(source.radiance_m.xyz) * cosine, 1e-5);
     let represented = clamp(source.radiance_m.w, 1.0, 32.0);
     let age_scale = represented / max(source.radiance_m.w, 1.0);
-    let weight = source.sample_pos_weight.w * age_scale * target / max(source.receiver_pos_target.w, 1e-5);
+    let weight = source.sample_pos_weight.w * age_scale * target_density / max(source.receiver_pos_target.w, 1e-5);
     restir_update(
         reservoir, source.sample_pos_weight.xyz, source.radiance_m.xyz,
-        target, weight, represented, is_sky,
+        target_density, weight, represented, is_sky,
         receiver_pos, receiver_normal, state
     );
 }
