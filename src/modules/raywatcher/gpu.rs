@@ -547,6 +547,7 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
     // Matte stone, terrain, plaster, wood, and foliage ALWAYS stay matte (0.92).
     // Only crisp close-range specular/metallic/glazed architectural trims qualify
     // for a subtle satin sheen (roughness 0.26..=0.34).
+    let is_water = roughness <= 0.12;
     if (!is_water && dist < 95.0) {
         let max_c = max(raster_rgb.r, max(raster_rgb.g, raster_rgb.b));
         let is_green_foliage = raster_rgb.g > raster_rgb.r * 1.12 && raster_rgb.g > raster_rgb.b * 1.12;
@@ -4523,32 +4524,6 @@ impl RaywatcherGpu {
             packed.fog_colour[3] = if flying { 2.0 } else { 1.0 };
         }
         packed.terrain_map_bounds = self.terrain_map_bounds();
-        let containing_water = water
-            .iter()
-            .filter(|w| {
-                params.eye.x >= w.bounds[0] - 2.0
-                    && params.eye.x <= w.bounds[1] + 2.0
-                    && params.eye.z >= w.bounds[2] - 2.0
-                    && params.eye.z <= w.bounds[3] + 2.0
-            })
-            .max_by(|a, b| a.height.total_cmp(&b.height));
-        let chosen_water = containing_water.or_else(|| {
-            water.iter().min_by(|a, b| {
-                let ca = glam::Vec2::new(
-                    (a.bounds[0] + a.bounds[1]) * 0.5,
-                    (a.bounds[2] + a.bounds[3]) * 0.5,
-                );
-                let cb = glam::Vec2::new(
-                    (b.bounds[0] + b.bounds[1]) * 0.5,
-                    (b.bounds[2] + b.bounds[3]) * 0.5,
-                );
-                let e = glam::Vec2::new(params.eye.x, params.eye.z);
-                ca.distance_squared(e).total_cmp(&cb.distance_squared(e))
-            })
-        });
-        if let Some(ws) = chosen_water {
-            packed.eye[3] = ws.height;
-        }
         let scene_albedo_gain = compute_scene_albedo_gain(
             params.sun.colour,
             params.sun.intensity,
@@ -5610,17 +5585,17 @@ mod phase_r1_tests {
             scene.triangles.iter().all(|t| t.kind() != KIND_WATER),
             "occluder BVH must contain zero KIND_WATER triangles"
         );
-        // Real water pixel still qualifies for reflections (roughness 0.06 <= cutoff 0.35).
+        // The flat water plane is tagged for the native-water bypass.
         let cutoff = 0.35_f32;
         let water_r =
-            classify_surface_roughness(0.32, 0.20, glam::Vec3::new(0.0, 10.0, 0.0), &water);
+            classify_surface_roughness(glam::Vec3::Y, glam::Vec3::new(0.0, 10.0, 0.0), &water);
         assert!(
             water_r <= cutoff,
-            "water pixel roughness {water_r} must qualify for reflections (<= {cutoff})"
+            "water pixel roughness {water_r} must qualify for the native-water bypass (<= {cutoff})"
         );
-        // Dry land pixel stays matte (0.92 > cutoff) and never traces reflections.
+        // A surface above the plane remains matte and is not mistaken for water.
         let land_r =
-            classify_surface_roughness(0.20, 0.20, glam::Vec3::new(0.0, 10.0, 0.0), &water);
+            classify_surface_roughness(glam::Vec3::Y, glam::Vec3::new(0.0, 11.0, 0.0), &water);
         assert!(
             land_r > cutoff,
             "land pixel roughness {land_r} must not qualify for reflections (> {cutoff})"
@@ -5652,6 +5627,12 @@ mod phase_r1_tests {
             night_gain >= 6.0 && night_gain <= 9.0,
             "nighttime scene_albedo_gain should recover textures (6.0..=9.0), got {night_gain}"
         );
+    }
+
+    #[test]
+    fn restir_reservoir_matches_the_64_byte_shader_record() {
+        assert_eq!(std::mem::size_of::<RestirReservoir>(), 64);
+        assert_eq!(std::mem::align_of::<RestirReservoir>(), 4);
     }
 
     #[test]
