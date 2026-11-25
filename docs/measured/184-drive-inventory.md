@@ -60,6 +60,8 @@ Every non-final part in every split group is `99,614,720` bytes (95 MiB).
 
 | File | Size (bytes) | Method tried | Result |
 | --- | --- | --- | --- |
+| `world.ecwld` (`1-JLS8LwSur1r_l5_8AD9XY4yvPTPqM76`) | 2,848,200 | Full Drive download | **Succeeded** — SHA-256 `c7d0895b7d9aa58d13b3a153c0a9f01fcdcaee7b7d6090cf33420fbb363d3ebb`; the production scene reader accepts v17 / 22,528 blocks; tree/effect census is in [`184-world-tree-effect-audit.md`](184-world-tree-effect-audit.md). This is a map, not a BMD fixture. |
+| `world.ecbsd` (`1fYClaA4uhX0uy4x0rgjRWDRnP5E-B-86`) | 2,678,024 | Full Drive download | **Succeeded** — SHA-256 `bf09a41990058b5aaedea6683bfccf2abc5c8b06c5f2b1a4d52cf05f20099f93`; revision 18; the paired scene reader resolves all 23,068 unique ornament records. |
 | `fonts.pck` (`1ZwBq31-cUJq6lgkR6qd8jm4I41wTbMc1`) | 4,650,236 | Full Drive download | **Succeeded** — SHA-256 `c85084c126d268cd6af2eeb2b88f0c964a2d2a11b171c87023ad634e8b898d56` |
 | `models2.zip.022` (`1FVsMbNvuQUJAYLWupWaDO2t1r0QDAwWw`) | 7,568,767 | Full Drive download | **Succeeded** — SHA-256 `559275b2b01f782f95e30e392e6525e0086a4de504c802c3f2fe6cb8ddf5ead0` |
 | `facedata.zip.004` (`1GC7x4GiTMQfdo_df-JqyraJqhAUsli81`) | 10,742,906 | Full Drive download | **Failed** — `File too large for download, over limit of 10 MB. For downloading larger files, use the standard Google Drive API.` |
@@ -72,4 +74,4 @@ Every non-final part in every split group is `99,614,720` bytes (95 MiB).
 ## Blocked Items (Source: Drive)
 
 - **Section 2.4 (`docs/measured/184-litmodels-tail.md`) & Section 3 (Trailer layout & 1.8.4 tail check)**: Blocked. Tried full Drive download on `litmodels.pkx1` (3,681,422,489 bytes) and `litmodels.pkx1.zip.037` (23,998,995 bytes), plus Drive content read on `litmodels.pkx1.zip.037`; all failed because the Drive download tool enforces a 10 MB cap and content read rejects `application/octet-stream`.
-- **Section 4.1 (BMD version-gate census in `src/bmd.rs:171,192,197` and `src/bmd_baked.rs:86,219`)**: Blocked. Every part of `building`, `litmodels`, and `models` (smallest split part is `litmodels.pkx1.zip.037` at 23,998,995 bytes) exceeds the 10 MB Drive download limit, so no real 1.8.4 `.bmd` census can be run. Hard version gates remain intact.
+- **Section 4.1 (1.8.4 BMD census and v300 parser validation)**: Blocked. Every part of `building`, `litmodels`, and `models` (smallest split part is `litmodels.pkx1.zip.037` at 23,998,995 bytes) exceeds the 10 MB Drive download limit, and a Drive search for standalone filenames containing `.bmd` returned zero files. No real 1.8.4 `.bmd` census or fixture-based parser validation can be run. `src/bmd.rs` currently groups `0x10000300..=0x10000305` as one provisional path; the dispatch evidence and outstanding schema gaps are recorded in [`184-v300-colours.md`](184-v300-colours.md).

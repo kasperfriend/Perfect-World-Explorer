@@ -4,7 +4,7 @@ Every place a loader can lose a value without saying so, classified. Generated b
 
 | category | sites |
 |---|---|
-| named | 5 |
+| named | 6 |
 | unreachable | 122 |
 | fix | 0 |
 | ? | 0 |
@@ -13,10 +13,10 @@ Every place a loader can lose a value without saying so, classified. Generated b
 
 | file | line | pattern | category | code |
 |---|---|---|---|---|
-| `src/bmd.rs` | 269 | `ok-question` | **probe** | `let name_len = u(b, q + 2).ok()? as usize;` |
-| `src/bmd.rs` | 277 | `ok-question` | **probe** | `let tex_len = u(b, name_end).ok()? as usize;` |
-| `src/bmd.rs` | 285 | `ok-question` | **probe** | `let n = u(b, tex_end).ok()? as usize;` |
-| `src/bmd.rs` | 286 | `ok-question` | **probe** | `let faces = u(b, tex_end + 4).ok()? as usize;` |
+| `src/bmd.rs` | 275 | `ok-question` | **probe** | `let name_len = u(b, q + 2).ok()? as usize;` |
+| `src/bmd.rs` | 283 | `ok-question` | **probe** | `let tex_len = u(b, name_end).ok()? as usize;` |
+| `src/bmd.rs` | 291 | `ok-question` | **probe** | `let n = u(b, tex_end).ok()? as usize;` |
+| `src/bmd.rs` | 292 | `ok-question` | **probe** | `let faces = u(b, tex_end + 4).ok()? as usize;` |
 | `src/client_detect.rs` | 181 | `ok-question` | **probe** | `let word = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 182 | `ok-question` | **probe** | `let timestamp = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 184 | `ok-question` | **probe** | `short: u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?),` |
@@ -154,9 +154,8 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/world_catalog.rs` | 228 | `ok-question` | **probe** | `.ok()?;` |
 | `src/world_catalog.rs` | 275 | `else-continue` | **named** | `else {` |
 | `src/world_catalog.rs` | 357 | `ok-question` | **probe** | `.ok()?` |
-| `src/world_catalog.rs` | 426 | `ok-question` | **probe** | `let bytes = fs::read(dir.join("precinct.clt")).ok()?;` |
-| `src/world_catalog.rs` | 427 | `ok-question` | **probe** | `let text = decode_client_text(&bytes).ok()?;` |
-| `src/world_catalog.rs` | 461 | `ok-question` | **probe** | `let number = digits.parse::<u32>().ok()?;` |
+| `src/world_catalog.rs` | 427 | `ok-question` | **named** | `let bytes = fs::read(&path).ok()?;` |
+| `src/world_catalog.rs` | 474 | `ok-question` | **probe** | `let number = digits.parse::<u32>().ok()?;` |
 | `src/world_handoff.rs` | 117 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
 | `src/world_handoff.rs` | 127 | `let-underscore` | **unreachable** | `let _ = fs::write(&files.focus, b"focused");` |
 | `src/world_handoff.rs` | 128 | `let-underscore` | **unreachable** | `let _ = fs::remove_file(&files.hwnd);` |

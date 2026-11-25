@@ -36,6 +36,9 @@
 #   tools/offline_harness.sh scene    run the real `src/scene.rs` reader over every
 #                                     ECWLD in a directory, so cross-version map
 #                                     coverage is measured rather than assumed
+#   tools/offline_harness.sh scene-census <world.ecwld> [world.ecbsd]
+#                                     print every authored tree type and effect
+#                                     root from one map using the production reader
 #   tools/offline_harness.sh pck      read every entry of every `.pck` in a
 #                                     directory with the real `src/pck.rs`, so a
 #                                     reader change is checked against retail
@@ -150,7 +153,8 @@ PY
 # type-check. Built here rather than inside one target, so a stub that gains an
 # item is not left stale for every other target that never rebuilds it.
 image_stub() {
-    [ -f "$OUT/libimage_stub.rlib" ] && return 0
+    # Rebuild on every invocation so additions to the compile-only API cannot
+    # be hidden by an older cached rlib from a previous harness run.
     # `bins` can run before `water` has ever created this directory.
     mkdir -p "$OUT/water"
     cat > "$OUT/water/image.rs" <<'EOF'
@@ -186,6 +190,13 @@ impl RgbaImage {
         PixIterMut { w: self.w, next: 0, buf: &mut self.pixels }
     }
 }
+impl std::ops::Deref for RgbaImage {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target { &self.pixels }
+}
+impl std::ops::DerefMut for RgbaImage {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.pixels }
+}
 pub struct PixIterMut<'a> { w: u32, next: u32, buf: &'a mut [u8] }
 impl<'a> Iterator for PixIterMut<'a> {
     type Item = (u32, u32, &'a mut Rgba<u8>);
@@ -204,6 +215,44 @@ impl<'a> Iterator for PixIterMut<'a> {
 pub struct Rgba<T>(pub [T; 4]);
 impl Rgba<u8> {
     pub fn channels(&self) -> [u8; 4] { self.0 }
+}
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Rgb<T>(pub [T; 3]);
+pub struct RgbImage { pub w: u32, pub h: u32, pub pixels: Vec<u8> }
+impl RgbImage {
+    pub fn new(w: u32, h: u32) -> Self {
+        Self { w, h, pixels: vec![0; (w as usize) * (h as usize) * 3] }
+    }
+    pub fn enumerate_pixels_mut(&mut self) -> RgbPixIterMut<'_> {
+        RgbPixIterMut { w: self.w, h: self.h, next: 0, buf: &mut self.pixels }
+    }
+}
+pub struct RgbPixIterMut<'a> { w: u32, h: u32, next: u32, buf: &'a mut [u8] }
+impl<'a> Iterator for RgbPixIterMut<'a> {
+    type Item = (u32, u32, &'a mut Rgb<u8>);
+    fn next(&mut self) -> Option<Self::Item> {
+        let i = self.next;
+        if i >= self.w * self.h { return None; }
+        let at = (i as usize) * 3;
+        let px = &mut self.buf[at..at + 3];
+        let rgb = unsafe { &mut *(px.as_mut_ptr() as *mut Rgb<u8>) };
+        self.next += 1;
+        Some((i % self.w.max(1), i / self.w.max(1), rgb))
+    }
+}
+pub mod codecs {
+    pub mod jpeg {
+        pub struct JpegEncoder<W: std::io::Write> { _writer: W }
+        impl<W: std::io::Write> JpegEncoder<W> {
+            pub fn new_with_quality(writer: W, _quality: u8) -> Self {
+                Self { _writer: writer }
+            }
+            pub fn encode_image(&mut self, _image: &crate::RgbImage) -> Result<(), std::io::Error> {
+                Ok(())
+            }
+        }
+    }
 }
 pub struct DynamicImage;
 impl DynamicImage {
@@ -246,6 +295,41 @@ EOF
     "$RUSTC" --crate-type rlib --crate-name image --edition 2021 \
         --sysroot "$SYSROOT" -C opt-level=0 "$OUT/water/image.rs" \
         -o "$OUT/libimage_stub.rlib"
+}
+
+# Compile-only PNG API for `loading-screen-check`; this harness does not claim
+# to encode or validate PNG output. The binary is type-checked, never run here.
+png_stub() {
+    [ -f "$OUT/libpng_stub.rlib" ] && return 0
+    mkdir -p "$OUT/png"
+    cat > "$OUT/png/png.rs" <<'EOF'
+use std::io::{self, Write};
+pub enum ColorType { Rgba }
+pub enum BitDepth { Eight }
+pub struct Encoder<W: Write> { _writer: W }
+impl<W: Write> Encoder<W> {
+    pub fn new(writer: W, _width: u32, _height: u32) -> Self {
+        Self { _writer: writer }
+    }
+    pub fn set_color(&mut self, _color: ColorType) {}
+    pub fn set_depth(&mut self, _depth: BitDepth) {}
+    pub fn write_header(self) -> Result<Writer<W>, io::Error> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "PNG codec unavailable in offline harness"))
+    }
+}
+pub struct Writer<W: Write> { _writer: W }
+impl<W: Write> Writer<W> {
+    pub fn write_image_data(&mut self, _data: &[u8]) -> Result<(), io::Error> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "PNG codec unavailable in offline harness"))
+    }
+    pub fn finish(self) -> Result<(), io::Error> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "PNG codec unavailable in offline harness"))
+    }
+}
+EOF
+    "$RUSTC" --crate-type rlib --crate-name png --edition 2021 \
+        --sysroot "$SYSROOT" -C opt-level=0 "$OUT/png/png.rs" \
+        -o "$OUT/libpng_stub.rlib"
 }
 
 real_deps() {
@@ -702,6 +786,25 @@ pub struct Entry {
     pub compressed: u32,
 }
 
+/// Minimal owner API used by `world_models`; this harness only exercises its
+/// missing-package error path, while archive parsing is covered by `pck` modes.
+pub struct Package {
+    file: File,
+}
+impl Package {
+    pub fn open(path: &std::path::Path) -> Result<Self, String> {
+        Ok(Self {
+            file: File::open(path).map_err(|e| e.to_string())?,
+        })
+    }
+    pub fn directory(&mut self) -> Result<Vec<Entry>, String> {
+        directory(&mut self.file)
+    }
+    pub fn read(&mut self, entry: &Entry) -> Result<Vec<u8>, String> {
+        read_entry(&mut self.file, entry)
+    }
+}
+
 pub fn directory(_f: &mut File) -> Result<Vec<Entry>, String> {
     Err("offline harness: no zlib backend".to_string())
 }
@@ -840,7 +943,7 @@ case "${1:-test}" in
             $EXT -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
             -C opt-level=0 "$OUT/lib.rs" -o "$OUT/libharness.rlib"
         echo "type-check clean" ;;
-    bins)  toolchain; sysroot; deps; real_deps; image_stub
+    bins)  toolchain; sysroot; deps; real_deps; image_stub; png_stub
         # Type-check the `src/bin` targets whose whole dependency set exists
         # offline, in their test configuration, which is how CI builds them.
         #
@@ -869,6 +972,7 @@ case "${1:-test}" in
                 $EXT --extern flate2="$OUT/libflate2.rlib" \
                 --extern encoding_rs="$OUT/libencoding_rs.rlib" \
                 --extern image="$OUT/libimage_stub.rlib" \
+                --extern png="$OUT/libpng_stub.rlib" \
                 --extern goblin="$OUT/libgoblin.rlib" \
                 --extern sha2="$OUT/libsha2.rlib" \
                 -o "$OUT/bins/$name" "$path" 2>"$OUT/bins/$name.log"; then
@@ -1588,6 +1692,13 @@ EOF
             "$OUT/scene/sweep.rs" -o "$OUT/scenesweep"
         shift || true
         exec "$OUT/scenesweep" "${1:-$REPO/google_drive/scenecorpus}" ;;
+    scene-census) toolchain; sysroot; deps
+        "$RUSTC" --edition 2021 --crate-name scenecensus --sysroot "$SYSROOT" \
+            -C opt-level=2 -L "$OUT" --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            -o "$OUT/scene-tree-effect-census" "$REPO/src/bin/scene-tree-effect-census.rs"
+        shift || true
+        [ $# -gt 0 ] || set -- "$REPO/google_drive/world.ecwld"
+        (cd "$REPO" && exec "$OUT/scene-tree-effect-census" "$@") ;;
     pck) toolchain; sysroot; deps
         # Decode every entry of every pack in the directory. A directory listing
         # alone would pass while a record walk silently desynchronised, so the
@@ -2192,4 +2303,4 @@ EOF
             -o "$OUT/matrix-maps" "$OUT/mm/run.rs"
         shift || true
         (cd "$REPO" && exec "$OUT/matrix-maps" "${1:-$REPO/google_drive/clients}") ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|settings|bmd-baked|objects|navigation|launcher|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|settings|bmd-baked|objects|navigation|launcher|gfx|player|bins|diagnostics|material|scene|scene-census|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac

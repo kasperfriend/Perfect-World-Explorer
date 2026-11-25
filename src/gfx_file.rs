@@ -3196,7 +3196,6 @@ mod tests {
         assert!(!authored.write_z, "an authored zero stays off");
     }
 
-    #[test]
     /// The sound's file list is `PathNum` rows of `Path` at root version 88
     /// or later: `GFXSOUNDIMP::Load` (A3DGFXSoundImp.cpp) reads the count
     /// and then exactly that many names into its `RandStringContainer(5)`,
@@ -3217,6 +3216,7 @@ mod tests {
         assert_eq!(sound.paths, ["Sfx\\a.wav", "Sfx\\b.wav"]);
     }
 
+    #[test]
     fn trail_152_cylinders_grids_children_lights_and_sounds() {
         let trail = "GFXELEMENTID: 152\nName: t\nSrcBlend: 5\nDestBlend: 2\nTexFile: 轨迹\\trail003.dds\n\
             BufLen: 256\nAmplitude: 1.000000\nWaveLen: 1\nPersistence: 0.250000\nOctaveNum: 5\n\

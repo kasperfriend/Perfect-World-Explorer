@@ -19,18 +19,20 @@ pub struct Material {
     pub power: f32,
     pub two_sided: bool,
 }
-/// Which colour/lightmap-UV branch a v300+ (`A3DLITMODEL_VERSION_EX`) mesh took,
-/// driven directly by `bSupportLightMap` and `bUseLightMap` per Angelica 2.2
-/// `A3DLitModel.cpp:2727-2822`.
+/// Parser-inferred colour-block classification for the provisional v300+ path.
+/// These labels summarize byte/tag/opacity heuristics; they are not native
+/// branches verified from a raw 1.8.4 BMD, and the parsed per-mesh flag bytes do
+/// not select them. Keep P3.01 partial until fixtures establish the layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum V300ColorBranch {
-    /// `!bSupportLightMap`: baked day/night vertex colours only (`n * 8` bytes).
+    /// The parser treated the first `n * 8` bytes after the normal block as
+    /// day/night vertex colours.
     VertexColorsOnly,
-    /// `bSupportLightMap && !bUseLightMap`: lightmap UVs (`n * 8`) followed by
-    /// baked day/night vertex colours (`n * 8`).
+    /// The parser skipped an `n * 8` block as presumed UVs, then read day/night
+    /// vertex colours from the following `n * 8` bytes.
     LightmapUvAndVertexColors,
-    /// `bSupportLightMap && bUseLightMap`: lightmap UVs (`n * 8`) only; neutral
-    /// `0xFF808080` fallback (1.0x under `MODULATE2X`).
+    /// The parser could not confirm its candidate colour blocks and substituted
+    /// neutral `0xFF808080` colours; this is not a verified client fallback.
     LightmapUvNeutralFallback,
 }
 
@@ -44,7 +46,8 @@ impl V300ColorBranch {
     }
 }
 
-/// Diagnostic counters for each v300 colour/lightmap branch taken while parsing.
+/// Diagnostic counters for parser-inferred v300 colour-block classifications;
+/// these are not a retail corpus census.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct V300BranchCounters {
     pub flags_read: usize,
@@ -66,11 +69,14 @@ pub struct Mesh {
     pub texture: String,
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
-    /// Flag-selected colour branch for v300+ meshes (`None` for legacy v2..=v6).
+    /// Heuristic colour-block classification for v300+ meshes (`None` for legacy
+    /// v2..=v6); this is not selected from the parsed flag bytes.
     pub color_branch: Option<V300ColorBranch>,
-    /// `bSupportLightMap` flag read from v300+ mesh header (false for legacy).
+    /// Nonzero test of the first per-mesh v300 flag byte. Its semantics are not
+    /// verified by a raw 1.8.4 fixture (false for legacy meshes).
     pub b_support_lightmap: bool,
-    /// `bUseLightMap` flag read from v300+ mesh header (false for legacy).
+    /// Nonzero test of the second per-mesh v300 flag byte. Its semantics are not
+    /// verified by a raw 1.8.4 fixture (false for legacy meshes).
     pub b_use_lightmap: bool,
     /// Count of vertices with `(day_diffuse >> 24) == 0xff`.
     pub opaque_day_words: usize,
@@ -340,6 +346,10 @@ impl Model {
             p += 5;
             version = u(b, p)?
         }
+        // Convenience range for the provisional parser, not a recovered client
+        // version table. The examined 1.8.4 dispatch shows only the
+        // 0x01000030/0x10000301 and 0x10000302 routes; no raw BMD validates this
+        // broader acceptance range.
         let is_v300 = matches!(version, 0x10000300..=0x10000305);
         if version != 0x10000001 && version != 0x10000002 && !is_v300 {
             return Err(format!(
@@ -353,8 +363,9 @@ impl Model {
         let position = v3(b, p + 36)?;
         p += 48;
         let v305_header_word = if version >= 0x10000303 {
-            // 0x10000303..=0x10000305 models carry a 4-byte model-level field
-            // (often 0xFFFFFFFF) immediately before nNumMeshes.
+            // Provisional parser assumption only: the code treats
+            // 0x10000303..=0x10000305 as carrying a 4-byte word before the mesh
+            // count. No raw 1.8.4 BMD has verified this offset or version range.
             let word = u(b, p)?;
             p += 4;
             Some(word)
@@ -376,12 +387,18 @@ impl Model {
         let mut lossy_gbk_diagnostics = Vec::new();
         let mut v300_branch_counters = V300BranchCounters::default();
         if is_v300 {
-            // 1.8.x A3DLitModel (0x10000300..=0x10000305): model-level
-            // `bLightMap` (1 B) + `bSharedData` (1 B), then per mesh:
-            // `bSupportLightMap` (1 B) + `bUseLightMap` (1 B), length-prefixed
-            // GBK name and texture, vertex and face counts, 24-byte vertices,
-            // 32-bit indices (12 B per face), normals, day/night vertex
-            // colours and/or lightmap UVs, and AABB + MATERIAL + dwExtraSize.
+            // PROVISIONAL 1.8.4 path: the disassembly distinguishes the
+            // 0x01000030/0x10000301 route from 0x10000302, but no raw BMD has
+            // verified this parser's offsets or the broader 0x10000300..=305
+            // acceptance range. This implementation assumes two model-level
+            // bytes, then two per-mesh bytes, length-prefixed GBK strings,
+            // counts, 24-byte vertices and a normal block. It guesses index
+            // width (u32 if all candidates are in-range and fit, otherwise
+            // u16), infers colour/UV blocks from tags, sizes and alpha bytes,
+            // and probes a material/AABB/size tail. The parsed flag bytes do not
+            // select the colour branch. Do not treat these guesses as a format
+            // specification; P3.01 stays partial until fixtures validate each
+            // route and every next-mesh offset.
             const MAT_TAG: &[u8] = b"MATERIAL: \0";
             let _b_lightmap = *b.get(p).ok_or("truncated BMD v300 bLightMap")? != 0;
             let b_shared_data = *b.get(p + 1).ok_or("truncated BMD v300 bSharedData")? != 0;

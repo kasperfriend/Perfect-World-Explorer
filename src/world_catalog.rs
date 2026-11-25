@@ -423,8 +423,21 @@ pub fn element_from_map_dir(dir: &Path) -> PathBuf {
 }
 
 fn first_zone_name(dir: &Path) -> Option<String> {
-    let bytes = fs::read(dir.join("precinct.clt")).ok()?;
-    let text = decode_client_text(&bytes).ok()?;
+    let path = dir.join("precinct.clt");
+    let bytes = fs::read(&path).ok()?;
+    let text = match decode_client_text(&bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            crate::load_status::dropped(
+                crate::load_status::Category::ZoneNames,
+                format!(
+                    "{}: cannot decode precinct zone name: {error}",
+                    path.display()
+                ),
+            );
+            return None;
+        }
+    };
     for line in text.lines().map(strip_comment).map(str::trim) {
         if let Some(name) = quoted(line) {
             let name = name.trim().to_string();
@@ -957,6 +970,39 @@ mod tests {
         assert_eq!(decode_client_text(&utf16).unwrap(), utf8);
         let (gbk, _, _) = encoding_rs::GBK.encode("完美大陆");
         assert_eq!(decode_client_text(&gbk).unwrap(), "完美大陆");
+    }
+
+    #[test]
+    fn invalid_gbk_zone_name_falls_back_and_counts_a_named_loss() {
+        let _guard = crate::load_status::test_guard();
+        crate::load_status::reset();
+        static UNIQUE: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "pwe-invalid-zone-gbk-{}-{}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let dir = root.join("maps/bad_zone");
+        fs::create_dir_all(&dir).unwrap();
+        for ext in ["trn2", "ecwld", "ecbsd"] {
+            fs::write(dir.join(format!("bad_zone.{ext}")), []).unwrap();
+        }
+        // An incomplete GBK lead byte cannot supply a localized name. The map
+        // remains selectable under its folder-derived fallback, while the
+        // ZoneNames counter carries a reason with the exact sidecar path.
+        fs::write(dir.join("precinct.clt"), [0x81]).unwrap();
+        let map = WorldMap::from_dir(&dir, &HashMap::new()).unwrap();
+        assert_eq!(map.name, "Bad Zone");
+        assert_eq!(
+            crate::load_status::dropped_count(crate::load_status::Category::ZoneNames),
+            1
+        );
+        let reasons = crate::load_status::reasons(crate::load_status::Category::ZoneNames);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("precinct.clt"), "{}", reasons[0]);
+        assert!(reasons[0].contains("cannot decode precinct zone name"));
+        crate::load_status::reset();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
