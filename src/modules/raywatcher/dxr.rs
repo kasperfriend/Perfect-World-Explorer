@@ -65,6 +65,9 @@ impl DxrTracer {
         Ok(())
     }
 
+    /// The non-Windows stub has no persistent DXR history to invalidate.
+    pub fn invalidate_restir_history(&mut self) {}
+
     pub fn resize(
         &mut self,
         _device: &wgpu::Device,
