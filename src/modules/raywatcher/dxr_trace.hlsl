@@ -885,7 +885,9 @@ void restir_reuse_one(
     }
     float target = max(luma(source.radiance_m.xyz) * cosine, 1e-5);
     float represented = clamp(source.radiance_m.w, 1.0, 32.0);
-    float weight = source.sample_pos_weight.w * target / max(source.receiver_pos_target.w, 1e-5);
+    float age_scale = represented / max(source.radiance_m.w, 1.0);
+    float weight = source.sample_pos_weight.w * age_scale
+        * target / max(source.receiver_pos_target.w, 1e-5);
     restir_update(reservoir, source.sample_pos_weight.xyz, source.radiance_m.xyz,
         target, weight, represented, is_sky, receiver_pos, receiver_normal, state);
 }
@@ -1953,7 +1955,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         ? (1.0 - clamp(pl_w_total, 0.0, 0.5) * (1.0 - point_vis))
         : 1.0;
 
-    if (params.restir.x > 0.5 && bits_gi) {
+    if (params.restir.x > 0.5 && bits_gi && max_bounces >= 1u &&
+        params.tuning.w > 0.0 && gi_fade > 0.01) {
         restir_reuse_history(restir_current, world_pos, normal, ray_origin, bias, dist,
             id.xy, extent, previous_base, opaque_offset, tri_count, state);
         bool selected_sky = restir_current.receiver_normal_flags.w < 0.0;

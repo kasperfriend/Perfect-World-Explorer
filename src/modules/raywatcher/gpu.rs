@@ -1259,7 +1259,7 @@ fn restir_empty() -> RestirReservoir {
 }
 
 fn restir_clear(index: u32) {
-    if (params.restir.x >= 0.0) {
+    if (params.restir.x > 0.5) {
         restir_reservoirs[index] = restir_empty();
     }
 }
@@ -2188,7 +2188,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let point_vis = select(1.0, pl_w_lit / max(pl_w_total, 1e-5), pl_w_total > 1e-4);
     let point_shadow_mod = select(1.0, 1.0 - clamp(pl_w_total, 0.0, 0.5) * (1.0 - point_vis), pl_shadows_enabled && pl_w_total > 1e-4);
 
-    if (params.restir.x > 0.5) {
+    if (params.restir.x > 0.5 && bits_gi && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
         restir_reuse_history(
             &restir_current, point, normal, ray_origin, bias, dist,
             id.xy, extent, previous_base, &state
@@ -4647,11 +4647,9 @@ impl RaywatcherGpu {
         } else {
             0.0
         };
-        packed.restir[0] = if self.restir_reservoirs_enabled && plan.effects.global_illumination {
-            1.0
-        } else {
-            0.0
-        };
+        // This is an allocation-valid bit, not the GI effect toggle. If GI is
+        // disabled, the shader clears valid history rather than reusing stale light.
+        packed.restir[0] = if self.restir_reservoirs_enabled { 1.0 } else { 0.0 };
         packed.restir[1] = 4.0;
         packed.restir[2] = 4.0;
         packed.restir[3] = (self.frames & 1) as f32;
