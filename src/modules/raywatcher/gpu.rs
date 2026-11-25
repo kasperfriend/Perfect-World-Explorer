@@ -216,7 +216,11 @@ impl RayParams {
             terrain_map_bounds: [0.0; 4],
             prev_view_projection: [[0.0; 4]; 4],
             restir: [
-                if plan.effects.global_illumination { 1.0 } else { 0.0 },
+                if plan.effects.global_illumination {
+                    1.0
+                } else {
+                    0.0
+                },
                 4.0,
                 4.0,
                 0.0,
@@ -2929,7 +2933,6 @@ impl Pipelines {
                 ),
                 storage_texture_entry(4, wgpu::StorageTextureAccess::WriteOnly, GUIDE_FORMAT),
                 storage_texture_entry(5, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
-                
             ],
         });
         let gbuf_prep_pipeline = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -4447,7 +4450,6 @@ impl RaywatcherGpu {
             },
         );
 
-
         // Build the 1:1 depth-anchored G-buffer (world pos, normal, water
         // roughness, and untouched raster colour) at ray-grid resolution.
         if self.gbuf_prep_bind_group.is_none() {
@@ -4529,7 +4531,11 @@ impl RaywatcherGpu {
         };
         // This is an allocation-valid bit, not the GI effect toggle. If GI is
         // disabled, the shader clears valid history rather than reusing stale light.
-        packed.restir[0] = if self.restir_reservoirs_enabled { 1.0 } else { 0.0 };
+        packed.restir[0] = if self.restir_reservoirs_enabled {
+            1.0
+        } else {
+            0.0
+        };
         packed.restir[1] = 4.0;
         packed.restir[2] = 4.0;
         packed.restir[3] = (self.frames & 1) as f32;
@@ -5566,11 +5572,26 @@ mod phase_r1_tests {
         }];
         let flat_normal = glam::Vec3::Y;
         let slope_normal = glam::Vec3::new(0.2, 0.97, 0.0);
-        assert_eq!(classify_surface_roughness(flat_normal, glam::Vec3::new(0.0, 10.0, 0.0), &water), 0.06);
-        assert_eq!(classify_surface_roughness(flat_normal, glam::Vec3::new(101.0, 10.0, 0.0), &water), 0.92);
-        assert_eq!(classify_surface_roughness(flat_normal, glam::Vec3::new(0.0, 10.2, 0.0), &water), 0.92);
-        assert_eq!(classify_surface_roughness(slope_normal, glam::Vec3::new(0.0, 10.0, 0.0), &water), 0.92);
-        assert_eq!(classify_surface_roughness(flat_normal, glam::Vec3::new(0.0, 10.0, 0.0), &[]), 0.92);
+        assert_eq!(
+            classify_surface_roughness(flat_normal, glam::Vec3::new(0.0, 10.0, 0.0), &water),
+            0.06
+        );
+        assert_eq!(
+            classify_surface_roughness(flat_normal, glam::Vec3::new(101.0, 10.0, 0.0), &water),
+            0.92
+        );
+        assert_eq!(
+            classify_surface_roughness(flat_normal, glam::Vec3::new(0.0, 10.2, 0.0), &water),
+            0.92
+        );
+        assert_eq!(
+            classify_surface_roughness(slope_normal, glam::Vec3::new(0.0, 10.0, 0.0), &water),
+            0.92
+        );
+        assert_eq!(
+            classify_surface_roughness(flat_normal, glam::Vec3::new(0.0, 10.0, 0.0), &[]),
+            0.92
+        );
     }
 
     #[test]

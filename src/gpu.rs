@@ -4955,11 +4955,7 @@ impl Renderer {
                     w as f32,
                     h as f32,
                     camera.far,
-                    if camera.water_reflections {
-                        1.
-                    } else {
-                        0.
-                    },
+                    if camera.water_reflections { 1. } else { 0. },
                 ],
                 animation: [
                     crate::water_gpu::normal_phase(frame.elapsed64),
@@ -4967,16 +4963,7 @@ impl Renderer {
                     0.,
                     crate::water_gpu::normal_offset_angle(frame.elapsed64),
                 ],
-                edge_mode: [
-                    if camera.water_reflections {
-                        1.
-                    } else {
-                        0.
-                    },
-                    0.,
-                    0.,
-                    0.,
-                ],
+                edge_mode: [if camera.water_reflections { 1. } else { 0. }, 0., 0., 0.],
                 // Water-surface fog: the client binds the region's own triple
                 // (white 100..400 above water, blue 10..60 below).
                 fog: frame.active_fog_range,

@@ -1894,7 +1894,11 @@ mod imp {
             self.restir_reservoirs = unsafe {
                 RawBuffer::create(
                     self.raw_device.as_mut_ptr(),
-                    if self.restir_reservoirs_enabled { reservoir_bytes.max(64) } else { 64 },
+                    if self.restir_reservoirs_enabled {
+                        reservoir_bytes.max(64)
+                    } else {
+                        64
+                    },
                     d12::D3D12_HEAP_TYPE_DEFAULT,
                     d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                     d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -1923,7 +1927,11 @@ mod imp {
                 let slot_idx = self.ring.acquire("DXR-Trace")?;
                 let mut dxr_params = *params;
                 dxr_params.fog[3] = self.scene.opaque_tri_count as f32;
-                dxr_params.restir[0] = if self.restir_reservoirs_enabled { 1.0 } else { 0.0 };
+                dxr_params.restir[0] = if self.restir_reservoirs_enabled {
+                    1.0
+                } else {
+                    0.0
+                };
                 dxr_params.frame[3] = if self.restir_history_valid && params.frame[3] > 0.5 {
                     1.0
                 } else {
