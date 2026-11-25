@@ -9869,7 +9869,6 @@ mod handoff_exit_tests {
     }
 }
 
-
 #[cfg(test)]
 mod raywatcher_fog_preservation_tests {
     use super::*;
@@ -9900,8 +9899,7 @@ mod raywatcher_fog_preservation_tests {
                 [0.; 4],
             );
             assert_eq!(
-                uniform.fog_range,
-                fog_range,
+                uniform.fog_range, fog_range,
                 "Raywatcher may replace lighting, never the client's fog range or enable flag"
             );
         }

@@ -5614,7 +5614,6 @@ mod phase_r1_tests {
     }
 }
 
-
 #[cfg(test)]
 mod shader_optimization_regression_tests {
     use super::RAY_SHADER;
@@ -5623,11 +5622,14 @@ mod shader_optimization_regression_tests {
     fn software_and_dxr_point_lights_reuse_one_inverse_square_root() {
         let dxr = include_str!("dxr_trace.hlsl");
         assert_eq!(
-            RAY_SHADER.matches("let inv_pl_dist = inverseSqrt(max(pl_d2, 1e-10));").count(),
+            RAY_SHADER
+                .matches("let inv_pl_dist = inverseSqrt(max(pl_d2, 1e-10));")
+                .count(),
             2
         );
         assert_eq!(
-            dxr.matches("float inv_pl_dist = rsqrt(max(pl_d2, 1e-10));").count(),
+            dxr.matches("float inv_pl_dist = rsqrt(max(pl_d2, 1e-10));")
+                .count(),
             2
         );
     }
@@ -5636,7 +5638,9 @@ mod shader_optimization_regression_tests {
     fn software_screen_radiance_uses_squared_distance_like_dxr() {
         let dxr = include_str!("dxr_trace.hlsl");
         assert!(RAY_SHADER.contains("dot(separation, separation) < tolerance * tolerance"));
-        assert!(dxr.contains("dot(screen_delta, screen_delta) < screen_tolerance * screen_tolerance"));
+        assert!(
+            dxr.contains("dot(screen_delta, screen_delta) < screen_tolerance * screen_tolerance")
+        );
     }
 
     #[test]
