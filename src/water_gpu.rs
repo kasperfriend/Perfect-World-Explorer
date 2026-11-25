@@ -985,7 +985,10 @@ impl WaterGpu {
 
 #[cfg(test)]
 mod animation_tests {
-    use super::{cell_base_uv, normal_frame_index, normal_offset_angle, normal_phase, refraction_fog_range, WATER_SHADER};
+    use super::{
+        cell_base_uv, normal_frame_index, normal_offset_angle, normal_phase, refraction_fog_range,
+        WATER_SHADER,
+    };
     /// The scissor that makes a reflection or refraction render cheap is sized
     /// from this number, so it has to be the decoded-component maximum the shader
     /// can actually sample: `texel * 2 - 1` of the red and blue channels, over
