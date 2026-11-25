@@ -409,6 +409,17 @@ impl Sun {
 /// The lighting record the renderer derives each frame. Kept separate from the
 /// GPU uniform so the CPU reference tracer and the tests can use it without a
 /// device, and so the shader's numbers have exactly one author.
+/// Convert the camera's active fog gate into the range consumed by RT
+/// transport. A disabled range is represented by equal endpoints, matching
+/// the RT shader's `end <= start` disable rule.
+pub fn effective_fog_range(enabled: bool, start: f32, end: f32) -> (f32, f32) {
+    if enabled && start.is_finite() && end.is_finite() && end > start {
+        (start, end)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct LightingRecord {
     /// Direction *towards* the sun (unit length).
@@ -1204,4 +1215,14 @@ mod tests {
             "moonlight should be cool-tinted"
         );
     }
+    
+    #[test]
+    fn ray_fog_range_respects_the_original_enable_gate() {
+        assert_eq!(effective_fog_range(false, 0.0, 400.0), (0.0, 0.0));
+        assert_eq!(effective_fog_range(true, 0.0, 400.0), (0.0, 400.0));
+        assert_eq!(effective_fog_range(true, 12.0, 64.0), (12.0, 64.0));
+        assert_eq!(effective_fog_range(true, 20.0, 20.0), (0.0, 0.0));
+        assert_eq!(effective_fog_range(true, f32::NAN, 64.0), (0.0, 0.0));
+    }
+
 }
