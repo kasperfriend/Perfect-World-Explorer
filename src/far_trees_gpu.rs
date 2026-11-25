@@ -1571,7 +1571,7 @@ impl FarTrees {
                     // after mask sampling) — these produce invisible leaf patches.
                     let zero_cov = ld.leaves_skipped;
                     total_zero_coverage += zero_cov;
-                    if zero_cov > leaf_tris * 0.3 {
+                    if (zero_cov as f64) > (leaf_tris as f64) * 0.3 {
                         total_low_coverage += 1;
                     }
                 }
