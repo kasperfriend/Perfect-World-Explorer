@@ -273,13 +273,7 @@ impl Bounds {
         self.hit_with_slabs(origin, RaySlabs::new(dir), t_min, t_max)
     }
 
-    fn hit_with_slabs(
-        &self,
-        origin: Vec3,
-        slabs: RaySlabs,
-        t_min: f32,
-        t_max: f32,
-    ) -> Option<f32> {
+    fn hit_with_slabs(&self, origin: Vec3, slabs: RaySlabs, t_min: f32, t_max: f32) -> Option<f32> {
         let mut t0 = t_min;
         let mut t1 = t_max;
         for axis in 0..3 {
