@@ -22,13 +22,20 @@ pub struct WaterUniform {
     pub fog_color: [f32; 4],
 }
 
-/// Retail increments the normal index every 33 milliseconds. Fractional
-/// position is retained for the viewer's smooth frame interpolation.
+/// Retail increments the 29-frame normal-map index every 33 milliseconds.
+/// The fractional tick is retained only so callers can derive that index once
+/// per frame; the shader samples one authored frame and never cross-blends.
 pub fn normal_phase(elapsed_seconds: f64) -> f32 {
     if !elapsed_seconds.is_finite() || elapsed_seconds < 0. {
         return 0.;
     }
     ((elapsed_seconds * (1000.0 / 33.0)).rem_euclid(29.0)) as f32
+}
+
+/// Native frame index for the standard normal-map water mode.
+/// This is evaluated once per CPU frame instead of flooring per water fragment.
+pub fn normal_frame_index(elapsed_seconds: f64) -> u32 {
+    normal_phase(elapsed_seconds).floor() as u32
 }
 /// The default client water mode rotates its 0.05 texture offset by 25
 /// degrees per second (elapsed milliseconds * 0.025 degrees).
@@ -92,15 +99,12 @@ fn surface_fog(c:vec3<f32>, reciprocal_w:f32)->vec3<f32>{
  // radius-.05 translation (0x7c95a8, 0x7ca47b).
  let angle=w.animation.w;
  let uv=i.uv*2.0+0.05*vec2<f32>(cos(angle),sin(angle));
- // The retail update routine at 0x7ca5ea advances the 29 normal frames
- // once per 33 ms. Interpolation is a viewer extension that preserves the
- // requested smooth playback while retaining the recovered cycle timing.
- let phase=w.animation.x; let frame=i32(floor(phase))%29;
- let n0=textureSample(normals,tile_sampler,uv,frame).xyz*2.0-vec3<f32>(1.0);
- let n1=textureSample(normals,tile_sampler,uv,(frame+1)%29).xyz*2.0-vec3<f32>(1.0);
+ // The retail update routine at 0x7ca5ea selects one of the 29 normal maps
+ // every 33 ms. It does not blend adjacent authored frames.
+ let frame=i32(w.animation.x)%29;
  // The retail pixel shader uses the decoded normal-map vector directly;
  // normalizing it changes both the bump displacement and Fresnel response.
- let n=mix(n0,n1,fract(phase));
+ let n=textureSample(normals,tile_sampler,uv,frame).xyz*2.0-vec3<f32>(1.0);
  let screen=i.pos.xy/w.size.xy;
  if w.size.w>0.5 && w.eye_time.y<=i.world.y {
    // 0x7ca9af selects waterrefract.txt below the surface, not the
@@ -981,7 +985,7 @@ impl WaterGpu {
 
 #[cfg(test)]
 mod animation_tests {
-    use super::{cell_base_uv, normal_offset_angle, normal_phase, refraction_fog_range};
+    use super::{cell_base_uv, normal_frame_index, normal_offset_angle, normal_phase, refraction_fog_range, WATER_SHADER};
     /// The scissor that makes a reflection or refraction render cheap is sized
     /// from this number, so it has to be the decoded-component maximum the shader
     /// can actually sample: `texel * 2 - 1` of the red and blue channels, over
@@ -1020,13 +1024,17 @@ mod animation_tests {
         assert!((normal_offset_angle(1_000_000.0) - normal_offset_angle(1_000_014.4)).abs() < 1e-4);
     }
     #[test]
-    fn client_frame_period_and_smooth_loop() {
+    fn client_frame_period_and_stepwise_normal_sequence() {
         assert_eq!(normal_phase(0.), 0.);
         assert!((normal_phase(0.0165) - 0.5).abs() < 1e-5);
-        assert!((normal_phase(0.033) - 1.).abs() < 1e-5);
-        assert!((normal_phase(0.9405) - 28.5).abs() < 1e-5);
-        assert!(normal_phase(0.957) < 1e-4);
-        assert!((normal_phase(3600000.0 + 0.0165) - normal_phase(3600000.0) - 0.5).abs() < 1e-3);
-        assert_eq!(normal_phase(f64::NAN), 0.);
+        assert_eq!(normal_frame_index(0.), 0);
+        assert_eq!(normal_frame_index(0.0165), 0);
+        assert_eq!(normal_frame_index(0.0329), 0);
+        assert_eq!(normal_frame_index(0.033), 1);
+        assert_eq!(normal_frame_index(0.9405), 28);
+        assert_eq!(normal_frame_index(0.957), 0);
+        assert_eq!(normal_frame_index(f64::NAN), 0);
+        assert!(WATER_SHADER.contains("let frame=i32(w.animation.x)%29;"));
+        assert!(!WATER_SHADER.contains("mix(n0,n1,fract(phase))"));
     }
 }
