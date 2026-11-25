@@ -304,7 +304,9 @@ fn foliage_opacity(hits: u32) -> f32 {
 /// The primary SpeedTree LOD selected by the same distance/height/scale bands as the raster compute shader.
 fn raster_lod_index(distance: f32, height: f32, scale: f32, lod_count: usize) -> usize {
     let count = lod_count.min(3);
-    if count <= 1 { return 0; }
+    if count <= 1 {
+        return 0;
+    }
     let h = height.max(5.0);
     let s = scale.clamp(0.25, 4.0);
     let lod0 = h * 5.0 * s;
@@ -314,7 +316,13 @@ fn raster_lod_index(distance: f32, height: f32, scale: f32, lod_count: usize) ->
             return index.min(count - 1);
         }
     }
-    if distance < lod0 { 0 } else if distance < lod1 { 1.min(count - 1) } else { 2.min(count - 1) }
+    if distance < lod0 {
+        0
+    } else if distance < lod1 {
+        1.min(count - 1)
+    } else {
+        2.min(count - 1)
+    }
 }
 
 #[inline]
@@ -831,19 +839,41 @@ impl FarTrees {
                         });
                         let leaf_normal = glam::Vec3::Y; // matches the raster leaf shader's forced normal
                         if h0 > 0 && (p[1] - p[0]).cross(p[2] - p[0]).length_squared() > 1e-8 {
-                            if h0 < 49 { ldiag.masked_tris += 1; } else { ldiag.unmasked_foliage_tris += 1; }
+                            if h0 < 49 {
+                                ldiag.masked_tris += 1;
+                            } else {
+                                ldiag.unmasked_foliage_tris += 1;
+                            }
                             lod_tris.push(RtTreeTriangle {
-                                a: p[0], b: p[1], c: p[2], normal: leaf_normal,
-                                albedo: a0, roughness: 0.84, opacity: foliage_opacity(h0), alpha_mask: m0,
-                                leaf_center: center, leaf_rho: leaf.rho,
+                                a: p[0],
+                                b: p[1],
+                                c: p[2],
+                                normal: leaf_normal,
+                                albedo: a0,
+                                roughness: 0.84,
+                                opacity: foliage_opacity(h0),
+                                alpha_mask: m0,
+                                leaf_center: center,
+                                leaf_rho: leaf.rho,
                             });
                         }
                         if h1 > 0 && (p[2] - p[0]).cross(p[3] - p[0]).length_squared() > 1e-8 {
-                            if h1 < 49 { ldiag.masked_tris += 1; } else { ldiag.unmasked_foliage_tris += 1; }
+                            if h1 < 49 {
+                                ldiag.masked_tris += 1;
+                            } else {
+                                ldiag.unmasked_foliage_tris += 1;
+                            }
                             lod_tris.push(RtTreeTriangle {
-                                a: p[0], b: p[2], c: p[3], normal: leaf_normal,
-                                albedo: a1, roughness: 0.84, opacity: foliage_opacity(h1), alpha_mask: m1,
-                                leaf_center: center, leaf_rho: leaf.rho,
+                                a: p[0],
+                                b: p[2],
+                                c: p[3],
+                                normal: leaf_normal,
+                                albedo: a1,
+                                roughness: 0.84,
+                                opacity: foliage_opacity(h1),
+                                alpha_mask: m1,
+                                leaf_center: center,
+                                leaf_rho: leaf.rho,
                             });
                         }
                     }
@@ -1427,7 +1457,15 @@ impl FarTrees {
     ) -> (usize, usize, usize) {
         // Opt #30: Pre-allocate RT tree triangle staging Vec to eliminate multi-MB reallocs during harvest.
         out.reserve(tri_budget.min(65_536));
-        harvest_rt_tree_species(&self.rt_species, eye, view_direction, max_dist, lod_scale, tri_budget, out)
+        harvest_rt_tree_species(
+            &self.rt_species,
+            eye,
+            view_direction,
+            max_dist,
+            lod_scale,
+            tri_budget,
+            out,
+        )
     }
 
     /// Build a human-readable diagnostic report of all SpeedTree species near `eye`
@@ -1931,7 +1969,8 @@ pub fn harvest_rt_tree_species(
         let mut chosen = None;
         for candidate in lod_idx..lod_count {
             let tris = &sp.lods[candidate];
-            let sparse_outer_lod = candidate > 0 && tris.len() < 12 && !sp.lods[candidate - 1].is_empty();
+            let sparse_outer_lod =
+                candidate > 0 && tris.len() < 12 && !sp.lods[candidate - 1].is_empty();
             if !tris.is_empty() && !sparse_outer_lod && tris.len() <= remaining {
                 chosen = Some(tris);
                 break;
@@ -2047,24 +2086,42 @@ mod raywatcher_tree_tests {
     #[test]
     fn exhausted_tree_budget_skips_a_tree_instead_of_creating_proxy_cards() {
         let tri = RtTreeTriangle {
-            a: glam::Vec3::ZERO, b: glam::Vec3::X, c: glam::Vec3::Y,
-            normal: glam::Vec3::Z, albedo: [0.2, 0.3, 0.1], roughness: 0.9,
-            opacity: 1.0, alpha_mask: 0,
-            leaf_center: glam::Vec3::ZERO, leaf_rho: -1.0,
+            a: glam::Vec3::ZERO,
+            b: glam::Vec3::X,
+            c: glam::Vec3::Y,
+            normal: glam::Vec3::Z,
+            albedo: [0.2, 0.3, 0.1],
+            roughness: 0.9,
+            opacity: 1.0,
+            alpha_mask: 0,
+            leaf_center: glam::Vec3::ZERO,
+            leaf_rho: -1.0,
         };
         let species = RtTreeSpecies {
-            species_id: 1, height: 8.0, composite_size: (64, 64),
-            composite_alpha_min: 0, composite_alpha_max: 255,
+            species_id: 1,
+            height: 8.0,
+            composite_size: (64, 64),
+            composite_alpha_min: 0,
+            composite_alpha_max: 255,
             positions: vec![[5.0, 0.0, 5.0]],
             lods: vec![vec![tri, tri], vec![tri, tri]],
             lod_diags: vec![RtTreeLodDiag::default(); 2],
         };
         let mut out = Vec::new();
         let (instances, triangles, skipped) = harvest_rt_tree_species(
-            &[species], glam::Vec3::ZERO, glam::Vec3::X, 100.0, 1.0, 1, &mut out,
+            &[species],
+            glam::Vec3::ZERO,
+            glam::Vec3::X,
+            100.0,
+            1.0,
+            1,
+            &mut out,
         );
         assert_eq!((instances, triangles, skipped), (0, 0, 1));
-        assert!(out.is_empty(), "no synthetic geometry may be emitted when a LOD cannot fit");
+        assert!(
+            out.is_empty(),
+            "no synthetic geometry may be emitted when a LOD cannot fit"
+        );
     }
 
     #[test]
@@ -2072,11 +2129,15 @@ mod raywatcher_tree_tests {
         let corner = [1.0, 2.0, 3.0];
         let billboard = speedtree_leaf_corner(corner, glam::Vec3::Z, 0.0);
         assert!((billboard - glam::Vec3::new(-2.0, 3.0, 1.0)).length() < 1e-5);
-        assert_eq!(speedtree_leaf_corner(corner, glam::Vec3::Z, 1001.0), glam::Vec3::new(1.0, 3.0, 2.0));
+        assert_eq!(
+            speedtree_leaf_corner(corner, glam::Vec3::Z, 1001.0),
+            glam::Vec3::new(1.0, 3.0, 2.0)
+        );
         let pivot = glam::Vec3::new(4.0, 5.0, 6.0);
         let local = pivot + glam::Vec3::new(corner[0], corner[2], corner[1]);
         let relative = local - pivot;
-        let transformed = pivot + speedtree_leaf_corner([relative.x, relative.z, relative.y], glam::Vec3::Z, 0.0);
+        let transformed =
+            pivot + speedtree_leaf_corner([relative.x, relative.z, relative.y], glam::Vec3::Z, 0.0);
         assert!((transformed - (pivot + glam::Vec3::new(-2.0, 3.0, 1.0))).length() < 1e-5);
     }
 }
