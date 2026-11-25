@@ -792,7 +792,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
 
     bool layered = params.effects.w > 0.5;
     // Keep native PW water (including its original planar reflection pass) completely out of DXR.
-    if (is_water && uint(round(params.counts.w)) == 0u) {
+    if (is_water) {
         out_colour[id.xy] = float4(layered ? float3(0.0, 0.0, 0.0) : raster_rgb, 1.0);
         if (params.point_light_meta.w > 0.5) {
             out_guide[id.xy] = float4(1.0, dist / max(params.lens.y, 1e-4), 1.0, roughness);

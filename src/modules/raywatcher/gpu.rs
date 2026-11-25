@@ -1185,7 +1185,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // Water is owned entirely by the original game renderer: no RT lighting,
     // reflection, denoising signal or reconstruction is allowed to alter it.
-    if (is_water && u32(round(params.counts.w)) == 0u) {
+    if (is_water) {
         textureStore(out_colour, ip, vec4<f32>(select(raster_rgb, vec3<f32>(0.0), layered), 1.0));
         textureStore(out_guide, ip, vec4<f32>(1.0, dist / max(params.lens.y, 1e-4), 1.0, roughness));
         textureStore(out_reflection, ip, vec4<f32>(0.0, 0.0, 0.0, 1.0));
