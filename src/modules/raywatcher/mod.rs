@@ -405,8 +405,6 @@ impl Raywatcher {
             ("Reflections", &mut effects.reflections),
             ("Ambient occlusion", &mut effects.ambient_occlusion),
             ("Global illumination", &mut effects.global_illumination),
-            ("Water refraction", &mut effects.refraction),
-            ("Water caustics", &mut effects.caustics),
             ("Cloud shadows", &mut effects.cloud_shadows),
             ("Contact shadows", &mut effects.contact_shadows),
             ("Moonlit night sky", &mut effects.moonlit_night),
@@ -644,8 +642,6 @@ impl Raywatcher {
             ("reflections", effects.reflections),
             ("ambient_occlusion", effects.ambient_occlusion),
             ("global_illumination", effects.global_illumination),
-            ("refraction", effects.refraction),
-            ("caustics", effects.caustics),
             ("cloud_shadows", effects.cloud_shadows),
             ("contact_shadows", effects.contact_shadows),
             ("moonlit_night", effects.moonlit_night),
@@ -727,8 +723,6 @@ impl Raywatcher {
             ("reflections", &mut effects.reflections),
             ("ambient_occlusion", &mut effects.ambient_occlusion),
             ("global_illumination", &mut effects.global_illumination),
-            ("refraction", &mut effects.refraction),
-            ("caustics", &mut effects.caustics),
             ("cloud_shadows", &mut effects.cloud_shadows),
             ("contact_shadows", &mut effects.contact_shadows),
             ("moonlit_night", &mut effects.moonlit_night),
@@ -1054,8 +1048,6 @@ mod tests {
             reflections: false,
             ambient_occlusion: false,
             global_illumination: false,
-            refraction: false,
-            caustics: false,
             cloud_shadows: false,
             contact_shadows: false,
             moonlit_night: false,
@@ -1079,7 +1071,6 @@ mod tests {
         s.samples = 2;
         s.denoise_iterations = 5;
         s.effects.reflections = false;
-        s.effects.refraction = false;
         s.effects.cloud_shadows = false;
         s.effects.contact_shadows = false;
         s.effects.moonlit_night = false;

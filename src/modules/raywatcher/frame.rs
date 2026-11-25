@@ -689,8 +689,6 @@ mod tests {
                 reflections: false,
                 ambient_occlusion: false,
                 global_illumination: false,
-                refraction: false,
-                caustics: false,
                 cloud_shadows: false,
                 contact_shadows: false,
                 moonlit_night: false,
@@ -717,8 +715,6 @@ mod tests {
         let g = only(|e| e.global_illumination = true);
         assert!(g.ambient);
         assert!(!g.directional_light && !g.reflection_pass && !g.occlusion);
-        // Refraction is water-only and removes nothing either.
-        assert!(!only(|e| e.refraction = true).any());
     }
 
     #[test]

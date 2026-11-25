@@ -164,10 +164,14 @@ pub enum DebugView {
     ReflectionHitKind,
     /// R = raster-only sun fraction, G = RT sun visibility, B = combined.
     ShadowSource,
+    /// Visualises tree/leaf geometry: primary hit alpha-mask coverage (bright
+    /// green = leaf, dark = not), plus reflection-hit foliage coverage in blue.
+    /// Reveals which leaves have sparse alpha masks (the "patches" problem).
+    FoliageDebug,
 }
 
 impl DebugView {
-    pub const ALL: [DebugView; 10] = [
+    pub const ALL: [DebugView; 11] = [
         Self::None,
         Self::RasterOnly,
         Self::SunVisibility,
@@ -178,6 +182,7 @@ impl DebugView {
         Self::OccluderKind,
         Self::ReflectionHitKind,
         Self::ShadowSource,
+        Self::FoliageDebug,
     ];
 
     pub fn label(self) -> &'static str {
@@ -194,6 +199,7 @@ impl DebugView {
             }
             Self::ReflectionHitKind => "Reflection hit kind",
             Self::ShadowSource => "Shadow source (R=raster sun, G=RT vis, B=combined)",
+            Self::FoliageDebug => "Foliage debug (leaf alpha coverage + reflection foliage)",
         }
     }
 
@@ -209,6 +215,7 @@ impl DebugView {
             Self::OccluderKind => "occluder",
             Self::ReflectionHitKind => "reflection_hit",
             Self::ShadowSource => "shadow_source",
+            Self::FoliageDebug => "foliage",
         }
     }
 
@@ -224,6 +231,7 @@ impl DebugView {
             "occluder" | "occluder_kind" => Some(Self::OccluderKind),
             "reflection_hit" | "refl_hit" | "reflection_hit_kind" => Some(Self::ReflectionHitKind),
             "shadow_source" | "shadows_source" => Some(Self::ShadowSource),
+            "foliage" | "foliage_debug" | "leaves" | "leaf" => Some(Self::FoliageDebug),
             _ => None,
         }
     }
@@ -240,6 +248,7 @@ impl DebugView {
             Self::OccluderKind => 7,
             Self::ReflectionHitKind => 8,
             Self::ShadowSource => 9,
+            Self::FoliageDebug => 10,
         }
     }
 }
@@ -264,10 +273,6 @@ pub struct Effects {
     /// One or more diffuse bounce rays, i.e. colour bleeding. The bounce count
     /// is [`Plan::bounces`]; this is the on/off gate the UI owns.
     pub global_illumination: bool,
-    /// Water refraction/absorption on submerged pixels (Beer-Lambert).
-    pub refraction: bool,
-    /// Animated ray-traced Voronoi water caustics (subtle from above, vivid underwater).
-    pub caustics: bool,
     /// Drifting ray-traced cloud shadows projected from the live sky-dome cloud cover.
     pub cloud_shadows: bool,
     /// High-precision short-range screen-space/RT micro-contact shadows for fine grounding.
@@ -289,8 +294,6 @@ impl Default for Effects {
             reflections: true,
             ambient_occlusion: true,
             global_illumination: true,
-            refraction: true,
-            caustics: true,
             cloud_shadows: true,
             contact_shadows: true,
             moonlit_night: true,
@@ -308,8 +311,6 @@ impl Effects {
             self.reflections,
             self.ambient_occlusion,
             self.global_illumination,
-            self.refraction,
-            self.caustics,
             self.cloud_shadows,
             self.contact_shadows,
             self.moonlit_night,
@@ -519,8 +520,6 @@ impl Plan {
             reflections: false,
             ambient_occlusion: false,
             global_illumination: false,
-            refraction: false,
-            caustics: false,
             cloud_shadows: false,
             contact_shadows: false,
             moonlit_night: false,
@@ -710,8 +709,6 @@ mod tests {
             reflections: false,
             ambient_occlusion: false,
             global_illumination: false,
-            refraction: false,
-            caustics: false,
             cloud_shadows: false,
             contact_shadows: false,
             moonlit_night: false,
@@ -723,15 +720,13 @@ mod tests {
             Plan::OFF,
             "no enabled effect must not disable the raster path"
         );
-        for enable in 0..6 {
+        for enable in 0..5 {
             let mut e = Effects {
                 shadows: false,
                 lighting: false,
                 reflections: false,
                 ambient_occlusion: false,
                 global_illumination: false,
-                refraction: false,
-                caustics: false,
                 cloud_shadows: false,
                 contact_shadows: false,
                 moonlit_night: false,
@@ -742,8 +737,7 @@ mod tests {
                 1 => e.lighting = true,
                 2 => e.reflections = true,
                 3 => e.ambient_occlusion = true,
-                4 => e.global_illumination = true,
-                _ => e.refraction = true,
+                _ => e.global_illumination = true,
             }
             s.effects = e;
             assert!(s.replaces_effects(), "effect {enable} must replace");

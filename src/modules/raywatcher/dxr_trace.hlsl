@@ -548,12 +548,6 @@ float3 apply_twilight_scattering(float3 base_sky, float3 dir, float3 sun_dir, fl
     return max(scattered, float3(0.0, 0.0, 0.0));
 }
 
-float2 hash22(float2 p) {
-    float3 p3 = frac(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
-    p3 += dot(p3, p3.yzx + 33.33);
-    return frac((p3.xx + p3.yz) * p3.zy);
-}
-
 float3 sample_sky_reflection(float3 dir) {
     return sample_sky_env(dir);
 }
@@ -640,44 +634,10 @@ float3 detail_offscreen_albedo(float3 hit_pos, float3 hit_normal, float3 base_al
     return clamp(base_albedo * slab, float3(0.02, 0.02, 0.02), float3(0.95, 0.95, 0.95));
 }
 
-
-// Organic Voronoi cellular ridge (non-repeating natural water caustics, zero grid wallpaper).
-float voronoi_ridge(float2 uv, float t) {
-    float2 n = floor(uv);
-    float2 f = frac(uv);
-    float d1 = 8.0;
-    float d2 = 8.0;
-    for (int j = -1; j <= 1; j++) {
-        for (int i = -1; i <= 1; i++) {
-            float2 g = float2(float(i), float(j));
-            float2 o = hash22(n + g);
-            o = 0.5 + 0.42 * sin(t + 6.28318 * o);
-            float2 r = g + o - f;
-            float d = dot(r, r);
-            if (d < d1) {
-                d2 = d1;
-                d1 = d;
-            } else if (d < d2) {
-                d2 = d;
-            }
-        }
-    }
-    // Opt #8: Fast cubic multiply replaces transcendental pow() in Voronoi ridge.
-    float edge = sqrt(d2) - sqrt(d1);
-    float v = smoothstep(0.58, 0.0, edge);
-    return v * v * (0.45 + 0.55 * v);
-}
-
-float caustic_pattern(float2 xz, float t, float cam_dist) {
-    float2 warp = float2(sin(xz.y * 0.27 + t * 0.7), cos(xz.x * 0.23 - t * 0.6)) * 0.45;
-    float c1 = voronoi_ridge((xz + warp) * 0.36 + float2(t * 0.22, -t * 0.17), t * 1.15);
-    // Opt #8: Single Voronoi layer beyond 22u (cuts caustic ALU by ~55%).
-    if (cam_dist > 22.0) {
-        return saturate(c1 * 1.05);
-    }
-    float c2 = voronoi_ridge((xz - warp * 0.7) * 0.58 + float2(-t * 0.19, t * 0.24), t * 0.85);
-    return saturate(c1 * 0.65 + c2 * 0.55);
-}
+// Water is rendered as the native game's simple flat water pass: a glossy
+// dielectric surface with fresnel reflections, no wave normals, refraction,
+// caustics, or subsurface scattering. The original realistic-water features
+// were removed to match the native client's simple water appearance.
 
 // Feature #1: Henyey-Greenstein forward-scattering phase for volumetric god rays.
 float hg_phase(float cos_theta, float g) {
@@ -812,30 +772,8 @@ float trace_contact_shadow(float3 world_pos, float3 sun_dir, float cam_dist, flo
 }
 
 // ============================================================================
-// Deep 3D Ray-Marched Volumetric Clouds (time-evolving, drifting, self-shadowed)
+// Ray-traced lighting, reflections, shadows and ambient occlusion.
 // ============================================================================
-// Enhancement #12: Subtle animated multi-octave capillary wave normal for living water reflections.
-float3 water_wave_normal(float2 xz, float t, float cam_dist) {
-    float amp = 0.028 * exp(-cam_dist * 0.0045);
-    float w1 = sin(xz.x * 0.55 + xz.y * 0.32 + t * 1.45);
-    float w2 = cos(xz.x * 0.38 - xz.y * 0.64 + t * 1.12);
-    float w3 = sin(xz.x * 1.25 + xz.y * 1.05 - t * 2.15) * 0.45;
-    float dx = (w1 * 0.55 + w2 * 0.38 + w3 * 1.25) * amp;
-    float dz = (w1 * 0.32 - w2 * 0.64 + w3 * 1.05) * amp;
-    return normalize(float3(-dx, 1.0, -dz));
-}
-
-// Enhancement #11: Chromatic RGB dispersion for shallow sunlit water caustics.
-float3 caustic_pattern_chromatic(float2 xz, float t, float cam_dist, float depth_w) {
-    float c_g = caustic_pattern(xz, t, cam_dist);
-    if (cam_dist > 34.0 || depth_w > 5.5) {
-        return float3(c_g, c_g, c_g);
-    }
-    float disp = 0.032 * (1.0 - saturate(depth_w / 5.5));
-    float c_r = caustic_pattern(xz + float2(disp, disp * 0.6), t, cam_dist + 24.0);
-    float c_b = caustic_pattern(xz - float2(disp, disp * 0.6), t, cam_dist + 24.0);
-    return float3(lerp(c_g, c_r, 0.65), c_g, lerp(c_g, c_b, 0.65));
-}
 
 float3 kind_colour(float kind) {
     if (kind < 0.5) return float3(0.04, 0.04, 0.04);
@@ -878,7 +816,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float roughness = clamp(norm_r.w, 0.04, 1.0);
     float4 raster_rgba = src_gbuf_raster.Load(int3(id.xy, 0));
     float3 raster_rgb = raster_rgba.rgb;
-    float water_depth = raster_rgba.a;
     float3 view_dir = normalize(world_pos - params.eye.xyz);
     bool is_water = roughness <= 0.12;
     bool is_glossy_trim = !is_water && roughness <= 0.36;
@@ -890,8 +827,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     bool bits_reflections = (effects & 4u) != 0u;
     bool bits_ao = (effects & 8u) != 0u;
     bool bits_gi = (effects & 16u) != 0u;
-    bool bits_refraction = (effects & 32u) != 0u;
-    bool bits_caustics = (effects & 64u) != 0u;
     bool bits_cloud_shadows = (effects & 128u) != 0u;
     bool bits_contact_shadows = (effects & 256u) != 0u;
     bool bits_moonlit_night = (effects & 512u) != 0u;
@@ -1105,10 +1040,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // #8 (Analytical Reflections of World Effects & Point Lights), #10 (Off-Screen Detail).
         float refl_dist = params.lens.y;
         if (bits_reflections && (eff_roughness <= params.effects.x || metalness > 0.1)) {
+            // Native game water is a flat glossy dielectric: no animated wave
+            // normals. Use the raster normal for both water and non-water surfaces.
             float3 refl_base_n = shade_normal;
-            if (is_water) {
-                refl_base_n = water_wave_normal(world_pos.xz, params.frame.x * 0.03, dist);
-            }
             float3 h = ggx_sample(refl_base_n, eff_roughness, rand01(state), rand01(state));
             float3 reflect_dir = reflect(view_dir, h);
             if (dot(reflect_dir, refl_base_n) <= 0.0) {
@@ -1171,18 +1105,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             } else {
                 float3 sky_col = apply_twilight_scattering(sample_sky_reflection(reflect_dir), reflect_dir, params.sun_dir.xyz, sun_strength, bits_twilight_sky);
                 refl_col = sky_col * (fresnel_rgb * trim_scale * 0.65 * (1.0 - fog_t));
-                // Enhancement #14: Ray-traced sun & moon glitter paths across living water
-                // (only when reflection ray misses all bridges, islands, cliffs & ships!).
-                if (is_water && params.sun_dir.y > 0.02) {
-                    float cos_glint = saturate(dot(reflect_dir, params.sun_dir.xyz));
-                    float g2 = cos_glint * cos_glint;
-                    float g8 = g2 * g2 * g2 * g2;
-                    float g32 = g8 * g8 * g8 * g8;
-                    float glint = g32 * g32 * 0.95 + g8 * g8 * 0.14;
-                    float3 glint_col = lerp(float3(0.55, 0.72, 1.0), params.sun_colour.xyz, sun_strength);
-                    float glint_amp = lerp(0.55, 1.35, sun_strength);
-                    refl_col += glint_col * (glint * glint_amp * fresnel * (1.0 - fog_t));
-                }
             }
 
             // Feature #8: Analytical reflections of animated world effects & point lights (skip negligible matte trims).
@@ -1191,55 +1113,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 refl_col += fx_refl * (fresnel * trim_scale * (1.0 - fog_t));
             }
 
-            // Feature #2: True RT Water Refraction (Snell ray-trace + Beer-Lambert depth absorption)
-            // and shadow-gated animated refractive sun caustics on riverbeds, rocks, and piers.
-            if (is_water && bits_refraction && fog_t < 0.90) {
-                float3 refract_dir = refract(view_dir, refl_base_n, 1.0 / 1.333);
-                if (dot(refract_dir, refract_dir) < 1e-4) {
-                    refract_dir = normalize(view_dir - float3(0.0, 0.25, 0.0));
-                }
-                float3 refr_origin = world_pos - float3(0.0, 0.08, 0.0);
-                float refr_max_t = (dist < 220.0) ? 36.0 : 18.0;
-                Hit refr_hit = closest_hit_fast(refr_origin, refract_dir, 0.08, refr_max_t, opaque_offset, tri_count);
-                float wdepth = (refr_hit.index != 0xffffffffu)
-                    ? max(refr_hit.t * max(-refract_dir.y, 0.25), 0.08)
-                    : ((water_depth > 0.01) ? water_depth : 14.0);
-                float refr_path = (refr_hit.index != 0xffffffffu) ? refr_hit.t : (wdepth / max(-refract_dir.y, 0.25));
-                // Physically-based Beer-Lambert absorption: clear turquoise shallows -> deep ocean blue/teal.
-                float3 beer = exp(-refr_path * float3(0.25, 0.085, 0.042));
-                float refract_w = (1.0 - fresnel) * (1.0 - fog_t);
-                float shallow_clear = exp(-wdepth * 0.14);
-                if (refr_hit.index != 0xffffffffu) {
-                    float3 seabed_pos = refr_origin + refract_dir * refr_hit.t;
-                    Material smat = material_of(refr_hit.index);
-                    float skind = tris[refr_hit.index].a.w;
-                    float3 s_albedo = (skind > 1.5 && skind < 2.5)
-                        ? sample_terrain_albedo_fast(seabed_pos, smat.albedo.rgb)
-                        : smat.albedo.rgb;
-                    float s_ndl = max(dot(refr_hit.normal, params.sun_dir.xyz), 0.0);
-                    float3 seabed_lit = s_albedo * (params.ambient.xyz * params.tuning.z * 0.85
-                        + params.sun_colour.xyz * (s_ndl * shadow));
-                    // Blend real refracted seabed tint with Beer-Lambert absorption
-                    float3 deep_scatter = lerp(float3(0.01, 0.03, 0.06), float3(0.03, 0.14, 0.18), sun_strength);
-                    float3 refr_col = seabed_lit * beer + deep_scatter * (1.0 - beer);
-                    refl_col += refr_col * (refract_w * 0.42 * shallow_clear);
-                    if (bits_caustics && wdepth < 14.0 && shadow > 0.05 && s_ndl > 0.06 && sun_strength > 0.05) {
-                        float3 caust_rgb = caustic_pattern_chromatic(seabed_pos.xz, params.frame.x * 0.025, dist, wdepth);
-                        float c_fade = smoothstep(0.10, 0.75, wdepth) * shallow_clear * exp(-dist * 0.014);
-                        refl_col += params.sun_colour.xyz * beer * caust_rgb * (shadow * s_ndl * sun_strength * refract_w * c_fade * 0.24);
-                    }
-                } else {
-                    float3 depth_tint = (beer - float3(1.0, 1.0, 1.0)) * (raster_rgb * 0.26 * refract_w);
-                    refl_col = max(refl_col + depth_tint, float3(0.0, 0.0, 0.0));
-                }
-                // Backlit shallow-water shoreline subsurface turquoise glow.
-                if (wdepth < 4.5 && shadow > 0.05 && sun_strength > 0.05) {
-                    float back_w = saturate(dot(view_dir, params.sun_dir.xyz));
-                    float bw3 = back_w * back_w * back_w;
-                    float shore_w = smoothstep(0.05, 0.55, wdepth) * (1.0 - smoothstep(1.2, 4.5, wdepth));
-                    refl_col += float3(0.12, 0.62, 0.58) * params.sun_colour.xyz * (bw3 * shore_w * shadow * sun_strength * refract_w * 0.45);
-                }
-            }
             accum_reflection += refl_col;
         }
         accum_refl_dist += refl_dist;
@@ -1442,22 +1315,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
     }
 
-    // Feature #2 (Underwater Caustics): Project organic Voronoi sun caustics onto
-    // submerged terrain, rocks, and ruins when beneath the active water plane.
-    float3 underwater_caustics = float3(0.0, 0.0, 0.0);
-    if (bits_caustics && !is_water && water_y > -1e5 && world_pos.y < water_y - 0.05 && fog_t < 0.95 && sun_strength > 0.05) {
-        float sub_depth = water_y - world_pos.y;
-        if (sub_depth < 28.0 && n_dot_l > 0.05) {
-            float uw_vis = bits_shadows ? (accum_shadow / float(samples)) : 1.0;
-            if (uw_vis > 0.05) {
-                float3 caust_rgb = caustic_pattern_chromatic(world_pos.xz, params.frame.x * 0.025, dist, sub_depth);
-                float3 beer = exp(-sub_depth * float3(0.18, 0.07, 0.04));
-                float fade = smoothstep(0.05, 0.50, sub_depth) * exp(-sub_depth * 0.065) * exp(-dist * 0.008);
-                underwater_caustics = params.sun_colour.xyz * beer * caust_rgb * (uw_vis * n_dot_l * sun_strength * fade * 0.85);
-            }
-        }
-    }
-
     // Feature #1: True World-Space Ray-Marched Volumetric God-Rays & Light Shafts.
     // Marches along the 3D camera ray against the DXR TLAS with IGN jitter + SVGF smoothing:
     // near steps use alpha-aware shadow queries so shafts slice through individual tree leaves,
@@ -1546,19 +1403,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
     }
 
-    // Enhancement #18: Colored Indirect Light Bounce from Water Surfaces ("Water-to-Wall" Caustic Bounce)
-    // onto undersides of bridges, piers, ship hulls, and coastal cliffs just above water.
-    if (bits_gi && !is_water && water_y > -1e5 && world_pos.y >= water_y - 0.1 && world_pos.y < water_y + 16.0
-        && normal.y < 0.35 && sun_strength > 0.05 && dist < 85.0)
-    {
-        float h_above = max(world_pos.y - water_y, 0.1);
-        float h_fade = exp(-h_above * 0.18) * (1.0 - saturate(normal.y + 0.15));
-        float caust_b = caustic_pattern(world_pos.xz, params.frame.x * 0.025, dist + 25.0);
-        float w_vis = bits_shadows ? (accum_shadow / float(samples)) : 1.0;
-        underwater_caustics += float3(0.18, 0.68, 0.62) * params.sun_colour.xyz
-            * (caust_b * h_fade * sun_strength * (0.35 + 0.65 * w_vis) * 0.22 * (1.0 - fog_t));
-    }
-
     // Enhancement #3: Subtle, smooth edge-free Volumetric Light Halos around world lanterns/portals
     // (excludes camera light < 3.5u from eye and uses strictly zero-at-boundary cubic falloff).
     if (bits_lighting && pl_count > 0u && dist > 3.0 && fog_t < 0.95) {
@@ -1628,10 +1472,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float pl_w_lit = 0.0;
 
     if (bits_lighting && pl_count > 0u && is_water) {
-        // Water is a glossy dielectric, NEVER a flat matte diffuse sheet: evaluate
-        // rippled specular glints from point/effect lights so night water stays reflective
-        // and textured instead of turning flat grey.
-        float3 w_norm = water_wave_normal(world_pos.xz, params.frame.x * 0.03, dist);
+        // Water is a glossy dielectric: evaluate specular glints from point/effect
+        // lights so water stays reflective. Uses the flat raster normal (native
+        // game water has no animated wave normals).
+        float3 w_norm = shade_normal;
         float3 view_to_eye = -view_dir;
         for (uint li = 0u; li < pl_count; li = li + 1u) {
             float4 pl_pr = params.point_lights_pos_rad[li];
@@ -1930,7 +1774,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float3 bent_normal = (dot(accum_bent_n, accum_bent_n) > 1e-4) ? normalize(accum_bent_n) : normal;
     float3 avg_refl = accum_reflection * inv + god_rays;
     float avg_refl_dist = accum_refl_dist * inv;
-    float3 avg_gi = accum_gi * inv + sss_light + underwater_caustics;
+    float3 avg_gi = accum_gi * inv + sss_light;
 
     // Enhancement #8: Ray-Traced Moonlit Night Sky & Starlight Hemispherical Bounce
     // (open hilltops catch cool silver-blue moonlight; deep shade/alleys stay pitch black).
@@ -2041,6 +1885,67 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float amb_e = max(luma(params.ambient.xyz) * params.tuning.z, 0.05);
         float sun_f = saturate(sun_e / max(sun_e + amb_e, 1e-4));
         out_rgb = float3(sun_f, avg_shadow, sun_f * avg_shadow);
+        out_lf = 1.0;
+        store_refl = float3(0.0, 0.0, 0.0);
+    } else if (debug_mode == 10u) {
+        // Foliage debug: visualise tree/leaf geometry and alpha-mask coverage.
+        //   R = primary hit alpha coverage (1 = solid leaf, 0 = no leaf)
+        //   G = shadow occluder foliage (1 = leaf blocks sun)
+        //   B = reflection-hit foliage (1 = reflection hits leaf)
+        // This reveals which trees have sparse alpha masks (patches) and
+        // whether reflection/shadow rays reach the leaf canopy.
+        float primary_leaf = 0.0;
+        float shadow_leaf = 0.0;
+        float refl_leaf = 0.0;
+
+        // Primary hit: trace the camera ray and check if the hit triangle is
+        // alpha-tested foliage (has a non-zero alpha mask).
+        Hit ph = closest_hit(params.eye.xyz, view_dir, 0.1, params.lens.y, opaque_offset, tri_count);
+        if (ph.index < tri_count) {
+            uint raw_lo = asuint(tris[ph.index].c.w);
+            uint raw_hi = asuint(tris[ph.index].n.w);
+            if ((raw_lo | raw_hi) != 0u) {
+                // Alpha-masked triangle: compute average coverage of the mask.
+                uint lo25 = unpack_alpha_mask25(tris[ph.index].c.w);
+                uint hi24 = unpack_alpha_mask25(tris[ph.index].n.w);
+                // Count set bits across the 49 mask entries.
+                uint total_bits = 0u;
+                for (uint b = 0u; b < 25u; b = b + 1u) {
+                    total_bits += (lo25 >> b) & 1u;
+                }
+                for (uint b = 0u; b < 24u; b = b + 1u) {
+                    total_bits += (hi24 >> b) & 1u;
+                }
+                primary_leaf = saturate(float(total_bits) / 49.0);
+            }
+        }
+
+        // Shadow occluder: check if the sun ray is blocked by a leaf triangle.
+        if (bits_shadows && n_dot_l > 0.02) {
+            Hit sh = closest_hit(world_pos + normal * bias, params.sun_dir.xyz, bias * 0.5, params.lens.y, opaque_offset, tri_count);
+            if (sh.index < tri_count) {
+                uint s_lo = asuint(tris[sh.index].c.w);
+                uint s_hi = asuint(tris[sh.index].n.w);
+                if ((s_lo | s_hi) != 0u) {
+                    shadow_leaf = 1.0;
+                }
+            }
+        }
+
+        // Reflection-hit foliage: check if the reflection ray hits a leaf.
+        if (roughness <= params.effects.x) {
+            float3 rdir = reflect(view_dir, normal);
+            Hit rh = closest_hit(ray_origin, rdir, bias, params.lens.y, opaque_offset, tri_count);
+            if (rh.index < tri_count) {
+                uint r_lo = asuint(tris[rh.index].c.w);
+                uint r_hi = asuint(tris[rh.index].n.w);
+                if ((r_lo | r_hi) != 0u) {
+                    refl_leaf = 1.0;
+                }
+            }
+        }
+
+        out_rgb = float3(primary_leaf, shadow_leaf, refl_leaf);
         out_lf = 1.0;
         store_refl = float3(0.0, 0.0, 0.0);
     }

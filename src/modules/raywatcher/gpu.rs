@@ -92,7 +92,7 @@ pub fn compute_scene_albedo_gain(
 
 impl RayParams {
     /// Effect bits, mirroring [`super::plan::Effects`]:
-    /// 1 shadows, 2 lighting, 4 reflections, 8 AO, 16 GI, 32 refraction.
+    /// 1 shadows, 2 lighting, 4 reflections, 8 AO, 16 GI, 128 cloud shadows.
     pub fn effect_bits(effects: super::plan::Effects) -> u32 {
         let mut bits = 0;
         if effects.shadows {
@@ -109,12 +109,6 @@ impl RayParams {
         }
         if effects.global_illumination {
             bits |= 16;
-        }
-        if effects.refraction {
-            bits |= 32;
-        }
-        if effects.caustics {
-            bits |= 64;
         }
         if effects.cloud_shadows {
             bits |= 128;
@@ -485,7 +479,6 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
     //     reconstructed world point sits on an active water plane (open-sea
     //     horizon where no terrain sits underneath).
     var roughness = 0.92;
-    var water_depth = 0.0;
     var is_water = false;
     let water_count = u32(round(prep.water_count.x));
     if (water_count > 0u) {
@@ -509,13 +502,6 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
         if (is_water) {
             roughness = 0.06;
             n = vec3<f32>(0.0, 1.0, 0.0);
-            // Feature #2: Compute true vertical water depth from pre-water seabed depth.
-            if (z_pre > 1e-6) {
-                let p_seabed = reconstruct_pos(px, z_pre, render);
-                water_depth = clamp(p.y - p_seabed.y, 0.05, 64.0);
-            } else {
-                water_depth = 16.0;
-            }
         }
       }
     }
@@ -545,7 +531,7 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
 
     textureStore(out_pos, vec2<i32>(id.xy), vec4<f32>(p, dist));
     textureStore(out_norm, vec2<i32>(id.xy), vec4<f32>(n, roughness));
-    textureStore(out_raster, vec2<i32>(id.xy), vec4<f32>(raster_rgb, water_depth));
+    textureStore(out_raster, vec2<i32>(id.xy), vec4<f32>(raster_rgb, 0.0));
 }
 "#;
 
@@ -1078,47 +1064,6 @@ fn detail_offscreen_albedo(hit_pos: vec3<f32>, hit_normal: vec3<f32>, base_albed
     return clamp(base_albedo * slab, vec3<f32>(0.02), vec3<f32>(0.95));
 }
 
-fn hash22(p: vec2<f32>) -> vec2<f32> {
-    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * vec3<f32>(0.1031, 0.1030, 0.0973));
-    p3 = p3 + dot(p3, p3.yzx + vec3<f32>(33.33));
-    return fract((p3.xx + p3.yz) * p3.zy);
-}
-
-fn voronoi_ridge(uv: vec2<f32>, t: f32) -> f32 {
-    let n = floor(uv);
-    let f = fract(uv);
-    var d1 = 8.0;
-    var d2 = 8.0;
-    for (var j = -1; j <= 1; j = j + 1) {
-        for (var i = -1; i <= 1; i = i + 1) {
-            let g = vec2<f32>(f32(i), f32(j));
-            var o = hash22(n + g);
-            o = vec2<f32>(0.5) + 0.42 * sin(vec2<f32>(t) + 6.28318 * o);
-            let r = g + o - f;
-            let d = dot(r, r);
-            if (d < d1) {
-                d2 = d1;
-                d1 = d;
-            } else if (d < d2) {
-                d2 = d;
-            }
-        }
-    }
-    let edge = sqrt(d2) - sqrt(d1);
-    let v = smoothstep(0.58, 0.0, edge);
-    return v * v * (0.45 + 0.55 * v);
-}
-
-fn caustic_pattern(xz: vec2<f32>, t: f32, cam_dist: f32) -> f32 {
-    let warp = vec2<f32>(sin(xz.y * 0.27 + t * 0.7), cos(xz.x * 0.23 - t * 0.6)) * 0.45;
-    let c1 = voronoi_ridge((xz + warp) * 0.36 + vec2<f32>(t * 0.22, -t * 0.17), t * 1.15);
-    if (cam_dist > 22.0) {
-        return clamp(c1 * 1.05, 0.0, 1.0);
-    }
-    let c2 = voronoi_ridge((xz - warp * 0.7) * 0.58 + vec2<f32>(-t * 0.19, t * 0.24), t * 0.85);
-    return clamp(c1 * 0.65 + c2 * 0.55, 0.0, 1.0);
-}
-
 fn hg_phase(cos_theta: f32, g: f32) -> f32 {
     let g2 = g * g;
     let denom = max(1.0 + g2 - 2.0 * g * cos_theta, 0.05);
@@ -1225,29 +1170,6 @@ fn trace_contact_shadow(world_pos: vec3<f32>, sun_dir: vec3<f32>, cam_dist: f32,
     return 1.0 - occ * 0.72 * dist_fade;
 }
 
-// Enhancement #12: Subtle animated multi-octave capillary wave normal for living water reflections.
-fn water_wave_normal(xz: vec2<f32>, t: f32, cam_dist: f32) -> vec3<f32> {
-    let amp = 0.028 * exp(-cam_dist * 0.0045);
-    let w1 = sin(xz.x * 0.55 + xz.y * 0.32 + t * 1.45);
-    let w2 = cos(xz.x * 0.38 - xz.y * 0.64 + t * 1.12);
-    let w3 = sin(xz.x * 1.25 + xz.y * 1.05 - t * 2.15) * 0.45;
-    let dx = (w1 * 0.55 + w2 * 0.38 + w3 * 1.25) * amp;
-    let dz = (w1 * 0.32 - w2 * 0.64 + w3 * 1.05) * amp;
-    return normalize(vec3<f32>(-dx, 1.0, -dz));
-}
-
-// Enhancement #11: Chromatic RGB dispersion for shallow sunlit water caustics.
-fn caustic_pattern_chromatic(xz: vec2<f32>, t: f32, cam_dist: f32, depth_w: f32) -> vec3<f32> {
-    let c_g = caustic_pattern(xz, t, cam_dist);
-    if (cam_dist > 34.0 || depth_w > 5.5) {
-        return vec3<f32>(c_g, c_g, c_g);
-    }
-    let disp = 0.032 * (1.0 - clamp(depth_w / 5.5, 0.0, 1.0));
-    let c_r = caustic_pattern(xz + vec2<f32>(disp, disp * 0.6), t, cam_dist + 24.0);
-    let c_b = caustic_pattern(xz - vec2<f32>(disp, disp * 0.6), t, cam_dist + 24.0);
-    return vec3<f32>(mix(c_g, c_r, 0.65), c_g, mix(c_g, c_b, 0.65));
-}
-
 fn kind_colour(kind: f32) -> vec3<f32> {
     if (kind < 0.5) { return vec3<f32>(0.04, 0.04, 0.04); }
     if (kind < 1.5) { return vec3<f32>(0.0, 0.85, 1.0); }   // cyan: water quad
@@ -1283,7 +1205,6 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let roughness = clamp(norm_r.w, 0.04, 1.0);
     let raster_rgba = textureLoad(src_gbuf_raster, ip, 0);
     let raster_rgb = raster_rgba.rgb;
-    let water_depth = raster_rgba.a;
     let view_dir = normalize(point - params.eye.xyz);
     let is_water = roughness <= 0.12;
     let is_glossy_trim = !is_water && roughness <= 0.36;
@@ -1294,8 +1215,6 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let bits_reflections = (effects & 4u) != 0u;
     let bits_ao = (effects & 8u) != 0u;
     let bits_gi = (effects & 16u) != 0u;
-    let bits_refraction = (effects & 32u) != 0u;
-    let bits_caustics = (effects & 64u) != 0u;
     let bits_cloud_shadows = (effects & 128u) != 0u;
     let bits_contact_shadows = (effects & 256u) != 0u;
     let bits_moonlit_night = (effects & 512u) != 0u;
@@ -1444,7 +1363,9 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
 
         var refl_dist = params.lens.y;
         if (bits_reflections && roughness <= params.effects.x) {
-            let refl_base_n = select(normal, water_wave_normal(point.xz, params.frame.x * 0.03, dist), is_water);
+            // Native game water is a flat glossy dielectric: no animated wave
+            // normals. Use the raster normal for both water and non-water surfaces.
+            let refl_base_n = normal;
             let h = ggx_sample(refl_base_n, roughness, next_f32(&state), next_f32(&state));
             var reflect_dir = reflect(view_dir, h);
             if (dot(reflect_dir, refl_base_n) <= 0.0) {
@@ -1488,60 +1409,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             } else {
                 let sky_col = sample_sky_reflection(reflect_dir);
                 refl_col = sky_col * (fresnel * trim_scale * 0.65 * (1.0 - fog_t));
-                // Enhancement #14: Ray-traced sun & moon glitter paths across living water.
-                if (is_water && params.sun_dir.y > 0.02) {
-                    let cos_glint = clamp(dot(reflect_dir, params.sun_dir.xyz), 0.0, 1.0);
-                    let g2 = cos_glint * cos_glint;
-                    let g8 = g2 * g2 * g2 * g2;
-                    let g32 = g8 * g8 * g8 * g8;
-                    let glint = g32 * g32 * 0.95 + g8 * g8 * 0.14;
-                    let glint_col = mix(vec3<f32>(0.55, 0.72, 1.0), params.sun_colour.xyz, sun_strength);
-                    let glint_amp = mix(0.55, 1.35, sun_strength);
-                    refl_col = refl_col + glint_col * (glint * glint_amp * fresnel * (1.0 - fog_t));
-                }
             }
             if (bits_lighting && pl_count > 0u && fog_t < 0.92) {
                 let fx_refl = trace_effect_light_reflections(ray_origin, reflect_dir, eff_max_t, pl_count);
                 refl_col = refl_col + fx_refl * (fresnel * trim_scale * (1.0 - fog_t));
-            }
-            if (is_water && bits_refraction && fog_t < 0.90) {
-                var refract_dir = refract(view_dir, refl_base_n, 1.0 / 1.333);
-                if (dot(refract_dir, refract_dir) < 1e-4) {
-                    refract_dir = normalize(view_dir - vec3<f32>(0.0, 0.25, 0.0));
-                }
-                let refr_origin = point - vec3<f32>(0.0, 0.08, 0.0);
-                let refr_max_t = select(18.0, 36.0, dist < 220.0);
-                let refr_hit = closest_hit(refr_origin, refract_dir, 0.08, refr_max_t);
-                let wdepth = select(select(14.0, water_depth, water_depth > 0.01), max(refr_hit.t * max(-refract_dir.y, 0.25), 0.08), refr_hit.index != 0xffffffffu);
-                let refr_path = select(wdepth / max(-refract_dir.y, 0.25), refr_hit.t, refr_hit.index != 0xffffffffu);
-                let beer = exp(-refr_path * vec3<f32>(0.25, 0.085, 0.042));
-                let refract_w = (1.0 - fresnel) * (1.0 - fog_t);
-                let shallow_clear = exp(-wdepth * 0.14);
-                if (refr_hit.index != 0xffffffffu) {
-                    let seabed_pos = refr_origin + refract_dir * refr_hit.t;
-                    let smat = material_of(refr_hit.index);
-                    let skind = tris[refr_hit.index].a.w;
-                    let s_albedo = select(smat.albedo.rgb, sample_terrain_albedo(seabed_pos, smat.albedo.rgb), skind > 1.5 && skind < 2.5);
-                    let s_ndl = max(dot(refr_hit.normal, params.sun_dir.xyz), 0.0);
-                    let seabed_lit = s_albedo * (params.ambient.xyz * params.tuning.z * 0.85 + params.sun_colour.xyz * (s_ndl * shadow));
-                    let deep_scatter = mix(vec3<f32>(0.01, 0.03, 0.06), vec3<f32>(0.03, 0.14, 0.18), sun_strength);
-                    let refr_col = seabed_lit * beer + deep_scatter * (vec3<f32>(1.0) - beer);
-                    refl_col = refl_col + refr_col * (refract_w * 0.42 * shallow_clear);
-                    if (bits_caustics && wdepth < 14.0 && shadow > 0.05 && s_ndl > 0.06 && sun_strength > 0.05) {
-                        let caust_rgb = caustic_pattern_chromatic(seabed_pos.xz, params.frame.x * 0.025, dist, wdepth);
-                        let c_fade = smoothstep(0.10, 0.75, wdepth) * shallow_clear * exp(-dist * 0.014);
-                        refl_col = refl_col + params.sun_colour.xyz * beer * caust_rgb * (shadow * s_ndl * sun_strength * refract_w * c_fade * 0.24);
-                    }
-                } else {
-                    let depth_tint = (beer - vec3<f32>(1.0)) * (raster_rgb * 0.26 * refract_w);
-                    refl_col = max(refl_col + depth_tint, vec3<f32>(0.0));
-                }
-                if (wdepth < 4.5 && shadow > 0.05 && sun_strength > 0.05) {
-                    let back_w = clamp(dot(view_dir, params.sun_dir.xyz), 0.0, 1.0);
-                    let bw3 = back_w * back_w * back_w;
-                    let shore_w = smoothstep(0.05, 0.55, wdepth) * (1.0 - smoothstep(1.2, 4.5, wdepth));
-                    refl_col = refl_col + vec3<f32>(0.12, 0.62, 0.58) * params.sun_colour.xyz * (bw3 * shore_w * shadow * sun_strength * refract_w * 0.45);
-                }
             }
             accum_reflection = accum_reflection + refl_col;
         }
@@ -1682,21 +1553,6 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Feature #2 (Underwater Caustics): organic Voronoi sun caustics on submerged geometry
-    var underwater_caustics = vec3<f32>(0.0);
-    if (bits_caustics && !is_water && water_y > -1e5 && point.y < water_y - 0.05 && fog_t < 0.95 && sun_strength > 0.05) {
-        let sub_depth = water_y - point.y;
-        if (sub_depth < 28.0 && n_dot_l > 0.05) {
-            let uw_vis = select(1.0, accum_shadow / f32(samples), bits_shadows);
-            if (uw_vis > 0.05) {
-                let caust_rgb = caustic_pattern_chromatic(point.xz, params.frame.x * 0.025, dist, sub_depth);
-                let beer = exp(-sub_depth * vec3<f32>(0.18, 0.07, 0.04));
-                let fade = smoothstep(0.05, 0.50, sub_depth) * exp(-sub_depth * 0.065) * exp(-dist * 0.008);
-                underwater_caustics = params.sun_colour.xyz * beer * caust_rgb * (uw_vis * n_dot_l * sun_strength * fade * 0.85);
-            }
-        }
-    }
-
     // Feature #1: True World-Space Ray-Marched Volumetric God-Rays & Light Shafts.
     var god_rays = vec3<f32>(0.0);
     if (bits_shadows && params.sun_dir.y > 0.04 && dist > 10.0 && fog_t < 0.92) {
@@ -1770,17 +1626,6 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     // Enhancement #18: Water-to-Wall caustic indirect bounce onto bridges, piers & cliffs.
-    if (bits_gi && !is_water && water_y > -1e5 && point.y >= water_y - 0.1 && point.y < water_y + 16.0
-        && normal.y < 0.35 && sun_strength > 0.05 && dist < 85.0)
-    {
-        let h_above = max(point.y - water_y, 0.1);
-        let h_fade = exp(-h_above * 0.18) * (1.0 - clamp(normal.y + 0.15, 0.0, 1.0));
-        let caust_b = caustic_pattern(point.xz, params.frame.x * 0.025, dist + 25.0);
-        let w_vis = select(1.0, accum_shadow / f32(samples), bits_shadows);
-        underwater_caustics = underwater_caustics + vec3<f32>(0.18, 0.68, 0.62) * params.sun_colour.xyz
-            * (caust_b * h_fade * sun_strength * (0.35 + 0.65 * w_vis) * 0.22 * (1.0 - fog_t));
-    }
-
     // Enhancement #3: Subtle, smooth edge-free Volumetric Light Halos (no camera-light orb, no balloon).
     if (bits_lighting && pl_count > 0u && dist > 3.0 && fog_t < 0.95) {
         let dark_fog_w = max(0.45 * (1.0 - sun_strength), fog_t * 0.65);
@@ -1845,7 +1690,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var pl_w_total = 0.0;
     var pl_w_lit = 0.0;
     if (bits_lighting && pl_count > 0u && is_water) {
-        let w_norm = water_wave_normal(point.xz, params.frame.x * 0.03, dist);
+        // Water is a glossy dielectric: evaluate specular glints from point/effect
+        // lights so water stays reflective. Uses the flat raster normal (native
+        // game water has no animated wave normals).
+        let w_norm = normal;
         let view_to_eye = -view_dir;
         for (var li = 0u; li < pl_count; li = li + 1u) {
             let pl_pr = params.point_lights_pos_rad[li];
@@ -2102,7 +1950,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let avg_refl = accum_reflection * inv + god_rays;
     let bent_normal = select(normal, normalize(accum_bent_n), dot(accum_bent_n, accum_bent_n) > 1e-4);
     let avg_refl_dist = accum_refl_dist * inv;
-    var avg_gi = accum_gi * inv + sss_light + underwater_caustics;
+    var avg_gi = accum_gi * inv + sss_light;
 
     // Enhancement #8: Ray-Traced Moonlit Night Sky & Starlight Hemispherical Bounce.
     if (bits_moonlit_night && !is_water && sun_strength < 0.35 && fog_t < 0.94) {
@@ -2208,6 +2056,59 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let amb_e = max(luminance(params.ambient.xyz) * params.tuning.z, 0.05);
         let sun_f = clamp(sun_e / max(sun_e + amb_e, 1e-4), 0.0, 1.0);
         out_rgb = vec3<f32>(sun_f, avg_shadow, sun_f * avg_shadow);
+        out_lf = 1.0;
+        store_refl = vec3<f32>(0.0);
+    } else if (debug_mode == 10u) {
+        // Foliage debug: visualise tree/leaf geometry and alpha-mask coverage.
+        //   R = primary hit alpha coverage (1 = solid leaf, 0 = no leaf)
+        //   G = shadow occluder foliage (1 = leaf blocks sun)
+        //   B = reflection-hit foliage (1 = reflection hits leaf)
+        let mut primary_leaf = 0.0;
+        let mut shadow_leaf = 0.0;
+        let mut refl_leaf = 0.0;
+
+        let ph = closest_hit(params.eye.xyz, view_dir, 0.1, params.lens.y);
+        if (ph.index != 0xffffffffu) {
+            let raw_lo = bitcast<u32>(tris[ph.index].c.w);
+            let raw_hi = bitcast<u32>(tris[ph.index].n.w);
+            if ((raw_lo | raw_hi) != 0u) {
+                let lo25 = unpack_alpha_mask25(tris[ph.index].c.w);
+                let hi24 = unpack_alpha_mask25(tris[ph.index].n.w);
+                var total_bits = 0u;
+                for (var b = 0u; b < 25u; b = b + 1u) {
+                    total_bits = total_bits + ((lo25 >> b) & 1u);
+                }
+                for (var b = 0u; b < 24u; b = b + 1u) {
+                    total_bits = total_bits + ((hi24 >> b) & 1u);
+                }
+                primary_leaf = clamp(f32(total_bits) / 49.0, 0.0, 1.0);
+            }
+        }
+
+        if (bits_shadows && n_dot_l > 0.02) {
+            let sh = closest_hit(point + normal * bias, params.sun_dir.xyz, bias * 0.5, params.lens.y);
+            if (sh.index != 0xffffffffu) {
+                let s_lo = bitcast<u32>(tris[sh.index].c.w);
+                let s_hi = bitcast<u32>(tris[sh.index].n.w);
+                if ((s_lo | s_hi) != 0u) {
+                    shadow_leaf = 1.0;
+                }
+            }
+        }
+
+        if (roughness <= params.effects.x) {
+            let rdir = reflect(view_dir, normal);
+            let rh = closest_hit(ray_origin, rdir, bias, params.lens.y);
+            if (rh.index != 0xffffffffu) {
+                let r_lo = bitcast<u32>(tris[rh.index].c.w);
+                let r_hi = bitcast<u32>(tris[rh.index].n.w);
+                if ((r_lo | r_hi) != 0u) {
+                    refl_leaf = 1.0;
+                }
+            }
+        }
+
+        out_rgb = vec3<f32>(primary_leaf, shadow_leaf, refl_leaf);
         out_lf = 1.0;
         store_refl = vec3<f32>(0.0);
     }

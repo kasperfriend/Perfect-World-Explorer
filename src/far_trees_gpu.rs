@@ -1551,6 +1551,40 @@ impl FarTrees {
             rows.len(),
             max_dist
         );
+        // Aggregate leaf alpha-mask coverage across all nearby species to help
+        // diagnose "patches" in reflections/shadows: sparse masks leave holes.
+        let mut total_leaf_tris = 0usize;
+        let mut total_low_coverage = 0usize;
+        let mut total_zero_coverage = 0usize;
+        for (_, _, _, sp) in &rows {
+            for ld in &sp.lod_diags {
+                let leaf_tris = ld.fixed_3d_leaves + ld.billboard_leaves + ld.frond_tris;
+                total_leaf_tris += leaf_tris;
+            }
+        }
+        for (_, _, _, sp) in &rows {
+            for (li, ld) in sp.lod_diags.iter().enumerate() {
+                if li > 0 { continue; }
+                let leaf_tris = ld.fixed_3d_leaves + ld.billboard_leaves + ld.frond_tris;
+                if leaf_tris > 0 {
+                    // Count triangles with zero alpha coverage (fully transparent
+                    // after mask sampling) — these produce invisible leaf patches.
+                    let zero_cov = ld.leaves_skipped;
+                    total_zero_coverage += zero_cov;
+                    if zero_cov > leaf_tris * 0.3 {
+                        total_low_coverage += 1;
+                    }
+                }
+            }
+        }
+        let _ = writeln!(
+            out,
+            "  [LEAF COVERAGE] total_leaf_tris={} zero_coverage_tris={} ({:.1}%) low_coverage_species={}",
+            total_leaf_tris,
+            total_zero_coverage,
+            if total_leaf_tris > 0 { (total_zero_coverage as f64 / total_leaf_tris as f64) * 100.0 } else { 0.0 },
+            total_low_coverage,
+        );
         for (nearest_d, near_cnt, np, sp) in rows {
             let d0 = sp.lod_diags.first().copied().unwrap_or_default();
             let warn = if d0.frond_tris + d0.fixed_3d_leaves + d0.billboard_leaves == 0 {
@@ -1562,9 +1596,19 @@ impl FarTrees {
             } else {
                 ""
             };
+            let leaf_cov_warn = if d0.leaves_skipped > 0 && (d0.fixed_3d_leaves + d0.billboard_leaves) > 0 {
+                let skip_pct = (d0.leaves_skipped as f64 / (d0.fixed_3d_leaves + d0.billboard_leaves + d0.frond_tris) as f64) * 100.0;
+                if skip_pct > 30.0 {
+                    format!(" [WARN: LEAF_PATCHES_SPARSE_MASK {:.0}%_SKIPPED]", skip_pct)
+                } else {
+                    "".to_string()
+                }
+            } else {
+                "".to_string()
+            };
             let _ = writeln!(
                 out,
-                "  species #{:03}: near_inst={} nearest={:.1}u at=({:.1},{:.1},{:.1}) h={:.1} comp={}x{} alpha=[{}..{}] lods={}{}",
+                "  species #{:03}: near_inst={} nearest={:.1}u at=({:.1},{:.1},{:.1}) h={:.1} comp={}x{} alpha=[{}..{}] lods={}{}{}",
                 sp.species_id,
                 near_cnt,
                 nearest_d,
@@ -1576,6 +1620,7 @@ impl FarTrees {
                 sp.composite_alpha_max,
                 sp.lods.len(),
                 warn,
+                leaf_cov_warn,
             );
             for (li, ld) in sp.lod_diags.iter().enumerate() {
                 let _ = writeln!(
