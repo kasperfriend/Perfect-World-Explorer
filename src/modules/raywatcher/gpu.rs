@@ -62,6 +62,10 @@ pub struct RayParams {
     pub point_lights_col_int: [[f32; 4]; 128],
     /// Top-down real textured terrain albedo map bounds: `[min_x, max_z, inv_diameter, valid]`.
     pub terrain_map_bounds: [f32; 4],
+    /// Previous frame's view-projection matrix, used to reproject GI reservoirs.
+    pub prev_view_projection: [[f32; 4]; 4],
+    /// x=ReSTIR GI enabled, y=max adaptive samples, z=spatial reuse count, w=history ping-pong parity.
+    pub restir: [f32; 4],
 }
 
 /// Maximum active point lights + luminous world effects packed for ReSTIR DI.
@@ -210,6 +214,13 @@ impl RayParams {
             point_lights_pos_rad: pl_pos_rad,
             point_lights_col_int: pl_col_int,
             terrain_map_bounds: [0.0; 4],
+            prev_view_projection: [[0.0; 4]; 4],
+            restir: [
+                if plan.effects.global_illumination { 1.0 } else { 0.0 },
+                4.0,
+                4.0,
+                0.0,
+            ],
         }
     }
 }
@@ -278,6 +289,43 @@ impl DenoiseParams {
             prev_view_projection: (prev_vp * unjittered_inv).to_cols_array_2d(),
         }
     }
+}
+
+/// ReSTIR GI history record. Keep this 4-vec4 / 64-byte layout identical in WGSL and DXR HLSL.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RestirReservoir {
+    /// xyz = sampled secondary position (or sky direction), w = accumulated importance weight.
+    pub sample_pos_weight: [f32; 4],
+    /// rgb = selected multi-bounce radiance, w = represented candidate count (M).
+    pub radiance_m: [f32; 4],
+    /// xyz = previous receiver position, w = selected target density at that receiver.
+    pub receiver_pos_target: [f32; 4],
+    /// xyz = receiver normal, w = sign encodes sky sample (<0) vs surface sample (>0).
+    pub receiver_normal_flags: [f32; 4],
+}
+
+fn create_restir_reservoir_buffer(
+    device: &wgpu::Device,
+    extent: (u32, u32),
+) -> (wgpu::Buffer, bool) {
+    let pixels = u64::from(extent.0.max(1)) * u64::from(extent.1.max(1));
+    let required = pixels
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<RestirReservoir>() as u64);
+    let limits = device.limits();
+    let enabled = required <= u64::from(limits.max_storage_buffer_binding_size)
+        && required <= limits.max_buffer_size;
+    // Keep a harmless non-zero descriptor bound when this adapter cannot fit
+    // the full two-frame history. The shader guards all reservoir accesses.
+    let size = if enabled { required } else { 64 };
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("raywatcher ReSTIR GI reservoirs"),
+        size: size.max(64),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    (buffer, enabled)
 }
 
 /// The scene arrays as the shader sees them.
@@ -572,6 +620,15 @@ struct Params {
     point_lights_pos_rad: array<vec4<f32>, 128>,
     point_lights_col_int: array<vec4<f32>, 128>,
     terrain_map_bounds: vec4<f32>,
+    prev_vp: mat4x4<f32>,
+    restir: vec4<f32>,
+};
+
+struct RestirReservoir {
+    sample_pos_weight: vec4<f32>,
+    radiance_m: vec4<f32>,
+    receiver_pos_target: vec4<f32>,
+    receiver_normal_flags: vec4<f32>,
 };
 
 struct Tri {
@@ -614,6 +671,7 @@ struct Material {
 @group(0) @binding(13) var src_sky_env: texture_2d<f32>;
 @group(0) @binding(14) var src_terrain_map: texture_2d<f32>;
 @group(0) @binding(15) var<storage, read_write> radiance_cache: array<vec4<f32>>;
+@group(0) @binding(16) var<storage, read_write> restir_reservoirs: array<RestirReservoir>;
 
 const PI: f32 = 3.14159265;
 
@@ -2844,6 +2902,16 @@ impl Pipelines {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let denoise_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -3304,6 +3372,8 @@ pub struct RaywatcherGpu {
     compose_uniforms: wgpu::Buffer,
     composite_uniforms: wgpu::Buffer,
     radiance_cache: wgpu::Buffer,
+    restir_reservoirs: wgpu::Buffer,
+    restir_reservoirs_enabled: bool,
     last_scene_albedo_gain: f32,
     filter_colour_tex: [wgpu::Texture; 2],
     filter_moments_tex: [wgpu::Texture; 2],
@@ -3470,6 +3540,8 @@ impl RaywatcherGpu {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let (restir_reservoirs, restir_reservoirs_enabled) =
+            create_restir_reservoir_buffer(device, grid_extent);
 
         let trace_bind_group = Self::trace_bindings(
             device,
@@ -3480,6 +3552,7 @@ impl RaywatcherGpu {
             &sky_env_view,
             &terrain_map_view,
             &radiance_cache,
+            &restir_reservoirs,
         );
         let temporal_bind_groups = [
             Self::temporal_binding(
@@ -3573,6 +3646,8 @@ impl RaywatcherGpu {
             compose_uniforms,
             composite_uniforms,
             radiance_cache,
+            restir_reservoirs,
+            restir_reservoirs_enabled,
             last_scene_albedo_gain: 1.25,
             filter_colour_tex,
             filter_moments_tex,
@@ -3617,6 +3692,7 @@ impl RaywatcherGpu {
         sky_env_view: &wgpu::TextureView,
         terrain_map_view: &wgpu::TextureView,
         radiance_cache: &wgpu::Buffer,
+        restir_reservoirs: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("raywatcher scene"),
@@ -3685,6 +3761,10 @@ impl RaywatcherGpu {
                 wgpu::BindGroupEntry {
                     binding: 15,
                     resource: radiance_cache.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: restir_reservoirs.as_entire_binding(),
                 },
             ],
         })
@@ -3923,6 +4003,11 @@ impl RaywatcherGpu {
         if grid_changed {
             self.grid = GridTargets::new(device, grid_extent.0, grid_extent.1);
             self.grid_extent = grid_extent;
+            let (reservoirs, enabled) = create_restir_reservoir_buffer(device, grid_extent);
+            self.restir_reservoirs = reservoirs;
+            self.restir_reservoirs_enabled = enabled;
+            self.prev_view_projection = None;
+            self.frames = 0;
             if let Some(dxr) = self.dxr.as_mut() {
                 if let Err(err) = dxr.resize(device, self.grid_extent) {
                     eprintln!("[Raywatcher] DXR resize failed ({err}); falling back to Software");
@@ -3942,6 +4027,7 @@ impl RaywatcherGpu {
                 &self.sky_env_view,
                 &self.terrain_map_view,
                 &self.radiance_cache,
+                &self.restir_reservoirs,
             );
             self.temporal_bind_groups = [
                 Self::temporal_binding(
@@ -4042,6 +4128,7 @@ impl RaywatcherGpu {
             &self.sky_env_view,
             &self.terrain_map_view,
             &self.radiance_cache,
+            &self.restir_reservoirs,
         );
         self.temporal_bind_groups = [
             Self::temporal_binding(
@@ -4144,6 +4231,8 @@ impl RaywatcherGpu {
     pub fn set_scene(&mut self, device: &wgpu::Device, scene: Arc<super::bvh::SceneGeometry>) {
         self.scene_geom = scene.clone();
         self.scene = SceneBuffers::upload(device, scene);
+        self.prev_view_projection = None;
+        self.frames = 0;
         if let Some(dxr) = self.dxr.as_mut() {
             if let Err(err) = dxr.set_scene(&self.scene_geom) {
                 eprintln!("[Raywatcher] DXR acceleration structure rebuild failed ({err}); falling back to Software");
@@ -4160,6 +4249,7 @@ impl RaywatcherGpu {
             &self.sky_env_view,
             &self.terrain_map_view,
             &self.radiance_cache,
+            &self.restir_reservoirs,
         );
     }
 
@@ -4325,6 +4415,23 @@ impl RaywatcherGpu {
             ],
             point_lights,
         );
+        packed.prev_view_projection = self
+            .prev_view_projection
+            .unwrap_or(unjittered_vp)
+            .to_cols_array_2d();
+        packed.frame[3] = if self.frames > 0 && self.prev_view_projection.is_some() {
+            1.0
+        } else {
+            0.0
+        };
+        packed.restir[0] = if self.restir_reservoirs_enabled && plan.effects.global_illumination {
+            1.0
+        } else {
+            0.0
+        };
+        packed.restir[1] = 4.0;
+        packed.restir[2] = 4.0;
+        packed.restir[3] = (self.frames & 1) as f32;
         if has_object_mv {
             packed.effects[1] = (packed.effects[1] as u32 | 2048u32) as f32;
         }

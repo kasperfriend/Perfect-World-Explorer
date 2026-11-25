@@ -354,6 +354,32 @@ pub fn composite_layered(
     (raster * light_factor + gi + point_lights + reflection).max(Vec3::ZERO)
 }
 
+/// Adaptive per-pixel sample budget shared with the shader's G-buffer complexity heuristic.
+/// Edges, close receivers and glossy surfaces receive more rays; flat distant surfaces
+/// stay at the configured minimum.
+pub fn adaptive_ray_samples(
+    base: u32,
+    max_samples: u32,
+    distance: f32,
+    normal_edge: f32,
+    depth_edge: f32,
+    colour_edge: f32,
+    roughness: f32,
+) -> u32 {
+    let base = base.clamp(1, 8);
+    let max_samples = max_samples.clamp(base, 8);
+    if max_samples == base {
+        return base;
+    }
+    let mut complexity = (normal_edge.max(0.0) * 2.0)
+        .max(depth_edge.max(0.0) * 5.0)
+        .max(colour_edge.max(0.0) * 2.0);
+    complexity = complexity.max((1.0 - distance.max(0.0) / 320.0).clamp(0.0, 1.0) * 0.20);
+    complexity = complexity.max(((0.36 - roughness) / 0.36).clamp(0.0, 1.0) * 0.20);
+    let extra = (complexity.clamp(0.0, 1.0) * (max_samples - base) as f32).ceil() as u32;
+    (base + extra).clamp(base, max_samples)
+}
+
 /// The sun, as the ray pass needs it: a *position* far away (for the shadow
 /// ray's angular size) and a radiance.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -644,6 +670,18 @@ mod tests {
 
     fn lighting() -> LightingRecord {
         LightingRecord::default()
+    }
+
+    #[test]
+    fn adaptive_ray_budget_spends_more_samples_on_complex_nearby_surfaces() {
+        let flat = adaptive_ray_samples(1, 4, 800.0, 0.0, 0.0, 0.0, 0.9);
+        let edge = adaptive_ray_samples(1, 4, 12.0, 0.8, 0.6, 0.7, 0.9);
+        let glossy = adaptive_ray_samples(1, 4, 20.0, 0.0, 0.0, 0.0, 0.04);
+        assert_eq!(flat, 1);
+        assert!(edge > flat && edge <= 4);
+        assert!(glossy > flat && glossy <= 4);
+        assert_eq!(adaptive_ray_samples(3, 2, 1.0, 1.0, 1.0, 1.0, 0.0), 3);
+        assert_eq!(adaptive_ray_samples(1, 4, 1.0, 1.0, 1.0, 1.0, 0.0), 4);
     }
 
     #[test]
