@@ -2986,7 +2986,7 @@ impl Renderer {
         self.last_sky_frame = Some((frame, main_sets));
         self.sky
             .update(&self.queue, direction, w, h, frame, main_sets, false);
-        if camera.water_reflections && !self.raywatcher_overrides.reflection_pass {
+        if camera.water_reflections {
             self.sky
                 .update(&self.queue, direction, w, h, frame, reflected_sets, true);
         }
@@ -4955,20 +4955,20 @@ impl Renderer {
                     w as f32,
                     h as f32,
                     camera.far,
-                    if camera.water_reflections && !self.raywatcher_overrides.reflection_pass {
+                    if camera.water_reflections {
                         1.
                     } else {
                         0.
                     },
                 ],
                 animation: [
-                    crate::water_gpu::normal_frame_index(frame.elapsed64) as f32,
+                    crate::water_gpu::normal_phase(frame.elapsed64),
                     camera.underwater_fog.end,
                     0.,
                     crate::water_gpu::normal_offset_angle(frame.elapsed64),
                 ],
                 edge_mode: [
-                    if camera.water_reflections && !self.raywatcher_overrides.reflection_pass {
+                    if camera.water_reflections {
                         1.
                     } else {
                         0.
@@ -5123,9 +5123,7 @@ impl Renderer {
         // this copy can never be read: the only frame that needs it is one with
         // reflections off, where no per-plane pass runs and the surface still
         // samples the refraction by screen UV.
-        let raster_water_reflections =
-            camera.water_reflections && !self.raywatcher_overrides.reflection_pass;
-        if !raster_water_reflections
+        if !camera.water_reflections
             && self
                 .water_batches
                 .iter()
@@ -5133,7 +5131,7 @@ impl Renderer {
         {
             self.water.copy_scene_to_refraction(&mut e);
         }
-        if use_post || self.raywatcher_frame_plan.trace {
+        if use_post {
             self.water.copy_depth(&mut e, &self.depth);
         }
         self.water.blit(&mut e, scene_target);
@@ -5193,7 +5191,7 @@ impl Renderer {
                 );
             });
         }
-        if !camera.water_reflections || self.raywatcher_overrides.reflection_pass {
+        if !camera.water_reflections {
             let mut e = self.device.create_command_encoder(&Default::default());
             for batch in &visible {
                 if batch.simple {
