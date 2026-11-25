@@ -706,6 +706,7 @@ mod imp {
         /// Two-frame ReSTIR GI reservoir history, shared with the DXR compute shader at u6.
         restir_reservoirs: RawBuffer,
         restir_reservoirs_enabled: bool,
+        restir_history_valid: bool,
         targets: DxrTargets,
         /// Opt #22: Reusable grow-only DXR AS scratch buffer (avoids per-rebuild WDDM allocs).
         reusable_scratch: Option<(u64, RawBuffer)>,
@@ -844,6 +845,7 @@ mod imp {
                 radiance_cache,
                 restir_reservoirs,
                 restir_reservoirs_enabled,
+                restir_history_valid: false,
                 targets,
                 reusable_scratch,
                 reusable_instance_desc,
@@ -1865,6 +1867,11 @@ mod imp {
             Ok(())
         }
 
+        /// Invalidate temporal ReSTIR history when the renderer switches tracing backends.
+        pub fn invalidate_restir_history(&mut self) {
+            self.restir_history_valid = false;
+        }
+
         pub fn resize(
             &mut self,
             device: &wgpu::Device,
@@ -1890,6 +1897,7 @@ mod imp {
                     d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )?
             };
+            self.restir_history_valid = false;
             self.write_target_descriptors();
             Ok(())
         }
@@ -1913,6 +1921,11 @@ mod imp {
                 let mut dxr_params = *params;
                 dxr_params.fog[3] = self.scene.opaque_tri_count as f32;
                 dxr_params.restir[0] = if self.restir_reservoirs_enabled { 1.0 } else { 0.0 };
+                dxr_params.frame[3] = if self.restir_history_valid && params.frame[3] > 0.5 {
+                    1.0
+                } else {
+                    0.0
+                };
                 self.cbvs[slot_idx].write_upload(bytemuck::bytes_of(&dxr_params))?;
                 let list = self.ring.slot_mut(slot_idx).list.as_mut_ptr();
 
@@ -2030,6 +2043,7 @@ mod imp {
 
                 self.ring.retire(slot_idx, &self.raw_queue, "DXR-Trace")?;
             }
+            self.restir_history_valid = self.restir_reservoirs_enabled;
 
             let copy_extent = wgpu::Extent3d {
                 width: w.min(self.targets.extent.0).min(dst_colour.width()),

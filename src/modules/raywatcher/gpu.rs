@@ -3552,6 +3552,8 @@ pub struct RaywatcherGpu {
     frames: u32,
     /// Whether the last frame dispatched the trace pass.
     pub traced_last_frame: bool,
+    /// Actual backend used for the previous traced frame; switching backends invalidates GI history.
+    last_traced_hardware: Option<bool>,
 }
 
 impl RaywatcherGpu {
@@ -3798,6 +3800,7 @@ impl RaywatcherGpu {
             prev_view_projection: None,
             frames: 0,
             traced_last_frame: false,
+            last_traced_hardware: None,
         }
     }
 
@@ -4398,6 +4401,16 @@ impl RaywatcherGpu {
             self.traced_last_frame = false;
             return;
         }
+        if self
+            .last_traced_hardware
+            .is_some_and(|previous| previous != hardware_mode)
+        {
+            self.frames = 0;
+            self.prev_view_projection = None;
+            if let Some(dxr) = self.dxr.as_mut() {
+                dxr.invalidate_restir_history();
+            }
+        }
         // Copy hardware depth FIRST so both the 1:1 G-buffer prep pass and the
         // denoiser/DLSS RR consume the exact raster depth from the world pass.
         // WebGPU/wgpu requires depth-texture copies to cover the ENTIRE source
@@ -4629,6 +4642,7 @@ impl RaywatcherGpu {
             );
         }
         self.frames = self.frames.saturating_add(1);
+        self.last_traced_hardware = Some(traced_hw);
         self.traced_last_frame = true;
     }
 
