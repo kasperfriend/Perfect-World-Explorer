@@ -140,9 +140,11 @@ pub struct DataFileInfo {
     /// `elements.data`'s structured header, when this row is that file. Parsed
     /// once so the scan does not read the file twice.
     pub header: Option<ElementsHeader>,
-    /// Raw header word as read (u16 or u32 depending on the file).
+    /// Raw header word as read (u16 or u32 depending on the file). The
+    /// `elements.data` value includes its family marker; it is not the
+    /// human-readable version.
     pub raw: Option<u32>,
-    /// Human-readable version, e.g. `v27 (0x3000001b)`.
+    /// Human-readable version label, e.g. `v27`, without the family marker.
     pub version: Option<String>,
     /// Extra header fields worth printing (`timestamp`, `count`, ...).
     pub detail: Option<String>,
@@ -200,8 +202,9 @@ impl ElementsHeader {
         self.short as u32
     }
 
-    /// The version word in canonical form (`0x3000_001b` for v27) — the
-    /// constant the Librarian/Designer readers compare against.
+    /// The complete header word (`0x3000_001b` for the v27 layout),
+    /// preserved for layout checks and tooling; it is not the displayed
+    /// version label.
     pub fn canonical(self) -> u32 {
         self.word
     }
@@ -213,8 +216,10 @@ impl ElementsHeader {
         self.word == 0x3000_001b
     }
 
+    /// The version label contains only the revision number; the family
+    /// marker is header metadata, not part of the version.
     pub fn describe(self) -> String {
-        format!("v{} ({:#010x})", self.version(), self.canonical())
+        format!("v{}", self.version())
     }
 }
 
@@ -415,7 +420,7 @@ impl Scan {
     }
 
     /// The three version rows the launcher card draws, and only those: the game
-    /// build, the `tasks.data` revision, and the `elements.data` revision.
+    /// build, then the `elements.data` revision, then the `tasks.data` revision.
     ///
     /// The card has four 14-pixel rows in a fixed-height panel, so a fourth row
     /// used to paint over the buttons below it; the archive tally and the extra
@@ -435,7 +440,6 @@ impl Scan {
         });
         vec![
             ("game".into(), self.game_version()),
-            ("tasks".into(), tasks.unwrap_or_else(|| "absent".into())),
             (
                 "elements".into(),
                 elements.unwrap_or_else(|| match self.elements.as_ref() {
@@ -446,6 +450,7 @@ impl Scan {
                     None => "absent".into(),
                 }),
             ),
+            ("tasks".into(), tasks.unwrap_or_else(|| "absent".into())),
         ]
     }
 
@@ -1750,7 +1755,7 @@ mod tests {
         assert_eq!(header.family(), 0x3000);
         assert_eq!(header.canonical(), 0x3000_001b);
         assert!(header.is_v27_layout());
-        assert_eq!(header.describe(), "v27 (0x3000001b)");
+        assert_eq!(header.describe(), "v27");
         assert_eq!(header.timestamp, 0x4b39_c931);
     }
 
@@ -1963,7 +1968,7 @@ mod tests {
         assert!(scan.readable_map.is_some());
         let elements = scan.elements.as_ref().expect("elements.data");
         assert_eq!(elements.raw, Some(0x3000_001b));
-        assert_eq!(elements.version.as_deref(), Some("v27 (0x3000001b)"));
+        assert_eq!(elements.version.as_deref(), Some("v27"));
         let tasks = scan
             .data_files
             .iter()
@@ -1979,11 +1984,11 @@ mod tests {
         // a 1.4.2 client can sit beside v27/v75 or v29/v78.
         assert_eq!(
             scan.data_versions(),
-            (Some("v27 (0x3000001b)".into()), Some("v75".into()))
+            (Some("v27".into()), Some("v75".into()))
         );
         assert_eq!(
             scan.data_version_summary(),
-            "elements.data v27 (0x3000001b) / tasks.data v75"
+            "elements.data v27 / tasks.data v75"
         );
         assert!(scan.headline().contains("v27"));
         assert!(scan.headline().contains("v75"));
@@ -1993,10 +1998,10 @@ mod tests {
             rows.iter()
                 .map(|(label, _)| label.as_str())
                 .collect::<Vec<_>>(),
-            vec!["game", "tasks", "elements"]
+            vec!["game", "elements", "tasks"]
         );
-        assert_eq!(rows[1].1, "v75");
-        assert!(rows[2].1.contains("v27"));
+        assert_eq!(rows[1].1, "v27");
+        assert_eq!(rows[2].1, "v75");
         // Nothing else may share the card; the archive tally stays in the report.
         assert!(!rows.iter().any(|(_, value)| value.contains("archives")));
         fs::remove_dir_all(root).unwrap();
@@ -2008,7 +2013,7 @@ mod tests {
         let scan = scan(&root);
         let report = scan.report();
         let pair = report
-            .find("pair      elements.data v27 (0x3000001b) / tasks.data v75")
+            .find("pair      elements.data v27 / tasks.data v75")
             .unwrap_or_else(|| panic!("pair line missing from:\n{report}"));
         let elements = report.find("elements.data    v27").expect("elements line");
         let tasks = report.find("tasks.data       v75").expect("tasks line");
@@ -2025,7 +2030,7 @@ mod tests {
         assert!(scan.loadable(), "{}", scan.report());
         assert_eq!(
             scan.data_versions(),
-            (Some("v27 (0x3000001b)".into()), None)
+            (Some("v27".into()), None)
         );
         assert!(scan.data_version_summary().contains("tasks.data absent"));
         fs::remove_dir_all(root).unwrap();
@@ -2040,11 +2045,11 @@ mod tests {
         assert!(scan.loadable(), "{}", scan.report());
         assert_eq!(
             scan.data_versions(),
-            (Some("v29 (0x3000001d)".into()), Some("v78".into()))
+            (Some("v29".into()), Some("v78".into()))
         );
         assert_eq!(
             scan.data_version_summary(),
-            "elements.data v29 (0x3000001d) / tasks.data v78"
+            "elements.data v29 / tasks.data v78"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -2056,7 +2061,7 @@ mod tests {
         assert!(scan.loadable(), "{}", scan.report());
         let elements = scan.elements.as_ref().expect("elements.data");
         assert_eq!(elements.raw, Some(0x3000_001d));
-        assert_eq!(elements.version.as_deref(), Some("v29 (0x3000001d)"));
+        assert_eq!(elements.version.as_deref(), Some("v29"));
         assert!(
             scan.notes
                 .iter()

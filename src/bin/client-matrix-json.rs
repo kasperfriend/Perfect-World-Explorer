@@ -261,7 +261,7 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
                     cells.push(Cell::ok(
                         "elements data",
                         format!(
-                            "v{} (family {:#06x}), timestamp {:#010x}",
+                            "v{}; family {:#06x}; timestamp {:#010x}",
                             h.version(),
                             h.family(),
                             h.timestamp

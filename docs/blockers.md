@@ -1557,7 +1557,7 @@ file.
   destination is now 3 units above the terrain rather than 30 above y=0.
 - **Launcher card overflow + auto-launch.** The card had four version rows in a
   96-pixel panel, so the fourth row painted over the buttons; it now draws
-  exactly the three requested versions (game, tasks, elements) in a 104-pixel
+  exactly the three requested versions (game, elements, tasks) in a 104-pixel
   panel. `summary_rows` returns exactly those three. Selecting a folder armed
   `SetTimer(hwnd, 1, 1800, …)` and launched on `WM_TIMER`; both are gone, so only
   the **Enter world** button (id 102) launches. Guarded by

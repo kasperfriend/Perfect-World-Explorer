@@ -25,7 +25,7 @@ pub fn unsupported_layout(version: u32) -> String {
         );
     }
     format!(
-        "elements.data is v{number} (0x{version:08x}), not the v27 layout this build reads; \
+        "elements.data is v{number}, not the v27 layout this build reads; \
          the face and equipment tables are version-specific and are not guessed"
     )
 }
@@ -1176,6 +1176,10 @@ mod tests {
         };
         assert!(error.contains("v29"), "{error}");
         assert!(error.contains("not the v27 layout"), "{error}");
+        assert!(
+            !error.contains("0x3000"),
+            "family marker is not part of the version: {error}"
+        );
         // A file that is not an elements file at all is distinguished from a
         // different revision of one.
         let error = match Catalog::parse_v27(&0x2000_001bu32.to_le_bytes()) {

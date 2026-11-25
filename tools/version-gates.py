@@ -115,7 +115,7 @@ def render(label, counter, total):
             # is the exact mistake `unsupported_layout` was written to avoid.
             print(
                 f"    family 0x{version >> 16:04x}  version {version & 0xffff:<6} "
-                f"0x{version:08x}  x{count}"
+                f"header 0x{version:08x}  x{count}"
             )
         elif isinstance(version, int):
             print(f"    version {version:<6} 0x{version:08x}  x{count}")

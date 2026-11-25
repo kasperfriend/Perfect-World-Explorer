@@ -2,11 +2,10 @@
 
 const ELEMENTS_V27: u32 = 0x3000_001b;
 
-/// Why a file cannot be read as the v27 layout: which version it says it is,
-/// and how that differs from v27. The header packs the family marker in the
-/// high half and the version number in the low half (`0x3000_001b` is v27),
-/// so a different release is named by its own number rather than reported as
-/// a bare hex word.
+/// Why a file cannot be read as the v27 layout: the version number is the low
+/// half of the header, while the high half is a separate family marker. A
+/// different release is named by its own revision (v29, for example), not by
+/// appending the complete header word to the displayed version.
 pub(crate) fn unsupported_layout(version: u32) -> String {
     let number = version & 0xffff;
     let family = version >> 16;
@@ -20,7 +19,7 @@ pub(crate) fn unsupported_layout(version: u32) -> String {
         );
     }
     format!(
-        "elements.data is v{number} (0x{version:08x}), not the v27 layout this build reads; \
+        "elements.data is v{number}, not the v27 layout this build reads; \
          the record tables are version-specific and are not guessed"
     )
 }

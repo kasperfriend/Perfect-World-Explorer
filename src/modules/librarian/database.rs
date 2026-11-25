@@ -287,6 +287,10 @@ mod tests {
         };
         assert!(error.contains("v26"), "{error}");
         assert!(error.contains("not the v27 layout"), "{error}");
+        assert!(
+            !error.contains("0x3000"),
+            "family marker is not part of the version: {error}"
+        );
         let mut data = 0x3000_001bu32.to_le_bytes().to_vec();
         data.extend_from_slice(&0u32.to_le_bytes());
         data.extend_from_slice(&u32::MAX.to_le_bytes());

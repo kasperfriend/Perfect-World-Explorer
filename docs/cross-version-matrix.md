@@ -37,9 +37,11 @@ the same readers the application uses — no probe code is duplicated.
 | water areas | — | — | — | a37: 3 | a07: 1 |
 
 A dash means that file was not staged in the measured corpus, **not** that the
-reader fails on it. `elements.data`/`tasks.data` rows are the version words the
-files declare, which is all the Librarian and Character Designer need to report
-honestly; those sections read the v27 layout and stop on anything else.
+reader fails on it. `elements.data`/`tasks.data` rows are the revisions declared
+in their headers. For `elements.data`, the displayed version is the low 16-bit
+revision (for example, v27); the full header word also carries a separate family
+marker. The Librarian and Character Designer report that revision honestly,
+then read the v27 layout and stop on anything else.
 
 ### Package revisions
 

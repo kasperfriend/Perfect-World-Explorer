@@ -713,7 +713,7 @@ pub unsafe fn paint(hwnd: Handle) {
         );
         // Client status card: low-contrast border and inset dark panel. It is
         // sized for the identity line, the folder path and exactly three version
-        // rows (game, tasks, elements), which end 40 pixels above the card's
+        // rows (game, elements, tasks), which end 40 pixels above the card's
         // bottom edge so nothing is clipped or painted over the buttons.
         rect(dc, 54, 252, 397, 104, rgb(56, 94, 100));
         rect(dc, 55, 253, 395, 102, rgb(14, 36, 44));
@@ -755,9 +755,9 @@ pub unsafe fn paint(hwnd: Handle) {
             compact(&s.path)
         };
         text(dc, 70, 283, &desc, 12, 400, rgb(190, 209, 210));
-        // Version rows: the game build, then the two data revisions that move
-        // independently of it. They are what makes a client other than the
-        // inspected 1.4.2 legible instead of "unknown".
+        // Version rows: the game build, then the elements.data and tasks.data
+        // revisions in that order. They move independently of the executable
+        // and make clients other than inspected 1.4.2 legible.
         let mut y = 306;
         for (label, value) in s.rows.iter().take(3) {
             let line = if value.is_empty() {
