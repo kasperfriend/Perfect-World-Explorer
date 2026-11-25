@@ -356,27 +356,23 @@ pub struct GbufPrepParams {
     pub water_heights: [[f32; 4]; 4],
 }
 
-/// CPU mirror of [`GBUF_PREP_SHADER`]'s reversed-Z water-vs-land roughness
-/// classification (`0.06` on water, `0.92` on matte land).
+/// CPU mirror of [`GBUF_PREP_SHADER`]'s plane-and-height water classification
+/// (`0.06` on native water, `0.92` on matte land).
 pub fn classify_surface_roughness(
-    z: f32,
-    z_pre: f32,
+    normal: glam::Vec3,
     world_pos: glam::Vec3,
     water: &[super::harvest::WaterSurface],
 ) -> f32 {
-    if water.is_empty() || z <= 1e-6 || z <= z_pre + 1e-6 {
+    if water.is_empty() || normal.y <= 0.985 {
         return 0.92;
-    }
-    if z_pre > 1e-6 {
-        return 0.06;
     }
     for w in water.iter().take(16) {
         let [x0, x1, z0, z1] = w.bounds;
-        if world_pos.x >= x0 - 1.0
-            && world_pos.x <= x1 + 1.0
-            && world_pos.z >= z0 - 1.0
-            && world_pos.z <= z1 + 1.0
-            && (world_pos.y - w.height).abs() <= 1.0
+        if world_pos.x >= x0
+            && world_pos.x <= x1
+            && world_pos.z >= z0
+            && world_pos.z <= z1
+            && (world_pos.y - w.height).abs() < 0.15
         {
             return 0.06;
         }
@@ -434,7 +430,6 @@ struct PrepParams {
 @group(0) @binding(3) var out_pos: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(4) var out_norm: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var out_raster: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(6) var src_pre_water_depth: texture_depth_2d;
 
 fn reconstruct_pos(px: vec2<i32>, z: f32, render: vec2<f32>) -> vec3<f32> {
     let uv = (vec2<f32>(px) + vec2<f32>(0.5)) / render;
@@ -529,41 +524,23 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Phase R1: Only actual water pixels become glossy (`roughness = 0.06`).
-    // Land pixels stay matte (`0.92`) with their depth-reconstructed normal.
-    // A pixel qualifies as water only when:
-    //  1) The scene has at least one water plane (`prep.water_count.x >= 0.5`),
-    //  2) The post-water reversed-Z depth is strictly closer than the pre-water
-    //     opaque depth (`z > z_pre + 1e-6`), and
-    //  3) Either real opaque depth exists behind it (`z_pre > 1e-6`) or the
-    //     reconstructed world point sits on an active water plane (open-sea
-    //     horizon where no terrain sits underneath).
+    // Native water remains a flat raster surface. Identify it using the
+    // active water plane footprint and height, without a second depth pass.
     var roughness = 0.92;
-    var is_water = false;
-    let water_count = u32(round(prep.water_count.x));
-    if (water_count > 0u) {
-      let z_pre = textureLoad(src_pre_water_depth, px, 0);
-      if (z > z_pre + 1e-6) {
-        is_water = z_pre > 1e-6;
-        if (!is_water) {
-            let n_planes = min(water_count, 16u);
-            for (var wi = 0u; wi < n_planes; wi = wi + 1u) {
-                let b = prep.water_planes[wi];
-                let wh = prep.water_heights[wi / 4u][wi % 4u];
-                if (p.x >= b.x - 1.0 && p.x <= b.y + 1.0
-                    && p.z >= b.z - 1.0 && p.z <= b.w + 1.0
-                    && abs(p.y - wh) <= 1.0)
-                {
-                    is_water = true;
-                    break;
-                }
+    let water_count = min(u32(prep.water_count.x), 16u);
+    if (n.y > 0.985) {
+        for (var wi = 0u; wi < water_count; wi = wi + 1u) {
+            let bounds = prep.water_planes[wi];
+            let height = prep.water_heights[wi / 4u][wi % 4u];
+            if (p.x >= bounds.x && p.x <= bounds.y
+                && p.z >= bounds.z && p.z <= bounds.w
+                && abs(p.y - height) < 0.15)
+            {
+                roughness = 0.06;
+                n = vec3<f32>(0.0, 1.0, 0.0);
+                break;
             }
         }
-        if (is_water) {
-            roughness = 0.06;
-            n = vec3<f32>(0.0, 1.0, 0.0);
-        }
-      }
     }
 
     // Feature #3: Ultra-conservative calibrated glossy reflection mask.
@@ -1455,10 +1432,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         fog_t = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
     }
 
-    let water_y = params.eye.w;
-    let is_submerged = (water_y > -1e5) && (params.eye.y < water_y - 0.05);
     let debug_mode_early = u32(round(params.counts.w));
-    if (fog_t >= 0.99 && layered && debug_mode_early == 0u && !is_submerged) {
+    if (fog_t >= 0.99 && layered && debug_mode_early == 0u) {
         textureStore(out_colour, ip, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         textureStore(out_guide, ip, vec4<f32>(1.0, 1.0, dist, 1.0));
         textureStore(out_reflection, ip, vec4<f32>(0.0, 0.0, 0.0, 1.0));
@@ -1828,42 +1803,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Enhancement #2: Ray-Traced Underwater Volumetric Sun/Moon Shafts & Scatter when submerged.
-    if (bits_shadows && water_y > -1e5 && params.sun_dir.y > 0.03
-        && (is_submerged || point.y < water_y - 0.15) && dist > 1.5)
-    {
-        let uw_march = min(dist, 60.0) - 0.5;
-        if (uw_march > 1.0) {
-            var uw_lit = 0.0;
-            var uw_occ = 0.0;
-            let t_anim = params.frame.x * 0.032;
-            for (var ui = 0u; ui < 6u; ui = ui + 1u) {
-                let u = (f32(ui) + ign_v) / 6.0;
-                let t_u = 0.5 + u * uw_march;
-                let p_u = params.eye.xyz + view_dir * t_u;
-                if (p_u.y >= water_y) {
-                    continue;
-                }
-                if (occluded(p_u, params.sun_dir.xyz, 0.4, 220.0, state ^ (ui * 41u))) {
-                    uw_occ = uw_occ + 1.0;
-                } else {
-                    let d_sub = max(water_y - p_u.y, 0.05);
-                    let w1 = sin(p_u.x * 0.42 + p_u.z * 0.36 + t_anim);
-                    let w2 = cos(p_u.x * 0.29 - p_u.z * 0.51 - t_anim * 0.8);
-                    let wave_focus = 0.45 + 0.55 * clamp(0.5 + 0.5 * w1 * w2, 0.0, 1.0);
-                    uw_lit = uw_lit + exp(-d_sub * 0.045) * wave_focus;
-                }
-            }
-            let uw_vis = uw_lit / 6.0;
-            let uw_phase = 0.55 + 0.45 * clamp(dot(view_dir, params.sun_dir.xyz), 0.0, 1.0);
-            let uw_contrast = mix(0.55, 1.0, smoothstep(0.05, 0.35, uw_occ / 6.0));
-            let day_uw = vec3<f32>(0.22, 0.78, 0.86) * max(params.sun_colour.xyz, vec3<f32>(0.4));
-            let night_uw = vec3<f32>(0.06, 0.16, 0.28);
-            let uw_tint = mix(night_uw, day_uw, sun_strength);
-            let uw_gain = select(0.18, 0.34, is_submerged);
-            god_rays = god_rays + uw_tint * (uw_vis * uw_phase * uw_contrast * uw_gain * (1.0 - fog_t * 0.25));
-        }
-    }
+
 
     // Enhancement #18: Water-to-Wall caustic indirect bounce onto bridges, piers & cliffs.
     // Enhancement #3: Subtle, smooth edge-free Volumetric Light Halos (no camera-light orb, no balloon).
@@ -1929,47 +1869,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var pl_debug_shadow = 0.0;
     var pl_w_total = 0.0;
     var pl_w_lit = 0.0;
-    if (bits_lighting && pl_count > 0u && is_water) {
-        // Water is a glossy dielectric: evaluate specular glints from point/effect
-        // lights so water stays reflective. Uses the flat raster normal (native
-        // game water has no animated wave normals).
-        let w_norm = normal;
-        let view_to_eye = -view_dir;
-        for (var li = 0u; li < pl_count; li = li + 1u) {
-            let pl_pr = params.point_lights_pos_rad[li];
-            let to_l = pl_pr.xyz - point;
-            if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
-                continue;
-            }
-            if (to_l.y < -2.0) {
-                continue;
-            }
-            let pl_d2 = dot(to_l, to_l);
-            if (pl_d2 <= 1e-6 || pl_d2 >= pl_pr.w * pl_pr.w) {
-                continue;
-            }
-            let pl_dist = sqrt(pl_d2);
-            let atten = point_light_falloff(pl_dist, pl_pr.w);
-            if (atten <= 1e-5) {
-                continue;
-            }
-            let l_dir = to_l / pl_dist;
-            let h_vec = normalize(l_dir + view_to_eye);
-            let ndh = clamp(dot(w_norm, h_vec), 0.0, 1.0);
-            let ndh2 = ndh * ndh;
-            let ndh4 = ndh2 * ndh2;
-            let ndh8 = ndh4 * ndh4;
-            let spec = ndh8 * ndh8 * ndh8 * 0.85 + ndh4 * 0.04;
-            let pl_ci = params.point_lights_col_int[li];
-            point_lighting = point_lighting + pl_ci.rgb * (pl_ci.w * atten * spec);
-        }
-        let wp = max(point_lighting.r, max(point_lighting.g, point_lighting.b));
-        if (wp > 0.9) {
-            let wc = 0.9 + (wp - 0.9) / (1.0 + (wp - 0.9) * 0.85);
-            point_lighting = point_lighting * (wc / wp);
-        }
-        point_lighting = min(point_lighting * (1.0 - fog_t), vec3<f32>(1.6));
-    } else if (bits_lighting && pl_count > 0u) {
+    if (bits_lighting && pl_count > 0u) {
         var any_pl_near = false;
         for (var pre_i = 0u; pre_i < pl_count; pre_i = pre_i + 1u) {
             let pr = params.point_lights_pos_rad[pre_i];
@@ -3026,7 +2926,7 @@ impl Pipelines {
                 ),
                 storage_texture_entry(4, wgpu::StorageTextureAccess::WriteOnly, GUIDE_FORMAT),
                 storage_texture_entry(5, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
-                texture_entry(6, wgpu::TextureSampleType::Depth),
+                
             ],
         });
         let gbuf_prep_pipeline = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3608,8 +3508,6 @@ pub struct RaywatcherGpu {
     _motion_tex: wgpu::Texture,
     depth: wgpu::TextureView,
     _depth_tex: wgpu::Texture,
-    pre_water_depth: wgpu::TextureView,
-    _pre_water_depth_tex: wgpu::Texture,
     /// 3x2 cubemap atlas (`SKY_ENV_WIDTH x SKY_ENV_HEIGHT`, `COLOUR_FORMAT`)
     /// holding the real `SkyGpu` + `CloudGpu` skybox for reflections & sky GI.
     sky_env_tex: wgpu::Texture,
@@ -3741,7 +3639,6 @@ impl RaywatcherGpu {
             plane(device, "raywatcher temporal moments", w, h, GUIDE_FORMAT);
         let (motion_tex, motion) = plane(device, "raywatcher motion", w, h, COLOUR_FORMAT);
         let (depth_tex, depth) = depth_plane(device, w, h);
-        let (pre_water_depth_tex, pre_water_depth) = depth_plane(device, w, h);
         let (output, output_view) = plane(device, "raywatcher output", w, h, COLOUR_FORMAT);
         let (guide, guide_view) = plane(device, "raywatcher output guide", w, h, GUIDE_FORMAT);
         let compose_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -3882,8 +3779,6 @@ impl RaywatcherGpu {
             _motion_tex: motion_tex,
             depth,
             _depth_tex: depth_tex,
-            pre_water_depth,
-            _pre_water_depth_tex: pre_water_depth_tex,
             sky_env_tex,
             sky_env_view,
             sky_env_face_cursor: 0,
@@ -4339,7 +4234,6 @@ impl RaywatcherGpu {
             plane(device, "raywatcher temporal moments", w, h, GUIDE_FORMAT);
         let (motion_tex, motion) = plane(device, "raywatcher motion", w, h, COLOUR_FORMAT);
         let (depth_tex, depth) = depth_plane(device, w, h);
-        let (pre_water_depth_tex, pre_water_depth) = depth_plane(device, w, h);
         let (output, output_view) = plane(device, "raywatcher output", w, h, COLOUR_FORMAT);
         let (guide, guide_view) = plane(device, "raywatcher output guide", w, h, GUIDE_FORMAT);
         self.trace_bind_group = Self::trace_bindings(
@@ -4434,8 +4328,6 @@ impl RaywatcherGpu {
         self._motion_tex = motion_tex;
         self.depth = depth;
         self._depth_tex = depth_tex;
-        self.pre_water_depth = pre_water_depth;
-        self._pre_water_depth_tex = pre_water_depth_tex;
         self.blit_bind_group = Self::blit_binding(device, &self.pipelines, &output_view);
         self.raster_copy = None;
         self.gbuf_prep_bind_group = None;
@@ -4494,7 +4386,6 @@ impl RaywatcherGpu {
         config: &DenoiseConfig,
         motion: &wgpu::Texture,
         depth: &wgpu::Texture,
-        pre_water_depth: &wgpu::Texture,
         water: &[super::harvest::WaterSurface],
         point_lights: &[super::frame::PointLight],
         unjittered_vp: glam::Mat4,
@@ -4535,34 +4426,7 @@ impl RaywatcherGpu {
                 depth_or_array_layers: 1,
             },
         );
-        // Boost #5: Only copy full-resolution pre-water depth when active water
-        // planes exist (or on frame 0 to initialize), saving a full-screen Depth32F copy.
-        if !water.is_empty() || self.frames == 0 {
-            let pre_src = if (pre_water_depth.width(), pre_water_depth.height()) == (rw, rh) {
-                pre_water_depth
-            } else {
-                depth
-            };
-            encoder.copy_texture_to_texture(
-                wgpu::ImageCopyTexture {
-                    texture: pre_src,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::DepthOnly,
-                },
-                wgpu::ImageCopyTexture {
-                    texture: &self._pre_water_depth_tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::DepthOnly,
-                },
-                wgpu::Extent3d {
-                    width: rw,
-                    height: rh,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+
 
         // Build the 1:1 depth-anchored G-buffer (world pos, normal, water
         // roughness, and untouched raster colour) at ray-grid resolution.
@@ -4602,10 +4466,6 @@ impl RaywatcherGpu {
                             resource: wgpu::BindingResource::TextureView(
                                 &self.grid.gbuf_raster_view,
                             ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 6,
-                            resource: wgpu::BindingResource::TextureView(&self.pre_water_depth),
                         },
                     ],
                 }));
@@ -5704,41 +5564,18 @@ mod phase_r1_tests {
     use super::*;
 
     #[test]
-    fn phase_r1_land_pixel_with_reversed_z_is_not_tagged_as_water() {
+    fn native_water_is_tagged_only_inside_a_flat_active_water_plane() {
         let water = [super::super::harvest::WaterSurface {
             bounds: [-100.0, 100.0, -100.0, 100.0],
             height: 10.0,
         }];
-        // Dry land pixel with reversed-Z depth (z == z_pre == 0.25), even inside
-        // the water body's rectangular AABB and at water height: MUST stay matte.
-        let land_r =
-            classify_surface_roughness(0.25, 0.25, glam::Vec3::new(0.0, 10.0, 0.0), &water);
-        assert!(
-            (land_r - 0.92).abs() < 1e-5,
-            "land pixel with reversed-Z depth must stay matte (0.92), got {land_r}"
-        );
-        // Land pixel when scene has no water planes at all (even if pre-water
-        // depth were 0.0): MUST stay matte.
-        let no_water_r =
-            classify_surface_roughness(0.25, 0.0, glam::Vec3::new(0.0, 12.0, 0.0), &[]);
-        assert!(
-            (no_water_r - 0.92).abs() < 1e-5,
-            "land pixel without water planes must stay matte (0.92), got {no_water_r}"
-        );
-        // Actual water pixel: water pass wrote closer reversed-Z depth (0.30 > 0.25).
-        let water_r =
-            classify_surface_roughness(0.30, 0.25, glam::Vec3::new(0.0, 10.0, 0.0), &water);
-        assert!(
-            (water_r - 0.06).abs() < 1e-5,
-            "water pixel closer than pre-water depth must be glossy (0.06), got {water_r}"
-        );
-        // Open-sea water pixel with no terrain underneath (z_pre == 0.0) on water plane.
-        let sea_r =
-            classify_surface_roughness(0.05, 0.0, glam::Vec3::new(10.0, 10.0, 10.0), &water);
-        assert!(
-            (sea_r - 0.06).abs() < 1e-5,
-            "open-sea water pixel on water plane must be glossy (0.06), got {sea_r}"
-        );
+        let flat_normal = glam::Vec3::Y;
+        let slope_normal = glam::Vec3::new(0.2, 0.97, 0.0);
+        assert_eq!(classify_surface_roughness(flat_normal, glam::Vec3::new(0.0, 10.0, 0.0), &water), 0.06);
+        assert_eq!(classify_surface_roughness(flat_normal, glam::Vec3::new(101.0, 10.0, 0.0), &water), 0.92);
+        assert_eq!(classify_surface_roughness(flat_normal, glam::Vec3::new(0.0, 10.2, 0.0), &water), 0.92);
+        assert_eq!(classify_surface_roughness(slope_normal, glam::Vec3::new(0.0, 10.0, 0.0), &water), 0.92);
+        assert_eq!(classify_surface_roughness(flat_normal, glam::Vec3::new(0.0, 10.0, 0.0), &[]), 0.92);
     }
 
     #[test]

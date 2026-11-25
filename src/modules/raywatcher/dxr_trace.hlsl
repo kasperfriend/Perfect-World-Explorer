@@ -1051,10 +1051,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         fog_t = saturate((dist - fog_start) / (fog_end - fog_start));
     }
 
-    float water_y = params.eye.w;
-    bool is_submerged = (water_y > -1e5) && (params.eye.y < water_y - 0.05);
     uint debug_mode_early = uint(round(params.counts.w));
-    if (fog_t >= 0.99 && layered && debug_mode_early == 0u && !is_submerged) {
+    if (fog_t >= 0.99 && layered && debug_mode_early == 0u) {
         out_colour[id.xy] = float4(0.0, 0.0, 0.0, 1.0);
         if (params.point_light_meta.w > 0.5) {
             out_guide[id.xy] = float4(1.0, 1.0, dist, 1.0);
@@ -1549,42 +1547,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
     }
 
-    // Enhancement #2: Ray-Traced Underwater Volumetric Sun/Moon Shafts & Scatter when submerged.
-    if (bits_shadows && water_y > -1e5 && params.sun_dir.y > 0.03
-        && (is_submerged || world_pos.y < water_y - 0.15) && dist > 1.5)
-    {
-        float uw_march = min(dist, 60.0) - 0.5;
-        if (uw_march > 1.0) {
-            float uw_lit = 0.0;
-            float uw_occ = 0.0;
-            float t_anim = params.frame.x * 0.032;
-            for (uint ui = 0u; ui < 6u; ui = ui + 1u) {
-                float u = (float(ui) + ign_v) / 6.0;
-                float t_u = 0.5 + u * uw_march;
-                float3 p_u = params.eye.xyz + view_dir * t_u;
-                if (p_u.y >= water_y) {
-                    continue;
-                }
-                if (occluded_fast(p_u, params.sun_dir.xyz, 0.4, 220.0)) {
-                    uw_occ += 1.0;
-                } else {
-                    float d_sub = max(water_y - p_u.y, 0.05);
-                    float w1 = sin(p_u.x * 0.42 + p_u.z * 0.36 + t_anim);
-                    float w2 = cos(p_u.x * 0.29 - p_u.z * 0.51 - t_anim * 0.8);
-                    float wave_focus = 0.45 + 0.55 * saturate(0.5 + 0.5 * w1 * w2);
-                    uw_lit += exp(-d_sub * 0.045) * wave_focus;
-                }
-            }
-            float uw_vis = uw_lit / 6.0;
-            float uw_phase = 0.55 + 0.45 * saturate(dot(view_dir, params.sun_dir.xyz));
-            float uw_contrast = lerp(0.55, 1.0, smoothstep(0.05, 0.35, uw_occ / 6.0));
-            float3 day_uw = float3(0.22, 0.78, 0.86) * max(params.sun_colour.xyz, float3(0.4, 0.4, 0.4));
-            float3 night_uw = float3(0.06, 0.16, 0.28);
-            float3 uw_tint = lerp(night_uw, day_uw, sun_strength);
-            float uw_gain = is_submerged ? 0.34 : 0.18;
-            god_rays += uw_tint * (uw_vis * uw_phase * uw_contrast * uw_gain * (1.0 - fog_t * 0.25));
-        }
-    }
+
 
     // Enhancement #3: Subtle, smooth edge-free Volumetric Light Halos around world lanterns/portals
     // (excludes camera light < 3.5u from eye and uses strictly zero-at-boundary cubic falloff).
@@ -1654,48 +1617,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float pl_w_total = 0.0;
     float pl_w_lit = 0.0;
 
-    if (bits_lighting && pl_count > 0u && is_water) {
-        // Water is a glossy dielectric: evaluate specular glints from point/effect
-        // lights so water stays reflective. Uses the flat raster normal (native
-        // game water has no animated wave normals).
-        float3 w_norm = shade_normal;
-        float3 view_to_eye = -view_dir;
-        for (uint li = 0u; li < pl_count; li = li + 1u) {
-            float4 pl_pr = params.point_lights_pos_rad[li];
-            float3 to_l = pl_pr.xyz - world_pos;
-            if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
-                continue;
-            }
-            if (to_l.y < -2.0) {
-                continue;
-            }
-            float pl_d2 = dot(to_l, to_l);
-            if (pl_d2 <= 1e-6 || pl_d2 >= pl_pr.w * pl_pr.w) {
-                continue;
-            }
-            float inv_pl_dist = rsqrt(pl_d2);
-            float pl_dist = pl_d2 * inv_pl_dist;
-            float atten = point_light_falloff(pl_dist, pl_pr.w);
-            if (atten <= 1e-5) {
-                continue;
-            }
-            float3 l_dir = to_l * inv_pl_dist;
-            float3 h_vec = normalize(l_dir + view_to_eye);
-            float ndh = saturate(dot(w_norm, h_vec));
-            float ndh2 = ndh * ndh;
-            float ndh4 = ndh2 * ndh2;
-            float ndh8 = ndh4 * ndh4;
-            float spec = ndh8 * ndh8 * ndh8 * 0.85 + ndh4 * 0.04;
-            float4 pl_ci = params.point_lights_col_int[li];
-            point_lighting += pl_ci.rgb * (pl_ci.w * atten * spec);
-        }
-        float wp = max(point_lighting.r, max(point_lighting.g, point_lighting.b));
-        if (wp > 0.9) {
-            float wc = 0.9 + (wp - 0.9) / (1.0 + (wp - 0.9) * 0.85);
-            point_lighting *= (wc / wp);
-        }
-        point_lighting = min(point_lighting * (1.0 - fog_t), float3(1.6, 1.6, 1.6));
-    } else if (bits_lighting && pl_count > 0u) {
+    if (bits_lighting && pl_count > 0u) {
         // Zero-visual-cost Perf Boost: fast AABB+radius pre-check before touching G-buffer neighbors.
         // Eliminates 16-24 G-buffer texture fetches on 80-95% of pixels with no nearby point lights!
         bool any_pl_near = false;

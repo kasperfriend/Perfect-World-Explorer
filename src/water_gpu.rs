@@ -22,20 +22,13 @@ pub struct WaterUniform {
     pub fog_color: [f32; 4],
 }
 
-/// Retail increments the 29-frame normal-map index every 33 milliseconds.
-/// The fractional tick is retained only so callers can derive that index once
-/// per frame; the shader samples one authored frame and never cross-blends.
+/// Retail increments the normal index every 33 milliseconds. Fractional
+/// position is retained for the viewer's smooth frame interpolation.
 pub fn normal_phase(elapsed_seconds: f64) -> f32 {
     if !elapsed_seconds.is_finite() || elapsed_seconds < 0. {
         return 0.;
     }
     ((elapsed_seconds * (1000.0 / 33.0)).rem_euclid(29.0)) as f32
-}
-
-/// Native frame index for the standard normal-map water mode.
-/// This is evaluated once per CPU frame instead of flooring per water fragment.
-pub fn normal_frame_index(elapsed_seconds: f64) -> u32 {
-    normal_phase(elapsed_seconds).floor() as u32
 }
 /// The default client water mode rotates its 0.05 texture offset by 25
 /// degrees per second (elapsed milliseconds * 0.025 degrees).
@@ -81,10 +74,6 @@ fn present_encoded(c:vec3<f32>)->vec3<f32>{
  let v=max(c,vec3<f32>(0.));
  return select(v/12.92,pow((v+0.055)/1.055,vec3<f32>(2.4)),v>vec3<f32>(0.04045));
 }
-fn pow5(x:f32)->f32{
- let x2=x*x;
- return x2*x2*x;
-}
 // The client binds its water-surface fog triple with D3DRS_FOGSTART/END/COLOR
 // right before the water draw (0x7cb444, 0x7cb502, 0x7cb94e) and D3D applies
 // the fixed-function fog stage to the source colour. The water shaders carry
@@ -103,12 +92,15 @@ fn surface_fog(c:vec3<f32>, reciprocal_w:f32)->vec3<f32>{
  // radius-.05 translation (0x7c95a8, 0x7ca47b).
  let angle=w.animation.w;
  let uv=i.uv*2.0+0.05*vec2<f32>(cos(angle),sin(angle));
- // The retail update routine at 0x7ca5ea selects one of the 29 normal maps
- // every 33 ms. It does not blend adjacent authored frames.
- let frame=i32(w.animation.x)%29;
+ // The retail update routine at 0x7ca5ea advances the 29 normal frames
+ // once per 33 ms. Interpolation is a viewer extension that preserves the
+ // requested smooth playback while retaining the recovered cycle timing.
+ let phase=w.animation.x; let frame=i32(floor(phase))%29;
+ let n0=textureSample(normals,tile_sampler,uv,frame).xyz*2.0-vec3<f32>(1.0);
+ let n1=textureSample(normals,tile_sampler,uv,(frame+1)%29).xyz*2.0-vec3<f32>(1.0);
  // The retail pixel shader uses the decoded normal-map vector directly;
  // normalizing it changes both the bump displacement and Fresnel response.
- let n=textureSample(normals,tile_sampler,uv,frame).xyz*2.0-vec3<f32>(1.0);
+ let n=mix(n0,n1,fract(phase));
  let screen=i.pos.xy/w.size.xy;
  if w.size.w>0.5 && w.eye_time.y<=i.world.y {
    // 0x7ca9af selects waterrefract.txt below the surface, not the
@@ -117,7 +109,7 @@ fn surface_fog(c:vec3<f32>, reciprocal_w:f32)->vec3<f32>{
    let uv_under=clamp(screen+n.xz*0.25,vec2<f32>(0.001),vec2<f32>(0.999));
    let refr=textureSample(refraction,screen_sampler,uv_under).rgb;
    let facing=clamp(dot(w.eye_time.xyz-i.world,-n),0.0,1.0);
-   let fresnel=pow5(1.0-facing);
+   let fresnel=pow(1.0-facing,5.0);
    let tint=mix(vec3<f32>(1.0),vec3<f32>(0.0,0.3,0.3),fresnel);
    return vec4<f32>(present_encoded(surface_fog(refr*0.85*tint,i.pos.w)),1.0);
  }
@@ -160,7 +152,7 @@ fn surface_fog(c:vec3<f32>, reciprocal_w:f32)->vec3<f32>{
  // The simple and cheap variants instead use their own literal `c1.a` (0.8 and
  // 0.6) as that identity term, so this camera-derived value is the expensive
  // path only.
- let quintic=pow5(1.0-facing);
+ let quintic=pow(1.0-facing,5.0);
  let fresnel=clamp(min_reflect+(1.0-min_reflect)*quintic,0.0,1.0);
  // The paired water_vs shader writes a zero secondary diffuse/specular color.
  let color=mix(refract_color*0.95,reflect_color,fresnel);
@@ -643,9 +635,7 @@ impl WaterGpu {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let terrain_depth = device.create_texture(&wgpu::TextureDescriptor {
@@ -816,11 +806,6 @@ impl WaterGpu {
     pub fn depth(&self) -> wgpu::TextureView {
         self.targets.reflect_depth.create_view(&Default::default())
     }
-    /// Pre-water opaque scene depth copied by [`Self::copy_depth`], used by
-    /// Raywatcher to derive an exact pixel water mask (`post_depth > pre_depth`).
-    pub fn sample_depth_texture(&self) -> &wgpu::Texture {
-        &self.targets.sample_depth
-    }
     pub fn update(&self, queue: &wgpu::Queue, u: &WaterUniform) {
         let mut value = *u;
         value.animation[2] = if self.format.is_srgb() { 1. } else { 0. };
@@ -989,10 +974,7 @@ impl WaterGpu {
 
 #[cfg(test)]
 mod animation_tests {
-    use super::{
-        cell_base_uv, normal_frame_index, normal_offset_angle, normal_phase, refraction_fog_range,
-        WATER_SHADER,
-    };
+    use super::{cell_base_uv, normal_offset_angle, normal_phase, refraction_fog_range};
     /// The scissor that makes a reflection or refraction render cheap is sized
     /// from this number, so it has to be the decoded-component maximum the shader
     /// can actually sample: `texel * 2 - 1` of the red and blue channels, over
@@ -1031,28 +1013,13 @@ mod animation_tests {
         assert!((normal_offset_angle(1_000_000.0) - normal_offset_angle(1_000_014.4)).abs() < 1e-4);
     }
     #[test]
-    fn client_frame_period_and_stepwise_normal_sequence() {
+    fn client_frame_period_and_smooth_loop() {
         assert_eq!(normal_phase(0.), 0.);
         assert!((normal_phase(0.0165) - 0.5).abs() < 1e-5);
-        assert_eq!(normal_frame_index(0.), 0);
-        assert_eq!(normal_frame_index(0.0165), 0);
-        assert_eq!(normal_frame_index(0.0329), 0);
-        assert_eq!(normal_frame_index(0.033), 1);
-        assert_eq!(normal_frame_index(0.9405), 28);
-        assert_eq!(normal_frame_index(0.957), 0);
-        assert_eq!(normal_frame_index(f64::NAN), 0);
-        assert!(WATER_SHADER.contains("let frame=i32(w.animation.x)%29;"));
-        assert!(!WATER_SHADER.contains("mix(n0,n1,fract(phase))"));
-    }
-
-    #[test]
-    fn water_fifth_power_helper_is_used_for_both_paths_and_is_exact() {
-        assert!(WATER_SHADER.contains("fn pow5(x:f32)->f32"));
-        assert_eq!(WATER_SHADER.matches("pow5(1.0-facing)").count(), 2);
-        for x in [0.0_f32, 0.1, 0.5, 0.9, 1.0] {
-            let x2 = x * x;
-            let expanded = x2 * x2 * x;
-            assert!((expanded - x.powi(5)).abs() < 1e-6);
-        }
+        assert!((normal_phase(0.033) - 1.).abs() < 1e-5);
+        assert!((normal_phase(0.9405) - 28.5).abs() < 1e-5);
+        assert!(normal_phase(0.957) < 1e-4);
+        assert!((normal_phase(3600000.0 + 0.0165) - normal_phase(3600000.0) - 0.5).abs() < 1e-3);
+        assert_eq!(normal_phase(f64::NAN), 0.);
     }
 }

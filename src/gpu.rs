@@ -4774,7 +4774,6 @@ impl Renderer {
             &denoise,
             &self.object_mv,
             &self.depth,
-            self.water.sample_depth_texture(),
             &active_water,
             &active_point_lights,
             unjittered_vp,
