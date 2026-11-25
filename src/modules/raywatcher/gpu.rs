@@ -2063,9 +2063,9 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         //   R = primary hit alpha coverage (1 = solid leaf, 0 = no leaf)
         //   G = shadow occluder foliage (1 = leaf blocks sun)
         //   B = reflection-hit foliage (1 = reflection hits leaf)
-        let mut primary_leaf = 0.0;
-        let mut shadow_leaf = 0.0;
-        let mut refl_leaf = 0.0;
+        var primary_leaf = 0.0;
+        var shadow_leaf = 0.0;
+        var refl_leaf = 0.0;
 
         let ph = closest_hit(params.eye.xyz, view_dir, 0.1, params.lens.y);
         if (ph.index != 0xffffffffu) {
