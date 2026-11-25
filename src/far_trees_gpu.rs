@@ -220,6 +220,10 @@ pub struct RtTreeTriangle {
     pub opacity: f32,
     /// Real 7x7 (49-bit) texture-sampled alpha cutout mask (`0` = opaque/unmasked).
     pub alpha_mask: u64,
+    /// Camera-facing leaf quad pivot in local tree space; zero and rho=-1 for branches/fronds.
+    pub leaf_center: glam::Vec3,
+    /// Original SpeedTree leaf rho, applied at per-frame harvest; -1 means this is not a leaf.
+    pub leaf_rho: f32,
 }
 
 /// Per-LOD RT harvest diagnostics for one SpeedTree species.
@@ -746,6 +750,8 @@ impl FarTrees {
                                     roughness: 0.85,
                                     opacity: foliage_opacity(hits),
                                     alpha_mask: mask,
+                                    leaf_center: glam::Vec3::ZERO,
+                                    leaf_rho: -1.0,
                                 });
                             } else {
                                 let uv_mid = [
@@ -763,6 +769,8 @@ impl FarTrees {
                                     roughness: 0.90,
                                     opacity: 1.0,
                                     alpha_mask: 0,
+                                    leaf_center: glam::Vec3::ZERO,
+                                    leaf_rho: -1.0,
                                 });
                             }
                         }
@@ -815,8 +823,11 @@ impl FarTrees {
                         }
                         // The raster vertex shader emits one leaf quad (two triangles), facing the current camera.
                         // Do not invent a second crossed card for RT shadows/reflections.
+                        // Keep source corners in local Y-up space; apply the camera-facing
+                        // transform when this cached species is harvested for the current frame.
                         let p = [0, 1, 2, 3].map(|j| {
-                            center + speedtree_leaf_corner(leaf.corners[j], view_direction, leaf.rho)
+                            let c = leaf.corners[j];
+                            center + glam::Vec3::new(c[0], c[2], c[1])
                         });
                         let leaf_normal = glam::Vec3::Y; // matches the raster leaf shader's forced normal
                         if h0 > 0 && (p[1] - p[0]).cross(p[2] - p[0]).length_squared() > 1e-8 {
@@ -824,6 +835,7 @@ impl FarTrees {
                             lod_tris.push(RtTreeTriangle {
                                 a: p[0], b: p[1], c: p[2], normal: leaf_normal,
                                 albedo: a0, roughness: 0.84, opacity: foliage_opacity(h0), alpha_mask: m0,
+                                leaf_center: center, leaf_rho: leaf.rho,
                             });
                         }
                         if h1 > 0 && (p[2] - p[0]).cross(p[3] - p[0]).length_squared() > 1e-8 {
@@ -831,6 +843,7 @@ impl FarTrees {
                             lod_tris.push(RtTreeTriangle {
                                 a: p[0], b: p[2], c: p[3], normal: leaf_normal,
                                 albedo: a1, roughness: 0.84, opacity: foliage_opacity(h1), alpha_mask: m1,
+                                leaf_center: center, leaf_rho: leaf.rho,
                             });
                         }
                     }
@@ -1399,8 +1412,8 @@ impl FarTrees {
     /// Phase 4: Harvest the runtime-generated SpeedTree LOD geometry (branches,
     /// fronds, leaves with per-material alpha) for trees near `eye`, selecting
     /// the LOD matching the view distance (`height * 5 * scale` / `height * 16 * scale`).
-    /// Falls back to an alpha-tested crossed canopy (never a box) only if the
-    /// triangle budget cannot fit a distant tree.
+    /// Tries progressively coarser real SpeedTree LODs when the selected detail
+    /// level cannot fit the triangle budget; skips an instance if none can fit.
     ///
     /// Returns `(real_tree_instances, real_tree_tris, budget_skips)`.
     pub fn harvest_rt_triangles(
@@ -1932,6 +1945,21 @@ pub fn harvest_rt_tree_species(
         out.reserve(src_tris.len());
         for t in src_tris {
             let mut moved = *t;
+            if moved.leaf_rho >= 0.0 {
+                let pivot = moved.leaf_center;
+                let rho = moved.leaf_rho;
+                let transform = |v: glam::Vec3| {
+                    let relative = v - pivot;
+                    let corner = [relative.x, relative.z, relative.y];
+                    pivot + speedtree_leaf_corner(corner, view_direction, rho)
+                };
+                moved.a = transform(moved.a);
+                moved.b = transform(moved.b);
+                moved.c = transform(moved.c);
+                moved.normal = glam::Vec3::Y;
+                moved.leaf_center = glam::Vec3::ZERO;
+                moved.leaf_rho = -1.0;
+            }
             moved.a += offset;
             moved.b += offset;
             moved.c += offset;
@@ -1958,6 +1986,8 @@ mod raywatcher_tree_tests {
             roughness: 0.9,
             opacity: 1.0,
             alpha_mask: 0,
+            leaf_center: glam::Vec3::ZERO,
+            leaf_rho: -1.0,
         };
         let leaf = RtTreeTriangle {
             a: glam::Vec3::new(-1.0, 4.0, 0.0),
@@ -1968,6 +1998,8 @@ mod raywatcher_tree_tests {
             roughness: 0.84,
             opacity: 0.65,
             alpha_mask: 0,
+            leaf_center: glam::Vec3::ZERO,
+            leaf_rho: -1.0,
         };
         let species = RtTreeSpecies {
             species_id: 0,
@@ -2018,6 +2050,7 @@ mod raywatcher_tree_tests {
             a: glam::Vec3::ZERO, b: glam::Vec3::X, c: glam::Vec3::Y,
             normal: glam::Vec3::Z, albedo: [0.2, 0.3, 0.1], roughness: 0.9,
             opacity: 1.0, alpha_mask: 0,
+            leaf_center: glam::Vec3::ZERO, leaf_rho: -1.0,
         };
         let species = RtTreeSpecies {
             species_id: 1, height: 8.0, composite_size: (64, 64),
@@ -2040,5 +2073,10 @@ mod raywatcher_tree_tests {
         let billboard = speedtree_leaf_corner(corner, glam::Vec3::Z, 0.0);
         assert!((billboard - glam::Vec3::new(-2.0, 3.0, 1.0)).length() < 1e-5);
         assert_eq!(speedtree_leaf_corner(corner, glam::Vec3::Z, 1001.0), glam::Vec3::new(1.0, 3.0, 2.0));
+        let pivot = glam::Vec3::new(4.0, 5.0, 6.0);
+        let local = pivot + glam::Vec3::new(corner[0], corner[2], corner[1]);
+        let relative = local - pivot;
+        let transformed = pivot + speedtree_leaf_corner([relative.x, relative.z, relative.y], glam::Vec3::Z, 0.0);
+        assert!((transformed - (pivot + glam::Vec3::new(-2.0, 3.0, 1.0))).length() < 1e-5);
     }
 }
