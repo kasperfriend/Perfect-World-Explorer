@@ -2106,7 +2106,9 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         if (restir_current.radiance_m.w > 0.0 && selected_target > 1e-5) {
             let normalisation = restir_current.sample_pos_weight.w
                 / max(restir_current.radiance_m.w * selected_target, 1e-5);
-            let gi_estimate = restir_current.radiance_m.xyz * (selected_cosine * normalisation);
+            // The stored candidate is already the full path contribution (including
+            // the receiver cosine). Do not multiply by cosine a second time.
+            let gi_estimate = restir_current.radiance_m.xyz * normalisation;
             accum_gi = gi_estimate * f32(samples);
         } else {
             accum_gi = vec3<f32>(0.0);
