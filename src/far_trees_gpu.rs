@@ -1577,12 +1577,17 @@ impl FarTrees {
                 }
             }
         }
+        let leaf_cov_pct = if total_leaf_tris > 0 {
+            (total_zero_coverage as f64 / total_leaf_tris as f64) * 100.0
+        } else {
+            0.0
+        };
         let _ = writeln!(
             out,
             "  [LEAF COVERAGE] total_leaf_tris={} zero_coverage_tris={} ({:.1}%) low_coverage_species={}",
             total_leaf_tris,
             total_zero_coverage,
-            if total_leaf_tris > 0 { (total_zero_coverage as f64 / total_leaf_tris as f64) * 100.0 } else { 0.0 },
+            leaf_cov_pct,
             total_low_coverage,
         );
         for (nearest_d, near_cnt, np, sp) in rows {
