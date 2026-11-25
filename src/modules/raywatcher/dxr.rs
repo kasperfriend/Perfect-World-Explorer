@@ -124,7 +124,8 @@ mod imp {
     use crate::fsr::{raw_dx12, NativeCommandRing, NativeTexture2D};
     use crate::modules::raywatcher::bvh::{RayMaterial, RayTriangle, SceneGeometry};
     use crate::modules::raywatcher::gpu::{
-        RayParams, COLOUR_FORMAT, GUIDE_FORMAT, SKY_ENV_HEIGHT, SKY_ENV_WIDTH, TERRAIN_MAP_SIZE,
+        RayParams, RestirReservoir, COLOUR_FORMAT, GUIDE_FORMAT, SKY_ENV_HEIGHT, SKY_ENV_WIDTH,
+        TERRAIN_MAP_SIZE,
     };
 
     const D3D12_FEATURE_D3D12_OPTIONS5: u32 = 27;
@@ -702,6 +703,9 @@ mod imp {
         /// Persistent 65,536-cell 3D world-space radiance cache (`u5`, 1 MB VRAM)
         /// updated and queried by hardware RT cores for low-noise multi-bounce GI.
         radiance_cache: RawBuffer,
+        /// Two-frame ReSTIR GI reservoir history, shared with the DXR compute shader at u6.
+        restir_reservoirs: RawBuffer,
+        restir_reservoirs_enabled: bool,
         targets: DxrTargets,
         /// Opt #22: Reusable grow-only DXR AS scratch buffer (avoids per-rebuild WDDM allocs).
         reusable_scratch: Option<(u64, RawBuffer)>,
@@ -731,8 +735,10 @@ mod imp {
     // 8: u2 out_reflection UAV
     // 9: u3 out_normals UAV
     // 10: u4 out_albedo UAV
+    // 11: u5 radiance cache UAV
+    // 12: u6 two-frame ReSTIR GI reservoir UAV
     const RADIANCE_CACHE_CELLS: u32 = 65_536;
-    const HEAP_SLOTS: u32 = 14;
+    const HEAP_SLOTS: u32 = 15;
 
     impl Drop for DxrTracer {
         fn drop(&mut self) {
@@ -802,6 +808,25 @@ mod imp {
                 )?
             };
             let targets = DxrTargets::new(device, &raw_device, grid_extent)?;
+            let reservoir_bytes = u64::from(grid_extent.0.max(1))
+                .saturating_mul(u64::from(grid_extent.1.max(1)))
+                .saturating_mul(2)
+                .saturating_mul(size_of::<RestirReservoir>() as u64);
+            let restir_reservoirs_enabled = reservoir_bytes <= device.limits().max_buffer_size;
+            let restir_buffer_bytes = if restir_reservoirs_enabled {
+                reservoir_bytes.max(64)
+            } else {
+                64
+            };
+            let restir_reservoirs = unsafe {
+                RawBuffer::create(
+                    dev_ptr,
+                    restir_buffer_bytes,
+                    d12::D3D12_HEAP_TYPE_DEFAULT,
+                    d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )?
+            };
 
             let tracer = Self {
                 raw_device,
@@ -817,6 +842,8 @@ mod imp {
                 retired_scenes: Vec::new(),
                 retired_buffers: vec![(build_fence, staging)],
                 radiance_cache,
+                restir_reservoirs,
+                restir_reservoirs_enabled,
                 targets,
                 reusable_scratch,
                 reusable_instance_desc,
@@ -847,7 +874,7 @@ mod imp {
         > {
             // Root parameter 0: CBV at b0
             // Root parameter 1: Descriptor table with 6 SRVs (t0..t5)
-            // Root parameter 2: Descriptor table with 5 UAVs (u0..u4)
+            // Root parameter 2: Descriptor table with 7 UAVs (u0..u6)
             let srv_range = d12::D3D12_DESCRIPTOR_RANGE {
                 RangeType: d12::D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
                 NumDescriptors: 8,
@@ -857,7 +884,7 @@ mod imp {
             };
             let uav_range = d12::D3D12_DESCRIPTOR_RANGE {
                 RangeType: d12::D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-                NumDescriptors: 6,
+                NumDescriptors: 7,
                 BaseShaderRegister: 0,
                 RegisterSpace: 0,
                 OffsetInDescriptorsFromTableStart: 0,
@@ -1468,6 +1495,28 @@ mod imp {
                     &rc_uav,
                     self.cpu_handle(13),
                 );
+
+                // Slot 14: u6 ReSTIR GI reservoirs (two pixel-sized frames, 64-byte records).
+                let mut restir_uav: d12::D3D12_UNORDERED_ACCESS_VIEW_DESC = zeroed();
+                restir_uav.Format = DXGI_FORMAT_UNKNOWN;
+                restir_uav.ViewDimension = d12::D3D12_UAV_DIMENSION_BUFFER;
+                *restir_uav.u.Buffer_mut() = d12::D3D12_BUFFER_UAV {
+                    FirstElement: 0,
+                    NumElements: if self.restir_reservoirs_enabled {
+                        (self.targets.extent.0 as u64 * self.targets.extent.1 as u64 * 2) as u32
+                    } else {
+                        1
+                    },
+                    StructureByteStride: size_of::<RestirReservoir>() as UINT,
+                    CounterOffsetInBytes: 0,
+                    Flags: d12::D3D12_BUFFER_UAV_FLAG_NONE,
+                };
+                (*dev).CreateUnorderedAccessView(
+                    self.restir_reservoirs.resource,
+                    null_mut(),
+                    &restir_uav,
+                    self.cpu_handle(14),
+                );
             }
         }
 
@@ -1827,6 +1876,20 @@ mod imp {
             }
             self.ring.wait_idle();
             self.targets = DxrTargets::new(device, &self.raw_device, target)?;
+            let reservoir_bytes = u64::from(target.0)
+                .saturating_mul(u64::from(target.1))
+                .saturating_mul(2)
+                .saturating_mul(size_of::<RestirReservoir>() as u64);
+            self.restir_reservoirs_enabled = reservoir_bytes <= device.limits().max_buffer_size;
+            self.restir_reservoirs = unsafe {
+                RawBuffer::create(
+                    self.raw_device.as_mut_ptr(),
+                    if self.restir_reservoirs_enabled { reservoir_bytes.max(64) } else { 64 },
+                    d12::D3D12_HEAP_TYPE_DEFAULT,
+                    d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )?
+            };
             self.write_target_descriptors();
             Ok(())
         }
@@ -1849,6 +1912,7 @@ mod imp {
                 let slot_idx = self.ring.acquire("DXR-Trace")?;
                 let mut dxr_params = *params;
                 dxr_params.fog[3] = self.scene.opaque_tri_count as f32;
+                dxr_params.restir[0] = if self.restir_reservoirs_enabled { 1.0 } else { 0.0 };
                 self.cbvs[slot_idx].write_upload(bytemuck::bytes_of(&dxr_params))?;
                 let list = self.ring.slot_mut(slot_idx).list.as_mut_ptr();
 
@@ -1874,7 +1938,7 @@ mod imp {
                 // Boost #10: Only transition output UAV planes that will actually be copied
                 // back to wgpu; unused planes stay in COMMON/UAV without barrier flushes.
                 let out_used = [true, dst_guide.is_some(), true, true, dst_albedo.is_some()];
-                let mut pre_barriers: [d12::D3D12_RESOURCE_BARRIER; 10] = zeroed();
+                let mut pre_barriers: [d12::D3D12_RESOURCE_BARRIER; 11] = zeroed();
                 let mut pre_count = 0usize;
                 for res in in_resources {
                     let b = &mut pre_barriers[pre_count];
@@ -1906,6 +1970,14 @@ mod imp {
                     self.targets.uav_resident[i] = true;
                     pre_count += 1;
                 }
+                // Order the previous frame's UAV writes before the next dispatch
+                // reads the previous parity and overwrites the current one.
+                let reservoir_barrier = &mut pre_barriers[pre_count];
+                reservoir_barrier.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                *reservoir_barrier.u.UAV_mut() = d12::D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: self.restir_reservoirs.resource,
+                };
+                pre_count += 1;
                 (*list).ResourceBarrier(pre_count as UINT, pre_barriers.as_ptr());
 
                 let mut heaps = [self.desc_heap];
