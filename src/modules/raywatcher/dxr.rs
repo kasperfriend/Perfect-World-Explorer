@@ -1352,6 +1352,7 @@ mod imp {
         }
 
         fn write_scene_descriptors(&self) {
+            self.write_tlas_descriptor();
             unsafe {
                 let dev = self.raw_device.as_mut_ptr();
                 // Slot 1: tris StructuredBuffer SRV.
