@@ -1292,7 +1292,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("pwe-architect-{}.pwa", std::process::id()));
         let editor = Architect {
             enabled: false,
-            client_root: PathBuf::new(),
+            client_root: PathBuf::from("/client"),
             map: None,
             project_root: path.parent().unwrap().to_path_buf(),
             project: project.clone(),
@@ -1339,6 +1339,14 @@ mod tests {
         assert_eq!(loaded.objects[0].asset, project.objects[0].asset);
         assert_eq!(loaded.strokes.len(), 1);
         assert_eq!(loaded.strokes[0].mode, BrushMode::Smooth);
+        assert_eq!(
+            editor.portable_asset_path("/client/element/models/tree.ecm"),
+            "element/models/tree.ecm"
+        );
+        assert_eq!(
+            editor.portable_asset_path("/client/element/models.pck::models/tree.ecm"),
+            "element/models.pck::models/tree.ecm"
+        );
         let _ = fs::remove_file(path);
     }
 
