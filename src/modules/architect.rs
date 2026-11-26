@@ -100,6 +100,7 @@ pub struct Architect {
     selected_scene_transform: Option<[f32; 3]>,
     selected_placement: Option<usize>,
     multi_selection: HashSet<usize>,
+    multi_scene_items: HashMap<usize, (String, [f32; 3])>,
     quick_bar: Vec<String>,
     left_dock: Dock,
     right_dock: Dock,
@@ -149,6 +150,7 @@ impl Architect {
             selected_scene_transform: None,
             selected_placement: None,
             multi_selection: HashSet::new(),
+            multi_scene_items: HashMap::new(),
             quick_bar: Vec::new(),
             left_dock: Dock::Left,
             right_dock: Dock::Right,
@@ -401,6 +403,7 @@ impl Architect {
                 self.selected_placement = None;
                 self.selected_scene_object = None;
                 self.multi_selection.clear();
+                self.multi_scene_items.clear();
                 self.status = format!(
                     "Loaded {} ({} placements, {} brush operations).",
                     self.project.name,
@@ -596,19 +599,36 @@ impl Architect {
     }
 
     fn duplicate_selected_scene_item(&mut self) {
-        let Some(asset) = self.selected_asset.clone() else {
-            return;
-        };
-        let position = self.selected_scene_transform.unwrap_or([0.; 3]);
-        let portable_asset = self.portable_asset_path(&asset);
-        self.project.objects.push(PlacedObject {
-            asset: portable_asset,
-            position,
-            rotation: [0.; 3],
-            scale: 1.,
-        });
+        let mut items = self
+            .multi_scene_items
+            .iter()
+            .map(|(index, (asset, position))| (*index, asset.clone(), *position))
+            .collect::<Vec<_>>();
+        items.sort_by_key(|(index, _, _)| *index);
+        if items.is_empty() {
+            let Some(asset) = self.selected_asset.clone() else {
+                return;
+            };
+            items.push((
+                self.selected_scene_object.unwrap_or(0),
+                asset,
+                self.selected_scene_transform.unwrap_or([0.; 3]),
+            ));
+        }
+        for (_, asset, position) in items {
+            let portable_asset = self.portable_asset_path(&asset);
+            self.project.objects.push(PlacedObject {
+                asset: portable_asset,
+                position,
+                rotation: [0.; 3],
+                scale: 1.,
+            });
+        }
         self.selected_placement = Some(self.project.objects.len() - 1);
-        self.status = "Selected client scene item copied into the editable project layer.".into();
+        self.status = format!(
+            "Copied {} selected client scene item(s) into the editable project layer.",
+            self.multi_selection.len().max(1)
+        );
     }
 
     fn scene_row(
@@ -633,12 +653,17 @@ impl Architect {
             self.selected_asset = Some(asset.to_string());
             self.selected_scene_transform = Some(position);
             if self.cursor == CursorMode::MultiSelect {
-                if !self.multi_selection.insert(index) {
-                    self.multi_selection.remove(&index);
+                self.selected_scene_object = None;
+                if self.multi_selection.insert(index) {
+                    self.multi_scene_items
+                        .insert(index, (asset.to_string(), position));
+                } else {
+                    self.multi_scene_items.remove(&index);
                 }
             } else {
                 self.selected_scene_object = Some(index);
                 self.multi_selection.clear();
+                self.multi_scene_items.clear();
             }
             if self.cursor == CursorMode::Place {
                 self.add_selected_asset_at_camera(camera);
@@ -821,6 +846,7 @@ impl Architect {
                     self.selected_scene_object = None;
                     self.selected_scene_transform = None;
                     self.multi_selection.clear();
+                    self.multi_scene_items.clear();
                     self.status = "New empty project. Choose a client map as its source when ready.".into();
                 }
                 ui.heading("Custom worlds");
@@ -1074,8 +1100,8 @@ impl Architect {
                 if ui.button("Place selected asset at camera").clicked() {
                     self.add_selected_asset_at_camera(camera);
                 }
-                if self.selected_scene_object.is_some()
-                    && ui.button("Duplicate selected scene item").clicked()
+                if (self.selected_scene_object.is_some() || !self.multi_selection.is_empty())
+                    && ui.button("Duplicate selected scene item(s)").clicked()
                 {
                     self.duplicate_selected_scene_item();
                 }
