@@ -2186,11 +2186,29 @@ mod tests {
     }
 
     #[test]
-    fn shared_legacy_marker_uses_only_unique_measured_data_profiles() {
+    fn shared_legacy_marker_uses_data_profiles_without_guessing_collisions() {
         let cases = [
             (10, 55, "1.3.1 (data-version profile)"),
-            (70, 105, "1.4.4 (data-version profile)"),
-            (12, 56, "unknown game version (unmapped client marker 1 0)"),
+            (
+                12,
+                56,
+                "unknown game version (ambiguous data pair; candidates: 1.3.4 / 1.3.6 / 1.3.8)",
+            ),
+            (
+                27,
+                75,
+                "unknown game version (ambiguous data pair; candidates: 1.4.1 / 1.4.2)",
+            ),
+            (
+                29,
+                78,
+                "unknown game version (ambiguous data pair; candidates: 1.4.1 / 1.4.2)",
+            ),
+            (
+                70,
+                105,
+                "unknown game version (ambiguous data pair; candidates: 1.4.4 / 1.4.5 / 1.4.6)",
+            ),
             (85, 176, "unknown game version (unmapped client marker 1 0)"),
         ];
         for (elements, tasks, expected) in cases {
@@ -2208,6 +2226,24 @@ mod tests {
             );
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn data_pair_fallback_works_without_a_version_marker_or_executable() {
+        let root = synthetic_client("data-pair-no-marker", 60, 93);
+        let marked = scan(&root);
+        assert_eq!(marked.game_version(), "1.4.4 (data-version profile)");
+
+        // The two data files remain sufficient evidence when the executable
+        // is missing; executable identity is preferred, not a hard dependency.
+        fs::remove_file(root.join("element/elementclient.exe")).unwrap();
+        let without_executable = scan(&root);
+        assert!(without_executable.loadable(), "{}", without_executable.report());
+        assert_eq!(
+            without_executable.game_version(),
+            "1.4.4 (data-version profile)"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
