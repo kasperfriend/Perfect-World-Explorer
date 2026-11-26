@@ -426,6 +426,35 @@ pub fn lod_admits(bounds: Option<[f32; 4]>, p: [f32; 3]) -> bool {
     cutoff_residency::contains(bounds, p)
 }
 
+type ResidentUpdateKey = (
+    [f32; 3],
+    f32,
+    Option<[f32; 4]>,
+    [[f32; 4]; 6],
+    Option<(f32, f32)>,
+);
+
+/// Whether the spatial candidate set is still valid. The small camera epsilon
+/// matches the old no-Hi-Z early-out; frustum and residency remain exact.
+fn same_resident_update(
+    previous: &ResidentUpdateKey,
+    camera: [f32; 3],
+    scale: f32,
+    bounds: Option<[f32; 4]>,
+    frustum: [[f32; 4]; 6],
+    clip_plane: Option<(f32, f32)>,
+) -> bool {
+    let (prev_cam, prev_scale, prev_bounds, prev_frustum, prev_clip) = previous;
+    let dx = camera[0] - prev_cam[0];
+    let dy = camera[1] - prev_cam[1];
+    let dz = camera[2] - prev_cam[2];
+    dx * dx + dy * dy + dz * dz < 1e-4
+        && *prev_scale == scale
+        && *prev_bounds == bounds
+        && *prev_frustum == frustum
+        && *prev_clip == clip_plane
+}
+
 pub struct FarTrees {
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
@@ -1559,15 +1588,8 @@ impl FarTrees {
             .last_resident_update
             .borrow()
             .as_ref()
-            .is_some_and(|(prev_cam, prev_scale, prev_bounds, prev_frustum, prev_clip)| {
-                let dx = camera[0] - prev_cam[0];
-                let dy = camera[1] - prev_cam[1];
-                let dz = camera[2] - prev_cam[2];
-                dx * dx + dy * dy + dz * dz < 1e-4
-                    && *prev_scale == scale
-                    && *prev_bounds == bounds
-                    && *prev_frustum == frustum
-                    && *prev_clip == clip_plane
+            .is_some_and(|previous| {
+                same_resident_update(previous, camera, scale, bounds, frustum, clip_plane)
             });
         if same_resident && !hiz_enabled {
             return;
@@ -1841,6 +1863,48 @@ fn sphere_visible(position: [f32; 3], radius: f32, planes: &[[f32; 4]; 6]) -> bo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stable_tree_view_reuses_spatial_candidates_even_when_hiz_is_enabled() {
+        let key = (
+            [10.0, 20.0, 30.0],
+            1.0,
+            Some([-100.0, 100.0, -100.0, 100.0]),
+            [[1.0, 0.0, 0.0, 1.0]; 6],
+            Some((5.0, 1.0)),
+        );
+        assert!(super::same_resident_update(
+            &key,
+            [10.0, 20.0, 30.0],
+            1.0,
+            key.2,
+            key.3,
+            key.4,
+        ));
+        assert!(super::same_resident_update(
+            &key,
+            [10.001, 20.0, 30.0],
+            1.0,
+            key.2,
+            key.3,
+            key.4,
+        ));
+        assert!(!super::same_resident_update(
+            &key,
+            [10.0, 20.0, 30.0],
+            1.0,
+            key.2,
+            [[0.0, 1.0, 0.0, 1.0]; 6],
+            key.4,
+        ));
+        assert!(!super::same_resident_update(
+            &key,
+            [10.0, 20.0, 30.0],
+            1.0,
+            None,
+            key.3,
+            key.4,
+        ));
+    }
     use super::*;
 
     #[test]
