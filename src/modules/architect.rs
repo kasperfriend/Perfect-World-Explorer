@@ -450,6 +450,10 @@ impl Architect {
                 self.project = Project::default();
                 self.project_name = "Untitled World".into();
                 self.selected_project = None;
+                self.selected_placement = None;
+                self.selected_scene_object = None;
+                self.multi_selection.clear();
+                self.multi_scene_items.clear();
                 self.confirm_erase = false;
                 self.refresh_projects();
                 self.status = "Custom project erased. Client map files were not touched.".into();
@@ -909,6 +913,8 @@ impl Architect {
                             self.project.objects.clear();
                             self.project.strokes.clear();
                             self.selected_placement = None;
+                            self.multi_selection.clear();
+                            self.multi_scene_items.clear();
                             self.confirm_clear = false;
                             self.status = "Current project edits cleared. Saved project files are unchanged.".into();
                         }
@@ -1238,6 +1244,15 @@ impl Architect {
                     });
                     self.status = "Brush operation recorded in the project. Terrain mesh mutation is not wired yet.".into();
                 }
+                ui.horizontal(|ui| {
+                    if ui.button("Undo last brush").clicked() {
+                        self.project.strokes.pop();
+                    }
+                    if ui.button("Undo last placement").clicked() {
+                        self.project.objects.pop();
+                        self.selected_placement = None;
+                    }
+                });
                 ui.label(format!("{} stored brush operations · {} stored placements", self.project.strokes.len(), self.project.objects.len()));
                 ui.label(egui::RichText::new("Brush modes and snapping are project metadata at this stage; they do not alter the live terrain mesh.").small().weak());
             });
