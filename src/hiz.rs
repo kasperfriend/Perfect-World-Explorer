@@ -4,6 +4,7 @@
 //! 2x2 source footprint in an R32Float mipmapped texture. Clear depth is zero,
 //! so holes propagate and remain visible to the conservative occlusion test.
 use bytemuck::{Pod, Zeroable};
+use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 const MAX_LEVELS: usize = 16;
@@ -151,9 +152,6 @@ impl Pyramid {
             w = (w / 2).max(1);
             h = (h / 2).max(1);
         }
-        next_offset
-            .checked_mul(4)
-            .ok_or("Hi-Z texture memory size overflow")?;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("reversed-Z minimum depth pyramid"),
             size: wgpu::Extent3d {
