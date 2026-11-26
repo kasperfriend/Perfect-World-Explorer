@@ -22,7 +22,12 @@ known offset:
     .clt   precinct/region      ASCII text header line (src/music.rs)
     .spt   SpeedTree            ASCII text header line
     .dat   BSData               magic+version dwords @0/@4
-    .data  elements/task table  dword @0, read as (family << 16) | version
+    elements.data              dword @0, read as (family << 16) | version
+    tasks.data                  dword @4, after magic 0x93858361
+    tasks_sample.data           same tasks header; aipolicy.data trigger @4
+
+Other .data files are not treated as dword versions: several carry u16 tags,
+timestamps, declared sizes or magic words at offset 0.
 
 GFX and package versions are inside containers, so `offline_harness.sh gfx` and
 `pck` report those where the real readers run.
@@ -80,15 +85,18 @@ def survey_client(root):
         except OSError:
             continue
         files += 1
-        if ext in DWORD_FORMATS:
-            label, offset, magic = DWORD_FORMATS[ext]
-            if size < offset + 4:
+        format_info = DWORD_FORMATS.get(ext)
+        if ext == ".data":
+            format_info = DATA_DWORD_FORMATS.get(os.path.basename(path).lower())
+        if format_info is not None:
+            label, offset, magic = format_info
+            if size < offset + 4 or len(head) < offset + 4:
                 continue
             if magic is not None:
                 at, want = magic
                 got = struct.unpack_from("<I", head, at)[0]
                 if got != want:
-                    bad_magic[(ext, hex(got))] += 1
+                    bad_magic[(os.path.basename(path).lower(), hex(got))] += 1
                     continue
             version = struct.unpack_from("<I", head, offset)[0]
             found[label][version] += 1
