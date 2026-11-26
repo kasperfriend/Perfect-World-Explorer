@@ -1418,6 +1418,32 @@ mod tests {
     }
 
     #[test]
+    fn renderer_asset_paths_only_accept_models_pck_ecm_entries() {
+        assert_eq!(
+            Architect::renderer_asset_path(
+                "element/models.pck::Models/NPCs/Guard/guard.ecm"
+            ),
+            Some("models/npcs/guard/guard.ecm".into())
+        );
+        assert_eq!(
+            Architect::renderer_asset_path("models/trees/oak.ecm"),
+            Some("models/trees/oak.ecm".into())
+        );
+        assert_eq!(
+            Architect::renderer_asset_path("element/gfx.pck::gfx/models/fire.ecm"),
+            None
+        );
+        assert_eq!(
+            Architect::renderer_asset_path("element/models.pck::textures/tree.dds"),
+            None
+        );
+        assert_eq!(
+            Architect::renderer_asset_path("element/loose/guard.ecm"),
+            None
+        );
+    }
+
+    #[test]
     fn project_names_cannot_escape_the_worlds_directory() {
         assert_eq!(Architect::safe_slug("../../Bad Name"), "bad-name");
         assert_eq!(Architect::safe_slug(""), "untitled-world");
