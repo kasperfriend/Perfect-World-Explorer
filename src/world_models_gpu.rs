@@ -257,6 +257,10 @@ pub struct World {
     /// pass needs anyway.
     terrain: Option<Box<dyn Fn(f32, f32) -> Option<f32> + Send + Sync>>,
     producers: Vec<Producer>,
+    /// Reused scratch for resolving model-hook effect parents; retaining these
+    /// allocations prevents per-frame Vec churn when many effects are attached.
+    attachment_results: Vec<(u64, Result<Option<[f32; 16]>, String>)>,
+    detached_producers: Vec<u64>,
     /// The animated half of the world's effects. Created on the first update that
     /// needs it, because `with_reader` has no queue to build a draw object with.
     effects: Option<gfx_effect_gpu::Draw>,
@@ -406,6 +410,8 @@ impl World {
             owners: gfx_owner::Manager::new(),
             terrain: None,
             producers: Vec::new(),
+            attachment_results: Vec::new(),
+            detached_producers: Vec::new(),
             effects: None,
             effect_trace_printed: false,
             effect_quads: Vec::new(),
@@ -1317,9 +1323,10 @@ impl World {
 
         // Static world props never change pose. Evaluate a bind pose once when
         // first resident, instead of ticking every one of them on every frame.
-        let pending = std::mem::take(pending_static_pose_slots);
-        pending_static_pose_slots.reserve(pending.len());
-        for index in pending {
+        // Drain in place instead of taking the Vec and reserving a replacement:
+        // the old implementation discarded the queue's allocation every time
+        // a residency update queued a batch of static poses.
+        for index in pending_static_pose_slots.drain(..) {
             let Some(instance) = assets.instances.get(index) else {
                 continue;
             };
@@ -1407,7 +1414,8 @@ impl World {
     /// a destroyed parent all surface as recorded failures instead of leaving a
     /// light attached to a stale or invented transform.
     fn resolve_attachments(&mut self) {
-        let mut resolved: Vec<(u64, Result<Option<[f32; 16]>, String>)> = Vec::new();
+        let mut resolved = std::mem::take(&mut self.attachment_results);
+        resolved.clear();
         for producer in &mut self.producers {
             let Some(binding) = producer.hook.as_mut() else {
                 continue;
@@ -1435,8 +1443,10 @@ impl World {
                 let static_parent = parent.action.is_none();
                 if static_parent {
                     if let Some(matrix) = binding.static_parent {
-                        let hook = glam::Mat4::from_cols_array(&matrix);
-                        let _ = model_attachment::world(hook, binding.local)?;
+                        // Both the hook matrix and its local composition were
+                        // validated when cached; neither changes for a static
+                        // parent. Residency was checked above, so no math or
+                        // matrix reconstruction is needed in the steady state.
                         return Ok(Some(matrix));
                     }
                 }
@@ -1465,8 +1475,9 @@ impl World {
             })();
             resolved.push((producer.identity, outcome));
         }
-        let mut detached = Vec::new();
-        for (identity, outcome) in resolved {
+        let mut detached = std::mem::take(&mut self.detached_producers);
+        detached.clear();
+        for (identity, outcome) in resolved.drain(..) {
             match outcome {
                 Ok(parent) => {
                     if !self.owners.set_attachment(identity, parent) {
@@ -1485,6 +1496,8 @@ impl World {
         if !detached.is_empty() {
             self.producers.retain(|p| !detached.contains(&p.identity));
         }
+        self.attachment_results = resolved;
+        self.detached_producers = detached;
     }
     /// Upload this frame's already-evaluated poses. Runs for every pass without
     /// touching playback, producer clocks or publications.
