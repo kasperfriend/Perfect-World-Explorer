@@ -623,8 +623,11 @@ impl Environments {
     pub fn streaming(&self) -> Option<RegionStreaming> {
         self.streaming.clone().map(RegionStreaming::new)
     }
+    /// The AutoFamily flag is authoritative when present. Older clients/maps may
+    /// omit configs.pck or autoscene.cfg while still carrying valid EC-BSD
+    /// regional fog; absence is not an instruction to disable that fog.
     pub fn auto_fog_enabled(&self) -> bool {
-        self.auto_fog.is_some_and(|fog| fog.enabled)
+        self.auto_fog.map(|fog| fog.enabled).unwrap_or(true)
     }
     pub fn underwater(&self, p: [f32; 3], hour: f32) -> Fog {
         self.sample(p, hour, true)
@@ -761,6 +764,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn missing_autofamily_config_does_not_disable_regional_fog_by_default() {
+        let env = Environments::default();
+        assert!(env.auto_fog_enabled());
+        let mut disabled = Environments::default();
+        disabled.auto_fog = Some(crate::sky_config::AutoFogConfig {
+            enabled: false,
+            day_start: 2500., day_end: 12000., day_color: [0.1, 0.2, 0.3],
+            night_start: 1800., night_end: 8000., night_color: [0.4, 0.5, 0.6],
+            water_color: [0.02, 0.04, 0.08],
+        });
+        assert!(!disabled.auto_fog_enabled());
+    }
+
     #[test]
     fn autofamily_fog_is_used_only_as_the_no_area_fallback() {
         let mut env = Environments::default();
