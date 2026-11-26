@@ -772,8 +772,12 @@ mod tests {
         let mut disabled = Environments::default();
         disabled.auto_fog = Some(crate::sky_config::AutoFogConfig {
             enabled: false,
-            day_start: 2500., day_end: 12000., day_color: [0.1, 0.2, 0.3],
-            night_start: 1800., night_end: 8000., night_color: [0.4, 0.5, 0.6],
+            day_start: 2500.,
+            day_end: 12000.,
+            day_color: [0.1, 0.2, 0.3],
+            night_start: 1800.,
+            night_end: 8000.,
+            night_color: [0.4, 0.5, 0.6],
             water_color: [0.02, 0.04, 0.08],
         });
         assert!(!disabled.auto_fog_enabled());
