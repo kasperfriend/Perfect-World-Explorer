@@ -5079,7 +5079,11 @@ fn spawn_world_handoff(
     files.set_focused(focused);
     let mut command = std::process::Command::new(exe);
     command.arg(client_root).arg("--world").arg(&id);
-    if reopen_architect { command.env("PWE_START_ARCHITECT", "1"); }
+    if reopen_architect {
+        command.env("PWE_START_ARCHITECT", "1");
+    } else {
+        command.env_remove("PWE_START_ARCHITECT");
+    }
     files.configure(&mut command);
     #[cfg(windows)]
     {
