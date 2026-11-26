@@ -1,22 +1,28 @@
 //! Conservative hierarchical depth (Hi-Z) pyramid for reversed-Z depth buffers.
 //!
 //! Level zero copies source depth. Every later level stores the minimum of its
-//! 2x2 source footprint. Clear depth is zero, so holes propagate and remain
-//! visible to the conservative occlusion test.
+//! 2x2 source footprint in an R32Float mipmapped texture. Clear depth is zero,
+//! so holes propagate and remain visible to the conservative occlusion test.
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 const MAX_LEVELS: usize = 16;
 const WORKGROUP: u32 = 8;
 const REDUCE_WGSL: &str = r#"
 struct Params {
-    src_width: u32, src_height: u32, dst_width: u32, dst_height: u32,
-    src_offset: u32, dst_offset: u32, mode: u32, _pad: u32,
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+    src_offset: u32,
+    dst_offset: u32,
+    mode: u32,
+    _pad: u32,
 };
 @group(0) @binding(0) var source_depth: texture_depth_2d;
-@group(1) @binding(0) var<storage, read_write> values: array<f32>;
-@group(2) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var source_values: texture_2d<f32>;
+@group(0) @binding(2) var destination: texture_storage_2d<r32float, write>;
+@group(0) @binding(3) var<uniform> p: Params;
 
 fn finite(v: f32) -> bool {
     return v >= -3.0e38 && v <= 3.0e38;
@@ -24,11 +30,15 @@ fn finite(v: f32) -> bool {
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= p.dst_width || id.y >= p.dst_height { return; }
+    if id.x >= p.dst_width || id.y >= p.dst_height {
+        return;
+    }
     var result = 1.0;
     if p.mode == 0u {
         result = textureLoad(source_depth, vec2<i32>(id.xy), 0);
-        if !finite(result) { result = 0.0; }
+        if !finite(result) {
+            result = 0.0;
+        }
     } else {
         // Ceil-halving keeps odd right/bottom edges in the hierarchy.
         for (var oy = 0u; oy < 2u; oy += 1u) {
@@ -36,7 +46,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 let sx = id.x * 2u + ox;
                 let sy = id.y * 2u + oy;
                 if sx < p.src_width && sy < p.src_height {
-                    let value = values[p.src_offset + sy * p.src_width + sx];
+                    let value = textureLoad(
+                        source_values,
+                        vec2<i32>(i32(sx), i32(sy)),
+                        0
+                    ).r;
                     // Invalid depth is treated exactly like a clear pixel.
                     if !finite(value) || value < 0.0 || value > 1.0 {
                         result = 0.0;
@@ -47,7 +61,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         }
     }
-    values[p.dst_offset + id.y * p.dst_width + id.x] = result;
+    textureStore(
+        destination,
+        vec2<i32>(id.xy),
+        vec4<f32>(result, 0.0, 0.0, 0.0)
+    );
 }
 "#;
 
@@ -68,18 +86,21 @@ struct DispatchParams {
 pub struct LevelInfo {
     pub width: u32,
     pub height: u32,
-    /// Offset in 32-bit float elements in the persistent storage buffer.
+    /// Offset in the CPU reference's packed representation; texture mips use
+    /// their native mip indices and do not consume this offset.
     pub offset: u32,
 }
 
 pub struct Pyramid {
     extent: (u32, u32),
     levels: Vec<LevelInfo>,
-    buffer: wgpu::Buffer,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    level_views: Vec<wgpu::TextureView>,
+    dummy_texture: wgpu::Texture,
+    dummy_view: wgpu::TextureView,
     pipeline: wgpu::ComputePipeline,
-    depth_layout: wgpu::BindGroupLayout,
-    values_bind: wgpu::BindGroup,
-    params_bind: Vec<wgpu::BindGroup>,
+    bind_layout: wgpu::BindGroupLayout,
     _params: Vec<wgpu::Buffer>,
 }
 
@@ -87,6 +108,13 @@ impl Pyramid {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Result<Self, String> {
         if width == 0 || height == 0 {
             return Err("Hi-Z extent must be non-zero".into());
+        }
+        let limits = device.limits();
+        if width > limits.max_texture_dimension_2d || height > limits.max_texture_dimension_2d {
+            return Err(format!(
+                "Hi-Z extent {width}x{height} exceeds the {}px texture limit",
+                limits.max_texture_dimension_2d
+            ));
         }
 
         let mut levels = Vec::with_capacity(MAX_LEVELS);
@@ -113,62 +141,111 @@ impl Pyramid {
             w = w.div_ceil(2);
             h = h.div_ceil(2);
         }
-        let byte_size = next_offset
+        let memory_size = next_offset
             .checked_mul(4)
-            .ok_or("Hi-Z byte size overflow")?;
-        let limits = device.limits();
-        if byte_size > u64::from(limits.max_storage_buffer_binding_size)
-            || byte_size > limits.max_buffer_size
-        {
-            return Err(format!(
-                "Hi-Z buffer requires {byte_size} bytes; device limits are {} bytes per storage binding and {} bytes per buffer",
-                limits.max_storage_buffer_binding_size, limits.max_buffer_size
-            ));
-        }
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            .ok_or("Hi-Z texture memory size overflow")?;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("reversed-Z minimum depth pyramid"),
-            size: byte_size.max(4),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: levels.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
         });
-        let depth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Hi-Z source depth"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Depth,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            }],
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("Hi-Z full mip texture view"),
+            format: Some(wgpu::TextureFormat::R32Float),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: Some(levels.len() as u32),
+            base_array_layer: 0,
+            array_layer_count: Some(1),
         });
-        let values_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Hi-Z pyramid storage"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+        let level_views: Vec<_> = (0..levels.len())
+            .map(|index| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("Hi-Z single mip view"),
+                    format: Some(wgpu::TextureFormat::R32Float),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    aspect: wgpu::TextureAspect::All,
+                    base_mip_level: index as u32,
+                    mip_level_count: Some(1),
+                    base_array_layer: 0,
+                    array_layer_count: Some(1),
+                })
+            })
+            .collect();
+        // Level zero's unused source binding must not alias its destination
+        // storage view, even though mode=0 never loads it.
+        let dummy_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Hi-Z unused source mip fallback"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
         });
-        let params_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Hi-Z reduction parameters"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+        let dummy_view = dummy_texture.create_view(&Default::default());
+
+        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Hi-Z reduction bindings"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Hi-Z minimum reduction WGSL"),
@@ -176,7 +253,7 @@ impl Pyramid {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Hi-Z reduction pipeline layout"),
-            bind_group_layouts: &[&depth_layout, &values_layout, &params_layout],
+            bind_group_layouts: &[&bind_layout],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -185,17 +262,8 @@ impl Pyramid {
             module: &module,
             entry_point: "main",
         });
-        let values_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Hi-Z pyramid storage binding"),
-            layout: &values_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer.as_entire_binding(),
-            }],
-        });
 
         let mut params = Vec::with_capacity(levels.len());
-        let mut params_bind = Vec::with_capacity(levels.len());
         for index in 0..levels.len() {
             let dst = levels[index];
             let (src_width, src_height, src_offset, mode) = if index == 0 {
@@ -219,25 +287,18 @@ impl Pyramid {
                 contents: bytemuck::bytes_of(&data),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
-            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Hi-Z level parameters binding"),
-                layout: &params_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                }],
-            });
             params.push(uniform);
-            params_bind.push(bind);
         }
         Ok(Self {
             extent: (width, height),
             levels,
-            buffer,
+            texture,
+            view,
+            level_views,
+            dummy_texture,
+            dummy_view,
             pipeline,
-            depth_layout,
-            values_bind,
-            params_bind,
+            bind_layout,
             _params: params,
         })
     }
@@ -248,39 +309,64 @@ impl Pyramid {
     pub fn levels(&self) -> &[LevelInfo] {
         &self.levels
     }
-    pub fn buffer(&self) -> &wgpu::Buffer {
-        &self.buffer
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
     }
-    pub fn buffer_size(&self) -> u64 {
-        self.buffer.size()
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+    pub fn memory_size(&self) -> u64 {
+        self.levels
+            .iter()
+            .map(|level| u64::from(level.width) * u64::from(level.height) * 4)
+            .sum()
     }
 
-    /// Per-mip (width, height, float-element-offset, 0) table for WGSL.
+    /// Per-mip (width, height, 0, 0) table for WGSL.
     pub fn shader_mips(&self) -> [[u32; 4]; MAX_LEVELS] {
         let mut out = [[1, 1, 0, 0]; MAX_LEVELS];
         for (slot, level) in out.iter_mut().zip(&self.levels) {
-            *slot = [level.width, level.height, level.offset, 0];
+            *slot = [level.width, level.height, 0, 0];
         }
         out
     }
 
-    /// Encode one compute pass per level into the caller's command buffer.
-    /// Pass boundaries make each level's storage writes visible to the next.
+    /// Encode one compute pass per mip into the caller's command buffer.
+    /// Separate views prevent read/write aliasing between adjacent mip levels.
     pub fn encode(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         depth_view: &wgpu::TextureView,
     ) {
-        let depth_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Hi-Z current-view depth binding"),
-            layout: &self.depth_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(depth_view),
-            }],
-        });
         for (index, level) in self.levels.iter().enumerate() {
+            let source_view = if index == 0 {
+                &self.dummy_view
+            } else {
+                &self.level_views[index - 1]
+            };
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Hi-Z reduction mip bindings"),
+                layout: &self.bind_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(source_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.level_views[index]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self._params[index].as_entire_binding(),
+                    },
+                ],
+            });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(if index == 0 {
                     "Hi-Z copy current depth"
@@ -290,9 +376,7 @@ impl Pyramid {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &depth_bind, &[]);
-            pass.set_bind_group(1, &self.values_bind, &[]);
-            pass.set_bind_group(2, &self.params_bind[index], &[]);
+            pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(
                 level.width.div_ceil(WORKGROUP),
                 level.height.div_ceil(WORKGROUP),

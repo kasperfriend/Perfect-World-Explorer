@@ -1881,7 +1881,8 @@ struct Renderer {
     /// A small storage fallback keeps the tree compute bind group valid when a
     /// viewport exceeds the adapter's storage-buffer binding limit.
     hiz: Option<crate::hiz::Pyramid>,
-    hiz_fallback: wgpu::Buffer,
+    hiz_fallback_texture: wgpu::Texture,
+    hiz_fallback_view: wgpu::TextureView,
     /// Object-motion attachment for the shared motion-vector pass: `rg` pixel
     /// motion, `a` coverage, `b` spare, at render extent. Cleared every frame and
     /// written only by the passes that know an object's own motion
@@ -2032,12 +2033,12 @@ fn resize_world_targets(renderer: &mut Renderer, w: u32, h: u32) {
             None
         }
     };
-    renderer.far_trees.set_hiz_buffer(
+    renderer.far_trees.set_hiz_view(
         &renderer.device,
         renderer
             .hiz
             .as_ref()
-            .map_or(&renderer.hiz_fallback, |p| p.buffer()),
+            .map_or(&renderer.hiz_fallback_view, |p| p.view()),
     );
     if renderer.object_mv_enabled {
         let (object_mv, object_mv_view) = object_mv_target(&renderer.device, w, h);
@@ -2232,7 +2233,7 @@ impl Renderer {
                     w,
                     h,
                     pyramid.levels().len(),
-                    pyramid.buffer_size()
+                    pyramid.memory_size()
                 );
                 Some(pyramid)
             }
@@ -2243,12 +2244,21 @@ impl Renderer {
                 None
             }
         };
-        let hiz_fallback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Hi-Z disabled fallback storage"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
+        let hiz_fallback_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Hi-Z disabled fallback texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
         });
+        let hiz_fallback_view = hiz_fallback_texture.create_view(&Default::default());
         let terrain_upload = m
             .terrain_upload
             .take()
@@ -2585,7 +2595,7 @@ impl Renderer {
             let (weather, cloud) = weather_cloud_task.join().unwrap();
             let (water, simple_water, shore) = water_task.join().unwrap();
             let mut far_trees = trees_task.join().unwrap();
-            far_trees.set_hiz_buffer(&device, hiz.as_ref().map_or(&hiz_fallback, |p| p.buffer()));
+            far_trees.set_hiz_view(&device, hiz.as_ref().map_or(&hiz_fallback_view, |p| p.view()));
             let (pipeline, scenery_pipeline, sdr_blend_pipeline) =
                 world_pipelines_task.join().unwrap();
             let post = post_task.join().unwrap();
@@ -2759,7 +2769,8 @@ impl Renderer {
             count,
             depth: d,
             hiz,
-            hiz_fallback,
+            hiz_fallback_texture,
+            hiz_fallback_view,
             object_mv,
             object_mv_view,
             object_mv_enabled: false,

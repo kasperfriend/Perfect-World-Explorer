@@ -105,7 +105,7 @@ struct Instance {data0:vec4<f32>,data1:vec4<f32>};
 @group(0) @binding(2) var<storage,read> groups:array<GroupInfo>;
 @group(0) @binding(3) var<storage,read_write> instances:array<Instance>;
 @group(0) @binding(4) var<storage,read_write> args:array<Args>;
-@group(0) @binding(5) var<storage,read> hiz:array<f32>;
+@group(0) @binding(5) var hiz:texture_2d<f32>;
 fn is_finite(v:f32)->bool {return v>=-3.0e38 && v<=3.0e38;}
 // SpeedTreeRT 0x100282b0's estimate: f32 squared distance, then the float-bit
 // square root. Matches `tree_lod::client_distance`.
@@ -188,7 +188,7 @@ fn sphere_occluded(position:vec3<f32>,radius:f32)->bool {
  let hi=min(rect_max/vec2<u32>(scale),info.xy-vec2<u32>(1u));
  for(var y=lo.y;y<=hi.y;y=y+1u) {
   for(var x=lo.x;x<=hi.x;x=x+1u) {
-   let depth=hiz[info.z+y*info.x+x];
+   let depth=textureLoad(hiz,vec2<i32>(i32(x),i32(y)),i32(mip)).r;
    if !is_finite(depth) || depth<0.0 || depth>1.0 || depth<=threshold {return false;}
   }
  }
@@ -1184,10 +1184,10 @@ impl FarTrees {
                 wgpu::BindGroupLayoutEntry {
                     binding: 5,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
                     count: None,
                 },
@@ -1205,14 +1205,23 @@ impl FarTrees {
             module: &lod_module,
             entry_point: "main",
         });
-        // A one-element storage buffer keeps the non-Hi-Z fallback valid on
-        // devices where the viewport exceeds the storage-binding limit.
-        let hiz_dummy = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("disabled Hi-Z fallback"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
+        // A sampled texture keeps the non-Hi-Z fallback valid on devices
+        // where Hi-Z allocation or R32Float storage textures are unavailable.
+        let hiz_dummy_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("disabled Hi-Z fallback texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
         });
+        let hiz_dummy_view = hiz_dummy_texture.create_view(&Default::default());
         let lod_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tree lod"),
             layout: &lod_layout,
@@ -1239,7 +1248,7 @@ impl FarTrees {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: hiz_dummy.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&hiz_dummy_view),
                 },
             ],
         });
@@ -1289,9 +1298,9 @@ impl FarTrees {
     /// instance counts the indirect draws read. Nothing is uploaded per frame,
     /// and the pass is skipped entirely when the camera, scale and cutoff are
     /// unchanged, exactly like the old staging rebuild.
-    pub fn set_hiz_buffer(&mut self, device: &wgpu::Device, buffer: &wgpu::Buffer) {
+    pub fn set_hiz_view(&mut self, device: &wgpu::Device, view: &wgpu::TextureView) {
         self.lod_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("tree LOD with current Hi-Z buffer"),
+            label: Some("tree LOD with current Hi-Z texture"),
             layout: &self.lod_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -1316,7 +1325,7 @@ impl FarTrees {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(view),
                 },
             ],
         });

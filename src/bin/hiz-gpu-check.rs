@@ -120,13 +120,45 @@ fn main() {
         pass.draw(0..3, 0..1);
     }
     pyramid.encode(&device, &mut encoder, &depth_view);
+    let mut copy_layouts = Vec::with_capacity(pyramid.levels().len());
+    let mut readback_size = 0u64;
+    for level in pyramid.levels() {
+        readback_size = readback_size.div_ceil(256) * 256;
+        let row_pitch = (u64::from(level.width) * 4).div_ceil(256) * 256;
+        copy_layouts.push((readback_size, row_pitch));
+        readback_size += row_pitch * u64::from(level.height);
+    }
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Hi-Z regression readback"),
-        size: pyramid.buffer_size(),
+        size: readback_size.max(4),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    encoder.copy_buffer_to_buffer(&pyramid.buffer(), 0, &readback, 0, pyramid.buffer_size());
+    for (index, (level, (offset, row_pitch))) in
+        pyramid.levels().iter().zip(copy_layouts.iter()).enumerate()
+    {
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: pyramid.texture(),
+                mip_level: index as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: *offset,
+                    bytes_per_row: Some(*row_pitch as u32),
+                    rows_per_image: Some(level.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: level.width,
+                height: level.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
     queue.submit(Some(encoder.finish()));
 
     let slice = readback.slice(..);
@@ -139,26 +171,29 @@ fn main() {
         .expect("readback callback dropped")
         .expect("Hi-Z readback mapping failed");
     let bytes = slice.get_mapped_range().to_vec();
-    let values = bytemuck::cast_slice::<u8, f32>(&bytes);
-
     let expected = [(13u32, 7u32), (7, 4), (4, 2), (2, 1), (1, 1)];
     assert_eq!(pyramid.levels().len(), expected.len());
     for (index, (level, (width, height))) in pyramid.levels().iter().zip(expected).enumerate() {
         assert_eq!((level.width, level.height), (width, height), "mip {index}");
-        let count = (width * height) as usize;
-        let mip = &values[level.offset as usize..level.offset as usize + count];
-        assert!(
-            mip.iter().all(|v| (*v - 0.8).abs() < 1.0e-5 || *v == 0.0),
-            "mip {index} contains unexpected depth values: {mip:?}"
-        );
-        let edge_index = (height as usize - 1) * width as usize + width as usize - 1;
-        assert_eq!(
-            mip[edge_index], 0.0,
-            "clear hole must propagate through mip {index}"
-        );
-        if index == 0 {
-            assert_eq!(mip[0], 0.8);
-            assert_eq!(mip[WIDTH as usize - 2], 0.8);
+        let (offset, row_pitch) = copy_layouts[index];
+        for y in 0..height as usize {
+            let row_start = offset as usize + y * row_pitch as usize;
+            let row = &bytes[row_start..row_start + width as usize * 4];
+            let mip = bytemuck::cast_slice::<u8, f32>(row);
+            assert!(
+                mip.iter().all(|v| (*v - 0.8).abs() < 1.0e-5 || *v == 0.0),
+                "mip {index} contains unexpected depth values: {mip:?}"
+            );
+            if y == height as usize - 1 {
+                assert_eq!(
+                    mip[width as usize - 1], 0.0,
+                    "clear hole must propagate through mip {index}"
+                );
+            }
+            if index == 0 && y == 0 {
+                assert_eq!(mip[0], 0.8);
+                assert_eq!(mip[WIDTH as usize - 2], 0.8);
+            }
         }
     }
     drop(bytes);
