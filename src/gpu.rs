@@ -9293,7 +9293,9 @@ mod raywatcher_water_surface_selection_tests {
 
         assert_eq!(surfaces.len(), 16);
         assert!(
-            surfaces.iter().any(|surface| surface.bounds == camera_lake.bounds),
+            surfaces
+                .iter()
+                .any(|surface| surface.bounds == camera_lake.bounds),
             "the water plane under the camera must be available to the G-buffer classifier"
         );
     }
