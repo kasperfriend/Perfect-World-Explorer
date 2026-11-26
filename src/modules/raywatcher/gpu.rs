@@ -1788,7 +1788,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let candidate_weight = candidate_target / candidate_cosine;
                 restir_update(
                     &restir_current, gi_first_position, gi_candidate,
-                    candidate_target, candidate_weight, 1.0, gi_first_is_sky,
+                    candidate_weight, candidate_weight, 1.0, gi_first_is_sky,
                     point, normal, &state
                 );
             } else {

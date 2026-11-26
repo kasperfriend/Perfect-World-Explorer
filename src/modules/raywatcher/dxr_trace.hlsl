@@ -1475,7 +1475,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 float candidate_target = max(luma(gi_candidate) * candidate_cosine, 1e-5);
                 float candidate_weight = candidate_target / candidate_cosine;
                 restir_update(restir_current, gi_first_position, gi_candidate,
-                    candidate_target, candidate_weight, 1.0, gi_first_is_sky,
+                    candidate_weight, candidate_weight, 1.0, gi_first_is_sky,
                     world_pos, normal, state);
             } else {
                 accum_gi += gi_candidate;
