@@ -131,7 +131,13 @@ struct Voice {
 
 /// The client gates modes 0/1/2 at the strict 0.5 day/night boundary.
 /// Gain and the voice cap are deliberately not claimed as native behavior.
-fn select(emitters: &[Emitter], spatial: &SpatialIndex, pos: [f32; 3], yaw: f32, night_factor: f32) -> Vec<Voice> {
+fn select(
+    emitters: &[Emitter],
+    spatial: &SpatialIndex,
+    pos: [f32; 3],
+    yaw: f32,
+    night_factor: f32,
+) -> Vec<Voice> {
     if !pos.iter().all(|v| v.is_finite()) || !yaw.is_finite() {
         return Vec::new();
     }
@@ -564,7 +570,10 @@ mod tests {
         let mut emitters = Vec::new();
         for z in -12i32..=12 {
             for x in -12i32..=12 {
-                let mut e = emitter([x as f32 * 173.0, (x - z) as f32 * 3.0, z as f32 * 191.0], 2);
+                let mut e = emitter(
+                    [x as f32 * 173.0, (x - z) as f32 * 3.0, z as f32 * 191.0],
+                    2,
+                );
                 e.sound.max_distance = match (x + z).rem_euclid(4) {
                     0 => 64.0,
                     1 => 256.0,
