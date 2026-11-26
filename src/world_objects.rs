@@ -281,6 +281,20 @@ struct PageDrawIndexedArgs {
 }
 const PAGE_DRAW_ARGS_SIZE: u64 = std::mem::size_of::<PageDrawIndexedArgs>() as u64;
 
+/// Retain an adequate allocation; grow geometrically only when this frame
+/// actually needs more space. None means direct draws are the safe fallback.
+fn page_indirect_capacity(current: u64, required: u64, limit: u64) -> Option<u64> {
+    if required == 0 {
+        return None;
+    }
+    let capacity = if current >= required {
+        current
+    } else {
+        required.max(current.saturating_mul(2).min(limit))
+    };
+    (capacity <= limit).then_some(capacity)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WorldIndirectRun {
     page: usize,
@@ -1963,10 +1977,11 @@ impl GpuPage {
                 let current_bytes = scratch.indirect_buffers[slot]
                     .as_ref()
                     .map_or(0, wgpu::Buffer::size);
-                let max_buffer_size = device.limits().max_buffer_size;
-                let capacity =
-                    required_bytes.max(current_bytes.saturating_mul(2).min(max_buffer_size));
-                if required_bytes > 0 && capacity <= max_buffer_size {
+                if let Some(capacity) = page_indirect_capacity(
+                    current_bytes,
+                    required_bytes,
+                    device.limits().max_buffer_size,
+                ) {
                     if capacity != current_bytes {
                         scratch.indirect_buffers[slot] =
                             Some(device.create_buffer(&wgpu::BufferDescriptor {
@@ -2629,6 +2644,16 @@ mod page_tests {
         assert!(all_chunks_inside_frustum(&[inside], &cube));
         assert!(!all_chunks_inside_frustum(&[inside, outside], &cube));
         assert!(!all_chunks_inside_frustum(&[], &cube));
+    }
+
+    #[test]
+    fn indirect_buffer_capacity_is_reused_and_only_grows_when_needed() {
+        assert_eq!(page_indirect_capacity(1024, 512, 4096), Some(1024));
+        assert_eq!(page_indirect_capacity(1024, 1024, 4096), Some(1024));
+        assert_eq!(page_indirect_capacity(1024, 1536, 4096), Some(2048));
+        assert_eq!(page_indirect_capacity(0, 1536, 4096), Some(1536));
+        assert_eq!(page_indirect_capacity(1024, 4097, 4096), None);
+        assert_eq!(page_indirect_capacity(1024, 0, 4096), None);
     }
 
     #[test]
