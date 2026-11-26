@@ -69,7 +69,6 @@ struct Project {
 
 pub struct Architect {
     enabled: bool,
-    element: PathBuf,
     client_root: PathBuf,
     map: Option<crate::navigation::MapSpace>,
     project_root: PathBuf,
@@ -112,7 +111,6 @@ impl Architect {
         let client_root = element.parent().unwrap_or(&element).to_path_buf();
         let mut editor = Self {
             enabled: false,
-            element,
             client_root,
             map,
             project_root,
@@ -351,7 +349,7 @@ impl Architect {
             });
     }
 
-    fn show_tree(&mut self, ui: &mut egui::Ui, path: &Path, depth: usize) {
+    fn show_tree(&mut self, ui: &mut egui::Ui, path: &Path, depth: usize, camera: Vec3) {
         if depth > 12 { return; }
         let Ok(entries) = fs::read_dir(path) else { return };
         let mut entries = entries.flatten().collect::<Vec<_>>();
@@ -366,7 +364,7 @@ impl Architect {
             if kind.is_dir() {
                 let response = egui::CollapsingHeader::new(format!("📁 {label}"))
                     .id_source(child.to_string_lossy().to_string())
-                    .show(ui, |ui| self.show_tree(ui, &child, depth + 1));
+                    .show(ui, |ui| self.show_tree(ui, &child, depth + 1, camera));
                 response.header_response.context_menu(|ui| {
                     if ui.button("Pin folder to quick bar").clicked() {
                         self.pin(child.to_string_lossy().into_owned());
@@ -378,7 +376,10 @@ impl Architect {
                     self.selected_asset.as_deref() == Some(child.to_string_lossy().as_ref()),
                     format!("📄 {label}"),
                 );
-                if response.clicked() { self.selected_asset = Some(child.to_string_lossy().into_owned()); }
+                if response.clicked() {
+                    self.selected_asset = Some(child.to_string_lossy().into_owned());
+                    if self.cursor == CursorMode::Place { self.add_selected_asset_at_camera(camera); }
+                }
                 response.context_menu(|ui| {
                     if ui.button("Pin to quick bar").clicked() {
                         self.pin(child.to_string_lossy().into_owned());
@@ -409,6 +410,23 @@ impl Architect {
         });
         self.selected_placement = Some(self.project.objects.len() - 1);
         self.status = "Custom placement staged in the project. It is not yet drawn by the world renderer.".into();
+    }
+
+    fn scene_row(&mut self, ui: &mut egui::Ui, index: usize, label: &str, asset: &str, camera: Vec3) {
+        if !self.object_filter.is_empty() && !label.to_lowercase().contains(&self.object_filter.to_lowercase()) {
+            return;
+        }
+        let selected = self.selected_scene_object == Some(index) || self.multi_selection.contains(&index);
+        if ui.selectable_label(selected, label).clicked() {
+            self.selected_asset = Some(asset.to_string());
+            if self.cursor == CursorMode::MultiSelect {
+                if !self.multi_selection.insert(index) { self.multi_selection.remove(&index); }
+            } else {
+                self.selected_scene_object = Some(index);
+                self.multi_selection.clear();
+            }
+            if self.cursor == CursorMode::Place { self.add_selected_asset_at_camera(camera); }
+        }
     }
 
     fn pin(&mut self, path: String) {
@@ -497,6 +515,15 @@ impl Architect {
                     map_request = Some(self.selected_map.clone());
                 }
                 ui.separator();
+                if ui.button("＋ New empty world project").clicked() {
+                    self.project = Project::default();
+                    self.project_name = "Untitled World".into();
+                    self.selected_project = None;
+                    self.selected_placement = None;
+                    self.selected_scene_object = None;
+                    self.multi_selection.clear();
+                    self.status = "New empty project. Choose a client map as its source when ready.".into();
+                }
                 ui.heading("Custom worlds");
                 self.refresh_projects();
                 if self.project_files.is_empty() {
@@ -512,7 +539,7 @@ impl Architect {
                     });
                 ui.horizontal(|ui| {
                     if ui.button("Open").clicked() { self.load_selected(); }
-                    if ui.button("Erase…").clicked() { self.confirm_erase = true; }
+                    if ui.add(egui::Button::new("Erase…").fill(egui::Color32::from_rgb(135, 42, 42))).clicked() { self.confirm_erase = true; }
                 });
                 if self.confirm_erase {
                     ui.colored_label(egui::Color32::LIGHT_RED, "Permanently erase this custom project?");
@@ -527,6 +554,8 @@ impl Architect {
                 if ui.button("Save custom world").clicked() { self.save_named(); }
                 ui.label(egui::RichText::new("Projects are stored separately from the client and never overwrite its files.").small().weak());
                 ui.separator();
+                ui.add_enabled(false, egui::Button::new("Save as real game map").fill(egui::Color32::from_rgb(38, 125, 72)))
+                    .on_hover_text("Disabled until the native ECWLD, EC-BSD and terrain exporters can round-trip validated client data.");
                 ui.colored_label(egui::Color32::from_rgb(240, 190, 100), "Native game-map export is not available yet.");
                 ui.label(egui::RichText::new("A real client map requires validated ECWLD, EC-BSD and terrain writers. Architect keeps edits in a portable project until that exporter is implemented.").small().weak());
                 ui.label(egui::RichText::new(&self.status).small().color(egui::Color32::LIGHT_BLUE));
@@ -543,7 +572,7 @@ impl Architect {
                 ui.label(egui::RichText::new("Loose files and folders under the client element directory. PCK archives are listed as files; their internal entries are not expanded here.").small().weak());
                 ui.text_edit_singleline(&mut self.tree_filter);
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                    self.show_tree(ui, &self.client_root.clone(), 0);
+                    self.show_tree(ui, &self.client_root.clone(), 0, camera);
                 });
                 if let Some(asset) = self.selected_asset.clone() {
                     ui.separator();
@@ -579,27 +608,31 @@ impl Architect {
                         for block in &scene.blocks {
                             for model in &block.models {
                                 let label = format!("Model {} · {}", model.export_id, model.path);
-                                if self.object_filter.is_empty() || label.to_lowercase().contains(&self.object_filter.to_lowercase()) {
-                                    let selected = self.selected_scene_object == Some(index) || self.multi_selection.contains(&index);
-                                    if ui.selectable_label(selected, label).clicked() {
-                                        if self.cursor == CursorMode::MultiSelect {
-                                            if !self.multi_selection.insert(index) { self.multi_selection.remove(&index); }
-                                        } else {
-                                            self.selected_scene_object = Some(index);
-                                            self.multi_selection.clear();
-                                        }
+                                self.scene_row(ui, index, &label, &model.path, camera);
+                                index += 1;
+                            }
+                            for tree in &block.trees {
+                                if let Some(kind) = scene.tree_types.get(tree.tree_type as usize) {
+                                    let label = format!("Tree {} · {}", tree.tree_type, kind.tree);
+                                    self.scene_row(ui, index, &label, &kind.tree, camera);
+                                    index += 1;
+                                    if !kind.composite.is_empty() {
+                                        let composite = format!("Tree composite {} · {}", tree.tree_type, kind.composite);
+                                        self.scene_row(ui, index, &composite, &kind.composite, camera);
+                                        index += 1;
                                     }
                                 }
+                            }
+                            for effect in &block.effects {
+                                let label = format!("Effect {} · {}", effect.export_id, effect.path);
+                                self.scene_row(ui, index, &label, &effect.path, camera);
                                 index += 1;
                             }
                         }
                         for ornament in ornaments {
                             let label = format!("Scenery {} · {}", ornament.export_id, ornament.path);
-                            if self.object_filter.is_empty() || label.to_lowercase().contains(&self.object_filter.to_lowercase()) {
-                                if ui.selectable_label(false, label).clicked() {
-                                    self.selected_asset = Some(ornament.path.clone());
-                                }
-                            }
+                            self.scene_row(ui, index, &label, &ornament.path, camera);
+                            index += 1;
                         }
                     });
                 }
@@ -612,18 +645,45 @@ impl Architect {
             .resizable(true)
             .show(ctx, |ui| {
                 if let Some(index) = self.selected_scene_object {
-                    ui.label(format!("Scene object index {index} selected. Existing client placements are read-only."));
+                    ui.label(format!("Client scene item {index} selected. Native placements are read-only."));
                 } else {
-                    ui.label("Select an object in the scene list or choose an asset in the client explorer.");
+                    ui.label("Select a client scene item or a custom placement.");
                 }
-                ui.label(format!("Pending custom placements: {}", self.project.objects.len()));
                 ui.label(format!("Camera position: {:.1}, {:.1}, {:.1}", camera.x, camera.y, camera.z));
                 if ui.button("Place selected asset at camera").clicked() {
-                    if let Some(asset) = self.selected_asset.clone() {
-                        self.project.objects.push(PlacedObject { asset, position: camera.to_array(), rotation: [0.; 3], scale: 1. });
-                        self.status = "Custom placement recorded.".into();
+                    self.add_selected_asset_at_camera(camera);
+                }
+                ui.separator();
+                ui.heading("Custom placements");
+                let mut delete_placement = None;
+                egui::ScrollArea::vertical().max_height(100.).show(ui, |ui| {
+                    for (index, object) in self.project.objects.iter().enumerate() {
+                        let label = format!("{} · ({:.1}, {:.1}, {:.1})", Path::new(&object.asset).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| object.asset.clone()), object.position[0], object.position[1], object.position[2]);
+                        if ui.selectable_label(self.selected_placement == Some(index), label).clicked() {
+                            self.selected_placement = Some(index);
+                        }
+                    }
+                });
+                if let Some(index) = self.selected_placement {
+                    if let Some(object) = self.project.objects.get_mut(index) {
+                        ui.label(egui::RichText::new(&object.asset).small().weak());
+                        ui.horizontal(|ui| {
+                            ui.label("Position");
+                            for axis in 0..3 { ui.add(egui::DragValue::new(&mut object.position[axis]).speed(0.5).prefix(["X ", "Y ", "Z "][axis])); }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Rotation");
+                            for axis in 0..3 { ui.add(egui::DragValue::new(&mut object.rotation[axis]).speed(0.01).prefix(["X ", "Y ", "Z "][axis])); }
+                        });
+                        ui.add(egui::Slider::new(&mut object.scale, 0.01..=100.0).logarithmic(true).text("Scale"));
+                        if ui.button("Delete custom placement").clicked() { delete_placement = Some(index); }
                     }
                 }
+                if let Some(index) = delete_placement {
+                    self.project.objects.remove(index);
+                    self.selected_placement = None;
+                }
+                ui.label(format!("Pending custom placements: {}", self.project.objects.len()));
             });
 
         egui::Window::new("Terrain tools")
@@ -638,7 +698,7 @@ impl Architect {
                 if ui.button("Record brush operation at camera").clicked() {
                     self.project.strokes.push(TerrainStroke {
                         mode: self.brush,
-                        position: camera.to_array(),
+                        position: self.placement_position(camera),
                         radius: self.brush_radius,
                         strength: if self.brush == BrushMode::Flatten { self.flatten_height } else { self.brush_strength },
                     });
@@ -691,7 +751,6 @@ mod tests {
         let path = std::env::temp_dir().join(format!("pwe-architect-{}.pwa", std::process::id()));
         let editor = Architect {
             enabled: false,
-            element: PathBuf::new(),
             client_root: PathBuf::new(),
             map: None,
             project_root: path.parent().unwrap().to_path_buf(),
