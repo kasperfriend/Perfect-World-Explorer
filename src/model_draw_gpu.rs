@@ -208,7 +208,7 @@ pub struct Draw {
     /// Reused per-mesh uniform payloads. Camera turns update every visible
     /// receiver's constants, but the payload scratch must not allocate or
     /// recompute material constants twice on each frame.
-    constant_scratch: Vec<raster::Params>,
+    constant_scratch: std::cell::RefCell<Vec<raster::Params>>,
     // Keep authored textures alive and share repeated per-skin texture slots.
     textures: Vec<std::sync::Arc<wgpu::Texture>>,
 }
@@ -484,7 +484,7 @@ impl Draw {
             meshes,
             pose_of,
             alpha_meshes,
-            constant_scratch: Vec::new(),
+            constant_scratch: std::cell::RefCell::new(Vec::new()),
             textures,
         })
     }
@@ -624,7 +624,7 @@ impl Draw {
     /// World-owned immutable topology: pass changes only require constants,
     /// not another prepare/copy/upload of the exact same posed vertices.
     pub fn update_constants(
-        &mut self,
+        &self,
         queue: &wgpu::Queue,
         asset: &ModelAsset,
         frame: Frame,
@@ -633,7 +633,8 @@ impl Draw {
             return Err("model pass blending changed; rebuild its pipeline".into());
         }
         let original = asset.descriptor.render_settings().original_color;
-        self.constant_scratch.clear();
+        let mut constant_scratch = self.constant_scratch.borrow_mut();
+        constant_scratch.clear();
         for mesh in self.meshes.iter().flatten() {
             let skin = asset.skins.get(mesh.key.0).ok_or("missing retained skin")?;
             let source = skin
@@ -652,14 +653,14 @@ impl Draw {
             };
             // Validate and retain the exact uniform payload before any writes,
             // so a bad final mesh cannot leave a partially updated model.
-            self.constant_scratch.push(frame.params(
+            constant_scratch.push(frame.params(
                 material,
                 color,
                 mesh.diffuse_alpha_only,
                 mesh.face_shader.as_ref(),
             )?);
         }
-        for (mesh, params) in self.meshes.iter().flatten().zip(&self.constant_scratch) {
+        for (mesh, params) in self.meshes.iter().flatten().zip(constant_scratch.iter()) {
             mesh.binding.update(queue, params)?;
         }
         Ok(())
