@@ -67,6 +67,8 @@ Texture2D<float4> src_gbuf_raster : register(t5);
 Texture2D<float4> src_sky_env : register(t6);
 // Top-down real textured terrain albedo map (512x512 around camera anchor).
 Texture2D<float4> src_terrain_map : register(t7);
+// 1:1 converted raster colour used after the ray-grid G-buffer validates a hit.
+Texture2D<float4> src_screen_raster : register(t8);
 
 RWTexture2D<float4> out_colour : register(u0);
 RWTexture2D<float4> out_guide : register(u1);
@@ -78,7 +80,7 @@ RWStructuredBuffer<uint4> radiance_cache : register(u5);
 RWStructuredBuffer<RestirReservoir> restir_reservoirs : register(u6);
 
 static const float PI = 3.14159265;
-static const float SKY_ENV_FACE_F = 128.0;
+static const float SKY_ENV_FACE_F = 512.0;
 static const float TERRAIN_MAP_SIZE_F = 512.0;
 static const uint RC_MASK = 65535u;
 
@@ -499,7 +501,13 @@ float4 sample_screen_radiance(float3 world_pos, float ray_t) {
     float3 screen_delta = gpos.xyz - world_pos;
     float screen_tolerance = max(2.5, ray_t * 0.08);
     if (gpos.w > 0.0 && dot(screen_delta, screen_delta) < screen_tolerance * screen_tolerance) {
-        return float4(src_gbuf_raster.Load(int3(hp, 0)).rgb, 1.0);
+        uint screen_width, screen_height;
+        src_screen_raster.GetDimensions(screen_width, screen_height);
+        int2 screen_px = clamp(
+            int2(uv * float2(screen_width, screen_height)),
+            int2(0, 0),
+            int2(screen_width, screen_height) - int2(1, 1));
+        return float4(src_screen_raster.Load(int3(screen_px, 0)).rgb, 1.0);
     }
     return float4(0.0, 0.0, 0.0, 0.0);
 }
@@ -533,8 +541,8 @@ float3 sample_sky_env(float3 dir) {
     float fy = float(row) * fh + fuv.y * (fh - 1.0);
     int x0 = int(floor(fx));
     int y0 = int(floor(fy));
-    int x1 = min(x0 + 1, int((col + 1u) * 128u) - 1);
-    int y1 = min(y0 + 1, int((row + 1u) * 128u) - 1);
+    int x1 = min(x0 + 1, int((col + 1u) * 512u) - 1);
+    int y1 = min(y0 + 1, int((row + 1u) * 512u) - 1);
     float2 frac_xy = float2(fx - float(x0), fy - float(y0));
     float3 c00 = src_sky_env.Load(int3(x0, y0, 0)).rgb;
     float3 c10 = src_sky_env.Load(int3(x1, y0, 0)).rgb;
