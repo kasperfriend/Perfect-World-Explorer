@@ -796,6 +796,11 @@ impl Manager {
             set_sorted_owner_index(&mut self.active_pending_indices, index, active);
         } else if live {
             set_sorted_owner_index(&mut self.active_owner_indices, index, active);
+            if !active {
+                // The previous full-owner pass released an inactive root on the
+                // same frame. Preserve that residency rule with indexed updates.
+                self.owners[index].player = None;
+            }
         }
         true
     }

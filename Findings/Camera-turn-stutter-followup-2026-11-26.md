@@ -158,3 +158,7 @@ hook-attached GFX keeps the same frame-consistent parent pose.
 - Swap-removal repairs the moved owner's index in each sorted list. Tests cover
   activation toggles, active-owner movement, pending preference and fallback.
   The existing full CI suite validates the complete owner lifecycle.
+
+- Deactivation immediately drops an already-built animated player in
+  `set_active(false)`. This preserves the previous full-scan behavior while the
+  frame loop no longer visits inactive owners.
