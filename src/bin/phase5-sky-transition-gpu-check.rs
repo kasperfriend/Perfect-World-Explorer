@@ -648,6 +648,7 @@ fn main() {
             moon_params[20..24].fill(0.);
             moon_params[24..28].copy_from_slice(&[1., el, az, 0.]);
             moon_params[23] = 0.;
+            moon_params[46] = 1.; // explicitly enable moonflare.bmp for this render
             let moon_with_halo = render(
                 &device,
                 &queue,

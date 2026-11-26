@@ -425,7 +425,7 @@ fn celestial(color:vec3<f32>,d:vec3<f32>,params:vec4<f32>,disc:i32,glow:i32,nigh
  var out=color;
  if !is_sun && p.moon_glow.z>0.5 {
   let halo_half=MOON_HALF*1.5;
-  let halo_uv=vec2<f32>(plane.x/(2.0*halo_half),(plane.y-halo_half)/(2.0*halo_half))
+  let halo_uv=vec2<f32>(plane.x/(2.0*halo_half),(plane.y-MOON_HALF)/(2.0*halo_half))
       +vec2<f32>(0.5)+p.moon_glow.xy;
   if halo_uv.x>=0.0 && halo_uv.x<=1.0 && halo_uv.y>=0.0 && halo_uv.y<=1.0 {
    let halo=textureSampleLevel(skies,smp,halo_uv,glow,0.);
@@ -466,8 +466,8 @@ fn celestial(color:vec3<f32>,d:vec3<f32>,params:vec4<f32>,disc:i32,glow:i32,nigh
   }
  }
  // The requested moon halo is a separate radial sprite, sized at 1.5x the
- // moon disc. Its sampling offset follows moon.tga's authored alpha centroid,
- // so transparent padding does not pull the halo away from the painted moon.
+ // moon disc and centred on the painted moon quad. Its sampling offset follows
+ // moon.tga's authored alpha centroid so transparent padding cannot misalign it.
  // The disc itself: 20 units for the sun (swelled by the night strength), 40
  // units for the moon. Both native templates start at `y == 0` and run down to
  // `-2 * half`, so the emitted point is the quad's *top edge* and the centre
