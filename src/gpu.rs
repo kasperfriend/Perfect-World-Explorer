@@ -1881,7 +1881,7 @@ struct Renderer {
     /// A small storage fallback keeps the tree compute bind group valid when a
     /// viewport exceeds the adapter's storage-buffer binding limit.
     hiz: Option<crate::hiz::Pyramid>,
-    hiz_fallback_texture: wgpu::Texture,
+    _hiz_fallback_texture: wgpu::Texture,
     hiz_fallback_view: wgpu::TextureView,
     /// Object-motion attachment for the shared motion-vector pass: `rg` pixel
     /// motion, `a` coverage, `b` spare, at render extent. Cleared every frame and
@@ -2772,7 +2772,7 @@ impl Renderer {
             count,
             depth: d,
             hiz,
-            hiz_fallback_texture,
+            _hiz_fallback_texture: hiz_fallback_texture,
             hiz_fallback_view,
             object_mv,
             object_mv_view,

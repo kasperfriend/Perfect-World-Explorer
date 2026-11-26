@@ -12,12 +12,13 @@ const DEPTH_TEST_WGSL: &str = r#"
 struct FragmentOut { @builtin(frag_depth) depth: f32 };
 @vertex
 fn vs(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
-    let vertices = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 3.0, -1.0),
-        vec2<f32>(-1.0,  3.0)
-    );
-    return vec4<f32>(vertices[index], 0.5, 1.0);
+    var position = vec2<f32>(-1.0, -1.0);
+    if index == 1u {
+        position = vec2<f32>(3.0, -1.0);
+    } else if index == 2u {
+        position = vec2<f32>(-1.0, 3.0);
+    }
+    return vec4<f32>(position, 0.5, 1.0);
 }
 @fragment
 fn fs(@builtin(position) pixel: vec4<f32>) -> FragmentOut {
@@ -98,6 +99,14 @@ fn main() {
     });
 
     let pyramid = hiz::Pyramid::new(&device, WIDTH, HEIGHT).expect("Hi-Z allocation failed");
+    assert_eq!(pyramid.extent(), (WIDTH, HEIGHT));
+    assert!(pyramid.memory_size() >= u64::from(WIDTH * HEIGHT * 4));
+    let _sampled_view = pyramid.view();
+    let metadata = pyramid.shader_mips();
+    for (entry, level) in metadata.iter().zip(pyramid.levels()) {
+        assert_eq!((entry[0], entry[1]), (level.width, level.height));
+        assert_eq!(entry[2], 0, "texture mips use native mip indices");
+    }
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Hi-Z GPU regression encoder"),
     });
