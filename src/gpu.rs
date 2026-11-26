@@ -234,6 +234,29 @@ fn water_view_scissor(
     Some([px0 as u32, py0 as u32, rw.max(1), rh.max(1)])
 }
 
+/// Narrow a water view's CPU/GPU culling frustum to the exact scissor
+/// rectangle that the surface can sample. The scissor still clips rasterization;
+/// this additionally avoids submitting and vertex-processing objects outside it.
+fn water_view_frustum(
+    matrix: Mat4,
+    extent: (u32, u32),
+    scissor: Option<[u32; 4]>,
+    fallback: [[f32; 4]; 6],
+) -> [[f32; 4]; 6] {
+    let Some([x, y, width, height]) = scissor else {
+        return fallback;
+    };
+    let (w, h) = (extent.0.max(1) as f32, extent.1.max(1) as f32);
+    let left = 2. * x as f32 / w - 1.;
+    let right = 2. * (x + width) as f32 / w - 1.;
+    let top = 1. - 2. * y as f32 / h;
+    let bottom = 1. - 2. * (y + height) as f32 / h;
+    crate::world_objects::frustum_planes_from_matrix_rect(
+        matrix.to_cols_array(),
+        [left, right, bottom, top],
+    )
+}
+
 /// Everything the top-down minimap's pixels can depend on.
 ///
 /// `minimap_matrix` builds the orthographic window from the camera's ground
@@ -4325,6 +4348,8 @@ impl Renderer {
                 self.water_scissored += 1;
                 self.water_scissor_cover += (sw as f32 * sh as f32) / (w as f32 * h as f32);
             }
+            let refraction_frustum =
+                water_view_frustum(matrix, (w, h), refraction_scissor, frustum);
             // A previous plane's reflection left its mirrored records in the
             // buffer; the refraction passes below draw through the main matrix.
             if batch_idx > 0 {
@@ -4371,7 +4396,7 @@ impl Renderer {
                 };
                 let fog = camera.underwater_fog.color;
                 let uw_refr_cull = crate::world_objects::CullParams {
-                    frustum,
+                    frustum: refraction_frustum,
                     eye: camera.pos.to_array(),
                     proj_scale,
                     min_screen_px: 4.0,
@@ -4438,7 +4463,7 @@ impl Renderer {
                 self.queue
                     .write_buffer(&self.reflected_uniform, 0, bytemuck::bytes_of(&above));
                 let above_refr_cull = crate::world_objects::CullParams {
-                    frustum,
+                    frustum: refraction_frustum,
                     eye: camera.pos.to_array(),
                     proj_scale,
                     min_screen_px: 4.0,
@@ -4511,7 +4536,7 @@ impl Renderer {
                         camera,
                         Pass::Refraction,
                         false,
-                        &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+                        &refraction_frustum,
                         unjittered_vp,
                     );
                 }
@@ -4576,8 +4601,16 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.reflected_uniform, 0, bytemuck::bytes_of(&reflected));
             self.queue_reflected_runs(matrix * flip);
+            let reflection_scissor =
+                water_view_scissor(matrix * flip, w, h, batch.bounds, plane, water_margin);
+            let reflection_frustum = water_view_frustum(
+                matrix * flip,
+                (w, h),
+                reflection_scissor,
+                reflected_frustum,
+            );
             let refl_cull = crate::world_objects::CullParams {
-                frustum: reflected_frustum,
+                frustum: reflection_frustum,
                 eye: [camera.pos.x, 2.0 * plane - camera.pos.y, camera.pos.z],
                 proj_scale,
                 min_screen_px: 4.0,
@@ -4601,7 +4634,7 @@ impl Renderer {
                 &refl_cull,
                 // The mirror is read at `screen ± 0.25` by the same surface, so
                 // the same rectangle applies through the mirrored matrix.
-                water_view_scissor(matrix * flip, w, h, batch.bounds, plane, water_margin),
+                reflection_scissor,
             );
             if let Some(cloud) = &self.cloud {
                 cloud.draw(
@@ -4648,7 +4681,7 @@ impl Renderer {
                 camera,
                 Pass::Reflection,
                 false,
-                &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
+                &reflection_frustum,
                 unjittered_vp,
             );
             self.draw_addons(
