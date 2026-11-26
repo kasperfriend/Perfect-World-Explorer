@@ -6025,7 +6025,7 @@ impl Camera {
             water_reflections: true,
             world_effects: true,
             effect_distance: 0.,
-            atmospheric_fog: false,
+            atmospheric_fog: true,
             celestial_discs: false,
             celestial_brightness: 1.,
             ignore_celestial_flags: false,
