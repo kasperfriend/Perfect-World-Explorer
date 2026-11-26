@@ -95,6 +95,7 @@ pub struct Architect {
     applied_right_dock: Dock,
     applied_bottom_dock: Dock,
     confirm_erase: bool,
+    confirm_clear: bool,
     status: String,
     tree_filter: String,
     object_filter: String,
@@ -118,7 +119,7 @@ impl Architect {
             project_files: Vec::new(),
             project_name: "Untitled World".into(),
             selected_project: None,
-            selected_map: String::new(),
+            selected_map: "world".into(),
             cursor: CursorMode::Select,
             snap: SnapMode::Smart,
             brush: BrushMode::Raise,
@@ -137,6 +138,7 @@ impl Architect {
             applied_right_dock: Dock::Right,
             applied_bottom_dock: Dock::Bottom,
             confirm_erase: false,
+            confirm_clear: false,
             status: "Ready. Changes are saved as a separate Architect project.".into(),
             tree_filter: String::new(),
             object_filter: String::new(),
@@ -289,7 +291,7 @@ impl Architect {
             return;
         }
         self.project.name = name.to_string();
-        if self.project.source_map.is_empty() { self.project.source_map = self.selected_map.clone(); }
+        if self.project.source_map.is_empty() && self.selected_map != "__empty__" { self.project.source_map = self.selected_map.clone(); }
         let path = self.project_root.join(format!("{}.pwa", Self::safe_slug(name)));
         match self.write_project(&path) {
             Ok(()) => {
@@ -306,7 +308,7 @@ impl Architect {
         match Self::read_project(&path) {
             Ok(project) => {
                 self.project_name = project.name.clone();
-                self.selected_map = if project.source_map.is_empty() { "world".into() } else { project.source_map.clone() };
+                self.selected_map = if project.source_map.is_empty() { "__empty__".into() } else { project.source_map.clone() };
                 self.project = project;
                 self.selected_placement = None;
                 self.selected_scene_object = None;
@@ -406,7 +408,7 @@ impl Architect {
     fn portable_asset_path(&self, asset: &str) -> String {
         Path::new(asset)
             .strip_prefix(&self.client_root)
-            .map(|relative| relative.to_string_lossy().replace('\\\\', "/"))
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
             .unwrap_or_else(|_| asset.to_string())
     }
 
@@ -503,25 +505,32 @@ impl Architect {
         let screen = ctx.input(|input| input.screen_rect());
         let mut map_request = None;
 
-        egui::Window::new("World")
+        let world_pos = Self::dock_position(self.left_dock, screen, 290., 560.);
+        let world_dock_changed = self.left_dock != self.applied_left_dock;
+        self.applied_left_dock = self.left_dock;
+        let mut world_panel = egui::Window::new("World")
             .id(egui::Id::new("architect_world_panel"))
-            .default_pos(Self::dock_position(self.left_dock, screen, 290., 560.))
+            .default_pos(world_pos)
             .default_size(egui::vec2(290., 560.))
             .min_size(egui::vec2(240., 300.))
-            .resizable(true)
-            .show(ctx, |ui| {
+            .resizable(true);
+        if world_dock_changed { world_panel = world_panel.current_pos(world_pos); }
+        world_panel.show(ctx, |ui| {
                 ui.horizontal(|ui| { ui.heading("World selector"); Self::dock_picker(ui, &mut self.left_dock); });
                 ui.label(egui::RichText::new(format!("Loaded: {} ({})", current_map.display_name, current_map.id)).small().weak());
                 egui::ComboBox::from_id_source("architect_client_maps")
-                    .selected_text(format!("{} ({})", catalog.maps.iter().find(|m| m.id == self.selected_map).map_or(current_map.display_name.as_str(), |m| m.display_name.as_str()), self.selected_map))
+                    .selected_text(if self.selected_map == "__empty__" { "Empty world (new project)".into() } else { format!("{} ({})", catalog.maps.iter().find(|m| m.id == self.selected_map).map_or(current_map.display_name.as_str(), |m| m.display_name.as_str()), self.selected_map) })
                     .width(ui.available_width())
                     .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.selected_map, "__empty__".into(), "Empty world (new project)");
                         for map in &catalog.maps {
                             ui.selectable_value(&mut self.selected_map, map.id.clone(), map.label())
                                 .on_hover_text(map.tooltip());
                         }
                     });
-                if ui.button("Load selected client map").clicked() && !self.selected_map.eq_ignore_ascii_case(&current_map.id) {
+                if self.selected_map == "__empty__" {
+                    ui.label(egui::RichText::new("Empty project: the current loaded world remains a reference viewport; no client map data is modified.").small().weak());
+                } else if ui.button("Load selected client map").clicked() && !self.selected_map.eq_ignore_ascii_case(&current_map.id) {
                     map_request = Some(self.selected_map.clone());
                 }
                 ui.separator();
@@ -562,6 +571,20 @@ impl Architect {
                 ui.heading("Save current world as custom");
                 ui.text_edit_singleline(&mut self.project_name);
                 if ui.button("Save custom world").clicked() { self.save_named(); }
+                if ui.add(egui::Button::new("Clear current project edits…").fill(egui::Color32::from_rgb(135, 42, 42))).clicked() { self.confirm_clear = true; }
+                if self.confirm_clear {
+                    ui.colored_label(egui::Color32::LIGHT_RED, "Clear every unsaved placement and terrain operation in this project?");
+                    ui.horizontal(|ui| {
+                        if ui.button("Confirm clear").clicked() {
+                            self.project.objects.clear();
+                            self.project.strokes.clear();
+                            self.selected_placement = None;
+                            self.confirm_clear = false;
+                            self.status = "Current project edits cleared. Saved project files are unchanged.".into();
+                        }
+                        if ui.button("Cancel").clicked() { self.confirm_clear = false; }
+                    });
+                }
                 ui.label(egui::RichText::new("Projects are stored separately from the client and never overwrite its files.").small().weak());
                 ui.separator();
                 ui.add_enabled(false, egui::Button::new("Save as real game map").fill(egui::Color32::from_rgb(38, 125, 72)))
@@ -571,13 +594,17 @@ impl Architect {
                 ui.label(egui::RichText::new(&self.status).small().color(egui::Color32::LIGHT_BLUE));
             });
 
-        egui::Window::new("Client assets")
+        let asset_pos = Self::dock_position(self.right_dock, screen, 340., 600.);
+        let asset_dock_changed = self.right_dock != self.applied_right_dock;
+        self.applied_right_dock = self.right_dock;
+        let mut asset_panel = egui::Window::new("Client assets")
             .id(egui::Id::new("architect_asset_panel"))
-            .default_pos(Self::dock_position(self.right_dock, screen, 340., 600.))
+            .default_pos(asset_pos)
             .default_size(egui::vec2(340., 600.))
             .min_size(egui::vec2(250., 300.))
-            .resizable(true)
-            .show(ctx, |ui| {
+            .resizable(true);
+        if asset_dock_changed { asset_panel = asset_panel.current_pos(asset_pos); }
+        asset_panel.show(ctx, |ui| {
                 ui.horizontal(|ui| { ui.heading("Client explorer"); Self::dock_picker(ui, &mut self.right_dock); });
                 ui.label(egui::RichText::new("Loose files and folders under the client element directory. PCK archives are listed as files; their internal entries are not expanded here.").small().weak());
                 ui.text_edit_singleline(&mut self.tree_filter);
@@ -699,13 +726,17 @@ impl Architect {
                 ui.label(format!("Pending custom placements: {}", self.project.objects.len()));
             });
 
-        egui::Window::new("Terrain tools")
+        let terrain_pos = Self::dock_position(self.bottom_dock, screen, 560., 230.);
+        let terrain_dock_changed = self.bottom_dock != self.applied_bottom_dock;
+        self.applied_bottom_dock = self.bottom_dock;
+        let mut terrain_panel = egui::Window::new("Terrain tools")
             .id(egui::Id::new("architect_terrain_panel"))
-            .default_pos(Self::dock_position(self.bottom_dock, screen, 560., 230.))
+            .default_pos(terrain_pos)
             .default_size(egui::vec2(560., 230.))
             .min_size(egui::vec2(360., 160.))
-            .resizable(true)
-            .show(ctx, |ui| {
+            .resizable(true);
+        if terrain_dock_changed { terrain_panel = terrain_panel.current_pos(terrain_pos); }
+        terrain_panel.show(ctx, |ui| {
                 ui.horizontal(|ui| { ui.heading("Terrain sculpt"); Self::dock_picker(ui, &mut self.bottom_dock); });
                 ui.add(egui::Slider::new(&mut self.flatten_height, -500.0..=500.0).text("Flatten target"));
                 if ui.button("Record brush operation at camera").clicked() {
@@ -790,6 +821,7 @@ mod tests {
             applied_right_dock: Dock::Right,
             applied_bottom_dock: Dock::Bottom,
             confirm_erase: false,
+            confirm_clear: false,
             status: String::new(),
             tree_filter: String::new(),
             object_filter: String::new(),
