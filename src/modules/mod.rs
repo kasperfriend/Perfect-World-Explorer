@@ -285,6 +285,13 @@ impl Modules {
         match installed.id.as_str() {
             "walker" => self.walker_module_ui(ui, spawn, yaw),
             "populator" => self.populator_module_ui(ui, spawn),
+            "architect" => {
+                let active = self.architect.active();
+                if ui.button(if active { "Disable Architect" } else { "Enable Architect" }).clicked() {
+                    self.architect.set_active(!active);
+                }
+                ui.label("Full-screen world authoring workspace with separate, non-destructive projects.");
+            }
             "librarian" => {
                 let active = self.librarian.active();
                 if ui
