@@ -306,7 +306,10 @@ impl ExecutableInfo {
         }
         match &self.release_version {
             Some(marker) => format!("unknown game version (unmapped client marker {marker})"),
-            None => "unknown game version (no config/element/version.sw or usable PE version resource)".into(),
+            None => {
+                "unknown game version (no config/element/version.sw or usable PE version resource)"
+                    .into()
+            }
         }
     }
 
@@ -836,9 +839,9 @@ fn is_dotted_game_version(value: &str) -> bool {
     let parts: Vec<_> = value.split('.').collect();
     parts.len() >= 3
         && parts.len() <= 4
-        && parts.iter().all(|part| {
-            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
-        })
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
         && parts[0] == "1"
         && parts[1].parse::<u32>().is_ok_and(|minor| minor >= 3)
 }
@@ -2152,10 +2155,7 @@ mod tests {
 
     #[test]
     fn loose_data_files_are_found_in_both_supported_locations() {
-        let root = std::env::temp_dir().join(format!(
-            "pw-data-locations-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("pw-data-locations-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("data")).unwrap();
 
@@ -2179,7 +2179,10 @@ mod tests {
         let data = scan_data_files(&root);
         let tasks = data.iter().find(|info| info.name == "tasks.data").unwrap();
         assert_eq!(tasks.version.as_deref(), Some("v75"));
-        let npc = data.iter().find(|info| info.name == "task_npc.data").unwrap();
+        let npc = data
+            .iter()
+            .find(|info| info.name == "task_npc.data")
+            .unwrap();
         assert!(npc.detail.as_deref().unwrap().contains("42 records"));
         fs::remove_dir_all(root).unwrap();
     }
