@@ -303,7 +303,7 @@ pub struct RestirReservoir {
     pub sample_pos_weight: [f32; 4],
     /// rgb = selected multi-bounce radiance, w = represented candidate count (M).
     pub radiance_m: [f32; 4],
-    /// xyz = previous receiver position, w = selected target density at that receiver.
+    /// xyz = previous receiver position, w = selected target / proposal-PDF at that receiver.
     pub receiver_pos_target: [f32; 4],
     /// xyz = receiver normal, w = sign encodes sky sample (<0) vs surface sample (>0).
     pub receiver_normal_flags: [f32; 4],
@@ -1272,7 +1272,7 @@ fn restir_update(
     reservoir: ptr<function, RestirReservoir>,
     sample_pos: vec3<f32>,
     radiance: vec3<f32>,
-    target_density: f32,
+    target_over_pdf: f32,
     weight: f32,
     represented: f32,
     is_sky: bool,
@@ -1286,7 +1286,10 @@ fn restir_update(
     if (next_f32(state) * sum < weight) {
         value.sample_pos_weight = vec4<f32>(sample_pos, 0.0);
         value.radiance_m = vec4<f32>(radiance, value.radiance_m.w);
-        value.receiver_pos_target = vec4<f32>(receiver_pos, max(target_density, 1e-5));
+        // Reuse needs the old importance weight (target / proposal PDF), not
+        // the un-divided target. The proposal is cosine-weighted, so storing
+        // target alone would reweight history by the cosine twice.
+        value.receiver_pos_target = vec4<f32>(receiver_pos, max(target_over_pdf, 1e-5));
         value.receiver_normal_flags = vec4<f32>(receiver_normal, select(1.0, -1.0, is_sky));
     }
     value.sample_pos_weight.w = sum;
@@ -1334,12 +1337,14 @@ fn restir_reuse_one(
         if (visible.index == 0xffffffffu || abs(visible.t - sample_distance) > tolerance) { return; }
     }
     let target_density = max(luminance(source.radiance_m.xyz) * cosine, 1e-5);
+    let target_over_pdf = target_density / max(cosine, 1e-5);
     let represented = clamp(source.radiance_m.w, 1.0, 32.0);
     let age_scale = represented / max(source.radiance_m.w, 1.0);
-    let weight = source.sample_pos_weight.w * age_scale * target_density / max(source.receiver_pos_target.w, 1e-5);
+    let weight = source.sample_pos_weight.w * age_scale * target_over_pdf
+        / max(source.receiver_pos_target.w, 1e-5);
     restir_update(
         reservoir, source.sample_pos_weight.xyz, source.radiance_m.xyz,
-        target_density, weight, represented, is_sky,
+        target_over_pdf, weight, represented, is_sky,
         receiver_pos, receiver_normal, state
     );
 }
@@ -5882,6 +5887,31 @@ mod shader_optimization_regression_tests {
         assert!(COMPOSITE_SHADER.contains("if (comp_params.y > 0.5)"));
         assert!(COMPOSITE_SHADER.contains("return raster;"));
         assert!(COMPOSITE_SHADER.contains("return textureLoad(src_rt, px, 0);"));
+    }
+
+    #[test]
+    fn restir_history_reweighting_uses_target_over_cosine_pdf() {
+        let dxr = include_str!("dxr_trace.hlsl");
+        let radiance_luma = 0.42_f32;
+        let old_cosine = 0.8_f32;
+        let new_cosine = 0.2_f32;
+        let old_target = radiance_luma * old_cosine;
+        let new_target = radiance_luma * new_cosine;
+
+        // q = luminance * cosine and p = cosine / PI; PI cancels in
+        // the ratio. Identical radiance therefore has the same q/p at both
+        // receivers. Reweighting by q alone would incorrectly scale history
+        // by new_cosine / old_cosine (= 0.25).
+        let old_target_over_pdf = old_target / old_cosine;
+        let new_target_over_pdf = new_target / new_cosine;
+        let reuse_scale = new_target_over_pdf / old_target_over_pdf;
+        assert!((reuse_scale - 1.0).abs() < 1e-6);
+        assert!((new_target / old_target - 0.25).abs() < 1e-6);
+
+        assert!(RAY_SHADER.contains("let target_over_pdf = target_density / max(cosine, 1e-5);"));
+        assert!(RAY_SHADER.contains("target_over_pdf, weight, represented, is_sky"));
+        assert!(dxr.contains("float target_over_pdf = target / max(cosine, 1e-5);"));
+        assert!(dxr.contains("target_over_pdf, weight, represented, is_sky"));
     }
 
     #[test]

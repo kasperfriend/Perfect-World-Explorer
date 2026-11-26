@@ -44,6 +44,7 @@ struct Material {
 struct RestirReservoir {
     float4 sample_pos_weight;
     float4 radiance_m;
+    // xyz = previous receiver position, w = selected target / proposal PDF.
     float4 receiver_pos_target;
     float4 receiver_normal_flags;
 };
@@ -821,7 +822,7 @@ void restir_update(
     inout RestirReservoir reservoir,
     float3 sample_pos,
     float3 radiance,
-    float target,
+    float target_over_pdf,
     float weight,
     float represented,
     bool is_sky,
@@ -834,7 +835,9 @@ void restir_update(
     if (rand01(state) * sum < weight) {
         reservoir.sample_pos_weight = float4(sample_pos, 0.0);
         reservoir.radiance_m = float4(radiance, reservoir.radiance_m.w);
-        reservoir.receiver_pos_target = float4(receiver_pos, max(target, 1e-5));
+        // Store the old target / proposal-PDF value so reusing this reservoir
+        // on another cosine-weighted receiver does not apply the cosine twice.
+        reservoir.receiver_pos_target = float4(receiver_pos, max(target_over_pdf, 1e-5));
         reservoir.receiver_normal_flags = float4(receiver_normal, is_sky ? -1.0 : 1.0);
     }
     reservoir.sample_pos_weight.w = sum;
@@ -884,12 +887,13 @@ void restir_reuse_one(
         if (visible.index == 0xffffffffu || abs(visible.t - sample_distance) > tolerance) return;
     }
     float target = max(luma(source.radiance_m.xyz) * cosine, 1e-5);
+    float target_over_pdf = target / max(cosine, 1e-5);
     float represented = clamp(source.radiance_m.w, 1.0, 32.0);
     float age_scale = represented / max(source.radiance_m.w, 1.0);
     float weight = source.sample_pos_weight.w * age_scale
-        * target / max(source.receiver_pos_target.w, 1e-5);
+        * target_over_pdf / max(source.receiver_pos_target.w, 1e-5);
     restir_update(reservoir, source.sample_pos_weight.xyz, source.radiance_m.xyz,
-        target, weight, represented, is_sky, receiver_pos, receiver_normal, state);
+        target_over_pdf, weight, represented, is_sky, receiver_pos, receiver_normal, state);
 }
 
 void restir_reuse_history(
