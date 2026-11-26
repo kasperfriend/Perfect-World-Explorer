@@ -40,7 +40,7 @@ numeric sequence. Regions are shown where the source distinguishes them.
 | `10 / 55` | 1.3.1 | Russian client inventory; also measured in this repository's matrix | Exact |
 | `12 / 56` | 1.3.4, 1.3.6, 1.3.8 | Russian/Chinese release lists and three distinct 1.3.6 client data sets | **Ambiguous** |
 | `27 / 75` | 1.4.1, 1.4.2 | Modified Brazilian 1.4.1 client based on 1.4.2 data; W2I 1.4.2; this repository measured the pair in a 1.4.2 client | **Ambiguous** |
-| `29 / 78` | 1.4.2 | Russian 1.4.2 client | Exact |
+| `29 / 78` | 1.4.1, 1.4.2 | Modified PWI-based 1.4.1 client; Russian 1.4.2 client | **Ambiguous** |
 | `60 / 93` | 1.4.4 | Russian 1.4.4 client | Exact |
 | `63 / 101` | 1.4.5 | Russian 1.4.5 Underworld client | Exact |
 | `69 / 103` | 1.4.5 | Russian 1.4.5 Reflections client | Exact |
@@ -85,7 +85,7 @@ the multi-client archive documents three separate client data sets called
 | v2 | Chinese 1.3.8 converted data | 26,140 | 4,116 |
 | v3 | PWI 1.3.9 converted data | 26,878 | 4,441 |
 
-Those counts are content-level evidence, not header fields. The viewer does
+The original post explicitly says it is a collection of client files and that 1.3.4/1.3.6 servers do not exist; these should be read as community-labelled client data sets, not proof of official server releases. Those counts are content-level evidence, not header fields. The viewer does
 not currently parse the v12 elements tables or v56 task records deeply enough
 to reproduce these counts. The safe result for `12/56` is therefore
 `unknown game version (ambiguous data pair; candidates: 1.3.4 / 1.3.6 / 1.3.8)`.
@@ -93,7 +93,7 @@ A later content-fingerprint pass could count the relevant records or compare
 stable file hashes and narrow the candidates. It would be unsafe to label every
 `12/56` client as 1.3.6 now.
 
-The same approach is taken for `27/75` and `70/105`: the files are genuine
+The same approach is taken for `27/75`, `29/78`, and `70/105`: the files are genuine
 client pairs, but more than one marketed release is documented with those
 headers. A known executable fingerprint or its own release marker still wins.
 
@@ -108,9 +108,9 @@ headers. A known executable fingerprint or its own release marker still wins.
   catalogue includes the client columns only.
 - **1.7.6 is regional.** The `386/191` entry is the documented Russian build
   4311. It must not be assumed to identify the separate PWI English build.
-- **1.8.9 is not auto-mapped.** A community work-in-progress post reports
-  `elements v620 / tasks v247`, but it is not strong enough evidence for a
-  stable release mapping.
+- **1.8.9 is not auto-mapped.** A community work-in-progress post reports the **server-side** data
+  pair `elements v620 / tasks v247` for a 1.8.9 build. It does not establish
+  that this is a verified client-side pair, so it is not mapped.
 - **1.8.0 and 1.8.4 remain release-marker driven.** Their explicit
   `version.sw` mappings are more authoritative than trying to infer those
   versions from an unverified data pair.
@@ -143,7 +143,7 @@ headers. A known executable fingerprint or its own release marker still wins.
    whose client requirements confirm that the Russian build's client and server
    must use the matching data files. The `386/191` pair is documented in the
    associated 1.7.6 client release discussion.
-8. RaGEZONE, [Oriental PW 1.8.9 development thread](https://forum.ragezone.com/threads/oriental-pw-1-8-9.124?),
+8. RaGEZONE, [Oriental PW 1.8.9 development thread](https://forum.ragezone.com/threads/release-wip-pw-1-7-6-source-1-8-0-now-running-the-1-8-9-client-pw-oriental-build-10469-%E2%80%94-reaper-azure-dragon-log-in.1275720/),
    a community WIP reference only; its reported `620/247` pair is not enabled
    in the scanner.
 
