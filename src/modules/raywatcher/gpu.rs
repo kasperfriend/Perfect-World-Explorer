@@ -71,7 +71,7 @@ pub struct RayParams {
 /// Maximum active point lights + luminous world effects packed for ReSTIR DI.
 pub const MAX_RAY_LIGHTS: usize = 128;
 
-/// Persistent 3D World-Space Radiance Cache cell count (65,536 * 16 bytes = 1 MB VRAM).
+/// Persistent 3D World-Space Radiance Cache cell count (65,536 * 4-byte packed atomic entries = 256 KB VRAM).
 pub const RADIANCE_CACHE_CELLS: usize = 65_536;
 
 /// Uniform per-frame scene-illumination albedo recovery gain (`1 / max(scene_illum, 0.08)`).
@@ -652,7 +652,7 @@ struct Material {
 @group(0) @binding(12) var src_gbuf_raster: texture_2d<f32>;
 @group(0) @binding(13) var src_sky_env: texture_2d<f32>;
 @group(0) @binding(14) var src_terrain_map: texture_2d<f32>;
-@group(0) @binding(15) var<storage, read_write> radiance_cache: array<vec4<f32>>;
+@group(0) @binding(15) var<storage, read_write> radiance_cache: array<atomic<u32>>;
 @group(0) @binding(16) var<storage, read_write> restir_reservoirs: array<RestirReservoir>;
 
 const PI: f32 = 3.14159265;
@@ -1050,6 +1050,24 @@ fn ggx_sample(normal: vec3<f32>, roughness: f32, u1: f32, u2: f32) -> vec3<f32> 
 
 const RC_MASK: u32 = 65535u;
 
+// Pack RGB into 10 bits/channel and a 2-bit confidence count. A single
+// atomic word makes colliding screen-space writers race-free while preserving
+// a small running average followed by a responsive 1/4 EMA.
+fn rc_pack(rgb: vec3<f32>, confidence: u32) -> u32 {
+    let q = vec3<u32>(round(clamp(rgb, vec3<f32>(0.0), vec3<f32>(2.5)) * (1023.0 / 2.5)));
+    return (q.x & 1023u) | ((q.y & 1023u) << 10u) | ((q.z & 1023u) << 20u)
+        | ((min(confidence, 3u) & 3u) << 30u);
+}
+
+fn rc_unpack(packed: u32) -> vec4<f32> {
+    let rgb = vec3<f32>(
+        f32(packed & 1023u),
+        f32((packed >> 10u) & 1023u),
+        f32((packed >> 20u) & 1023u)
+    ) * (2.5 / 1023.0);
+    return vec4<f32>(rgb, f32(packed >> 30u));
+}
+
 fn rc_slot(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> u32 {
     let cell_size = select(12.0, 4.0, cam_dist < 64.0);
     let cell = vec3<i32>(floor(world_pos / cell_size));
@@ -1075,16 +1093,27 @@ fn rc_slot(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> u32 {
 }
 
 fn rc_query(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> vec4<f32> {
-    return radiance_cache[rc_slot(world_pos, normal, cam_dist)];
+    return rc_unpack(atomicLoad(&radiance_cache[rc_slot(world_pos, normal, cam_dist)]));
 }
 
 fn rc_update(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32, rad: vec3<f32>) {
     let slot = rc_slot(world_pos, normal, cam_dist);
-    let prev = radiance_cache[slot];
-    let w = min(prev.w + 1.0, 32.0);
-    let alpha = select(max(1.0 / w, 0.08), 1.0, prev.w < 1.0);
-    let clamped = clamp(rad, vec3<f32>(0.0), vec3<f32>(2.5));
-    radiance_cache[slot] = vec4<f32>(mix(prev.rgb, clamped, alpha), w);
+    let sample = clamp(rad, vec3<f32>(0.0), vec3<f32>(2.5));
+    var observed = atomicLoad(&radiance_cache[slot]);
+    // Bounded CAS retries avoid a lock/spin-wait on heavily contended voxels.
+    // Losing an update is preferable to blocking a whole GPU wave.
+    for (var attempt = 0u; attempt < 16u; attempt = attempt + 1u) {
+        let previous_count = observed >> 30u;
+        let next_count = min(previous_count + 1u, 3u);
+        let alpha = select(0.25, 1.0 / f32(next_count), previous_count < 3u);
+        let previous = rc_unpack(observed);
+        let updated = rc_pack(mix(previous.rgb, sample, alpha), next_count);
+        let result = atomicCompareExchangeWeak(&radiance_cache[slot], observed, updated);
+        if (result.exchanged) {
+            return;
+        }
+        observed = result.old_value;
+    }
 }
 
 fn detail_offscreen_albedo(hit_pos: vec3<f32>, hit_normal: vec3<f32>, base_albedo: vec3<f32>, opacity: f32) -> vec3<f32> {
@@ -3662,11 +3691,13 @@ impl RaywatcherGpu {
             contents: bytemuck::bytes_of(&[1.25f32, 0.0, 0.0, 0.0]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let radiance_cache = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("raywatcher world-space radiance cache"),
-            size: (RADIANCE_CACHE_CELLS * 16) as u64,
+        // Explicitly initialise cache confidence to zero. Hardware DXR mirrors
+        // this packed layout and performs its own upload-heap clear on creation.
+        let radiance_cache_zeroes = vec![0u8; RADIANCE_CACHE_CELLS * std::mem::size_of::<u32>()];
+        let radiance_cache = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("raywatcher world-space radiance cache (packed atomic)"),
+            contents: &radiance_cache_zeroes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
         let (restir_reservoirs, restir_reservoirs_enabled) =
             create_restir_reservoir_buffer(device, grid_extent);
@@ -5804,6 +5835,18 @@ mod phase_r1_tests {
 #[cfg(test)]
 mod shader_optimization_regression_tests {
     use super::RAY_SHADER;
+
+    #[test]
+    fn shared_radiance_cache_is_packed_atomic_and_race_free_in_both_backends() {
+        let dxr = include_str!("dxr_trace.hlsl");
+        assert!(RAY_SHADER.contains("array<atomic<u32>>"));
+        assert!(RAY_SHADER.contains("atomicCompareExchangeWeak"));
+        assert!(dxr.contains("RWStructuredBuffer<uint> radiance_cache"));
+        assert!(dxr.contains("InterlockedCompareExchange"));
+        assert!(!RAY_SHADER.contains("array<vec4<f32>> radiance_cache"));
+        assert!(!dxr.contains("RWStructuredBuffer<float4> radiance_cache"));
+        assert_eq!(super::RADIANCE_CACHE_CELLS * std::mem::size_of::<u32>(), 256 * 1024);
+    }
 
     #[test]
     fn software_and_dxr_point_lights_reuse_one_inverse_square_root() {
