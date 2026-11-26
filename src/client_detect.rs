@@ -1785,6 +1785,50 @@ mod tests {
     }
 
     #[test]
+    fn release_markers_map_to_marketing_versions_without_numeric_guessing() {
+        let cases = [
+            ("1432 0", Some("1.8.4")),
+            ("1352", Some("1.8.0")),
+            ("1352 0", Some("1.8.0")),
+            ("1311 0", Some("1.7.8")),
+            ("1233 0", Some("1.7.2")),
+            ("1163 0", Some("1.6.6")),
+            ("962 0", Some("1.5.5")),
+            ("920 0", Some("1.5.2")),
+            ("1 0", None),
+            ("6154", None),
+            ("not a version", None),
+        ];
+        for (marker, expected) in cases {
+            assert_eq!(
+                display_release_version(marker).as_deref(),
+                expected,
+                "marker {marker:?}"
+            );
+        }
+        assert_eq!(display_release_version("1.8.4").as_deref(), Some("1.8.4"));
+    }
+
+    #[test]
+    fn pe_resource_build_revision_is_not_mistaken_for_game_version() {
+        let exe = ExecutableInfo {
+            path: "elementclient.exe".into(),
+            size: 1,
+            sha256: "0".repeat(64),
+            pe32: true,
+            parsed_as_pe: true,
+            known: None,
+            file_version: Some("1,0,0,6154".into()),
+            product_version: Some("1,0,0,6154".into()),
+            release_version: None,
+            release_version_source: None,
+            pe_timestamp: None,
+        };
+        assert_eq!(resource_game_version(&exe), None);
+        assert!(exe.version_row().contains("unknown game version"));
+    }
+
+    #[test]
     fn release_version_walks_element_parent_configs_pck_and_missing() {
         let base = std::env::temp_dir().join(format!(
             "pw-version-locations-{}-{}",
