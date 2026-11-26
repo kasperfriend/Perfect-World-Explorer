@@ -68,6 +68,17 @@ pub struct RayParams {
     pub restir: [f32; 4],
 }
 
+/// ReSTIR history is only reusable when the host explicitly says this frame
+/// continues the same camera history. Checking only that a previous VP exists
+/// lets reservoirs survive camera cuts even though the denoiser correctly resets.
+fn restir_history_valid_for_frame(
+    frame_history_valid: u32,
+    frames: u32,
+    has_previous_view_projection: bool,
+) -> bool {
+    frame_history_valid > 0 && frames > 0 && has_previous_view_projection
+}
+
 /// Maximum active point lights + luminous world effects packed for ReSTIR DI.
 pub const MAX_RAY_LIGHTS: usize = 128;
 
@@ -4540,7 +4551,11 @@ impl RaywatcherGpu {
             .prev_view_projection
             .unwrap_or(unjittered_vp)
             .to_cols_array_2d();
-        packed.frame[3] = if self.frames > 0 && self.prev_view_projection.is_some() {
+        packed.frame[3] = if restir_history_valid_for_frame(
+            params.history_valid,
+            self.frames,
+            self.prev_view_projection.is_some(),
+        ) {
             1.0
         } else {
             0.0
@@ -5887,6 +5902,14 @@ mod shader_optimization_regression_tests {
         assert!(COMPOSITE_SHADER.contains("if (comp_params.y > 0.5)"));
         assert!(COMPOSITE_SHADER.contains("return raster;"));
         assert!(COMPOSITE_SHADER.contains("return textureLoad(src_rt, px, 0);"));
+    }
+
+    #[test]
+    fn restir_history_requires_the_host_camera_reset_flag() {
+        assert!(!super::restir_history_valid_for_frame(0, 12, true));
+        assert!(!super::restir_history_valid_for_frame(1, 0, true));
+        assert!(!super::restir_history_valid_for_frame(1, 12, false));
+        assert!(super::restir_history_valid_for_frame(1, 12, true));
     }
 
     #[test]
