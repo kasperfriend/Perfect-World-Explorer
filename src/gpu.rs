@@ -3294,6 +3294,13 @@ impl Renderer {
         // camera's real motion and not the sub-pixel jitter of the frame.
         unjittered_vp: Mat4,
     ) {
+        // Architect shares the native receiving-model pipeline. Synchronize its
+        // project layer before any main/reflection/refraction class gate so
+        // disabling the module also removes its transient placements promptly.
+        let editor_placements = self.modules.architect_placements();
+        if let Some(models) = &mut self.models {
+            models.sync_editor_placements(&editor_placements);
+        }
         // WaterEffect 0 (shipped default) hides EC models and home ornaments
         // in reflection/refraction (0x5b2015, 0x5b2336). RenderContext carries
         // the recovered level-2 / underwater class gates; per-placement flags
