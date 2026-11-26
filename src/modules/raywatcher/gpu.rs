@@ -2963,13 +2963,12 @@ const SCREEN_RASTER_COPY_SHADER: &str = r#"
 
 @compute @workgroup_size(8, 8, 1)
 fn copy_fullres(@builtin(global_invocation_id) id: vec3<u32>) {
-    let dst_dim = textureDimensions(dst_raster);
-    if (id.x >= dst_dim.x || id.y >= dst_dim.y) {
+    let dim = textureDimensions(src_raster);
+    if (id.x >= dim.x || id.y >= dim.y) {
         return;
     }
-    let src_dim = textureDimensions(src_raster);
-    let src_px = min(id.xy, src_dim - vec2<u32>(1));
-    textureStore(dst_raster, vec2<i32>(id.xy), textureLoad(src_raster, vec2<i32>(src_px), 0));
+    let pixel = vec2<i32>(id.xy);
+    textureStore(dst_raster, pixel, textureLoad(src_raster, pixel, 0));
 }
 "#;
 
@@ -5573,6 +5572,9 @@ impl RaywatcherGpu {
     ) {
         let fmt = source.format();
         let ext = (source.width().max(1), source.height().max(1));
+        if ext != self.render_extent && !self.resize(device, ext, self.grid_extent) {
+            return;
+        }
         let needs_alloc = self
             .raster_copy
             .as_ref()
