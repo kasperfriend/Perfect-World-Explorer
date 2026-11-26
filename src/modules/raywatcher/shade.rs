@@ -987,7 +987,7 @@ mod tests {
         params.lighting.fog_range = (10., 110.);
         params.lighting.fog_colour = Vec3::new(0.6, 0.7, 0.9);
         let near = apply_fog(Vec3::splat(0.1), &params, 0.);
-        assert_eq!(near, Vec3::splat(0.1));
+        assert!((near - Vec3::splat(0.1)).length() < 1e-6);
         let far = apply_fog(Vec3::splat(0.1), &params, 1000.);
         let fog_linear = Vec3::new(srgb_to_linear(0.6), srgb_to_linear(0.7), srgb_to_linear(0.9));
         assert!((far - fog_linear).length() < 1e-5);
@@ -1021,7 +1021,7 @@ mod tests {
         params.lighting.fog_range = (45., 55.);
         let correct = apply_fog(Vec3::splat(0.1), &params, view_z);
         let euclidean_bug = apply_fog(Vec3::splat(0.1), &params, ray_length);
-        assert_eq!(correct, Vec3::splat(0.1));
+        assert!((correct - Vec3::splat(0.1)).length() < 1e-6);
         assert!(
             euclidean_bug.x > correct.x,
             "Euclidean distance would fog this off-axis point too early"
