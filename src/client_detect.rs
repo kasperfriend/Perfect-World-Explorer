@@ -2192,7 +2192,7 @@ mod tests {
             (
                 12,
                 56,
-                "unknown game version (ambiguous data pair; candidates: 1.3.4 / 1.3.6 / 1.3.8)",
+                "Version is guessed: 1.3.6",
             ),
             (
                 27,
@@ -2923,20 +2923,20 @@ mod tests {
         use DataVersionProfile::Ambiguous;
 
         let cases = [
-            ((12, 56), "1.3.4 / 1.3.6 / 1.3.8"),
-            ((27, 75), "1.4.1 / 1.4.2"),
-            ((29, 78), "1.4.1 / 1.4.2"),
-            ((70, 105), "1.4.4 / 1.4.5 / 1.4.6"),
+            ((12, 56), "1.3.6"),
+            ((27, 75), "1.4.2"),
+            ((29, 78), "1.4.2"),
+            ((70, 105), "1.4.4"),
         ];
-        for ((elements, tasks), candidates) in cases {
+        for ((elements, tasks), guess) in cases {
             assert_eq!(
                 data_version_profile(elements, tasks),
-                Some(Ambiguous(candidates)),
+                Some(Ambiguous(guess)),
                 "elements v{elements} / tasks v{tasks}"
             );
         }
         assert_eq!(
-            Ambiguous("1.3.4 / 1.3.6 / 1.3.8").game_version(),
+            Ambiguous("1.3.6").game_version(),
             "unknown game version (ambiguous data pair; candidates: 1.3.4 / 1.3.6 / 1.3.8)"
         );
     }
@@ -2950,8 +2950,8 @@ mod tests {
 }
 
 /// The result of matching both client data headers against the public corpus.
-/// An ambiguous signature is surfaced as candidates, never as a single game
-/// version. This is separate from parser support and client compatibility.
+/// Ambiguous signatures use a clearly labelled best-effort release guess.
+/// This is separate from parser support and client compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataVersionProfile {
     Exact(&'static str),
@@ -2962,9 +2962,7 @@ impl DataVersionProfile {
     fn game_version(self) -> String {
         match self {
             Self::Exact(version) => format!("{version} (data-version profile)"),
-            Self::Ambiguous(candidates) => {
-                format!("unknown game version (ambiguous data pair; candidates: {candidates})")
-            }
+            Self::Ambiguous(version) => format!("Version is guessed: {version}"),
         }
     }
 }
@@ -2983,14 +2981,14 @@ fn data_version_profile(elements: u32, tasks: u32) -> Option<DataVersionProfile>
         (10, 55) => Some(Exact("1.3.1")),
         // The same pair appears in 1.3.4, all three known 1.3.6 data sets,
         // and 1.3.8. Their full contents/counts differ, but header versions do not.
-        (12, 56) => Some(Ambiguous("1.3.4 / 1.3.6 / 1.3.8")),
+        (12, 56) => Some(Ambiguous("1.3.6")),
         // A modified Brazilian 1.4.1 client and the W2I 1.4.2 client share
         // this data pair. The executable or its release marker can disambiguate.
-        (27, 75) => Some(Ambiguous("1.4.1 / 1.4.2")),
+        (27, 75) => Some(Ambiguous("1.4.2")),
         (29, 78) => Some(Ambiguous("1.4.1 / 1.4.2")),
         (60, 93) => Some(Exact("1.4.4")),
         (63, 101) | (69, 103) => Some(Exact("1.4.5")),
-        (70, 105) => Some(Ambiguous("1.4.4 / 1.4.5 / 1.4.6")),
+        (70, 105) => Some(Ambiguous("1.4.4")),
         (80, 105) => Some(Exact("1.4.7")),
         (84, 106) => Some(Exact("1.4.6")),
         (85, 108) => Some(Exact("1.4.8")),
