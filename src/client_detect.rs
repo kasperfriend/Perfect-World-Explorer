@@ -1830,6 +1830,21 @@ mod tests {
         };
         assert_eq!(resource_game_version(&exe), None);
         assert!(exe.version_row().contains("unknown game version"));
+
+        // Older retail executables can publish the marketing release directly
+        // in their PE resource. The final resource component is a build
+        // revision, not a fourth component of the game release.
+        let mut older = exe.clone();
+        older.product_version = Some("1,3,6,1234".into());
+        older.file_version = Some("1,3,6,1234".into());
+        assert_eq!(resource_game_version(&older).as_deref(), Some("1.3.6"));
+        assert_eq!(older.version_row(), "1.3.6");
+
+        let mut later = exe;
+        later.product_version = Some("1,7,8,1311".into());
+        later.file_version = Some("1,7,8,1311".into());
+        assert_eq!(resource_game_version(&later).as_deref(), Some("1.7.8"));
+        assert_eq!(later.version_row(), "1.7.8");
     }
 
     #[test]
