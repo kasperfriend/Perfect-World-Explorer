@@ -274,7 +274,11 @@ fn main() {
         .expect("half-resolution Hi-Z mapping failed");
     let half_bytes = half_slice.get_mapped_range().to_vec();
     for (index, (level, (width, height))) in half.levels().iter().zip(half_expected).enumerate() {
-        assert_eq!((level.width, level.height), (width, height), "half mip {index}");
+        assert_eq!(
+            (level.width, level.height),
+            (width, height),
+            "half mip {index}"
+        );
         let (offset, row_pitch) = half_layouts[index];
         for y in 0..height as usize {
             let row_start = offset as usize + y * row_pitch as usize;
