@@ -72,8 +72,8 @@ RWTexture2D<float4> out_guide : register(u1);
 RWTexture2D<float4> out_reflection : register(u2);
 RWTexture2D<float4> out_normals : register(u3);
 RWTexture2D<float4> out_albedo : register(u4);
-// Feature #6: Persistent 65,536-cell 3D World-Space Radiance Cache (1 MB VRAM).
-RWStructuredBuffer<float4> radiance_cache : register(u5);
+// Feature #6: Persistent 65,536-cell packed atomic radiance cache (256 KB VRAM).
+RWStructuredBuffer<uint> radiance_cache : register(u5);
 RWStructuredBuffer<RestirReservoir> restir_reservoirs : register(u6);
 
 static const float PI = 3.14159265;
@@ -147,19 +147,47 @@ uint rc_slot(float3 world_pos, float3 normal, float cam_dist) {
     return h & RC_MASK;
 }
 
+uint rc_pack(float3 rgb, uint confidence) {
+    uint3 q = (uint3)round(saturate(rgb / 2.5) * 1023.0);
+    return (q.x & 1023u) | ((q.y & 1023u) << 10u) | ((q.z & 1023u) << 20u)
+        | ((min(confidence, 3u) & 3u) << 30u);
+}
+
+float4 rc_unpack(uint packed) {
+    float3 rgb = float3(
+        float(packed & 1023u),
+        float((packed >> 10u) & 1023u),
+        float((packed >> 20u) & 1023u)
+    ) * (2.5 / 1023.0);
+    return float4(rgb, float(packed >> 30u));
+}
+
 float4 rc_query(float3 world_pos, float3 normal, float cam_dist) {
     uint slot = rc_slot(world_pos, normal, cam_dist);
-    return radiance_cache[slot];
+    uint packed;
+    InterlockedAdd(radiance_cache[slot], 0u, packed);
+    return rc_unpack(packed);
 }
 
 void rc_update(float3 world_pos, float3 normal, float cam_dist, float3 rad) {
     uint slot = rc_slot(world_pos, normal, cam_dist);
-    float4 prev = radiance_cache[slot];
-    float w = min(prev.w + 1.0, 32.0);
-    float alpha = (prev.w < 1.0) ? 1.0 : max(1.0 / w, 0.08);
-    float3 clamped = clamp(rad, float3(0.0, 0.0, 0.0), float3(2.5, 2.5, 2.5));
-    float3 blended = lerp(prev.rgb, clamped, alpha);
-    radiance_cache[slot] = float4(blended, w);
+    float3 sample = clamp(rad, float3(0.0, 0.0, 0.0), float3(2.5, 2.5, 2.5));
+    uint observed;
+    InterlockedAdd(radiance_cache[slot], 0u, observed);
+    [loop]
+    for (uint attempt = 0u; attempt < 16u; ++attempt) {
+        uint previous_count = observed >> 30u;
+        uint next_count = min(previous_count + 1u, 3u);
+        float alpha = (previous_count < 3u) ? (1.0 / float(next_count)) : 0.25;
+        float4 previous = rc_unpack(observed);
+        uint updated = rc_pack(lerp(previous.rgb, sample, alpha), next_count);
+        uint original;
+        InterlockedCompareExchange(radiance_cache[slot], observed, updated, original);
+        if (original == observed) {
+            return;
+        }
+        observed = original;
+    }
 }
 
 uint unpack_alpha_mask25(float f) {
