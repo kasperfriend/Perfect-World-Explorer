@@ -165,8 +165,8 @@ struct Bucket {
 /// How many distinct (layer, state, texture) groups are cached before the pass
 /// drops them all. Retail roots reuse a few hundred at most.
 const BUCKET_CACHE_LIMIT: usize = 1024;
-/// Missing/corrupt effect textures are probed again every five seconds, not
-/// every rendered frame. This preserves recovery if an archive becomes available
+/// Missing/corrupt effect textures are probed again every five seconds at 60 FPS,
+/// not every rendered frame. This preserves recovery if an archive becomes available
 /// later while keeping the steady-state render path free of repeated disk I/O.
 const TEXTURE_RETRY_INTERVAL_FRAMES: u64 = 300;
 
@@ -2207,13 +2207,11 @@ mod tests {
             draw.buckets.values().next().unwrap().bound_fallback,
             "the first frame must bind the placeholder"
         );
-        // The archive answers later. Retry after the five-second backoff
-        // rather than performing the same failed read on every intervening frame.
-        let texture_id = draw.texture_ids["late.png"];
-        let retry_frame = draw.failed_textures[&texture_id];
-        assert!(retry_frame > draw.frame_index);
-        draw.frame_index = retry_frame - 1;
+        // A texture that becomes available on the next frame must not trigger a
+        // second archive read immediately; the failed path is on cooldown.
+        let mut present_attempts = 0;
         let mut present = |_: &str| -> Result<Vec<u8>, String> {
+            present_attempts += 1;
             let mut bytes = vec![0; 18];
             bytes[2] = 2;
             bytes[12..14].copy_from_slice(&1u16.to_le_bytes());
@@ -2234,6 +2232,27 @@ mod tests {
             &mut present,
         )
         .unwrap();
+        assert_eq!(present_attempts, 0, "failed paths are not retried each frame");
+        assert!(draw.buckets.values().next().unwrap().bound_fallback);
+
+        // When the retry window arrives, the archive answers and replaces the
+        // fallback binding as before.
+        let texture_id = draw.texture_ids["late.png"];
+        let retry_frame = draw.failed_textures[&texture_id];
+        assert!(retry_frame > draw.frame_index);
+        draw.frame_index = retry_frame - 1;
+        draw.update(
+            &harness.device,
+            &harness.queue,
+            &frame,
+            matrix,
+            [0., 0., 0., 1.],
+            [0., 0., 0., 100.],
+            None,
+            &mut present,
+        )
+        .unwrap();
+        assert_eq!(present_attempts, 1);
         assert!(
             !draw.buckets.values().next().unwrap().bound_fallback,
             "a texture that loads after failing must replace the placeholder binding"
