@@ -4,6 +4,7 @@
 //! in portable .pwa project files. It deliberately does not rewrite native
 //! ECWLD/T2BK client data: a project remains reversible until a validated native
 //! exporter exists.
+use glam::Vec3;
 use std::{
     collections::HashSet,
     fs,
