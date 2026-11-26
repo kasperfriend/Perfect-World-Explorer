@@ -1424,8 +1424,10 @@ fn push_instances_chunked(
     far: f32,
     config: HarvestConfig,
 ) -> usize {
-    push_instances_chunked_cancellable(triangles, materials, instances, eye, frustum, far, config, None)
-        .unwrap_or(0)
+    push_instances_chunked_cancellable(
+        triangles, materials, instances, eye, frustum, far, config, None,
+    )
+    .unwrap_or(0)
 }
 
 fn push_instances_chunked_cancellable(
