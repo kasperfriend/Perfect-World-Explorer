@@ -2674,5 +2674,4 @@ mod tests {
         }
         assert!(cancel.load(Ordering::Relaxed));
     }
-
 }
