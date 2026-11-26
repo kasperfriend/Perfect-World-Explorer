@@ -1064,15 +1064,15 @@ const RC_MASK: u32 = 65535u;
 // a small running average followed by a responsive 1/4 EMA.
 fn rc_query(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> vec4<f32> {
     let cell = &radiance_cache[rc_slot(world_pos, normal, cam_dist)];
+    // Read sums before count: writers add all channels before incrementing
+    // count, so a concurrent query can only briefly underestimate confidence.
+    let r = atomicLoad(&cell.r);
+    let g = atomicLoad(&cell.g);
+    let b = atomicLoad(&cell.b);
     let count = atomicLoad(&cell.count);
     if (count == 0u) {
         return vec4<f32>(0.0);
     }
-    // Count is published after the three channel sums. Querying it last gives
-    // a consistent lower bound if a writer overlaps this read.
-    let r = atomicLoad(&cell.r);
-    let g = atomicLoad(&cell.g);
-    let b = atomicLoad(&cell.b);
     let scale = 2.5 / (255.0 * f32(count));
     return vec4<f32>(vec3<f32>(f32(r), f32(g), f32(b)) * scale, f32(count));
 }
