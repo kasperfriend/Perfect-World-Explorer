@@ -3790,15 +3790,18 @@ impl Renderer {
             .modules
             .raywatcher()
             .plan(render_extent, !reset_history);
+        // Update even on the disabled path: the render loop uses this exact
+        // flag to avoid creating/submitting an empty Raywatcher command encoder.
+        self.raywatcher_frame_plan = plan;
         if !plan.trace {
             // Holding the GPU state would keep a BVH and a dozen targets alive
-            // for a module the user turned off.
+            // for a module the user turned off. The harvester also signals any
+            // detached CPU worker to cancel before dropping its receiver.
             self.raywatcher_gpu = None;
             self.raywatcher_scene = None;
             self.raywatcher_harvest.invalidate();
             return RasterOverrides::NONE;
         }
-        self.raywatcher_frame_plan = plan;
         RasterOverrides::for_plan(&plan)
     }
 
