@@ -3813,6 +3813,11 @@ impl Renderer {
                 self.modules.raywatcher().sdk_dir(),
                 cfg!(windows),
             );
+            if dlss.note == "Checking SDK files in background..." {
+                self.modules.raywatcher_mut().set_hardware_probing(true);
+                self.raywatcher_frame_plan = crate::modules::raywatcher::plan::Plan::OFF;
+                return RasterOverrides::NONE;
+            }
             (dlss.available, fsr.available)
         };
         // Probe DXR Tier 1.1 once per session, but never call the native
