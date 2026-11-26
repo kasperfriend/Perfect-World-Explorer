@@ -9004,7 +9004,7 @@ mod frame_snapshot_tests {
         let src = source();
         for needle in [
             "            main_pass,\n            ViewRuns::Main,\n",
-            "                    Pass::Refraction,\n                    ViewRuns::Main,",
+            "                    Pass::Refraction,\n                    ViewRuns::Water,",
             "                Pass::Reflection,\n                ViewRuns::Reflected,",
             "                Pass::Minimap\n            },\n            view_runs,",
             "&normal, camera, Pass::Main, true);",
