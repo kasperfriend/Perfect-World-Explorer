@@ -11,7 +11,7 @@ Open the main menu and choose ARCHITECT | WORLD EDITOR. The original HUD and vie
 - World (left by default): choose an empty project, any readable client map, or a saved Architect project. Client map changes use the viewer's existing world-handoff path and reopen Architect in the destination map.
 - Client assets (right by default): browse the client folder tree lazily, expand PCK archive indexes on demand, and right-click folders/files/archive entries to pin them to the quick bar.
 - Scene objects: inspect loaded models, trees, scenery and effects; multi-select and duplicate eligible ECM models into the editable project layer.
-- Transform: edit custom placements' position, Euler rotation and scale. Supported ECM placements update in the live viewport through the same native model, material, animation and GPU queue used by map models.
+- Transform: edit custom placements' position, Euler rotation (degree-based controls) and scale. Supported ECM placements update in the live viewport through the same native model, material, animation and GPU queue used by map models.
 - Terrain tools: record raise/lower/flatten/smooth/paint operations with radius, strength and terrain/object/smart snapping settings. These operations are saved, but do not yet deform the native terrain.
 - Quick bar (bottom): select pinned assets quickly.
 
