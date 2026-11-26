@@ -1239,12 +1239,20 @@ impl Architect {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Rotation");
+                            let mut degrees = object.rotation.map(f32::to_degrees);
+                            let mut changed = false;
                             for axis in 0..3 {
-                                ui.add(
-                                    egui::DragValue::new(&mut object.rotation[axis])
-                                        .speed(0.01)
-                                        .prefix(["X ", "Y ", "Z "][axis]),
-                                );
+                                changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut degrees[axis])
+                                            .speed(1.0)
+                                            .suffix("°")
+                                            .prefix(["X ", "Y ", "Z "][axis]),
+                                    )
+                                    .changed();
+                            }
+                            if changed {
+                                object.rotation = degrees.map(f32::to_radians);
                             }
                         });
                         ui.add(
