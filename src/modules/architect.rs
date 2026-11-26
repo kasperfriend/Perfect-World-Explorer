@@ -88,6 +88,7 @@ pub struct Architect {
     archive_entries: Vec<String>,
     archive_error: Option<String>,
     selected_scene_object: Option<usize>,
+    selected_scene_transform: Option<[f32; 3]>,
     selected_placement: Option<usize>,
     multi_selection: HashSet<usize>,
     quick_bar: Vec<String>,
@@ -134,6 +135,7 @@ impl Architect {
             archive_entries: Vec::new(),
             archive_error: None,
             selected_scene_object: None,
+            selected_scene_transform: None,
             selected_placement: None,
             multi_selection: HashSet::new(),
             quick_bar: Vec::new(),
@@ -434,13 +436,28 @@ impl Architect {
         self.status = "Custom placement staged in the project. It is not yet drawn by the world renderer.".into();
     }
 
-    fn scene_row(&mut self, ui: &mut egui::Ui, index: usize, label: &str, asset: &str, camera: Vec3) {
+    fn duplicate_selected_scene_item(&mut self) {
+        let Some(asset) = self.selected_asset.clone() else { return };
+        let position = self.selected_scene_transform.unwrap_or([0.; 3]);
+        let portable_asset = self.portable_asset_path(&asset);
+        self.project.objects.push(PlacedObject {
+            asset: portable_asset,
+            position,
+            rotation: [0.; 3],
+            scale: 1.,
+        });
+        self.selected_placement = Some(self.project.objects.len() - 1);
+        self.status = "Selected client scene item copied into the editable project layer.".into();
+    }
+
+    fn scene_row(&mut self, ui: &mut egui::Ui, index: usize, label: &str, asset: &str, position: [f32; 3], camera: Vec3) {
         if !self.object_filter.is_empty() && !label.to_lowercase().contains(&self.object_filter.to_lowercase()) {
             return;
         }
         let selected = self.selected_scene_object == Some(index) || self.multi_selection.contains(&index);
         if ui.selectable_label(selected, label).clicked() {
             self.selected_asset = Some(asset.to_string());
+            self.selected_scene_transform = Some(position);
             if self.cursor == CursorMode::MultiSelect {
                 if !self.multi_selection.insert(index) { self.multi_selection.remove(&index); }
             } else {
@@ -566,6 +583,7 @@ impl Architect {
                     self.selected_project = None;
                     self.selected_placement = None;
                     self.selected_scene_object = None;
+                    self.selected_scene_transform = None;
                     self.multi_selection.clear();
                     self.status = "New empty project. Choose a client map as its source when ready.".into();
                 }
@@ -632,7 +650,7 @@ impl Architect {
         if asset_dock_changed { asset_panel = asset_panel.current_pos(asset_pos); }
         asset_panel.show(ctx, |ui| {
                 ui.horizontal(|ui| { ui.heading("Client explorer"); Self::dock_picker(ui, &mut self.right_dock); });
-                ui.label(egui::RichText::new("Loose files and folders under the client element directory. PCK archives are listed as files; their internal entries are not expanded here.").small().weak());
+                ui.label(egui::RichText::new("Loose client files are browsed lazily. Select a PCK archive to index its internal asset paths on demand.").small().weak());
                 ui.text_edit_singleline(&mut self.tree_filter);
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                     self.show_tree(ui, &self.client_root.clone(), 0, camera);
@@ -645,12 +663,14 @@ impl Architect {
                         ui.colored_label(egui::Color32::LIGHT_RED, error);
                     } else {
                         ui.label(format!("{} indexed entries", self.archive_entries.len()));
+                        let archive_entries = self.archive_entries.clone();
                         egui::ScrollArea::vertical().max_height(180.).show(ui, |ui| {
-                            for entry in self.archive_entries.iter().take(2000) {
+                            for entry in archive_entries.iter().take(2000) {
                                 let label = Path::new(entry).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| entry.clone());
                                 let response = ui.selectable_label(false, format!("📦 {label}"));
                                 if response.clicked() {
                                     self.selected_asset = Some(format!("{}::{}", archive.display(), entry));
+                                    if self.cursor == CursorMode::Place { self.add_selected_asset_at_camera(camera); }
                                 }
                                 response.context_menu(|ui| {
                                     if ui.button("Pin archive entry to quick bar").clicked() {
@@ -696,30 +716,30 @@ impl Architect {
                         for block in &scene.blocks {
                             for model in &block.models {
                                 let label = format!("Model {} · {}", model.export_id, model.path);
-                                self.scene_row(ui, index, &label, &model.path, camera);
+                                self.scene_row(ui, index, &label, &model.path, model.position, camera);
                                 index += 1;
                             }
                             for tree in &block.trees {
                                 if let Some(kind) = scene.tree_types.get(tree.tree_type as usize) {
                                     let label = format!("Tree {} · {}", tree.tree_type, kind.tree);
-                                    self.scene_row(ui, index, &label, &kind.tree, camera);
+                                    self.scene_row(ui, index, &label, &kind.tree, tree.position, camera);
                                     index += 1;
                                     if !kind.composite.is_empty() {
                                         let composite = format!("Tree composite {} · {}", tree.tree_type, kind.composite);
-                                        self.scene_row(ui, index, &composite, &kind.composite, camera);
+                                        self.scene_row(ui, index, &composite, &kind.composite, tree.position, camera);
                                         index += 1;
                                     }
                                 }
                             }
                             for effect in &block.effects {
                                 let label = format!("Effect {} · {}", effect.export_id, effect.path);
-                                self.scene_row(ui, index, &label, &effect.path, camera);
+                                self.scene_row(ui, index, &label, &effect.path, effect.position, camera);
                                 index += 1;
                             }
                         }
                         for ornament in ornaments {
                             let label = format!("Scenery {} · {}", ornament.export_id, ornament.path);
-                            self.scene_row(ui, index, &label, &ornament.path, camera);
+                            self.scene_row(ui, index, &label, &ornament.path, ornament.position, camera);
                             index += 1;
                         }
                     });
@@ -740,6 +760,9 @@ impl Architect {
                 ui.label(format!("Camera position: {:.1}, {:.1}, {:.1}", camera.x, camera.y, camera.z));
                 if ui.button("Place selected asset at camera").clicked() {
                     self.add_selected_asset_at_camera(camera);
+                }
+                if self.selected_scene_object.is_some() && ui.button("Duplicate selected scene item").clicked() {
+                    self.duplicate_selected_scene_item();
                 }
                 ui.separator();
                 ui.heading("Custom placements");
