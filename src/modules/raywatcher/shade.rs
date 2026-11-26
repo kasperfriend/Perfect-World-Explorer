@@ -469,7 +469,11 @@ pub fn apply_fog(colour: Vec3, params: &FrameParams, distance: f32) -> Vec3 {
 
 fn linear_to_srgb(v: f32) -> f32 {
     let v = v.max(0.0);
-    if v <= 0.0031308 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+    if v <= 0.0031308 {
+        12.92 * v
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    }
 }
 
 fn srgb_to_linear(v: f32) -> f32 {
