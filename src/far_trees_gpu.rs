@@ -184,7 +184,7 @@ pub(crate) struct LodParams {
     pub(crate) frustum: [[f32; 4]; 6],
     /// Optional water clip plane: height, sign, enabled, unused.
     pub(crate) clip: [f32; 4],
-    /// `active placements, groups, bounds_active, 0`.
+    /// `active placements, active-index word offset (0 = full scan), bounds_active, 0`.
     pub(crate) counts: [u32; 4],
     /// The exact view-projection used by the depth-producing pass.
     pub(crate) view_projection: [[f32; 4]; 4],
@@ -219,12 +219,26 @@ struct GroupInfo {height:f32,args_base:u32,first_instance:u32,capacity:u32};
 struct Args {index_count:u32,instance_count:atomic<u32>,first_index:u32,base_vertex:i32,first_instance:u32};
 struct Instance {data0:vec4<f32>,data1:vec4<f32>};
 @group(0) @binding(0) var<uniform> p:LodParamsGpu;
-@group(0) @binding(1) var<storage,read> placements:array<Placement>;
+@group(0) @binding(1) var<storage,read> placement_words:array<u32>;
 @group(0) @binding(2) var<storage,read> groups:array<GroupInfo>;
 @group(0) @binding(3) var<storage,read_write> instances:array<Instance>;
 @group(0) @binding(4) var<storage,read_write> args:array<Args>;
 @group(0) @binding(5) var hiz:texture_2d<f32>;
-@group(0) @binding(6) var<storage,read> active_indices:array<u32>;
+fn load_placement(index:u32)->Placement {
+ let base=index*8u;
+ return Placement(
+  vec4<f32>(
+   bitcast<f32>(placement_words[base]),
+   bitcast<f32>(placement_words[base+1u]),
+   bitcast<f32>(placement_words[base+2u]),
+   bitcast<f32>(placement_words[base+3u])
+  ),
+  placement_words[base+4u],
+  placement_words[base+5u],
+  placement_words[base+6u],
+  placement_words[base+7u]
+ );
+}
 fn is_finite(v:f32)->bool {return v>=-3.0e38 && v<=3.0e38;}
 // SpeedTreeRT 0x100282b0's estimate: f32 squared distance, then the float-bit
 // square root. Matches `tree_lod::client_distance`.
@@ -330,8 +344,8 @@ fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>) {
 fn main(@builtin(global_invocation_id) id:vec3<u32>) {
  let active_slot=id.x;
  if active_slot>=p.counts.x {return;}
- let index=active_indices[active_slot];
- let placement=placements[index];
+ let index=select(active_slot,placement_words[p.counts.y+active_slot],p.counts.y!=0u);
+ let placement=load_placement(index);
  let position=placement.pos_height.xyz;
  if !is_finite(position.x) || !is_finite(position.y) || !is_finite(position.z) {return;}
  if p.counts.z!=0u {
@@ -427,7 +441,10 @@ pub struct FarTrees {
     /// are uploaded before the per-tree GPU LOD/occlusion pass.
     spatial_cells: Vec<TreeSpatialCell>,
     active_placement_indices: RefCell<Vec<u32>>,
-    active_index_buffer: wgpu::Buffer,
+    /// Byte offset of the optional active-index tail packed after placements.
+    /// None means the combined buffer would exceed the adapter's storage limit;
+    /// the shader then scans the static placement prefix directly.
+    active_index_offset: Option<u64>,
     last_resident_update: RefCell<
         Option<(
             [f32; 3],
@@ -1205,17 +1222,29 @@ impl FarTrees {
         }
         let spatial_cells = build_tree_spatial_cells(&placement_data, &group_data);
         let placement_count = placement_data.len() as u32;
+        // WebGPU guarantees four storage buffers per compute stage. Pack the
+        // visible-index tail into the placement buffer so tree LOD uses exactly
+        // four storage bindings (placements, groups, instances and indirect args).
+        // On an adapter whose maximum storage binding cannot hold both regions,
+        // keep only the placement prefix and let the shader conservatively scan
+        // every placement instead of requesting an unsupported fifth binding.
+        let placement_bytes = bytemuck::cast_slice::<Placement, u8>(&placement_data);
+        let active_index_offset = placement_bytes.len() as u64;
+        let active_index_bytes = (placement_data.len().max(1) * std::mem::size_of::<u32>()) as u64;
+        let combined_size = active_index_offset.saturating_add(active_index_bytes);
+        let can_pack_active_indices = combined_size
+            <= u64::from(device.limits().max_storage_buffer_binding_size)
+            && combined_size <= device.limits().max_buffer_size;
+        let mut placement_storage = placement_bytes.to_vec();
+        if can_pack_active_indices {
+            placement_storage.resize(combined_size as usize, 0);
+        }
         let placement_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tree placements"),
-            contents: bytemuck::cast_slice(&placement_data),
+            label: Some("tree placements and visible-index tail"),
+            contents: &placement_storage,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        let active_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("visible tree placement indices"),
-            size: (placement_data.len().max(1) * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let active_index_offset = can_pack_active_indices.then_some(active_index_offset);
         let lod_group_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tree lod groups"),
             contents: bytemuck::cast_slice(&group_data),
@@ -1325,16 +1354,6 @@ impl FarTrees {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
             ],
         });
         let lod_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1394,10 +1413,6 @@ impl FarTrees {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(&hiz_dummy_view),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: active_index_buffer.as_entire_binding(),
-                },
             ],
         });
         eprintln!(
@@ -1425,7 +1440,7 @@ impl FarTrees {
             capacity,
             spatial_cells,
             active_placement_indices: RefCell::new(Vec::new()),
-            active_index_buffer,
+            active_index_offset,
             last_resident_update: RefCell::new(None),
             lod_pipeline,
             lod_bind,
@@ -1477,10 +1492,6 @@ impl FarTrees {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: self.active_index_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1562,26 +1573,33 @@ impl FarTrees {
         // map's tree count to the subset whose conservative cell bounds overlap
         // this view. The shader still performs exact per-tree frustum, clip,
         // distance/LOD and optional Hi-Z tests.
-        let mut active_indices = self.active_placement_indices.borrow_mut();
-        active_indices.clear();
-        append_visible_tree_indices(
-            &self.spatial_cells,
-            &frustum,
-            clip_plane,
-            bounds,
-            &mut active_indices,
-        );
-        let active_count = active_indices.len();
-        if active_count == 0 {
-            queue.write_buffer(&self.lod_args, 0, &self.lod_args_reset);
-            *self.last_resident_update.borrow_mut() = Some(key);
-            return;
-        }
-        queue.write_buffer(
-            &self.active_index_buffer,
-            0,
-            bytemuck::cast_slice(active_indices.as_slice()),
-        );
+        let active_count = if let Some(offset) = self.active_index_offset {
+            let mut active_indices = self.active_placement_indices.borrow_mut();
+            active_indices.clear();
+            append_visible_tree_indices(
+                &self.spatial_cells,
+                &frustum,
+                clip_plane,
+                bounds,
+                &mut active_indices,
+            );
+            if active_indices.is_empty() {
+                queue.write_buffer(&self.lod_args, 0, &self.lod_args_reset);
+                *self.last_resident_update.borrow_mut() = Some(key);
+                return;
+            }
+            queue.write_buffer(
+                &self.placement_buffer,
+                offset,
+                bytemuck::cast_slice(active_indices.as_slice()),
+            );
+            active_indices.len()
+        } else {
+            // The packed tail would exceed this adapter's binding limit. Keep
+            // the correctness path by dispatching over every placement; the
+            // shader's original frustum/clip/LOD/Hi-Z tests remain authoritative.
+            self.placements as usize
+        };
         let (hiz_width, hiz_height, hiz_levels) = hiz_extent.unwrap_or((0, 0, 0));
         let params = LodParams {
             camera: [camera[0], camera[1], camera[2], scale],
@@ -1590,7 +1608,8 @@ impl FarTrees {
             clip: clip_plane.map_or([0.; 4], |(height, sign)| [height, sign, 1., 0.]),
             counts: [
                 active_count as u32,
-                self.groups.len() as u32,
+                self.active_index_offset
+                    .map_or(0, |offset| (offset / std::mem::size_of::<u32>() as u64) as u32),
                 u32::from(bounds.is_some()),
                 0,
             ],
@@ -1851,7 +1870,9 @@ mod tests {
         // The first two trees share a cell. The second tree's sphere reaches
         // the view, so retaining that entire cell is intentionally conservative.
         assert_eq!(visible, vec![0, 1]);
-        assert!(LOD_COMPUTE.contains("active_indices[active_slot]"));
+        assert!(LOD_COMPUTE.contains("placement_words[p.counts.y+active_slot]"));
+        assert!(!LOD_COMPUTE.contains("@group(0) @binding(6)"));
+        assert!(LOD_COMPUTE.contains("load_placement(index)"));
     }
 
     #[test]
