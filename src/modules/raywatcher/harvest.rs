@@ -839,6 +839,14 @@ impl Harvester {
     }
 }
 
+impl Drop for Harvester {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.pending_bg_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 fn hash_instances(instances: &[InstanceProxy], eye: Vec3, config: HarvestConfig) -> u64 {
     // FNV-1a over the quantised proxy state, mixed with the eye so that a camera
     // move which pulls different instances into range is a miss.
@@ -2640,4 +2648,27 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn invalidate_signals_a_detached_scene_builder_to_stop() {
+        let mut harvester = Harvester::new();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        harvester.pending_bg_cancel = Some(std::sync::Arc::clone(&cancel));
+
+        harvester.invalidate();
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(harvester.pending_bg_cancel.is_none());
+        assert!(harvester.pending_bg.is_none());
+    }
+
+    #[test]
+    fn dropping_harvester_signals_a_detached_scene_builder_to_stop() {
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        {
+            let mut harvester = Harvester::new();
+            harvester.pending_bg_cancel = Some(std::sync::Arc::clone(&cancel));
+        }
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
 }
