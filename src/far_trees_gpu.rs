@@ -113,6 +113,53 @@ fn build_tree_spatial_cells(
     cells.into_values().collect()
 }
 
+/// Conservative AABB/frustum rejection kept local because this module is also
+/// compiled by standalone tree diagnostics that intentionally omit world_objects.
+fn tree_cell_intersects_frustum(
+    planes: &[[f32; 4]; 6],
+    min: [f32; 3],
+    max: [f32; 3],
+) -> bool {
+    if min.iter().chain(max.iter()).any(|value| !value.is_finite())
+        || (0..3).any(|axis| min[axis] > max[axis])
+    {
+        return true;
+    }
+    for plane in planes {
+        let positive = [
+            if plane[0] >= 0.0 { max[0] } else { min[0] },
+            if plane[1] >= 0.0 { max[1] } else { min[1] },
+            if plane[2] >= 0.0 { max[2] } else { min[2] },
+        ];
+        if plane[0] * positive[0]
+            + plane[1] * positive[1]
+            + plane[2] * positive[2]
+            + plane[3]
+            < 0.0
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Reject only when the complete tree-cell AABB is on the clipped side.
+fn tree_cell_survives_clip(
+    clip_plane: Option<(f32, f32)>,
+    min: [f32; 3],
+    max: [f32; 3],
+) -> bool {
+    if let Some((water_y, sign)) = clip_plane {
+        if sign > 0.0 && max[1] < water_y {
+            return false;
+        }
+        if sign < 0.0 && min[1] > water_y {
+            return false;
+        }
+    }
+    true
+}
+
 /// Append only cells whose conservative tree bounds can intersect this view.
 /// The per-tree shader tests still run on every selected placement.
 fn append_visible_tree_indices(
@@ -132,8 +179,8 @@ fn append_visible_tree_indices(
                 continue;
             }
         }
-        if !crate::world_objects::aabb_survives_clip(clip_plane, cell.min, cell.max)
-            || !crate::world_objects::aabb_in_frustum(frustum, cell.min, cell.max)
+        if !tree_cell_survives_clip(clip_plane, cell.min, cell.max)
+            || !tree_cell_intersects_frustum(frustum, cell.min, cell.max)
         {
             continue;
         }
