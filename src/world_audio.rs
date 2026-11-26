@@ -62,8 +62,10 @@ impl SpatialIndex {
         result.extend_from_slice(&self.global);
         for z in -AUDIO_CELL_RADIUS..=AUDIO_CELL_RADIUS {
             for x in -AUDIO_CELL_RADIUS..=AUDIO_CELL_RADIUS {
-                if let Some(ids) = self.cells.get(&(cx + x, cz + z)) {
-                    result.extend_from_slice(ids);
+                if let (Some(x), Some(z)) = (cx.checked_add(x), cz.checked_add(z)) {
+                    if let Some(ids) = self.cells.get(&(x, z)) {
+                        result.extend_from_slice(ids);
+                    }
                 }
             }
         }
@@ -140,6 +142,8 @@ fn select(emitters: &[Emitter], spatial: &SpatialIndex, pos: [f32; 3], yaw: f32,
         let s = &e.sound;
         if e.asset.is_none()
             || !scene::effect_visible(s.mode, night_factor)
+            || !s.min_distance.is_finite()
+            || !s.max_distance.is_finite()
             || s.min_distance < 0.
             || s.max_distance <= 0.
             || s.max_distance < s.min_distance
@@ -559,7 +563,7 @@ mod tests {
     fn spatial_index_keeps_nearby_short_range_and_all_long_range_emitters() {
         let emitters = vec![
             emitter([510., 0., 0.], 2),
-            emitter([513., 0., 0.], 2),
+            emitter([770., 0., 0.], 2),
             emitter([0., 0., 900.], 2),
         ];
         let mut long = emitters[2].clone();
