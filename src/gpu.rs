@@ -10142,7 +10142,7 @@ mod raywatcher_camera_cut_tests {
 
     #[test]
     fn boosted_continuous_flight_does_not_reset_temporal_history() {
-        let moved = Vec3::new(240.0 * 4.0 * 0.1, 240.0 * 4.0 * 0.1, 0.0);
+        let moved = Vec3::splat(240.0 * 4.0 * 0.1);
         assert!(!camera_cut_detected(
             Vec3::ZERO,
             moved,
