@@ -576,9 +576,8 @@ struct MeshData {
 enum ViewRuns {
     Full,
     Main,
-    Reflected,
     Water,
-    WaterReflected,
+    Reflected,
     Map,
 }
 #[derive(Clone, Debug)]
@@ -3348,15 +3347,11 @@ impl Renderer {
                 Some(self.terrain_runs.as_slice()),
                 Some(self.far_terrain_runs.as_slice()),
             ),
-            ViewRuns::Reflected => (
-                Some(self.reflected_terrain_runs.as_slice()),
-                Some(self.reflected_far_runs.as_slice()),
-            ),
             ViewRuns::Water => (
                 Some(self.water_terrain_runs.as_slice()),
                 Some(self.water_far_terrain_runs.as_slice()),
             ),
-            ViewRuns::WaterReflected => (
+            ViewRuns::Reflected => (
                 Some(self.reflected_terrain_runs.as_slice()),
                 Some(self.reflected_far_runs.as_slice()),
             ),
@@ -3895,7 +3890,7 @@ impl Renderer {
 
     /// Queue the mirrored terrain, additionally constrained to the water
     /// surface's sampled screen rectangle.
-    fn queue_water_reflected_runs(
+    fn queue_reflected_runs(
         &mut self,
         matrix: Mat4,
         extent: (u32, u32),
@@ -3945,24 +3940,6 @@ impl Renderer {
             &self.queue,
             Some(&self.map_terrain_runs),
             Some(&self.map_far_runs),
-        );
-    }
-    /// Culls both terrain meshes for the water reflection's mirrored view
-    /// (`matrix * flip`) and queues those records. The symmetry plane is the
-    /// water height, so this runs once per reflected submit.
-    fn queue_reflected_runs(&mut self, matrix: Mat4) {
-        crate::terrain_residency::visible_runs_into(
-            &self.spans,
-            matrix,
-            &mut self.reflected_terrain_runs,
-        );
-        self.terrain_gpu
-            .visible_far_runs_into(matrix, &mut self.reflected_far_runs);
-        self.terrain_gpu.prepare_runs(
-            &self.device,
-            &self.queue,
-            Some(&self.reflected_terrain_runs),
-            Some(&self.reflected_far_runs),
         );
     }
     fn render(
@@ -4695,7 +4672,7 @@ impl Renderer {
                 .write_buffer(&self.reflected_uniform, 0, bytemuck::bytes_of(&reflected));
             let reflection_scissor =
                 water_view_scissor(matrix * flip, w, h, batch.bounds, plane, water_margin);
-            self.queue_water_reflected_runs(matrix * flip, (w, h), reflection_scissor);
+            self.queue_reflected_runs(matrix * flip, (w, h), reflection_scissor);
             let reflection_frustum = water_view_frustum(
                 matrix * flip,
                 (w, h),
@@ -4721,7 +4698,7 @@ impl Renderer {
                 // `matrix * flip` mirrors the view, so this submit draws the
                 // reflected block set queued just above it.
                 Pass::Reflection,
-                ViewRuns::WaterReflected,
+                ViewRuns::Reflected,
                 None,
                 None,
                 &refl_cull,
