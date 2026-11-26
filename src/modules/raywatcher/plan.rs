@@ -914,7 +914,7 @@ mod tests {
         // it unchanged so the ray image is reconstructed by that upscaler.
         let plan = Plan::decide(&s, (1280, 720), true, |_| true);
         assert_eq!(plan.render, (1280, 720));
-        assert_eq!(plan.grid, (640, 360));
+        assert_eq!(plan.grid, (1280, 720));
         // A degenerate extent still produces a one-pixel plan instead of a
         // zero-sized texture.
         let plan = Plan::decide(&s, (0, 0), true, |_| true);
