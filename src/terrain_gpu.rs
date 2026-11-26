@@ -996,6 +996,19 @@ impl TerrainGpu {
             None => out.clear(),
         }
     }
+    pub fn visible_far_runs_rect_into(
+        &self,
+        matrix: glam::Mat4,
+        rect: [f32; 4],
+        out: &mut Vec<(u32, u32)>,
+    ) {
+        match &self.far {
+            Some(far) => {
+                crate::terrain_residency::visible_runs_rect_into(&far.spans, matrix, rect, out)
+            }
+            None => out.clear(),
+        }
+    }
     pub fn edge_mesh(&self) -> Option<(&wgpu::Buffer, &wgpu::Buffer, u32)> {
         self.far
             .as_ref()
