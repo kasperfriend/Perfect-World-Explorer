@@ -292,7 +292,7 @@ impl Default for ViewSettings {
             world_effects: true,
             effect_shaft: EffectShaft::Client,
             effect_distance: 0.,
-            atmospheric_fog: false,
+            atmospheric_fog: true,
             bloom: false,
             sharpen: false,
             bloom_strength: 1.,
