@@ -462,7 +462,10 @@ impl Scan {
         if elements.family() != 0x3000 {
             return None;
         }
-        let tasks = self.data_files.iter().find(|info| info.name == "tasks.data")?;
+        let tasks = self
+            .data_files
+            .iter()
+            .find(|info| info.name == "tasks.data")?;
         if !tasks
             .detail
             .as_deref()
