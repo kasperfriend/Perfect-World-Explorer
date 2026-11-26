@@ -4514,6 +4514,9 @@ impl Renderer {
                     &reflect_depth,
                     self.terrain_gpu.edge_mesh(),
                     (&self.vertex, &self.index, self.terrain_end),
+                    refraction_scissor,
+                    &self.water_far_terrain_runs,
+                    &self.water_terrain_runs,
                 );
             } else {
                 // Client 0x7cca50 renders the sky and the scene above this
