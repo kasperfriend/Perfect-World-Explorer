@@ -478,7 +478,11 @@ fn linear_to_srgb(v: f32) -> f32 {
 
 fn srgb_to_linear(v: f32) -> f32 {
     let v = v.max(0.0);
-    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 fn material_of(scene: &SceneGeometry, triangle: u32) -> RayMaterial {
@@ -1018,10 +1022,15 @@ mod tests {
         let correct = apply_fog(Vec3::splat(0.1), &params, view_z);
         let euclidean_bug = apply_fog(Vec3::splat(0.1), &params, ray_length);
         assert_eq!(correct, Vec3::splat(0.1));
-        assert!(euclidean_bug.x > correct.x, "Euclidean distance would fog this off-axis point too early");
+        assert!(
+            euclidean_bug.x > correct.x,
+            "Euclidean distance would fog this off-axis point too early"
+        );
 
         let shader = super::super::gpu::RAY_SHADER;
-        assert!(shader.contains("let fog_view_z = max((params.vp * vec4<f32>(point, 1.0)).w, 0.0);"));
+        assert!(shader.contains(
+            "let fog_view_z = max((params.vp * vec4<f32>(point, 1.0)).w, 0.0);"
+        ));
         assert!(shader.contains("linear_to_srgb(relit), params.fog_colour.xyz"));
     }
 
