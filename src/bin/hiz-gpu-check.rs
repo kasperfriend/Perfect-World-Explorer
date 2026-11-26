@@ -144,11 +144,7 @@ fn main() {
     let expected = [(13u32, 7u32), (7, 4), (4, 2), (2, 1), (1, 1)];
     assert_eq!(pyramid.levels().len(), expected.len());
     for (index, (level, (width, height))) in pyramid.levels().iter().zip(expected).enumerate() {
-        assert_eq!(
-            (level.width, level.height),
-            (width, height),
-            "mip {index}"
-        );
+        assert_eq!((level.width, level.height), (width, height), "mip {index}");
         let count = (width * height) as usize;
         let mip = &values[level.offset as usize..level.offset as usize + count];
         assert!(

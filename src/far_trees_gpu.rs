@@ -1385,22 +1385,26 @@ impl FarTrees {
                 let dy = camera[1] - prev_cam[1];
                 let dz = camera[2] - prev_cam[2];
                 if dx * dx + dy * dy + dz * dz < 1e-4
-                    && prev_scale == scale && prev_bounds == bounds
-                    && prev_frustum == frustum && prev_clip == clip_plane
+                    && prev_scale == scale
+                    && prev_bounds == bounds
+                    && prev_frustum == frustum
+                    && prev_clip == clip_plane
                 {
                     return;
                 }
             }
         }
-        let (hiz_width, hiz_height, hiz_levels) =
-            hiz_extent.unwrap_or((0, 0, 0));
+        let (hiz_width, hiz_height, hiz_levels) = hiz_extent.unwrap_or((0, 0, 0));
         let params = LodParams {
             camera: [camera[0], camera[1], camera[2], scale],
             bounds: bounds.unwrap_or([0.; 4]),
             frustum,
             clip: clip_plane.map_or([0.; 4], |(height, sign)| [height, sign, 1., 0.]),
             counts: [
-                self.placements, self.groups.len() as u32, u32::from(bounds.is_some()), 0,
+                self.placements,
+                self.groups.len() as u32,
+                u32::from(bounds.is_some()),
+                0,
             ],
             view_projection,
             hiz_mips,
@@ -1412,7 +1416,11 @@ impl FarTrees {
         queue.write_buffer(&self.lod_args, 0, &self.lod_args_reset);
         queue.write_buffer(&self.lod_params, 0, bytemuck::bytes_of(&params));
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(if hiz_enabled { "tree Hi-Z + LOD culling" } else { "tree LOD selection" }),
+            label: Some(if hiz_enabled {
+                "tree Hi-Z + LOD culling"
+            } else {
+                "tree LOD selection"
+            }),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.lod_pipeline);

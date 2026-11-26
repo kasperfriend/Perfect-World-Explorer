@@ -2026,13 +2026,18 @@ fn resize_world_targets(renderer: &mut Renderer, w: u32, h: u32) {
     renderer.hiz = match crate::hiz::Pyramid::new(&renderer.device, w, h) {
         Ok(pyramid) => Some(pyramid),
         Err(error) => {
-            eprintln!("Hi-Z disabled after resize; frustum-only tree culling remains active: {error}");
+            eprintln!(
+                "Hi-Z disabled after resize; frustum-only tree culling remains active: {error}"
+            );
             None
         }
     };
     renderer.far_trees.set_hiz_buffer(
         &renderer.device,
-        renderer.hiz.as_ref().map_or(&renderer.hiz_fallback, |p| p.buffer()),
+        renderer
+            .hiz
+            .as_ref()
+            .map_or(&renderer.hiz_fallback, |p| p.buffer()),
     );
     if renderer.object_mv_enabled {
         let (object_mv, object_mv_view) = object_mv_target(&renderer.device, w, h);
@@ -2222,12 +2227,19 @@ impl Renderer {
         let depth_tex = depth(&device, w, h);
         let hiz = match crate::hiz::Pyramid::new(&device, w, h) {
             Ok(pyramid) => {
-                eprintln!("Initialized reversed-Z Hi-Z pyramid: {}x{} ({} levels, {} bytes)",
-                    w, h, pyramid.levels().len(), pyramid.buffer_size());
+                eprintln!(
+                    "Initialized reversed-Z Hi-Z pyramid: {}x{} ({} levels, {} bytes)",
+                    w,
+                    h,
+                    pyramid.levels().len(),
+                    pyramid.buffer_size()
+                );
                 Some(pyramid)
             }
             Err(error) => {
-                eprintln!("Hi-Z occlusion unavailable; retaining frustum-only tree culling: {error}");
+                eprintln!(
+                    "Hi-Z occlusion unavailable; retaining frustum-only tree culling: {error}"
+                );
                 None
             }
         };
@@ -3403,7 +3415,11 @@ impl Renderer {
             let (mips, extent) = match pyramid {
                 Some(pyramid) => (
                     pyramid.shader_mips(),
-                    Some((pyramid.extent().0, pyramid.extent().1, pyramid.levels().len() as u32)),
+                    Some((
+                        pyramid.extent().0,
+                        pyramid.extent().1,
+                        pyramid.levels().len() as u32,
+                    )),
                 ),
                 None => ([[1, 1, 0, 0]; 16], None),
             };
