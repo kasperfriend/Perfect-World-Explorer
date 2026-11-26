@@ -343,6 +343,9 @@ fn finite3(v: vec3<f32>) -> bool {
 fn visible_aabb(b: Bounds) -> bool {
     let mn = b.min.xyz;
     let mx = b.max.xyz;
+    if p.flags.y != 0u && (b.flags & 1u) == 0u {
+        return false;
+    }
     // Invalid numerical bounds are uncertainty, not evidence of occlusion.
     if !finite3(mn) || !finite3(mx) {
         return true;
@@ -367,9 +370,6 @@ fn visible_aabb(b: Bounds) -> bool {
         if sign < 0.0 && mn.y > water_y {
             return false;
         }
-    }
-    if p.flags.y != 0u && (b.flags & 1u) == 0u {
-        return false;
     }
     let proj_scale = p.eye_proj.w;
     let min_screen_px = p.screen_clip.x;
@@ -438,14 +438,14 @@ impl WorldGpuCullParams {
                 cull.proj_scale,
             ],
             screen_clip: [cull.min_screen_px, clip_enabled, water_y, sign],
-            flags: [count as u32, u32::from(sdr_only), 0, 0],
+            flags: [count as u32, if sdr_only { 1 } else { 0 }, 0, 0],
         }
     }
 }
 
 struct WorldGpuCullView {
     commands: Vec<WorldDrawCmd>,
-    bounds: wgpu::Buffer,
+    _bounds: wgpu::Buffer,
     indirect: wgpu::Buffer,
     params: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -471,7 +471,7 @@ impl WorldGpuCullView {
                 max: [cmd.max[0], cmd.max[1], cmd.max[2], 0.0],
                 index_count: cmd.end.saturating_sub(cmd.start),
                 first_index: cmd.start,
-                flags: u32::from(cmd.has_sdr),
+                flags: if cmd.has_sdr { 1 } else { 0 },
                 pad: 0,
             });
             args.push(PageDrawIndexedArgs {
@@ -500,7 +500,7 @@ impl WorldGpuCullView {
         let indirect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("whole-world GPU-generated indirect commands"),
             contents: bytemuck::cast_slice(&args),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC,
         });
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("whole-world GPU culling parameters"),
@@ -528,7 +528,7 @@ impl WorldGpuCullView {
         });
         Some(Self {
             commands: commands.to_vec(),
-            bounds,
+            _bounds: bounds,
             indirect,
             params,
             bind_group,
@@ -2202,7 +2202,7 @@ impl GpuPage {
             .get_or_insert_with(|| WorldGpuCuller::new(device));
         let rebuild = culler.views[view_slot]
             .as_ref()
-            .is_none_or(|view| view.commands.as_slice() != list.cmds.as_slice());
+            .map_or(true, |view| view.commands.as_slice() != list.cmds.as_slice());
         if rebuild {
             let Some(view) =
                 WorldGpuCullView::new(device, &culler.layout, &list.cmds)
@@ -3218,6 +3218,143 @@ mod page_tests {
         assert!(args
             .iter()
             .all(|arg| arg.instance_count == 1 && arg.base_vertex == 0 && arg.first_instance == 0));
+    }
+
+    #[test]
+    #[ignore = "requires software Vulkan; exercised by the PR GPU regression step"]
+    fn gpu_world_culler_executes_and_updates_indirect_visibility() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            force_fallback_adapter: true,
+            compatible_surface: None,
+        }))
+        .expect("no software Vulkan adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("world culling regression device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+            },
+            None,
+        ))
+        .expect("failed to create world culling regression device");
+
+        let mut commands = Vec::with_capacity(64);
+        for index in 0..64u32 {
+            let (min, max) = if index < 32 {
+                ([-1.0, 0.0, -5.0], [1.0, 2.0, -3.0])
+            } else {
+                ([20.0, 0.0, -5.0], [22.0, 2.0, -3.0])
+            };
+            commands.push(WorldDrawCmd {
+                page: 0,
+                start: index * 3,
+                end: index * 3 + 3,
+                min,
+                max,
+                has_sdr: index % 2 == 0,
+            });
+        }
+        let list = WorldDrawList {
+            cmds: commands,
+            chunks: vec![WorldDrawChunk {
+                min: [-1.0, 0.0, -5.0],
+                max: [22.0, 2.0, -3.0],
+                has_sdr: true,
+                start: 0,
+                end: 64,
+            }],
+        };
+        let frustum = [
+            [1.0, 0.0, 0.0, 10.0],
+            [-1.0, 0.0, 0.0, 10.0],
+            [0.0, 1.0, 0.0, 10.0],
+            [0.0, -1.0, 0.0, 10.0],
+            [0.0, 0.0, 1.0, 10.0],
+            [0.0, 0.0, -1.0, 10.0],
+        ];
+        let mut cull = CullParams::frustum_only(frustum);
+        let mut scratch = WorldDrawScratch::default();
+        let read_records = |device: &wgpu::Device,
+                            queue: &wgpu::Queue,
+                            scratch: &WorldDrawScratch,
+                            count: usize| {
+            let view = scratch.gpu_culler.as_ref().unwrap().views[0]
+                .as_ref().unwrap();
+            let size = (count as u64) * PAGE_DRAW_ARGS_SIZE;
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("world culling indirect readback"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("world culling readback encoder"),
+            });
+            encoder.copy_buffer_to_buffer(&view.indirect, 0, &readback, 0, size);
+            queue.submit(Some(encoder.finish()));
+            let slice = readback.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            let mapped = slice.get_mapped_range();
+            let records = bytemuck::cast_slice::<u8, PageDrawIndexedArgs>(&mapped).to_vec();
+            drop(mapped);
+            readback.unmap();
+            records
+        };
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("world culling regression encoder"),
+        });
+        assert!(GpuPage::encode_world_culling(
+            &device,
+            &mut encoder,
+            &queue,
+            &list,
+            &cull,
+            0,
+            false,
+            true,
+            &mut scratch,
+        ));
+        queue.submit(Some(encoder.finish()));
+        let first = read_records(&device, &queue, &scratch, 64);
+        assert!(first[..32].iter().all(|arg| arg.instance_count == 1));
+        assert!(first[32..].iter().all(|arg| arg.instance_count == 0));
+
+        // Reusing the same static command/bounds buffers with a changed view
+        // must rewrite every count; old occluded bits cannot survive a turn.
+        cull.frustum = [
+            [1.0, 0.0, 0.0, 100.0],
+            [-1.0, 0.0, 0.0, 100.0],
+            [0.0, 1.0, 0.0, 100.0],
+            [0.0, -1.0, 0.0, 100.0],
+            [0.0, 0.0, 1.0, 100.0],
+            [0.0, 0.0, -1.0, 100.0],
+        ];
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("world culling second-view encoder"),
+        });
+        assert!(GpuPage::encode_world_culling(
+            &device,
+            &mut encoder,
+            &queue,
+            &list,
+            &cull,
+            0,
+            false,
+            true,
+            &mut scratch,
+        ));
+        queue.submit(Some(encoder.finish()));
+        let second = read_records(&device, &queue, &scratch, 64);
+        assert!(second.iter().all(|arg| arg.instance_count == 1));
+        println!("::notice::GPU world culling passed: frustum compaction and current-view invalidation");
     }
 
     #[test]

@@ -232,6 +232,21 @@ jobs:
             done
             exit 1
           fi
+      - name: Test GPU world-page culling on software Vulkan
+        env:
+          WGPU_BACKEND: vulkan
+          XDG_RUNTIME_DIR: /tmp
+        run: |
+          icd="$(find /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d \
+            /etc/vulkan/icd.d -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null || true)"
+          if [ -z "$icd" ]; then
+            echo "::error::no lavapipe ICD found for world culling compute regression"
+            exit 41
+          fi
+          export VK_ICD_FILENAMES="$icd"
+          cargo test --locked --bin perfect-world-explorer \
+            gpu_world_culler_executes_and_updates_indirect_visibility \
+            -- --ignored --nocapture
       - name: Test Librarian preview with an sRGB window
         env:
           WGPU_BACKEND: vulkan
