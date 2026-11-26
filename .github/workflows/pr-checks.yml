@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
   pull-requests: write
 
@@ -501,6 +502,7 @@ jobs:
         with:
           name: Perfect-World-Explorer-Windows-x64
           path: ${{ runner.temp }}/uploaded-viewer
+          github-token: ${{ github.token }}
       - name: Audit the uploaded artifact layout
         shell: pwsh
         run: |

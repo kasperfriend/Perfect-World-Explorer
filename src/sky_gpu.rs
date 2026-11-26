@@ -162,6 +162,7 @@ struct Uniform {
     /// `xy` the glow art's own bright-core lookup offset (`glow_lookup_center`),
     /// `zw` the sun's screen position in NDC for the flare chain.
     glow_center: [f32; 4],
+    moon_glow: [f32; 4],
     /// `xy` the stage-0 sky texture-matrix translation, `z` the NDC height of
     /// one pixel (`2 / height`, the screen-space scale the client's flare
     /// sprites are sized in), `w` the matrix's diagonal scale.
@@ -180,6 +181,7 @@ struct Uniform {
 
 pub struct SkyGpu {
     glow_center: [f32; 4],
+    moon_halo_offset: [f32; 2],
     pipeline: wgpu::RenderPipeline,
     normal: wgpu::BindGroup,
     reflected: wgpu::BindGroup,
@@ -231,7 +233,39 @@ fn luminous_center(image: &image::RgbaImage) -> [f32; 2] {
     ]
 }
 
-/// Align the authored bright cores of the disc and the shine strip.
+
+fn alpha_center(image: &image::RgbaImage) -> [f32; 2] {
+    let mut sum = [0.0f64; 3];
+    for (x, y, pixel) in image.enumerate_pixels() {
+        let weight = pixel[3] as f64;
+        sum[0] += (x as f64 + 0.5) * weight;
+        sum[1] += (y as f64 + 0.5) * weight;
+        sum[2] += weight;
+    }
+    if sum[2] == 0.0 || image.width() == 0 || image.height() == 0 {
+        return [0.5; 2];
+    }
+    [
+        (sum[0] / sum[2] / image.width() as f64) as f32,
+        (sum[1] / sum[2] / image.height() as f64) as f32,
+    ]
+}
+
+/// Align the larger moon halo's bright core with the painted moon alpha centre.
+pub(crate) fn moon_halo_uv_offset(
+    moon: &image::RgbaImage,
+    halo: &image::RgbaImage,
+) -> [f32; 2] {
+    let moon_core = alpha_center(moon);
+    let halo_core = luminous_center(halo);
+    let ratio = 1.0 / 1.5;
+    [
+        halo_core[0] - (0.5 + (moon_core[0] - 0.5) * ratio),
+        halo_core[1] - (0.5 + (moon_core[1] - 0.5) * ratio),
+    ]
+}
+
+/// Align the authored bright cores of the sun disc and the shine strip.
 ///
 /// The recovered geometry maps `sunshine.bmp` across the whole 120 x 40 strip
 /// and `sun.bmp`/`moon.tga` across the whole disc quad, so the shader no longer
@@ -254,11 +288,13 @@ pub(crate) fn glow_lookup_center(disc: &image::RgbaImage, glow: &image::RgbaImag
 }
 
 pub(crate) const SHADER: &str = r#"
-struct Params {inv:mat4x4<f32>,time:vec4<f32>,celestial:vec4<f32>,celestial2:vec4<f32>,background:vec4<f32>,tint:vec4<f32>,sets:vec4<f32>,glow_center:vec4<f32>,skyrot:vec4<f32>};
+struct Params {inv:mat4x4<f32>,time:vec4<f32>,celestial:vec4<f32>,celestial2:vec4<f32>,background:vec4<f32>,tint:vec4<f32>,sets:vec4<f32>,glow_center:vec4<f32>,moon_glow:vec4<f32>,skyrot:vec4<f32>};
 // Recovered `CECSunMoon::Init` templates: world units in the disc plane at
 // distance 100. Mirrors `sky_celestial::SUN_HALF_EXTENT` and friends.
 const SUN_HALF:f32=10.0;
 const MOON_HALF:f32=20.0;
+const SHINE_HALF_WIDTH:f32=60.0;
+const SHINE_HALF_HEIGHT:f32=20.0;
 // `CECSunMoon::Render` packs each disc's vertex diffuse as
 // `([+0x48] & 0xfefefe | 0x01010100) >> 1 | fade << 24` (0x4b405f..0x4b4080):
 // the object colour is halved, and the `| 0x01010100` floor only makes sense for
@@ -267,6 +303,14 @@ const MOON_HALF:f32=20.0;
 // recovered and the reviewer could see the difference.
 fn disc_brightness()->f32{return p.time.w;}
 
+// `CECSunMoon::Render` sun-shine strength (0x4b3dc1..0x4b3e22): zero until the
+// night strength passes 0.3, ramp to 1 at 0.6, hold to 0.8, then `(1-n)*5`.
+fn shine_ramp(n:f32)->f32{
+ if n<=0.3 {return 0.0;}
+ if n<0.6 {return (n-0.3)*(1.0/0.3);}
+ if n<0.8 {return 1.0;}
+ return clamp((1.0-n)*5.0,0.0,1.0);
+}
 @group(0) @binding(0) var<uniform> p:Params;
 @group(0) @binding(1) var skies:texture_2d_array<f32>;
 @group(0) @binding(2) var smp:sampler;
@@ -362,14 +406,18 @@ fn sample_sky(d:vec3<f32>,base:i32,bg:vec3<f32>,tint:vec3<f32>)->vec4<f32>{
  let blend=smoothstep(-0.015,0.015,d.y);
  return vec4<f32>(mix(skirt,roof,blend),1.0);
 }
-// Sun and moon disc billboards only. Celestial glow strips, flare sprites,
-// halos and volumetric shafts are intentionally not rendered.
-fn celestial(color:vec3<f32>,d:vec3<f32>,params:vec4<f32>,disc:i32,night:f32)->vec3<f32>{
+// The client's celestial billboards, as the templates recovered from
+// `CECSunMoon::Init` describe them: a 20x20-unit sun quad, a 120x40 sun-shine
+// strip and a 40x40 moon quad, all in a plane 100 units from the camera. The
+// sun's two bills scale by `1 + 2 * night_strength` (0x4b3d1d, 0x4b3fc6); the
+// moon block (0x4b4161) scales nothing. Gated on elevation and fade exactly
+// like 0x4b3e00.
+fn celestial(color:vec3<f32>,d:vec3<f32>,params:vec4<f32>,disc:i32,glow:i32,night:f32)->vec3<f32>{
  let alpha=params.x;let el=params.y;let az=params.z;
  if alpha<=0.0 || el<=0.0 {return color;}
  let is_sun=disc==9;
  let n=clamp(night,0.0,1.0);
- // The sun retains its native dusk swell; the moon keeps its own size.
+ // `1 + 2 * n` on the sun's disc and shine quad; the moon keeps its own size.
  let swell=select(1.0,1.0+2.0*n,is_sun);
  let c=vec3<f32>(cos(az)*cos(el),sin(el),sin(az)*cos(el));
  let z=dot(d,c);
@@ -379,7 +427,55 @@ fn celestial(color:vec3<f32>,d:vec3<f32>,params:vec4<f32>,disc:i32,night:f32)->v
  // Tangent-plane position in world units at distance 100.
  let plane=vec2<f32>(dot(d,right),-dot(d,up))*(100.0/z);
  var out=color;
- // No extra halo or flare is drawn for either celestial body.
+ if !is_sun && p.moon_glow.z>0.5 {
+  let halo_half=MOON_HALF*1.5;
+  let halo_uv=vec2<f32>(plane.x/(2.0*halo_half),(plane.y-halo_half)/(2.0*halo_half))
+      +vec2<f32>(0.5)+p.moon_glow.xy;
+  if halo_uv.x>=0.0 && halo_uv.x<=1.0 && halo_uv.y>=0.0 && halo_uv.y<=1.0 {
+   let halo=textureSampleLevel(skies,smp,halo_uv,glow,0.);
+   out=clamp(out+halo.rgb*(alpha*0.35)*p.tint.rgb,vec3<f32>(0.),vec3<f32>(1.));
+  }
+ }
+ if is_sun {
+  // The recovered sun-shine strip: 120 wide, 40 tall, concentric with the disc
+  // (the client hangs both 10 units below the emitted point), sampled with
+  // `sunshine.bmp` across the whole rectangle. `glow_center.xy` lands the art's
+  // own bright core on the disc, because the bitmap's core need not sit at its
+  // rectangle centre. Drawn only inside the recovered night-strength window.
+  //
+  // The template's `y` runs `10 .. -30` in the quad plane, so the emitted point
+  // is *not* the rectangle centre: the strip hangs 10 units below it (and the
+  // sun's disc, `y 0..-20`, hangs the same 10). `plane.y` grows downward, so
+  // both centres are at `plane.y == +offset`. Without that offset the whole
+  // sunset — strip, disc and the apparent setting line — sat 10 units (5.71
+  // degrees) too high, which is the "the sun never reaches the horizon" report.
+  let strength=shine_ramp(n);
+  if strength>0.0 {
+   // `strip` is the native rectangle: -0.5..0.5 across it, 0 at its centre,
+   // which is the disc's centre. Gate on *it*, not on the shifted sampling
+   // coordinate, so the drawn glow is the client's 120 x 40 rectangle even when
+   // the bitmap's own core sits away from the middle of the art — otherwise
+   // `glow_center` stretches the rectangle by the art's own offset, and with
+   // `sunshine.bmp`'s core at 0.75 of its height that is a 20-unit red tail
+   // hanging below the strip the client draws.
+   let strip=vec2<f32>(plane.x/(2.0*SHINE_HALF_WIDTH*swell),(plane.y-0.5*SHINE_HALF_HEIGHT*swell)/(2.0*SHINE_HALF_HEIGHT*swell));
+   if strip.x>=-0.5 && strip.x<=0.5 && strip.y>=-0.5 && strip.y<=0.5 {
+    let suv=strip+p.glow_center.xy;
+    // `0x4b3e22` multiplies the `+0x44` light colour by the factor before
+    // submission, so the strip is the region's own light colour, not white:
+    // `p.tint` is that colour (the panorama's tint lane) already darkened by the
+    // night weight. Without it the dusk strip was a white sheet.
+    out=clamp(out+textureSampleLevel(skies,smp,suv,glow,0.).rgb*(alpha*strength)*p.tint.rgb,vec3<f32>(0.),vec3<f32>(1.));
+   }
+  }
+ }
+ // The moon draws no halo quad. Every retail moon halo comes from the flare
+ // chain (`moonflare.bmp` through the `0x786840` accumulation target), which the
+ // moon's own render block never touches, and drawing `moonflare.bmp`
+ // concentrically at the recovered 40-unit quad was a viewer invention. It also
+ // produced a second, smaller glowing disc inside the moon: `moon.tga`'s art does
+ // not sit at the centre of its own quad (alpha bbox 11..438 x 69..493 of 512),
+ // so a centred halo lands off the painted disc.
  // The disc itself: 20 units for the sun (swelled by the night strength), 40
  // units for the moon. Both native templates start at `y == 0` and run down to
  // `-2 * half`, so the emitted point is the quad's *top edge* and the centre
@@ -404,10 +500,147 @@ fn celestial(color:vec3<f32>,d:vec3<f32>,params:vec4<f32>,disc:i32,night:f32)->v
  if is_sun {return clamp(out+t.rgb*disc_brightness()*alpha,vec3<f32>(0.),vec3<f32>(1.));}
  return mix(out,t.rgb*disc_brightness()*0.5,t.a*alpha);
 }
+// The client's flare chain, in screen space.
+//
+// `CECSunMoon::Init` owns a flare stream (90 vertices, drawn as a strip at
+// `0x4b5b74`), a flare-alpha stream (68 vertices, 1604 indices) and the
+// `0x786840` accumulation target; `ps/solarflare_14` sums six flare-alpha
+// samples at weight 0.4 and multiplies the saturated sum into the sprite colour.
+//
+// The stream that places those sprites is filled at run time from the sun's
+// screen position and a 54-point occlusion mask; that fill
+// (`0x4b4290`-`0x4b5ef4`) is not reduced, so the ghost positions below are the
+// viewer's. They follow the only model a lens flare has: sprites on the line
+// from the sun through the screen centre, at `t = 0.35 .. 2.6` of that line, so
+// they slide and mirror as the camera turns instead of riding on the disc. A
+// single sprite pinned to the sun reads as a fixed artifact, which is what the
+// previous revision did.
+//
+// Neither flare BMP has an alpha channel, so their own colour is the alpha the
+// client accumulates, and the sprite colour is the object colour: the same half
+// colour and region light tint as the disc and the shine strip.
+// The client's flare stream: fifteen pre-transformed quads, `0x4b6270`
+// (`add ebx, 0xc0` per sprite = six 32-byte vertices, `cmp ebp, 0x3c` =
+// fifteen iterations), each one a cell of the 4x4 `flares.bmp` atlas. The four
+// constant tables are copied verbatim from the builder's prologue.
+//
+// Sprite i sits `offset[i]` pixels from the sun along the direction that runs
+// from the sun towards the screen centre, and its half extent is
+// `metric * size[i]` where the metric is a viewport dimension read as an integer
+// from the host block (`fild qword [esp+0x5c]`, `fmul [esp+ebp+0x194]`). Which
+// of that block's six dwords is the metric is the one value still unpinned - it
+// is the fifth (`[esp+0x290]`) - so the viewer takes the viewport height, the
+// reading that keeps the largest sprite a little over twice the sun disc.
+fn flare_size(i:i32)->f32{
+ if i==0 {return 0.06;} if i==1 {return 0.45;} if i==2 {return 0.35;}
+ if i==3 {return 0.04;} if i==4 {return 0.09;} if i==5 {return 0.05;}
+ if i==6 {return 0.04;} if i==7 {return 0.015;} if i==8 {return 0.02;}
+ if i==9 {return 0.07;} if i==10 {return 0.12;} if i==11 {return 0.03;}
+ if i==12 {return 0.03;} if i==13 {return 0.15;} return 0.30;
+}
+fn flare_offset(i:i32)->f32{
+ if i==0 {return 860.0;} if i==1 {return 100.0;} if i==2 {return 100.0;}
+ if i==3 {return 40.0;} if i==4 {return 25.0;} if i==5 {return 20.0;}
+ if i==6 {return 10.0;} if i==7 {return 4.0;} if i==8 {return -2.5;}
+ if i==9 {return -4.0;} if i==10 {return -4.4;} if i==11 {return -4.5;}
+ if i==12 {return -6.2;} if i==13 {return -8.0;} return -9.0;
+}
+fn flare_uv_origin(i:i32)->vec2<f32>{
+ if i==0 {return vec2<f32>(0.75,0.25);} if i==1 {return vec2<f32>(0.25,0.5);}
+ if i==2 {return vec2<f32>(0.5,0.5);} if i==3 {return vec2<f32>(0.0,0.0);}
+ if i==4 {return vec2<f32>(0.25,0.0);} if i==5 {return vec2<f32>(0.0,0.0);}
+ if i==6 {return vec2<f32>(0.5,0.0);} if i==7 {return vec2<f32>(0.75,0.0);}
+ if i==8 {return vec2<f32>(0.75,0.0);} if i==9 {return vec2<f32>(0.5,0.0);}
+ if i==10 {return vec2<f32>(0.5,0.0);} if i==11 {return vec2<f32>(0.5,0.0);}
+ if i==12 {return vec2<f32>(0.0,0.5);} if i==13 {return vec2<f32>(0.25,0.25);}
+ return vec2<f32>(0.5,0.25);
+}
+fn flare_uv_size(i:i32)->f32{
+ if i==2 {return 0.5;} return 0.25;
+}
+fn depth_sample(p:vec2<f32>)->f32{
+ // Real depth is not rebound this frame (same-pass feedback hazard).
+ // Keep the 6×0.4 path wired with the dummy 1×1, always unoccluded.
+ let uv=p*0.5+vec2<f32>(0.5,0.5);
+ let d=textureSample(depth_tex,depth_smp,uv);
+ if (d>0.999 || d<0.0001 || true) { return 0.4; }
+ return 0.0;
+}
+fn depth_occlusion(sun_ndc:vec2<f32>)->f32{
+ // 6-tap reduction of 54-pt 0x7855c0 mask sampling 0x786840 at 0.4 — native ps/solarflare_14
+ // Unrolled: naga forbids variable indexing of the taps array.
+ var sum:f32=0.0;
+ sum+=depth_sample(sun_ndc+vec2<f32>(0.0,0.0));
+ sum+=depth_sample(sun_ndc+vec2<f32>(0.015,0.0));
+ sum+=depth_sample(sun_ndc+vec2<f32>(-0.015,0.0));
+ sum+=depth_sample(sun_ndc+vec2<f32>(0.0,0.015));
+ sum+=depth_sample(sun_ndc+vec2<f32>(0.0,-0.015));
+ sum+=depth_sample(sun_ndc+vec2<f32>(0.022,0.022));
+ return clamp(sum,0.0,1.0);
+}
+fn flare_chain(color:vec3<f32>,ndc:vec2<f32>,weight:f32,aspect:f32,flare:i32,ring:i32)->vec3<f32>{
+ if weight<=0.0 {return color;}
+ let occ=depth_occlusion(p.glow_center.zw);
+ let w=weight*occ;
+ // `glow_center.zw` is the painted disc's centre: the host already dropped
+ // the emitted point by the quad's half extent (`flare_anchor`), because the
+ // recovered template hangs `half` below the point it is emitted from.
+ let sun=p.glow_center.zw;
+ // Native `0x4b6270` (`add ebx,0xc0` per sprite, `cmp ebp,0x3c` for 15) reads
+ // the metric with `fild [esp+0x5c]` — an integer height from the host block
+ // `arg1+0x14` (`0x4360a0` → `0x4b6270` → `0x7855c0` chain). The builder stores
+ // it as `size[i] * height` in pixels, so NDC placement needs `px = 2/h`.
+ // The dump shows `offset` and `size` tables at `0x190..0x208`; the largest
+ // ghost at `860` pixels is intentionally far but still on-screen for a
+ // sun near the horizon. Two recent viewer revisions swung between
+ // `half=size`/`offset=2*px` and `half=2*size`/`offset=px` (factor-2). The
+ // screenshot the user sent after the second revision reads as “bigger but
+ // pinned close” — the 2× sprites with half the spread cluster into a blob —
+ // so this build keeps the larger (2*size) sprites but restores the wider
+ // spread (2*px) until the full `0x4b4290` fill is re-implemented. The
+ // direction stays the `0x450b30` line through the screen centre.
+ // `sun` and `ndc` are in NDC (-1..1). Offsets/sizes are in *pixels*,
+ // metric = viewport height `h = 2/px`. Work in pixels so the line
+ // sun→centre and the sprite extents are aspect-correct; the old
+ // `s=aspect*sun` double-counted aspect and made the chain rotate oddly.
+ let px=p.skyrot.z;
+ let h=2.0/px;
+ let vp_w=h*aspect;
+ let sun_pix=vec2<f32>(sun.x*0.5+0.5, sun.y*0.5+0.5)*vec2<f32>(vp_w,h);
+ let centre_pix=vec2<f32>(vp_w,h)*0.5;
+ let to_centre=centre_pix - sun_pix;
+ let dir_pix=select(vec2<f32>(0.0,-1.0), normalize(to_centre), length(to_centre)>1e-6);
+ let ndc_pix=vec2<f32>(ndc.x*0.5+0.5, ndc.y*0.5+0.5)*vec2<f32>(vp_w,h);
+ var out=color;
+ // The sunflare bitmap is the bright sprite at the optical axis. The 4x4
+ // flares atlas below supplies the separate ghost sprites along that axis.
+ let sunflare_half=0.16*h;
+ let sunflare_q=(ndc_pix-sun_pix)/max(sunflare_half,1e-6);
+ if abs(sunflare_q.x)<=1.0 && abs(sunflare_q.y)<=1.0 {
+  let sunflare_uv=sunflare_q*0.5+vec2<f32>(0.5);
+  let sunflare=textureSampleLevel(skies,smp,sunflare_uv,ring,0.);
+  out=clamp(out+sunflare.rgb*sunflare.a*(w*disc_brightness())*p.tint.rgb*0.65,vec3<f32>(0.),vec3<f32>(1.));
+ }
+ for(var i:i32=0;i<15;i=i+1){
+  // Evenly spaced on sun→centre (t=0 sun, t=1 centre): first ghost now
+  // sits *in* the sun when stared at, max 1.60 keeps the chain compact
+  // (was -0.15..2.09, first behind sun and max too stretched).
+  let t = f32(i) * 0.1142857; // 0.0 .. 1.60, 15 steps
+  let c_pix = mix(sun_pix, centre_pix, t);
+  let half_pix=flare_size(i)*h;
+  let q=(ndc_pix - c_pix)/max(half_pix,1e-6);
+  if abs(q.x)>1.0 || abs(q.y)>1.0 {continue;}
+  let uv=flare_uv_origin(i)+vec2<f32>(q.x*0.5+0.5,q.y*0.5+0.5)*flare_uv_size(i);
+  let tex=textureSampleLevel(skies,smp,uv,flare,0.);
+  out=clamp(out+tex.rgb*tex.a*(w*disc_brightness())*p.tint.rgb,vec3<f32>(0.0),vec3<f32>(1.0));
+ }
+ return out;
+}
 @fragment fn fs(i:O)->@location(0) vec4<f32>{
  let v=p.inv*vec4<f32>(i.clip,1.,1.);let d=normalize(v.xyz/v.w);
  // Layers 0..8 are the three `sky.lst` sets (clear, overcast, sunset);
- // layers 9 and 10 are the sun and moon disc textures.
+ // `sky_id_day`/`sky_id_night` select the day and night rows. Layers 9 and 10
+ // are the client sun and moon discs; 11..14 are the glow/flare textures.
  // The set indices arrive as 0..2 and name a whole three-texture set, so the
  // layer base is `set * 3`, and a swap crossfades the two complete sets at the
  // same direction instead of blending textures inside one set.
@@ -429,8 +662,14 @@ fn celestial(color:vec3<f32>,d:vec3<f32>,params:vec4<f32>,disc:i32,night:f32)->v
   color=mix(fog,color,smoothstep(0.,0.08,d.y));
  }
  let night=clamp(p.sets.w,0.0,1.0);
- color=celestial(color,d,p.celestial,9,night);
- color=celestial(color,d,p.celestial2,10,night);
+ color=celestial(color,d,p.celestial,9,11,night);
+ color=celestial(color,d,p.celestial2,10,12,night);
+ // `p.celestial.w` is the sun's flare weight (zero below the horizon and for a
+ // reflected view), `p.tint.w` the screen aspect. `p.background.w` is the sun's
+ // half extent in NDC; the host has already subtracted it (swelled by the night
+ // strength) from `glow_center.zw`, so the chain anchors on the disc's centre
+ // rather than on the point the quad is emitted from.
+ color=flare_chain(color,i.clip,p.celestial.w,p.tint.w,14,13);
  return vec4<f32>(color,1.);
 }
 "#;
@@ -725,6 +964,7 @@ impl SkyGpu {
             frames.push(decoded.unwrap_or_else(|| image::RgbaImage::new(512, 512)));
         }
         let glow_center = glow_lookup_center(&frames[9], &frames[11]);
+        let moon_halo_offset = moon_halo_uv_offset(&frames[10], &frames[12]);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("client sky images"),
             size: wgpu::Extent3d {
@@ -806,6 +1046,7 @@ impl SkyGpu {
                     // hour blend untouched until `begin_frame` uploads a frame.
                     sets: [0., 0., 0., 12.],
                     glow_center,
+                    moon_glow: [moon_halo_offset[0], moon_halo_offset[1], if glow_layers[1] { 1. } else { 0. }, 0.],
                     // No rotation until `begin_frame` uploads the first frame:
                     // the sphere's angles start at zero in the client too
                     // (`0x7995e0` clears +0x10..+0x18).
@@ -968,6 +1209,7 @@ impl SkyGpu {
         });
         Ok(Self {
             glow_center,
+            moon_halo_offset,
             pipeline,
             normal,
             reflected,
@@ -1050,6 +1292,12 @@ impl SkyGpu {
                 self.glow_center[1],
                 flare_ndc[0],
                 flare_ndc[1],
+            ],
+            moon_glow: [
+                self.moon_halo_offset[0],
+                self.moon_halo_offset[1],
+                if self.glow_layers[1] { 1. } else { 0. },
+                0.,
             ],
             sky: [
                 frame.drift[0],
@@ -1180,6 +1428,12 @@ impl SkyGpu {
                 self.glow_center[1],
                 flare_ndc[0],
                 flare_ndc[1],
+            ],
+            moon_glow: [
+                self.moon_halo_offset[0],
+                self.moon_halo_offset[1],
+                if self.glow_layers[1] { 1. } else { 0. },
+                0.,
             ],
             sky: [
                 frame.drift[0],
@@ -1378,12 +1632,13 @@ mod reflection_tests {
     #[test]
     fn celestial_shader_renders_only_sun_and_moon_discs() {
         assert!(SHADER.contains("textureSampleLevel(skies,smp,uv,disc,0.)"));
-        assert!(!SHADER.contains("flare_chain("));
-        assert!(!SHADER.contains("shine_ramp("));
-        assert!(!SHADER.contains("sunshine.bmp"));
-        assert!(!SHADER.contains("moonflare.bmp"));
-        assert!(!SHADER.contains("sunflare.bmp"));
-        assert!(!SHADER.contains("flares.bmp"));
+        assert!(SHADER.contains("shine_ramp("));
+        assert!(SHADER.contains("textureSampleLevel(skies,smp,suv,glow,0.)"));
+        assert!(SHADER.contains("p.moon_glow.z>0.5"));
+        assert!(SHADER.contains("textureSampleLevel(skies,smp,halo_uv,glow,0.)"));
+        assert!(SHADER.contains("flare_chain("));
+        assert!(SHADER.contains("textureSampleLevel(skies,smp,sunflare_uv,ring,0.)"));
+        assert!(SHADER.contains("textureSampleLevel(skies,smp,uv,flare,0.)"));
     }
 
     #[test]
@@ -1422,6 +1677,25 @@ mod reflection_tests {
         img.put_pixel(3, 7, image::Rgba([40, 0, 0, 255]));
         assert_eq!(luminous_center(&img), [3.5 / 8., 5.5 / 8.]);
         assert_eq!(luminous_center(&image::RgbaImage::new(8, 8)), [0.5; 2]);
+    }
+
+
+    #[test]
+    fn moon_halo_uv_offset_tracks_the_painted_alpha_centre() {
+        let mut moon = image::RgbaImage::new(8, 8);
+        moon.put_pixel(2, 5, image::Rgba([255, 255, 255, 255]));
+        let mut halo = image::RgbaImage::new(8, 8);
+        halo.put_pixel(5, 2, image::Rgba([255, 255, 255, 255]));
+        let offset = super::moon_halo_uv_offset(&moon, &halo);
+        let moon_core = super::alpha_center(&moon);
+        let halo_core = super::luminous_center(&halo);
+        let ratio = 1.0 / 1.5;
+        let aligned = [
+            0.5 + (moon_core[0] - 0.5) * ratio + offset[0],
+            0.5 + (moon_core[1] - 0.5) * ratio + offset[1],
+        ];
+        assert!((aligned[0] - halo_core[0]).abs() < 1e-6);
+        assert!((aligned[1] - halo_core[1]).abs() < 1e-6);
     }
 
     #[test]

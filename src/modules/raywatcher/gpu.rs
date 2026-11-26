@@ -5808,7 +5808,7 @@ mod shader_optimization_regression_tests {
     }
 
     #[test]
-    fn sun_and_moon_volumetric_shafts_and_celestial_flares_are_not_rendered() {
+    fn sun_moon_volumetric_shafts_stay_disabled_while_celestial_sprites_render() {
         let dxr = include_str!("dxr_trace.hlsl");
         assert!(!RAY_SHADER.contains("True World-Space Ray-Marched Volumetric God-Rays"));
         assert!(!dxr.contains("True World-Space Ray-Marched Volumetric God-Rays"));
@@ -5822,12 +5822,13 @@ mod shader_optimization_regression_tests {
             .and_then(|tail| tail.split("\"#;").next())
             .expect("sky shader literal");
         assert!(shader.contains("textureSampleLevel(skies,smp,uv,disc,0.)"));
-        assert!(!shader.contains("flare_chain("));
-        assert!(!shader.contains("shine_ramp("));
-        assert!(!shader.contains("sunshine.bmp"));
-        assert!(!shader.contains("moonflare.bmp"));
-        assert!(!shader.contains("sunflare.bmp"));
-        assert!(!shader.contains("flares.bmp"));
+        assert!(shader.contains("shine_ramp("));
+        assert!(shader.contains("textureSampleLevel(skies,smp,suv,glow,0.)"));
+        assert!(shader.contains("p.moon_glow.z>0.5"));
+        assert!(shader.contains("textureSampleLevel(skies,smp,halo_uv,glow,0.)"));
+        assert!(shader.contains("flare_chain("));
+        assert!(shader.contains("textureSampleLevel(skies,smp,sunflare_uv,ring,0.)"));
+        assert!(shader.contains("textureSampleLevel(skies,smp,uv,flare,0.)"));
     }
 
     #[test]
