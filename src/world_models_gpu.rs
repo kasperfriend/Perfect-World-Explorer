@@ -48,6 +48,114 @@ fn attenuation_step(fade: f32, target: f32, delta_ms: u32) -> f32 {
     (fade + (target - fade).clamp(-step, step)).clamp(0., 1.)
 }
 
+const MODEL_SPATIAL_CELL_SIZE: f32 = 256.0;
+const MODEL_SPATIAL_RADIUS: f32 = 128.0;
+
+struct ModelSpatialCell {
+    min: [f32; 3],
+    max: [f32; 3],
+    slots: Vec<usize>,
+}
+
+fn build_model_spatial_cells(
+    positions: impl IntoIterator<Item = (usize, [f32; 3])>,
+) -> Vec<ModelSpatialCell> {
+    let mut cells = std::collections::BTreeMap::<(i32, i32), ModelSpatialCell>::new();
+    for (slot, position) in positions {
+        let valid = position.iter().all(|value| value.is_finite());
+        let key = if valid {
+            (
+                (position[0] / MODEL_SPATIAL_CELL_SIZE).floor() as i32,
+                (position[2] / MODEL_SPATIAL_CELL_SIZE).floor() as i32,
+            )
+        } else {
+            (i32::MIN, i32::MIN)
+        };
+        let (min, max) = if valid {
+            (
+                [
+                    position[0] - MODEL_SPATIAL_RADIUS,
+                    position[1] - MODEL_SPATIAL_RADIUS,
+                    position[2] - MODEL_SPATIAL_RADIUS,
+                ],
+                [
+                    position[0] + MODEL_SPATIAL_RADIUS,
+                    position[1] + MODEL_SPATIAL_RADIUS,
+                    position[2] + MODEL_SPATIAL_RADIUS,
+                ],
+            )
+        } else {
+            ([-f32::MAX; 3], [f32::MAX; 3])
+        };
+        let cell = cells.entry(key).or_insert_with(|| ModelSpatialCell {
+            min: [f32::INFINITY; 3],
+            max: [f32::NEG_INFINITY; 3],
+            slots: Vec::new(),
+        });
+        for axis in 0..3 {
+            cell.min[axis] = cell.min[axis].min(min[axis]);
+            cell.max[axis] = cell.max[axis].max(max[axis]);
+        }
+        cell.slots.push(slot);
+    }
+    cells.into_values().collect()
+}
+
+/// Conservative broad phase for the existing per-model 128-unit sphere test.
+/// Every kept slot still runs that exact sphere test before it is drawn.
+fn model_cell_intersects_frustum(
+    planes: &[[f32; 4]; 6],
+    min: [f32; 3],
+    max: [f32; 3],
+) -> bool {
+    if min.iter().chain(max.iter()).any(|value| !value.is_finite())
+        || (0..3).any(|axis| min[axis] > max[axis])
+    {
+        return true;
+    }
+    for plane in planes {
+        let positive = [
+            if plane[0] >= 0.0 { max[0] } else { min[0] },
+            if plane[1] >= 0.0 { max[1] } else { min[1] },
+            if plane[2] >= 0.0 { max[2] } else { min[2] },
+        ];
+        if plane[0] * positive[0]
+            + plane[1] * positive[1]
+            + plane[2] * positive[2]
+            + plane[3]
+            < 0.0
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn append_visible_model_slots(
+    cells: &[ModelSpatialCell],
+    frustum: Option<&[[f32; 4]; 6]>,
+    bounds: Option<[f32; 4]>,
+    out: &mut Vec<usize>,
+) {
+    for cell in cells {
+        if let Some([x0, x1, z0, z1]) = bounds {
+            if cell.max[0] < x0
+                || cell.min[0] >= x1
+                || cell.max[2] < z0
+                || cell.min[2] >= z1
+            {
+                continue;
+            }
+        }
+        if frustum.is_some_and(|planes| {
+            !model_cell_intersects_frustum(planes, cell.min, cell.max)
+        }) {
+            continue;
+        }
+        out.extend_from_slice(&cell.slots);
+    }
+}
+
 /// The fade a root asks for: full alpha when the fade is switched off, else
 /// `CECOrnamentMan::Update`'s ground-plane distance test against
 /// `SCNRES_EFFECT`. `eye` is the camera; its height is skipped on purpose.
@@ -114,6 +222,11 @@ pub struct World {
     assets: Assets,
     keep_unbounded: bool,
     slots: Vec<Slot>,
+    model_spatial_cells: Vec<ModelSpatialCell>,
+    /// Indices of slots visible in the most recently prepared view.
+    visible_slots: Vec<usize>,
+    /// Reused candidate storage for the spatial-cell query.
+    scratch_model_candidates: Vec<usize>,
     read: Box<dyn FnMut(&str) -> Result<Vec<u8>, String>>,
     textures: HashMap<String, (std::sync::Arc<wgpu::Texture>, bool)>,
     receivers: crate::model_draw_gpu::ReceiverCache,
@@ -212,6 +325,13 @@ impl World {
                 clock.tick(initial)?;
             }
         }
+        let model_spatial_cells = build_model_spatial_cells(
+            assets
+                .instances
+                .iter()
+                .enumerate()
+                .map(|(index, instance)| (index, instance.placement.position)),
+        );
         let slots = assets
             .instances
             .iter()
@@ -238,6 +358,9 @@ impl World {
             assets,
             keep_unbounded: false,
             slots,
+            model_spatial_cells,
+            visible_slots: Vec::new(),
+            scratch_model_candidates: Vec::new(),
             read: Box::new(read),
             textures: HashMap::new(),
             receivers: Default::default(),
@@ -1282,6 +1405,16 @@ impl World {
         if self.slots.is_empty() {
             return;
         }
+        // Clear the previous view's visible flags, then visit only spatial
+        // cells that can intersect this view. This replaces a full instance
+        // scan for main + reflection + refraction on every camera turn.
+        for &index in &self.visible_slots {
+            if let Some(slot) = self.slots.get_mut(index) {
+                slot.visible = false;
+            }
+        }
+        self.visible_slots.clear();
+
         let bounds = self.resident_bounds;
         let frustum = self.frustum;
         let frustum_plane_lengths = self.frustum_plane_lengths.unwrap_or([0.; 6]);
@@ -1289,6 +1422,9 @@ impl World {
         let Self {
             assets,
             slots,
+            model_spatial_cells,
+            visible_slots,
+            scratch_model_candidates,
             read,
             textures,
             receivers,
@@ -1298,7 +1434,27 @@ impl World {
             reported,
             ..
         } = self;
-        for (instance, slot) in assets.instances.iter().zip(slots.iter_mut()) {
+
+        scratch_model_candidates.clear();
+        if frustum.is_none() && bounds.is_none() {
+            scratch_model_candidates.extend(0..assets.instances.len());
+        } else {
+            append_visible_model_slots(
+                model_spatial_cells,
+                frustum.as_ref(),
+                bounds,
+                scratch_model_candidates,
+            );
+            scratch_model_candidates.sort_unstable();
+        }
+
+        for &index in scratch_model_candidates.iter() {
+            let Some(instance) = assets.instances.get(index) else {
+                continue;
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                continue;
+            };
             if !cutoff_residency::contains(bounds, instance.placement.position) {
                 slot.visible = false;
                 if !keep_unbounded {
@@ -1316,13 +1472,14 @@ impl World {
                     &planes,
                     &frustum_plane_lengths,
                     instance.placement.position,
-                    128.0,
+                    MODEL_SPATIAL_RADIUS,
                 ) {
                     slot.visible = false;
                     continue;
                 }
             }
             slot.visible = true;
+            visible_slots.push(index);
             let asset = &assets.assets[instance.asset];
             let outcome = draw_one(
                 device,
@@ -1345,6 +1502,8 @@ impl World {
                     instance.placement.export_id, instance.placement.path
                 ));
                 slot.failed = true;
+                slot.visible = false;
+                visible_slots.pop();
                 slot.draw = None;
             }
         }
@@ -1356,7 +1515,10 @@ impl World {
     fn rebuild_alpha_order(&mut self, eye: [f32; 3]) {
         self.scratch_candidates.clear();
         self.scratch_failures.clear();
-        for (slot, entry) in self.slots.iter().enumerate() {
+        for &slot in &self.visible_slots {
+            let Some(entry) = self.slots.get(slot) else {
+                continue;
+            };
             if !entry.visible {
                 continue;
             }
@@ -1441,7 +1603,10 @@ impl World {
     /// Used by the main pass before water so water surfaces cannot overwrite
     /// blended effect quads that do not write depth.
     pub fn draw_models_only<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        for slot in &self.slots {
+        for &index in &self.visible_slots {
+            let Some(slot) = self.slots.get(index) else {
+                continue;
+            };
             if !slot.visible {
                 continue;
             }
@@ -1700,6 +1865,27 @@ fn event_milliseconds(event: &crate::ecmodel::EcmEvent, key: &str) -> Result<f32
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_spatial_cells_preserve_original_indices_and_keep_sphere_overlaps() {
+        let cells = super::build_model_spatial_cells([
+            (0, [100.0, 0.0, 0.0]),
+            (1, [330.0, 0.0, 0.0]),
+            (2, [1024.0, 0.0, 0.0]),
+        ]);
+        let frustum = [
+            [1.0, 0.0, 0.0, 100.0],
+            [-1.0, 0.0, 0.0, 100.0],
+            [0.0, 1.0, 0.0, 100.0],
+            [0.0, -1.0, 0.0, 100.0],
+            [0.0, 0.0, 1.0, 100.0],
+            [0.0, 0.0, -1.0, 100.0],
+        ];
+        let mut visible = Vec::new();
+        super::append_visible_model_slots(&cells, Some(&frustum), None, &mut visible);
+        visible.sort_unstable();
+        assert_eq!(visible, vec![0, 1]);
+    }
+
     use super::*;
 
     #[test]
