@@ -1676,7 +1676,14 @@ fn tick_owner(
         return Ok(true);
     }
     let visible = owner.request.active && owner.elapsed >= start;
-    let transform = owner.request.world_transform()?;
+    // Hidden roots and roots before StartTime still advance each emitter's
+    // clocks, but Emitter::tick returns before reading the parent transform
+    // when !visible. Do not compose/validate the world matrix for those owners.
+    let transform = if visible {
+        owner.request.world_transform()?
+    } else {
+        glam::Mat4::IDENTITY.to_cols_array()
+    };
     let outer = owner.request.outer;
     let serial = owner.serial;
     let emitters = lights;
