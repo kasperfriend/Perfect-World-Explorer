@@ -750,6 +750,12 @@ mod tests {
             RasterOverrides::for_plan_when_ready(&plan, true),
             RasterOverrides::for_plan(&plan),
         );
+        let mut raster_only = plan;
+        raster_only.debug_view = super::super::plan::DebugView::RasterOnly;
+        assert_eq!(
+            RasterOverrides::for_plan_when_ready(&raster_only, true),
+            RasterOverrides::NONE,
+        );
     }
 
     #[test]
