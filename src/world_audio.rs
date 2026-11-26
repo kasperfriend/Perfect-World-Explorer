@@ -562,8 +562,8 @@ mod tests {
     #[test]
     fn spatial_selection_matches_full_scan_for_short_and_long_ranges() {
         let mut emitters = Vec::new();
-        for z in -12..=12 {
-            for x in -12..=12 {
+        for z in -12i32..=12 {
+            for x in -12i32..=12 {
                 let mut e = emitter([x as f32 * 173.0, (x - z) as f32 * 3.0, z as f32 * 191.0], 2);
                 e.sound.max_distance = match (x + z).rem_euclid(4) {
                     0 => 64.0,
