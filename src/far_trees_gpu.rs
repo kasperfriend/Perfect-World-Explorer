@@ -69,6 +69,14 @@ pub(crate) struct LodParams {
     pub(crate) clip: [f32; 4],
     /// `placements, groups, bounds_active, 0`.
     pub(crate) counts: [u32; 4],
+    /// The exact view-projection used by the depth-producing pass.
+    pub(crate) view_projection: [[f32; 4]; 4],
+    /// `(width, height, element offset, 0)` for each ceil-halved mip.
+    pub(crate) hiz_mips: [[u32; 4]; 16],
+    /// Width, height, mip count, enabled.
+    pub(crate) hiz_info: [u32; 4],
+    /// Positive reversed-depth comparison bias and padding.
+    pub(crate) hiz_bias: [f32; 4],
 }
 
 /// The LOD selection pass.
@@ -84,7 +92,10 @@ pub(crate) struct LodParams {
 /// which can move a distance by ~1e-7 relative — inside a transition window that
 /// changes the fade fraction, never whether the tree is drawn.
 pub(crate) const LOD_COMPUTE: &str = r#"
-struct LodParamsGpu {camera:vec4<f32>,bounds:vec4<f32>,frustum:array<vec4<f32>,6>,clip:vec4<f32>,counts:vec4<u32>};
+struct LodParamsGpu {
+ camera:vec4<f32>, bounds:vec4<f32>, frustum:array<vec4<f32>,6>, clip:vec4<f32>, counts:vec4<u32>,
+ view_projection:mat4x4<f32>, hiz_mips:array<vec4<u32>,16>, hiz_info:vec4<u32>, hiz_bias:vec4<f32>
+};
 struct Placement {pos_height:vec4<f32>,group:u32,pad0:u32,pad1:u32,pad2:u32};
 struct GroupInfo {height:f32,args_base:u32,first_instance:u32,capacity:u32};
 struct Args {index_count:u32,instance_count:atomic<u32>,first_index:u32,base_vertex:i32,first_instance:u32};
@@ -94,6 +105,7 @@ struct Instance {data0:vec4<f32>,data1:vec4<f32>};
 @group(0) @binding(2) var<storage,read> groups:array<GroupInfo>;
 @group(0) @binding(3) var<storage,read_write> instances:array<Instance>;
 @group(0) @binding(4) var<storage,read_write> args:array<Args>;
+@group(0) @binding(5) var<storage,read> hiz:array<f32>;
 fn is_finite(v:f32)->bool {return v>=-3.0e38 && v<=3.0e38;}
 // SpeedTreeRT 0x100282b0's estimate: f32 squared distance, then the float-bit
 // square root. Matches `tree_lod::client_distance`.
@@ -131,6 +143,57 @@ fn sphere_in_frustum(position:vec3<f32>,radius:f32)->bool {
  }
  return true;
 }
+// Reversed-Z conservative occlusion. The placement sphere is projected as
+// an AABB; any near/far-plane ambiguity or invalid projection keeps it visible.
+fn sphere_occluded(position:vec3<f32>,radius:f32)->bool {
+ if p.hiz_info.w==0u || p.hiz_info.z==0u {return false;}
+ let extent=vec2<f32>(f32(p.hiz_info.x),f32(p.hiz_info.y));
+ var min_pixel=vec2<f32>(1.0e30);
+ var max_pixel=vec2<f32>(-1.0e30);
+ var nearest_depth=0.0;
+ for(var corner=0u;corner<8u;corner=corner+1u) {
+  let sx=select(-1.0,1.0,(corner&1u)!=0u);
+  let sy=select(-1.0,1.0,(corner&2u)!=0u);
+  let sz=select(-1.0,1.0,(corner&4u)!=0u);
+  let clip=p.view_projection*vec4<f32>(position+vec3<f32>(sx,sy,sz)*radius,1.0);
+  if !all(isFinite(clip)) || clip.w<=1.0 {return false;}
+  let ndc=clip.xyz/clip.w;
+  // A box intersecting either depth plane is uncertain and must be drawn.
+  if !all(isFinite(ndc)) || ndc.z<0.0 || ndc.z>=1.0 {return false;}
+  let pixel=vec2<f32>((ndc.x*0.5+0.5)*extent.x,(0.5-ndc.y*0.5)*extent.y);
+  min_pixel=min(min_pixel,pixel);
+  max_pixel=max(max_pixel,pixel);
+  nearest_depth=max(nearest_depth,ndc.z);
+ }
+ // No overlap with the viewport means the frustum path owns this decision.
+ if max_pixel.x<0.0 || max_pixel.y<0.0 || min_pixel.x>=extent.x || min_pixel.y>=extent.y {return false;}
+ let screen_max=extent-vec2<f32>(1.0);
+ let rect_min=vec2<u32>(clamp(floor(min_pixel-vec2<f32>(2.0)),vec2<f32>(0.0),screen_max));
+ let rect_max=vec2<u32>(clamp(ceil(max_pixel+vec2<f32>(2.0)),vec2<f32>(0.0),screen_max));
+ let threshold=nearest_depth+p.hiz_bias.x;
+ if !isFinite(threshold) || threshold>=1.0 {return false;}
+ var mip=0u;
+ loop {
+  let scale=1u<<mip;
+  let lo=rect_min/vec2<u32>(scale);
+  let hi=rect_max/vec2<u32>(scale);
+  if (hi.x-lo.x)<4u && (hi.y-lo.y)<4u {break;}
+  if mip+1u>=p.hiz_info.z {break;}
+  mip=mip+1u;
+ }
+ let info=p.hiz_mips[mip];
+ if info.x==0u || info.y==0u {return false;}
+ let scale=1u<<mip;
+ let lo=min(rect_min/vec2<u32>(scale),info.xy-vec2<u32>(1u));
+ let hi=min(rect_max/vec2<u32>(scale),info.xy-vec2<u32>(1u));
+ for(var y=lo.y;y<=hi.y;y=y+1u) {
+  for(var x=lo.x;x<=hi.x;x=x+1u) {
+   let depth=hiz[info.z+y*info.x+x];
+   if !isFinite(depth) || depth<0.0 || depth>1.0 || depth<=threshold {return false;}
+  }
+ }
+ return true;
+}
 fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>) {
  let g=groups[group_index];
  if level>2u {return;}
@@ -160,6 +223,7 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {
   if p.clip.y>0. && position.y+radius<p.clip.x {return;}
   if p.clip.y<0. && position.y>p.clip.x {return;}
  }
+ if sphere_occluded(position,radius) {return;}
  let distance=client_distance(position,p.camera.xyz);
  if distance<0. {return;}
  let selection=select_level(distance,constants.height,p.camera.w);
@@ -250,6 +314,9 @@ pub struct FarTrees {
     /// every placement on the CPU and re-uploading the instance buffer.
     lod_pipeline: wgpu::ComputePipeline,
     lod_bind: wgpu::BindGroup,
+    lod_layout: wgpu::BindGroupLayout,
+    placement_buffer: wgpu::Buffer,
+    group_buffer: wgpu::Buffer,
     lod_params: wgpu::Buffer,
     placements: u32,
     /// Indirect args, one record per batch (`DRAW_ARGS` bytes each), plus the
@@ -1114,6 +1181,16 @@ impl FarTrees {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let lod_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1127,6 +1204,14 @@ impl FarTrees {
             ),
             module: &lod_module,
             entry_point: "main",
+        });
+        // A one-element storage buffer keeps the non-Hi-Z fallback valid on
+        // devices where the viewport exceeds the storage-binding limit.
+        let hiz_dummy = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("disabled Hi-Z fallback"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
         });
         let lod_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tree lod"),
@@ -1151,6 +1236,10 @@ impl FarTrees {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: lod_args.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: hiz_dummy.as_entire_binding(),
                 },
             ],
         });
@@ -1180,6 +1269,9 @@ impl FarTrees {
             last_resident_update: RefCell::new(None),
             lod_pipeline,
             lod_bind,
+            lod_layout,
+            placement_buffer,
+            group_buffer: lod_group_buffer,
             lod_params,
             placements: placement_count,
             lod_args,
@@ -1197,6 +1289,23 @@ impl FarTrees {
     /// instance counts the indirect draws read. Nothing is uploaded per frame,
     /// and the pass is skipped entirely when the camera, scale and cutoff are
     /// unchanged, exactly like the old staging rebuild.
+    pub fn set_hiz_buffer(&mut self, device: &wgpu::Device, buffer: &wgpu::Buffer) {
+        self.lod_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tree LOD with current Hi-Z buffer"),
+            layout: &self.lod_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.lod_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.placement_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.group_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.instances.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.lod_args.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: buffer.as_entire_binding() },
+            ],
+        });
+    }
+
+    /// Compatibility entry point for diagnostics that run only the LOD/frustum
+    /// pass. Production encodes this dispatch in the view's render command buffer.
     pub fn update_resident_lods(
         &self,
         device: &wgpu::Device,
@@ -1207,52 +1316,81 @@ impl FarTrees {
         frustum: [[f32; 4]; 6],
         clip_plane: Option<(f32, f32)>,
     ) {
-        if self.placements == 0 {
-            return;
-        }
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tree LOD diagnostic encoder"),
+        });
+        self.encode_resident_lods(
+            device, queue, &mut encoder, camera, scale, bounds, frustum, clip_plane,
+            glam::Mat4::IDENTITY.to_cols_array_2d(),
+            [[1, 1, 0, 0]; 16], None,
+        );
+        queue.submit(Some(encoder.finish()));
+    }
+
+    /// Encode the frustum, optional Hi-Z occlusion, LOD compaction and indirect
+    /// count generation into the caller's view command buffer. Hi-Z is forced
+    /// for every enabled view because main/reflection/refraction depth differs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_resident_lods(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: [f32; 3],
+        scale: f32,
+        bounds: Option<[f32; 4]>,
+        frustum: [[f32; 4]; 6],
+        clip_plane: Option<(f32, f32)>,
+        view_projection: [[f32; 4]; 4],
+        hiz_mips: [[u32; 4]; 16],
+        hiz_extent: Option<(u32, u32, u32)>,
+    ) {
+        if self.placements == 0 { return; }
         let frustum = normalize_frustum(frustum);
         let key = (camera, scale, bounds, frustum, clip_plane);
-        if let Some((prev_cam, prev_scale, prev_bounds, prev_frustum, prev_clip)) =
-            *self.last_resident_update.borrow()
-        {
-            let dx = camera[0] - prev_cam[0];
-            let dy = camera[1] - prev_cam[1];
-            let dz = camera[2] - prev_cam[2];
-            if dx * dx + dy * dy + dz * dz < 1e-4
-                && prev_scale == scale
-                && prev_bounds == bounds
-                && prev_frustum == frustum
-                && prev_clip == clip_plane
+        let hiz_enabled = hiz_extent.is_some();
+        if !hiz_enabled {
+            if let Some((prev_cam, prev_scale, prev_bounds, prev_frustum, prev_clip)) =
+                *self.last_resident_update.borrow()
             {
-                return;
+                let dx = camera[0] - prev_cam[0];
+                let dy = camera[1] - prev_cam[1];
+                let dz = camera[2] - prev_cam[2];
+                if dx * dx + dy * dy + dz * dz < 1e-4
+                    && prev_scale == scale && prev_bounds == bounds
+                    && prev_frustum == frustum && prev_clip == clip_plane
+                {
+                    return;
+                }
             }
         }
+        let (hiz_width, hiz_height, hiz_levels) =
+            hiz_extent.unwrap_or((0, 0, 0));
         let params = LodParams {
             camera: [camera[0], camera[1], camera[2], scale],
             bounds: bounds.unwrap_or([0.; 4]),
             frustum,
             clip: clip_plane.map_or([0.; 4], |(height, sign)| [height, sign, 1., 0.]),
             counts: [
-                self.placements,
-                self.groups.len() as u32,
-                u32::from(bounds.is_some()),
-                0,
+                self.placements, self.groups.len() as u32, u32::from(bounds.is_some()), 0,
             ],
+            view_projection,
+            hiz_mips,
+            hiz_info: [hiz_width, hiz_height, hiz_levels, u32::from(hiz_enabled)],
+            // Positive depth-space slack prevents near-equal surfaces from
+            // being classified as occluders due to floating-point rounding.
+            hiz_bias: [0.00005, 0., 0., 0.],
         };
-        // Zero the per-batch instance counts, keep the static draw spans.
         queue.write_buffer(&self.lod_args, 0, &self.lod_args_reset);
         queue.write_buffer(&self.lod_params, 0, bytemuck::bytes_of(&params));
-        let mut e = device.create_command_encoder(&Default::default());
-        {
-            let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("tree lod selection"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.lod_pipeline);
-            pass.set_bind_group(0, &self.lod_bind, &[]);
-            pass.dispatch_workgroups(self.placements.div_ceil(64), 1, 1);
-        }
-        queue.submit(Some(e.finish()));
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(if hiz_enabled { "tree Hi-Z + LOD culling" } else { "tree LOD selection" }),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.lod_pipeline);
+        pass.set_bind_group(0, &self.lod_bind, &[]);
+        pass.dispatch_workgroups(self.placements.div_ceil(64), 1, 1);
+        drop(pass);
         *self.last_resident_update.borrow_mut() = Some(key);
     }
     /// CPU LOD packing, kept for the checks that place one tree at a distance.

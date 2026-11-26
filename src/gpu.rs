@@ -1877,6 +1877,11 @@ struct Renderer {
     index_capacity: u64,
     count: u32,
     depth: wgpu::Texture,
+    /// Main/reflection/refraction Hi-Z storage is reused sequentially per view.
+    /// A small storage fallback keeps the tree compute bind group valid when a
+    /// viewport exceeds the adapter's storage-buffer binding limit.
+    hiz: Option<crate::hiz::Pyramid>,
+    hiz_fallback: wgpu::Buffer,
     /// Object-motion attachment for the shared motion-vector pass: `rg` pixel
     /// motion, `a` coverage, `b` spare, at render extent. Cleared every frame and
     /// written only by the passes that know an object's own motion
@@ -2018,6 +2023,17 @@ pub fn ten_class_placements(t: &Terrain) -> Vec<crate::scenery_visibility::Place
 /// intermediates stay at the full window size and are resized separately.
 fn resize_world_targets(renderer: &mut Renderer, w: u32, h: u32) {
     renderer.depth = depth(&renderer.device, w, h);
+    renderer.hiz = match crate::hiz::Pyramid::new(&renderer.device, w, h) {
+        Ok(pyramid) => Some(pyramid),
+        Err(error) => {
+            eprintln!("Hi-Z disabled after resize; frustum-only tree culling remains active: {error}");
+            None
+        }
+    };
+    renderer.far_trees.set_hiz_buffer(
+        &renderer.device,
+        renderer.hiz.as_ref().map_or(&renderer.hiz_fallback, |p| p.buffer()),
+    );
     if renderer.object_mv_enabled {
         let (object_mv, object_mv_view) = object_mv_target(&renderer.device, w, h);
         renderer.object_mv = object_mv;
@@ -2204,6 +2220,23 @@ impl Renderer {
             ],
         });
         let depth_tex = depth(&device, w, h);
+        let hiz = match crate::hiz::Pyramid::new(&device, w, h) {
+            Ok(pyramid) => {
+                eprintln!("Initialized reversed-Z Hi-Z pyramid: {}x{} ({} levels, {} bytes)",
+                    w, h, pyramid.levels().len(), pyramid.buffer_size());
+                Some(pyramid)
+            }
+            Err(error) => {
+                eprintln!("Hi-Z occlusion unavailable; retaining frustum-only tree culling: {error}");
+                None
+            }
+        };
+        let hiz_fallback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Hi-Z disabled fallback storage"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let terrain_upload = m
             .terrain_upload
             .take()
@@ -2539,7 +2572,8 @@ impl Renderer {
             let sky = sky_task.join().unwrap()?;
             let (weather, cloud) = weather_cloud_task.join().unwrap();
             let (water, simple_water, shore) = water_task.join().unwrap();
-            let far_trees = trees_task.join().unwrap();
+            let mut far_trees = trees_task.join().unwrap();
+            far_trees.set_hiz_buffer(&device, hiz.as_ref().map_or(&hiz_fallback, |p| p.buffer()));
             let (pipeline, scenery_pipeline, sdr_blend_pipeline) =
                 world_pipelines_task.join().unwrap();
             let post = post_task.join().unwrap();
@@ -2712,6 +2746,8 @@ impl Renderer {
             index_capacity,
             count,
             depth: d,
+            hiz,
+            hiz_fallback,
             object_mv,
             object_mv_view,
             object_mv_enabled: false,
@@ -3287,23 +3323,9 @@ impl Renderer {
         // The water's extra views are read only by the water surface, inside
         // `water_view_scissor`'s rectangle. `None` draws the whole attachment.
         scissor: Option<[u32; 4]>,
+        view_projection: Mat4,
+        use_hiz: bool,
     ) {
-        // Far-tree instances used to be submitted for every placement inside
-        // the resident map bounds, even when the camera faced the opposite
-        // direction. Select LOD and compact the visible instances on the GPU
-        // for this exact view (main, reflection, or refraction). Updating here
-        // also prevents a reflection from reusing the main view's tree set.
-        if !ui_test() && !skip_trees_test() {
-            self.far_trees.update_resident_lods(
-                &self.device,
-                &self.queue,
-                cull.eye,
-                self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
-                self.resident_bounds(),
-                cull.frustum,
-                cull.clip_plane,
-            );
-        }
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3369,6 +3391,35 @@ impl Renderer {
         drop(p);
         if let Some(source) = terrain_depth_source {
             self.water.copy_terrain_depth(e, source);
+        }
+        // Terrain is the first opaque depth producer in this view. Build the
+        // matching hierarchy now, then compact this view's tree instances in
+        // the same command buffer before the tree draw consumes indirect args.
+        if !ui_test() && !skip_trees_test() {
+            let pyramid = if use_hiz { self.hiz.as_ref() } else { None };
+            if let Some(pyramid) = pyramid {
+                pyramid.encode(&self.device, e, depth);
+            }
+            let (mips, extent) = match pyramid {
+                Some(pyramid) => (
+                    pyramid.shader_mips(),
+                    Some((pyramid.extent().0, pyramid.extent().1, pyramid.levels().len() as u32)),
+                ),
+                None => ([[1, 1, 0, 0]; 16], None),
+            };
+            self.far_trees.encode_resident_lods(
+                &self.device,
+                &self.queue,
+                e,
+                cull.eye,
+                self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
+                self.resident_bounds(),
+                cull.frustum,
+                cull.clip_plane,
+                view_projection.to_cols_array_2d(),
+                mips,
+                extent,
+            );
         }
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("opaque scenery after terrain"),
@@ -3795,6 +3846,8 @@ impl Renderer {
             &map_cull,
             // The map image is read as a whole, so there is nothing to scissor.
             None,
+            matrix,
+            false,
         );
         {
             let mut pass = e.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -4142,6 +4195,8 @@ impl Renderer {
             None,
             &main_cull,
             None,
+            matrix,
+            true,
         );
         let model_target = self.water.scene_raw();
         self.draw_models(
@@ -4489,6 +4544,8 @@ impl Renderer {
                     }),
                     &uw_refr_cull,
                     refraction_scissor,
+                    matrix,
+                    true,
                 );
                 let model_view = self.water.refraction_raw();
                 self.draw_addons(
@@ -4553,6 +4610,8 @@ impl Renderer {
                     None,
                     &above_refr_cull,
                     refraction_scissor,
+                    matrix,
+                    true,
                 );
                 if let Some(cloud) = &self.cloud {
                     cloud.draw(
@@ -4699,6 +4758,8 @@ impl Renderer {
                 // The mirror is read at `screen ± 0.25` by the same surface, so
                 // the same rectangle applies through the mirrored matrix.
                 reflection_scissor,
+                matrix * flip,
+                true,
             );
             if let Some(cloud) = &self.cloud {
                 cloud.draw(

@@ -352,6 +352,9 @@ jobs:
           # Phase 4 vegetation diagnostics: tree LOD/lighting preservation,
           # grass mip coverage/upload, and synthetic authored tree mip upload.
           run_check tree-lod-gpu-check
+          # Production reversed-Z hierarchy: actual Depth32Float render output,
+          # odd viewport edges, and clear-depth hole propagation through mips.
+          run_check hiz-gpu-check
           run_check grass-gpu-mip-check
           run_check tree-authored-mip-gpu-check
           # The client's own loading-screen artwork: a synthetic surfaces.pck

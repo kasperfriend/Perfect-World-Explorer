@@ -82,6 +82,7 @@ mod grass;
 mod grass_instances;
 mod grass_mips;
 mod grass_wind;
+mod hiz;
 mod indirect_args;
 mod latency;
 #[cfg(windows)]
