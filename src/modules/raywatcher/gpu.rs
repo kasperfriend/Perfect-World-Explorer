@@ -1059,9 +1059,32 @@ fn ggx_sample(normal: vec3<f32>, roughness: f32, u1: f32, u2: f32) -> vec3<f32> 
 
 const RC_MASK: u32 = 65535u;
 
-// Pack RGB into 10 bits/channel and a 2-bit confidence count. A single
-// atomic word makes colliding screen-space writers race-free while preserving
-// a small running average followed by a responsive 1/4 EMA.
+// Stable spatial hash shared with the DXR shader: world voxel, dominant
+// normal direction, and near/far cache scale all contribute to the key.
+fn rc_slot(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> u32 {
+    let cell_size = select(12.0, 4.0, cam_dist < 64.0);
+    let cell = vec3<i32>(floor(world_pos / cell_size));
+    let an = abs(normal);
+    var ndir = 0u;
+    if (an.x >= an.y && an.x >= an.z) {
+        ndir = select(1u, 0u, normal.x >= 0.0);
+    } else if (an.y >= an.x && an.y >= an.z) {
+        ndir = select(3u, 2u, normal.y >= 0.0);
+    } else {
+        ndir = select(5u, 4u, normal.z >= 0.0);
+    }
+    let scale_bit = select(1u, 0u, cam_dist < 64.0);
+    var h = bitcast<u32>(cell.x) * 73856093u
+        ^ bitcast<u32>(cell.y) * 19349663u
+        ^ bitcast<u32>(cell.z) * 83492791u
+        ^ (ndir * 2654435761u)
+        ^ (scale_bit * 374761393u);
+    h = h ^ (h >> 16u);
+    h = h * 0x85ebca6bu;
+    h = h ^ (h >> 13u);
+    return h & RC_MASK;
+}
+
 fn rc_query(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> vec4<f32> {
     let cell = &radiance_cache[rc_slot(world_pos, normal, cam_dist)];
     // Read sums before count: writers add all channels before incrementing
