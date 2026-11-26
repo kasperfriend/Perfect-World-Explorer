@@ -610,10 +610,52 @@ impl Architect {
             .unwrap_or_else(|_| asset.to_string())
     }
 
+    fn renderer_asset_path(asset: &str) -> Option<String> {
+        let path = if let Some((archive, entry)) = asset.split_once("::") {
+            let archive_name = Path::new(archive)
+                .file_name()
+                .map(|name| name.to_string_lossy());
+            if !archive_name.is_some_and(|name| name.eq_ignore_ascii_case("models.pck")) {
+                return None;
+            }
+            entry
+        } else {
+            asset
+        };
+        let normalized = crate::ecmodel::normalize(path);
+        (normalized.starts_with("models/") && normalized.ends_with(".ecm"))
+            .then_some(normalized)
+    }
+
+    /// Current project's supported ECM placements, for the native GPU model
+    /// queue. Other archive types remain browsable/pinnable but are not guessed
+    /// into a renderer format they do not implement.
+    pub fn renderer_placements(&self) -> Vec<crate::world_models_gpu::EditorPlacement> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        self.project
+            .objects
+            .iter()
+            .filter_map(|object| {
+                Some(crate::world_models_gpu::EditorPlacement {
+                    path: Self::renderer_asset_path(&object.asset)?,
+                    position: object.position,
+                    rotation: object.rotation,
+                    scale: object.scale,
+                })
+            })
+            .collect()
+    }
+
     fn add_selected_asset_at_camera(&mut self, camera: Vec3) {
         let Some(asset) = self.selected_asset.clone() else {
             return;
         };
+        if Self::renderer_asset_path(&asset).is_none() {
+            self.status = "Only ECM model entries from models.pck can currently be instantiated in the live viewport. Other client assets can still be pinned.".into();
+            return;
+        }
         let portable_asset = self.portable_asset_path(&asset);
         let position = self.placement_position(camera);
         self.project.objects.push(PlacedObject {
@@ -623,9 +665,7 @@ impl Architect {
             scale: 1.,
         });
         self.selected_placement = Some(self.project.objects.len() - 1);
-        self.status =
-            "Custom placement staged in the project. It is not yet drawn by the world renderer."
-                .into();
+        self.status = "ECM placement added to the live Architect viewport.".into();
     }
 
     fn duplicate_selected_scene_item(&mut self) {
@@ -646,6 +686,10 @@ impl Architect {
             ));
         }
         for (_, asset, position) in items {
+            if Self::renderer_asset_path(&asset).is_none() {
+                self.status = "One or more selected items are not ECM models from models.pck; those items cannot be duplicated into the live model layer.".into();
+                continue;
+            }
             let portable_asset = self.portable_asset_path(&asset);
             self.project.objects.push(PlacedObject {
                 asset: portable_asset,
@@ -1250,7 +1294,7 @@ impl Architect {
                             self.brush_strength
                         },
                     });
-                    self.status = "Brush operation recorded in the project. Terrain mesh mutation is not wired yet.".into();
+                    self.status = "Brush operation saved to the project. Native terrain deformation is still pending.".into();
                 }
                 ui.horizontal(|ui| {
                     if ui.button("Undo last brush").clicked() {
