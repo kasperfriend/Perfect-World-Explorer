@@ -72,6 +72,21 @@ impl RasterOverrides {
     /// reflections are enabled, the native mirror is marked for replacement;
     /// the renderer keeps it active until the RT reflection is ready. Other
     /// raster terms are only removed when the user opts into `replace_raster`.
+    /// Apply plan overrides only after a complete RT frame is available.
+    /// The host makes this decision before the raster pass, whereas RT output
+    /// is produced afterwards. Without this guard a transient scene/AS rebuild
+    /// can remove raster terms before their replacement image exists.
+    pub fn for_plan_when_ready(
+        plan: &crate::modules::raywatcher::plan::Plan,
+        rt_output_ready: bool,
+    ) -> Self {
+        if rt_output_ready {
+            Self::for_plan(plan)
+        } else {
+            Self::NONE
+        }
+    }
+
     pub fn for_plan(plan: &crate::modules::raywatcher::plan::Plan) -> Self {
         if !plan.trace {
             return Self::NONE;
@@ -713,6 +728,26 @@ mod tests {
         let no_sh_plan = Plan::decide(&s, (1920, 1080), true, |_| false);
         let no_sh_ov = RasterOverrides::for_plan(&no_sh_plan);
         assert!(!no_sh_ov.suppress_baked_shadows);
+    }
+
+    #[test]
+    fn raster_effects_stay_enabled_until_a_complete_rt_frame_exists() {
+        use super::super::plan::{Plan, RayTracingMode, Settings};
+        let mut settings = Settings::default();
+        settings.mode = RayTracingMode::Software;
+        settings.replace_raster = true;
+        settings.effects.lighting = true;
+        settings.effects.ambient_occlusion = true;
+        settings.effects.global_illumination = true;
+        settings.effects.shadows = true;
+        settings.effects.reflections = true;
+        let plan = Plan::decide(&settings, (1920, 1080), true, |_| true);
+        assert!(plan.trace);
+        assert_eq!(RasterOverrides::for_plan_when_ready(&plan, false), RasterOverrides::NONE);
+        assert_eq!(
+            RasterOverrides::for_plan_when_ready(&plan, true),
+            RasterOverrides::for_plan(&plan),
+        );
     }
 
     #[test]
