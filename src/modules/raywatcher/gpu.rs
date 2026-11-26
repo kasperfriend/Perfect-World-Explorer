@@ -926,8 +926,19 @@ fn luminance(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let v = max(c, vec3<f32>(0.0));
+    return select(v / 12.92, pow((v + 0.055) / 1.055, vec3<f32>(2.4)), v > vec3<f32>(0.04045));
+}
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let v = max(c, vec3<f32>(0.0));
+    return select(v * 12.92, 1.055 * pow(v, vec3<f32>(1.0 / 2.4)) - 0.055, v > vec3<f32>(0.0031308));
+}
 fn environment() -> vec3<f32> {
-    return max(params.fog_colour.xyz, params.ambient.xyz * 0.85);
+    if params.fog.y > params.fog.x {
+        return max(srgb_to_linear(params.fog_colour.xyz), params.ambient.xyz * 0.85);
+    }
+    return params.ambient.xyz * 0.85;
 }
 
 fn material_of(index: u32) -> Material {
@@ -1485,8 +1496,11 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var fog_t = 0.0;
     let fog_start = params.fog.x;
     let fog_end = params.fog.y;
+    // Match D3D table fog: distance is view-space Z (clip.w), not the
+    // longer Euclidean ray length at the edges of a wide field of view.
+    let fog_view_z = max((params.vp * vec4<f32>(point, 1.0)).w, 0.0);
     if (fog_end > fog_start && fog_start >= 0.0) {
-        fog_t = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
+        fog_t = clamp((fog_view_z - fog_start) / (fog_end - fog_start), 0.0, 1.0);
     }
 
     let debug_mode_early = u32(round(params.counts.w));
@@ -2221,7 +2235,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let direct = select(vec3<f32>(0.0), params.sun_colour.xyz * (n_dot_l * avg_shadow), bits_lighting);
         let ambient = params.ambient.xyz * (avg_open * params.tuning.z);
         let relit = raster_rgb * (direct + ambient + avg_gi + point_lighting) + point_light_halos;
-        out_rgb = mix(relit, params.fog_colour.xyz, fog_t);
+        // Raster fog blends in the client's encoded colour space. Convert
+        // the RT-lit linear result, blend with the encoded fog bytes, then
+        // return to linear so the final target matches the raster pass.
+        out_rgb = srgb_to_linear(mix(linear_to_srgb(relit), params.fog_colour.xyz, fog_t));
         out_lf = 1.0;
     }
 
