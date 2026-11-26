@@ -1652,6 +1652,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             var cur_onb = onb;
             var cur_bias = bias;
             var path_dist = dist;
+            var cur_hit_world = point;
+            var cur_normal = normal;
             var throughput = vec3<f32>(1.0);
             var gi_sample = vec3<f32>(0.0);
             var gi_first_direction = vec3<f32>(0.0, 1.0, 0.0);
@@ -1660,6 +1662,15 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             gi_total_rays = gi_total_rays + 1.0;
 
             for (var bounce = 0u; bounce < max_bounces; bounce = bounce + 1u) {
+                // Confidence-gated radiance-cache tail: at the last secondary
+                // bounce, a converged entry replaces the ray entirely.
+                if (bounce > 0u && bounce + 1u == max_bounces) {
+                    let cached = rc_query(cur_hit_world, cur_normal, path_dist);
+                    if (cached.w >= 2.0) {
+                        gi_sample = gi_sample + throughput * min(cached.rgb, vec3<f32>(2.4));
+                        break;
+                    }
+                }
                 let u1 = next_f32(&state);
                 let phi = rot_angle + 1.0471975 + f32(s) * 2.39996323
                     + f32(bounce) * 1.9132 + next_f32(&state) * 0.65;
@@ -1747,6 +1758,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                     cur_origin = bhit_world + bhit.normal * b_bias;
                     cur_onb = orthonormal_basis(bhit.normal);
                     cur_bias = b_bias;
+                    cur_hit_world = bhit_world;
+                    cur_normal = bhit.normal;
                 } else {
                     if (bounce == 0u) {
                         gi_sky_hits = gi_sky_hits + 1.0;
@@ -5843,6 +5856,8 @@ mod shader_optimization_regression_tests {
         assert!(RAY_SHADER.contains("atomicCompareExchangeWeak"));
         assert!(dxr.contains("RWStructuredBuffer<uint> radiance_cache"));
         assert!(dxr.contains("InterlockedCompareExchange"));
+        assert!(RAY_SHADER.contains("Confidence-gated radiance-cache tail"));
+        assert!(dxr.contains("Confidence-gated radiance-cache tail"));
         assert!(!RAY_SHADER.contains("array<vec4<f32>> radiance_cache"));
         assert!(!dxr.contains("RWStructuredBuffer<float4> radiance_cache"));
         assert_eq!(super::RADIANCE_CACHE_CELLS * std::mem::size_of::<u32>(), 256 * 1024);
