@@ -8,7 +8,6 @@ use crate::{
 };
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
-use wgpu::util::DeviceExt;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -18,6 +17,7 @@ use std::{
         Arc,
     },
 };
+use wgpu::util::DeviceExt;
 pub(crate) const SIDE: usize = 4096;
 const DEFAULT_MAX_VERTICES: usize = 2_000_000;
 const MAX_PAGE_VERTICES: usize = 8_000_000;
@@ -431,12 +431,7 @@ impl WorldGpuCullParams {
             .map_or((0.0, 0.0, 0.0), |(y, sign)| (1.0, y, sign));
         Self {
             frustum: cull.frustum,
-            eye_proj: [
-                cull.eye[0],
-                cull.eye[1],
-                cull.eye[2],
-                cull.proj_scale,
-            ],
+            eye_proj: [cull.eye[0], cull.eye[1], cull.eye[2], cull.proj_scale],
             screen_clip: [cull.min_screen_px, clip_enabled, water_y, sign],
             flags: [count as u32, if sdr_only { 1 } else { 0 }, 0, 0],
         }
@@ -500,7 +495,9 @@ impl WorldGpuCullView {
         let indirect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("whole-world GPU-generated indirect commands"),
             contents: bytemuck::cast_slice(&args),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_SRC,
         });
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("whole-world GPU culling parameters"),
@@ -604,19 +601,11 @@ impl WorldGpuCuller {
     }
 }
 
-fn world_command_survives_gpu_cull(
-    cmd: &WorldDrawCmd,
-    cull: &CullParams,
-    sdr_only: bool,
-) -> bool {
+fn world_command_survives_gpu_cull(cmd: &WorldDrawCmd, cull: &CullParams, sdr_only: bool) -> bool {
     if cmd.start >= cmd.end || (sdr_only && !cmd.has_sdr) {
         return false;
     }
-    let finite = cmd
-        .min
-        .iter()
-        .chain(cmd.max.iter())
-        .all(|v| v.is_finite());
+    let finite = cmd.min.iter().chain(cmd.max.iter()).all(|v| v.is_finite());
     if !finite {
         return true;
     }
@@ -2200,13 +2189,11 @@ impl GpuPage {
         let culler = scratch
             .gpu_culler
             .get_or_insert_with(|| WorldGpuCuller::new(device));
-        let rebuild = culler.views[view_slot]
-            .as_ref()
-            .map_or(true, |view| view.commands.as_slice() != list.cmds.as_slice());
+        let rebuild = culler.views[view_slot].as_ref().map_or(true, |view| {
+            view.commands.as_slice() != list.cmds.as_slice()
+        });
         if rebuild {
-            let Some(view) =
-                WorldGpuCullView::new(device, &culler.layout, &list.cmds)
-            else {
+            let Some(view) = WorldGpuCullView::new(device, &culler.layout, &list.cmds) else {
                 return false;
             };
             culler.views[view_slot] = Some(view);
@@ -2265,7 +2252,11 @@ impl GpuPage {
                     if !same_atlas {
                         pass.set_bind_group(
                             0,
-                            if reflected { &page.reflected } else { &page.normal },
+                            if reflected {
+                                &page.reflected
+                            } else {
+                                &page.normal
+                            },
                             &[],
                         );
                     }
@@ -2275,11 +2266,7 @@ impl GpuPage {
                 }
                 let offset = u64::from(run.first_record) * PAGE_DRAW_ARGS_SIZE;
                 if run.record_count > 1 && multi_draw {
-                    pass.multi_draw_indexed_indirect(
-                        &view.indirect,
-                        offset,
-                        run.record_count,
-                    );
+                    pass.multi_draw_indexed_indirect(&view.indirect, offset, run.record_count);
                 } else {
                     for record in 0..run.record_count {
                         pass.draw_indexed_indirect(
@@ -3281,7 +3268,8 @@ mod page_tests {
                             scratch: &WorldDrawScratch,
                             count: usize| {
             let view = scratch.gpu_culler.as_ref().unwrap().views[0]
-                .as_ref().unwrap();
+                .as_ref()
+                .unwrap();
             let size = (count as u64) * PAGE_DRAW_ARGS_SIZE;
             let readback = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("world culling indirect readback"),
@@ -3357,7 +3345,9 @@ mod page_tests {
         queue.submit(Some(encoder.finish()));
         let second = read_records(&device, &queue, &scratch, 64);
         assert!(second.iter().all(|arg| arg.instance_count == 1));
-        println!("::notice::GPU world culling passed: frustum compaction and current-view invalidation");
+        println!(
+            "::notice::GPU world culling passed: frustum compaction and current-view invalidation"
+        );
     }
 
     #[test]
