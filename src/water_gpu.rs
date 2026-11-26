@@ -1002,9 +1002,12 @@ impl WaterGpu {
         depth: &wgpu::TextureView,
         far: Option<(&wgpu::Buffer, &wgpu::Buffer, u32)>,
         near: (&wgpu::Buffer, &wgpu::Buffer, u32),
+        scissor: Option<[u32; 4]>,
+        far_runs: &[(u32, u32)],
+        near_runs: &[(u32, u32)],
     ) {
-        let far = far.filter(|f| f.2 > 0);
-        if far.is_none() && near.2 == 0 {
+        let far = far.filter(|f| f.2 > 0 && !far_runs.is_empty());
+        if far.is_none() && near_runs.is_empty() {
             return;
         }
         let params = EdgeUniform {
@@ -1037,18 +1040,25 @@ impl WaterGpu {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            if let Some([x, y, width, height]) = scissor {
+                pass.set_scissor_rect(x, y, width, height);
+            }
             pass.set_bind_group(0, &self.edge_bind, &[]);
             if let Some(far) = far {
                 pass.set_pipeline(&self.edge_far);
                 pass.set_vertex_buffer(0, far.0.slice(..));
                 pass.set_index_buffer(far.1.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..far.2, 0, 0..1);
+                for &(start, count) in far_runs {
+                    pass.draw_indexed(start..start + count, 0, 0..1);
+                }
             }
             if near.2 > 0 {
                 pass.set_pipeline(&self.edge_near);
                 pass.set_vertex_buffer(0, near.0.slice(..));
                 pass.set_index_buffer(near.1.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..near.2, 0, 0..1);
+                for &(start, count) in near_runs {
+                    pass.draw_indexed(start..start + count, 0, 0..1);
+                }
             }
         }
         queue.submit(Some(e.finish()));
