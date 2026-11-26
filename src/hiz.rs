@@ -40,6 +40,31 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if !finite(result) {
             result = 0.0;
         }
+    } else if p.mode == 2u {
+        // Half-resolution base level: one conservative minimum per 2x2 source
+        // block. Fold any odd trailing row/column into the last output texel.
+        var x_count = 2u;
+        var y_count = 2u;
+        if id.x == p.dst_width - 1u && (p.src_width & 1u) == 1u {
+            x_count = 3u;
+        }
+        if id.y == p.dst_height - 1u && (p.src_height & 1u) == 1u {
+            y_count = 3u;
+        }
+        for (var oy = 0u; oy < 3u; oy += 1u) {
+            for (var ox = 0u; ox < 3u; ox += 1u) {
+                let sx = id.x * 2u + ox;
+                let sy = id.y * 2u + oy;
+                if ox < x_count && oy < y_count && sx < p.src_width && sy < p.src_height {
+                    let value = textureLoad(source_depth, vec2<i32>(i32(sx), i32(sy)), 0);
+                    if !finite(value) || value < 0.0 || value > 1.0 {
+                        result = 0.0;
+                    } else {
+                        result = min(result, value);
+                    }
+                }
+            }
+        }
     } else {
         // Ceil-halving keeps odd right/bottom edges in the hierarchy.
         var x_count = 2u;
@@ -101,7 +126,10 @@ pub struct LevelInfo {
 }
 
 pub struct Pyramid {
+    /// Base mip extent. Production uses half the source depth resolution.
     extent: (u32, u32),
+    source_extent: (u32, u32),
+    downsample_depth: bool,
     levels: Vec<LevelInfo>,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -111,15 +139,53 @@ pub struct Pyramid {
     pipeline: wgpu::ComputePipeline,
     bind_layout: wgpu::BindGroupLayout,
     _params: Vec<wgpu::Buffer>,
+    /// Bind groups are immutable until the scene-depth texture is resized.
+    depth_bindings: Option<Vec<wgpu::BindGroup>>,
 }
 
 impl Pyramid {
+    /// Full-resolution hierarchy, retained for diagnostics and exact tests.
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Result<Self, String> {
-        if width == 0 || height == 0 {
+        Self::new_scaled(device, width, height, width, height, false)
+    }
+
+    /// Production hierarchy: half-resolution base mip, conservatively formed
+    /// by taking the minimum of every 2x2 source-depth footprint.
+    pub fn new_half_resolution(
+        device: &wgpu::Device,
+        source_width: u32,
+        source_height: u32,
+    ) -> Result<Self, String> {
+        if source_width == 0 || source_height == 0 {
+            return Err("Hi-Z source extent must be non-zero".into());
+        }
+        Self::new_scaled(
+            device,
+            source_width,
+            source_height,
+            source_width.div_ceil(2),
+            source_height.div_ceil(2),
+            true,
+        )
+    }
+
+    fn new_scaled(
+        device: &wgpu::Device,
+        source_width: u32,
+        source_height: u32,
+        width: u32,
+        height: u32,
+        downsample_depth: bool,
+    ) -> Result<Self, String> {
+        if width == 0 || height == 0 || source_width == 0 || source_height == 0 {
             return Err("Hi-Z extent must be non-zero".into());
         }
         let limits = device.limits();
-        if width > limits.max_texture_dimension_2d || height > limits.max_texture_dimension_2d {
+        if source_width > limits.max_texture_dimension_2d
+            || source_height > limits.max_texture_dimension_2d
+            || width > limits.max_texture_dimension_2d
+            || height > limits.max_texture_dimension_2d
+        {
             return Err(format!(
                 "Hi-Z extent {width}x{height} exceeds the {}px texture limit",
                 limits.max_texture_dimension_2d
@@ -275,7 +341,12 @@ impl Pyramid {
         for index in 0..levels.len() {
             let dst = levels[index];
             let (src_width, src_height, src_offset, mode) = if index == 0 {
-                (width, height, 0, 0)
+                (
+                    if downsample_depth { source_width } else { width },
+                    if downsample_depth { source_height } else { height },
+                    0,
+                    if downsample_depth { 2 } else { 0 },
+                )
             } else {
                 let src = levels[index - 1];
                 (src.width, src.height, src.offset, 1)
@@ -299,6 +370,8 @@ impl Pyramid {
         }
         Ok(Self {
             extent: (width, height),
+            source_extent: (source_width, source_height),
+            downsample_depth,
             levels,
             texture,
             view,
@@ -308,11 +381,15 @@ impl Pyramid {
             pipeline,
             bind_layout,
             _params: params,
+            depth_bindings: None,
         })
     }
 
     pub fn extent(&self) -> (u32, u32) {
         self.extent
+    }
+    pub fn source_extent(&self) -> (u32, u32) {
+        self.source_extent
     }
     pub fn levels(&self) -> &[LevelInfo] {
         &self.levels
@@ -339,57 +416,89 @@ impl Pyramid {
         out
     }
 
-    /// Encode one compute pass per mip into the caller's command buffer.
-    /// Separate views prevent read/write aliasing between adjacent mip levels.
-    pub fn encode(
+    /// Cache the current scene-depth view against all mip destinations.
+    /// Call once after creating or resizing the depth target.
+    pub fn set_depth_view(&mut self, device: &wgpu::Device, depth_view: &wgpu::TextureView) {
+        self.depth_bindings = Some(self.make_depth_bindings(device, depth_view));
+    }
+
+    fn make_depth_bindings(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
         depth_view: &wgpu::TextureView,
-    ) {
+    ) -> Vec<wgpu::BindGroup> {
+        self.level_views
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let source_view = if index == 0 {
+                    &self.dummy_view
+                } else {
+                    &self.level_views[index - 1]
+                };
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Hi-Z reduction mip bindings"),
+                    layout: &self.bind_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(depth_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(source_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&self.level_views[index]),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self._params[index].as_entire_binding(),
+                        },
+                    ],
+                })
+            })
+            .collect()
+    }
+
+    fn encode_bindings(&self, encoder: &mut wgpu::CommandEncoder, bindings: &[wgpu::BindGroup]) {
         for (index, level) in self.levels.iter().enumerate() {
-            let source_view = if index == 0 {
-                &self.dummy_view
-            } else {
-                &self.level_views[index - 1]
-            };
-            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Hi-Z reduction mip bindings"),
-                layout: &self.bind_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(depth_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(source_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&self.level_views[index]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: self._params[index].as_entire_binding(),
-                    },
-                ],
-            });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(if index == 0 {
-                    "Hi-Z copy current depth"
+                    if self.downsample_depth {
+                        "Hi-Z downsample scene depth"
+                    } else {
+                        "Hi-Z copy current depth"
+                    }
                 } else {
                     "Hi-Z reduce minimum depth"
                 }),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind, &[]);
+            pass.set_bind_group(0, &bindings[index], &[]);
             pass.dispatch_workgroups(
                 level.width.div_ceil(WORKGROUP),
                 level.height.div_ceil(WORKGROUP),
                 1,
             );
+        }
+    }
+
+    /// Production calls use cached bindings; diagnostic users that do not
+    /// install a depth view retain the original safe uncached path.
+    pub fn encode(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        depth_view: &wgpu::TextureView,
+    ) {
+        if let Some(bindings) = &self.depth_bindings {
+            self.encode_bindings(encoder, bindings);
+        } else {
+            let bindings = self.make_depth_bindings(device, depth_view);
+            self.encode_bindings(encoder, &bindings);
         }
     }
 }

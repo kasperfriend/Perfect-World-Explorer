@@ -2026,8 +2026,12 @@ pub fn ten_class_placements(t: &Terrain) -> Vec<crate::scenery_visibility::Place
 /// intermediates stay at the full window size and are resized separately.
 fn resize_world_targets(renderer: &mut Renderer, w: u32, h: u32) {
     renderer.depth = depth(&renderer.device, w, h);
-    renderer.hiz = match crate::hiz::Pyramid::new(&renderer.device, w, h) {
-        Ok(pyramid) => Some(pyramid),
+    let hiz_depth_view = renderer.depth.create_view(&Default::default());
+    renderer.hiz = match crate::hiz::Pyramid::new_half_resolution(&renderer.device, w, h) {
+        Ok(mut pyramid) => {
+            pyramid.set_depth_view(&renderer.device, &hiz_depth_view);
+            Some(pyramid)
+        },
         Err(error) => {
             eprintln!(
                 "Hi-Z disabled after resize; frustum-only tree culling remains active: {error}"
@@ -2228,8 +2232,10 @@ impl Renderer {
             ],
         });
         let depth_tex = depth(&device, w, h);
-        let hiz = match crate::hiz::Pyramid::new(&device, w, h) {
-            Ok(pyramid) => {
+        let hiz_depth_view = depth_tex.create_view(&Default::default());
+        let hiz = match crate::hiz::Pyramid::new_half_resolution(&device, w, h) {
+            Ok(mut pyramid) => {
+                pyramid.set_depth_view(&device, &hiz_depth_view);
                 eprintln!(
                     "Initialized reversed-Z Hi-Z pyramid: {}x{} ({} levels, {} bytes)",
                     w,
@@ -4103,14 +4109,13 @@ impl Renderer {
         // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
         // the same block walk the client runs before the level rule.
         // Both buffers are reused: this runs for every view of every frame.
-        let spans = &self.spans;
-        let terrain_runs = &mut self.terrain_runs;
-        let terrain_gpu = &self.terrain_gpu;
-        let far_terrain_runs = &mut self.far_terrain_runs;
-        std::thread::scope(|s| {
-            s.spawn(|| crate::terrain_residency::visible_runs_into(spans, matrix, terrain_runs));
-            s.spawn(|| terrain_gpu.visible_far_runs_into(matrix, far_terrain_runs));
-        });
+        crate::terrain_residency::visible_runs_into(
+            &self.spans,
+            matrix,
+            &mut self.terrain_runs,
+        );
+        self.terrain_gpu
+            .visible_far_runs_into(matrix, &mut self.far_terrain_runs);
         // One indirect record per run, so the terrain itself is one call per mesh
         // instead of one call per run.
         self.queue_main_runs();

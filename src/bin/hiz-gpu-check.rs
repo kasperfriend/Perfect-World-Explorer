@@ -208,6 +208,92 @@ fn main() {
     }
     drop(bytes);
     readback.unmap();
-    println!("::notice::Hi-Z GPU check passed: {}x{} depth, {} min-reduction levels, odd-edge clear propagated",
-        WIDTH, HEIGHT, pyramid.levels().len());
+
+    // Exercise the production half-resolution base-level downsample and the
+    // depth-target-scoped cached bind groups on the same odd-sized depth source.
+    let mut half = hiz::Pyramid::new_half_resolution(&device, WIDTH, HEIGHT)
+        .expect("half-resolution Hi-Z allocation failed");
+    assert_eq!(half.source_extent(), (WIDTH, HEIGHT));
+    assert_eq!(half.extent(), (WIDTH.div_ceil(2), HEIGHT.div_ceil(2)));
+    let half_expected = [(7u32, 4u32), (3, 2), (1, 1)];
+    assert_eq!(half.levels().len(), half_expected.len());
+    half.set_depth_view(&device, &depth_view);
+    let mut half_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("half-resolution Hi-Z GPU regression encoder"),
+    });
+    half.encode(&device, &mut half_encoder, &depth_view);
+    let mut half_layouts = Vec::with_capacity(half.levels().len());
+    let mut half_size = 0u64;
+    for level in half.levels() {
+        half_size = half_size.div_ceil(256) * 256;
+        let row_pitch = (u64::from(level.width) * 4).div_ceil(256) * 256;
+        half_layouts.push((half_size, row_pitch));
+        half_size += row_pitch * u64::from(level.height);
+    }
+    let half_readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("half-resolution Hi-Z readback"),
+        size: half_size.max(4),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    for (index, (level, (offset, row_pitch))) in
+        half.levels().iter().zip(half_layouts.iter()).enumerate()
+    {
+        half_encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: half.texture(),
+                mip_level: index as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &half_readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: *offset,
+                    bytes_per_row: Some(*row_pitch as u32),
+                    rows_per_image: Some(level.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: level.width,
+                height: level.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    queue.submit(Some(half_encoder.finish()));
+    let half_slice = half_readback.slice(..);
+    let (half_tx, half_rx) = mpsc::channel();
+    half_slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = half_tx.send(result);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    half_rx
+        .recv()
+        .expect("half-resolution readback callback dropped")
+        .expect("half-resolution Hi-Z mapping failed");
+    let half_bytes = half_slice.get_mapped_range().to_vec();
+    for (index, (level, (width, height))) in half.levels().iter().zip(half_expected).enumerate() {
+        assert_eq!((level.width, level.height), (width, height), "half mip {index}");
+        let (offset, row_pitch) = half_layouts[index];
+        for y in 0..height as usize {
+            let row_start = offset as usize + y * row_pitch as usize;
+            let row = &half_bytes[row_start..row_start + width as usize * 4];
+            let mip = bytemuck::cast_slice::<u8, f32>(row);
+            assert!(
+                mip.iter().all(|value| (*value - 0.8).abs() < 1.0e-5 || *value == 0.0),
+                "half mip {index} contains unexpected depths: {mip:?}"
+            );
+            if y + 1 == height as usize {
+                assert_eq!(
+                    mip[width as usize - 1],
+                    0.0,
+                    "odd-edge clear hole must propagate through half mip {index}"
+                );
+            }
+        }
+    }
+    drop(half_bytes);
+    half_readback.unmap();
+    println!("::notice::Hi-Z GPU check passed: full + half-resolution min pyramids, cached bindings, odd-edge clear propagated");
 }

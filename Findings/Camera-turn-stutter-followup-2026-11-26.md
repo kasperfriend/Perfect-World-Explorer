@@ -62,3 +62,26 @@ and sphere tests still run before drawing. The opaque/alpha submission and alpha
 sort now iterate the visible index list instead of the full model slot array.
 Pose ticking and hook resolution are intentionally unchanged because attached
 effect roots depend on current parent poses.
+
+
+## Additional frame-path reductions
+
+- The production main-view Hi-Z now starts at half render resolution. Its first
+  mip is the minimum of every 2x2 scene-depth footprint (including odd trailing
+  rows/columns), so any clear pixel propagates as zero and can only make an
+  occluded tree visible. This reduces hierarchy depth-copy/reduction traffic
+  and storage by roughly 4x while retaining conservative occlusion.
+- Hi-Z mip bind groups are created once with the depth target and reused until
+  resize; the previous hot path allocated a bind group for every mip on every
+  rendered main view.
+- The near/far terrain visibility walk now runs inline instead of launching two
+  short-lived scoped threads on every frame. The work is a bounded walk over
+  already-resident span arrays, and avoiding thread creation removes needless
+  scheduler/context-switch variability from camera turns.
+- The lavapipe Hi-Z regression now checks full- and half-resolution hierarchies,
+  including odd-edge clear propagation through the real WGSL downsample shader
+  and the cached-binding path.
+
+A physical-GPU frame-time capture at the reported 3440x1369 / RTX 3060
+configuration is still required to measure the actual FPS gain. CI validates
+correctness, not a specific runtime frame rate.
