@@ -5860,7 +5860,10 @@ mod shader_optimization_regression_tests {
         assert!(dxr.contains("Confidence-gated radiance-cache tail"));
         assert!(!RAY_SHADER.contains("array<vec4<f32>> radiance_cache"));
         assert!(!dxr.contains("RWStructuredBuffer<float4> radiance_cache"));
-        assert_eq!(super::RADIANCE_CACHE_CELLS * std::mem::size_of::<u32>(), 256 * 1024);
+        assert_eq!(
+            super::RADIANCE_CACHE_CELLS * std::mem::size_of::<u32>(),
+            256 * 1024
+        );
     }
 
     #[test]
