@@ -104,6 +104,7 @@ impl DxrTracer {
         _device: &wgpu::Device,
         _scene: &Arc<SceneGeometry>,
         _grid_extent: (u32, u32),
+        _render_extent: (u32, u32),
     ) -> Result<Self, String> {
         Err("DXR 1.1 hardware ray tracing requires Windows + DX12".into())
     }
@@ -123,6 +124,7 @@ impl DxrTracer {
         &mut self,
         _device: &wgpu::Device,
         _grid_extent: (u32, u32),
+        _render_extent: (u32, u32),
     ) -> Result<(), String> {
         Err("DXR 1.1 hardware ray tracing requires Windows + DX12".into())
     }
@@ -134,6 +136,7 @@ impl DxrTracer {
         _src_pos: &wgpu::Texture,
         _src_norm: &wgpu::Texture,
         _src_raster: &wgpu::Texture,
+        _src_screen_raster: &wgpu::Texture,
         _src_sky_env: &wgpu::Texture,
         _copy_sky_env: bool,
         _src_terrain_map: &wgpu::Texture,
@@ -670,6 +673,7 @@ mod imp {
         in_pos: NativeTexture2D,
         in_norm: NativeTexture2D,
         in_raster: NativeTexture2D,
+        in_screen_raster: NativeTexture2D,
         in_sky_env: NativeTexture2D,
         in_terrain_map: NativeTexture2D,
         colour: NativeTexture2D,
@@ -678,6 +682,7 @@ mod imp {
         normals: NativeTexture2D,
         albedo: NativeTexture2D,
         extent: (u32, u32),
+        screen_extent: (u32, u32),
         /// True once `wgpu` has copied from the corresponding output target,
         /// leaving wgpu's DX12 state tracker expecting `COPY_SOURCE`.
         wgpu_tracked_copy_src: [bool; 5],
@@ -694,8 +699,10 @@ mod imp {
             device: &wgpu::Device,
             raw_device: &d3d12::Device,
             extent: (u32, u32),
+            screen_extent: (u32, u32),
         ) -> Result<Self, String> {
             let (w, h) = (extent.0.max(1), extent.1.max(1));
+            let (sw, sh) = (screen_extent.0.max(1), screen_extent.1.max(1));
             let state = d12::D3D12_RESOURCE_STATE_COMMON;
             let in_usage = wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING;
             let in_pos = unsafe {
@@ -734,6 +741,20 @@ mod imp {
                     COLOUR_FORMAT,
                     DXGI_FORMAT_R16G16B16A16_FLOAT,
                     (w, h),
+                    d12::D3D12_RESOURCE_FLAG_NONE,
+                    in_usage,
+                    state,
+                    false,
+                )?
+            };
+            let in_screen_raster = unsafe {
+                NativeTexture2D::create(
+                    device,
+                    raw_device,
+                    "raywatcher dxr in full-resolution screen raster",
+                    COLOUR_FORMAT,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    (sw, sh),
                     d12::D3D12_RESOURCE_FLAG_NONE,
                     in_usage,
                     state,
@@ -795,6 +816,7 @@ mod imp {
                 in_pos,
                 in_norm,
                 in_raster,
+                in_screen_raster,
                 in_sky_env,
                 in_terrain_map,
                 colour,
@@ -803,6 +825,7 @@ mod imp {
                 normals,
                 albedo,
                 extent: (w, h),
+                screen_extent: (sw, sh),
                 wgpu_tracked_copy_src: [false; 5],
                 uav_resident: [false; 5],
                 wgpu_tracked_copy_dst: false,
@@ -869,7 +892,7 @@ mod imp {
     // 11: u5 radiance cache UAV
     // 12: u6 two-frame ReSTIR GI reservoir UAV
     const RADIANCE_CACHE_CELLS: u32 = 65_536;
-    const HEAP_SLOTS: u32 = 15;
+    const HEAP_SLOTS: u32 = 16;
 
     impl Drop for DxrTracer {
         fn drop(&mut self) {
@@ -888,6 +911,7 @@ mod imp {
             device: &wgpu::Device,
             scene: &Arc<SceneGeometry>,
             grid_extent: (u32, u32),
+            render_extent: (u32, u32),
         ) -> Result<Self, String> {
             let startup_started = std::time::Instant::now();
             let (ok, reason) = probe_hardware_rt(device);
@@ -944,7 +968,7 @@ mod imp {
                     d12::D3D12_RESOURCE_STATE_COPY_DEST,
                 )?
             };
-            let targets = DxrTargets::new(device, &raw_device, grid_extent)?;
+            let targets = DxrTargets::new(device, &raw_device, grid_extent, render_extent)?;
             let reservoir_bytes = u64::from(grid_extent.0.max(1))
                 .saturating_mul(u64::from(grid_extent.1.max(1)))
                 .saturating_mul(2)
@@ -1063,11 +1087,11 @@ mod imp {
             String,
         > {
             // Root parameter 0: CBV at b0
-            // Root parameter 1: Descriptor table with 6 SRVs (t0..t5)
+            // Root parameter 1: Descriptor table with 9 SRVs (t0..t8)
             // Root parameter 2: Descriptor table with 7 UAVs (u0..u6)
             let srv_range = d12::D3D12_DESCRIPTOR_RANGE {
                 RangeType: d12::D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                NumDescriptors: 8,
+                NumDescriptors: 9,
                 BaseShaderRegister: 0,
                 RegisterSpace: 0,
                 OffsetInDescriptorsFromTableStart: 0,
@@ -1675,7 +1699,7 @@ mod imp {
         fn write_target_descriptors(&self) {
             unsafe {
                 let dev = self.raw_device.as_mut_ptr();
-                // Slots 3..5: t3..t5 G-buffer input Texture2D SRVs.
+                // Slots 3..8: t3..t8 G-buffer, environment and full-res raster SRVs.
                 let in_specs = [
                     (
                         self.targets.in_pos.resource.as_mut_ptr(),
@@ -1695,6 +1719,10 @@ mod imp {
                     ),
                     (
                         self.targets.in_terrain_map.resource.as_mut_ptr(),
+                        DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    ),
+                    (
+                        self.targets.in_screen_raster.resource.as_mut_ptr(),
                         DXGI_FORMAT_R16G16B16A16_FLOAT,
                     ),
                 ];
@@ -1728,7 +1756,7 @@ mod imp {
                         res,
                         null_mut(),
                         &uav,
-                        self.cpu_handle(8 + i as u32),
+                        self.cpu_handle(9 + i as u32),
                     );
                 }
 
@@ -1747,7 +1775,7 @@ mod imp {
                     self.radiance_cache.resource,
                     null_mut(),
                     &rc_uav,
-                    self.cpu_handle(13),
+                    self.cpu_handle(14),
                 );
 
                 // Slot 14: u6 ReSTIR GI reservoirs (two pixel-sized frames, 64-byte records).
@@ -1769,7 +1797,7 @@ mod imp {
                     self.restir_reservoirs.resource,
                     null_mut(),
                     &restir_uav,
-                    self.cpu_handle(14),
+                    self.cpu_handle(15),
                 );
             }
         }
@@ -1784,6 +1812,7 @@ mod imp {
             src_pos: &wgpu::Texture,
             src_norm: &wgpu::Texture,
             src_raster: &wgpu::Texture,
+            src_screen_raster: &wgpu::Texture,
             src_sky_env: &wgpu::Texture,
             copy_sky_env: bool,
             src_terrain_map: &wgpu::Texture,
@@ -1796,6 +1825,13 @@ mod imp {
                 (src_pos, &self.targets.in_pos.texture, tw, th, true),
                 (src_norm, &self.targets.in_norm.texture, tw, th, true),
                 (src_raster, &self.targets.in_raster.texture, tw, th, true),
+                (
+                    src_screen_raster,
+                    &self.targets.in_screen_raster.texture,
+                    self.targets.screen_extent.0,
+                    self.targets.screen_extent.1,
+                    true,
+                ),
                 (
                     src_sky_env,
                     &self.targets.in_sky_env.texture,
@@ -2128,31 +2164,36 @@ mod imp {
             &mut self,
             device: &wgpu::Device,
             grid_extent: (u32, u32),
+            render_extent: (u32, u32),
         ) -> Result<(), String> {
             let target = (grid_extent.0.max(1), grid_extent.1.max(1));
-            if self.targets.extent == target {
+            let screen_target = (render_extent.0.max(1), render_extent.1.max(1));
+            if self.targets.extent == target && self.targets.screen_extent == screen_target {
                 return Ok(());
             }
+            let grid_changed = self.targets.extent != target;
             self.ring.wait_idle();
-            self.targets = DxrTargets::new(device, &self.raw_device, target)?;
-            let reservoir_bytes = u64::from(target.0)
-                .saturating_mul(u64::from(target.1))
-                .saturating_mul(2)
-                .saturating_mul(size_of::<RestirReservoir>() as u64);
-            self.restir_reservoirs_enabled = reservoir_bytes <= device.limits().max_buffer_size;
-            self.restir_reservoirs = unsafe {
-                RawBuffer::create(
-                    self.raw_device.as_mut_ptr(),
-                    if self.restir_reservoirs_enabled {
-                        reservoir_bytes.max(64)
-                    } else {
-                        64
-                    },
-                    d12::D3D12_HEAP_TYPE_DEFAULT,
-                    d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                    d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )?
-            };
+            self.targets = DxrTargets::new(device, &self.raw_device, target, screen_target)?;
+            if grid_changed {
+                let reservoir_bytes = u64::from(target.0)
+                    .saturating_mul(u64::from(target.1))
+                    .saturating_mul(2)
+                    .saturating_mul(size_of::<RestirReservoir>() as u64);
+                self.restir_reservoirs_enabled = reservoir_bytes <= device.limits().max_buffer_size;
+                self.restir_reservoirs = unsafe {
+                    RawBuffer::create(
+                        self.raw_device.as_mut_ptr(),
+                        if self.restir_reservoirs_enabled {
+                            reservoir_bytes.max(64)
+                        } else {
+                            64
+                        },
+                        d12::D3D12_HEAP_TYPE_DEFAULT,
+                        d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )?
+                };
+            }
             self.restir_history_valid = false;
             self.write_target_descriptors();
             Ok(())
@@ -2193,6 +2234,7 @@ mod imp {
                     self.targets.in_pos.resource.as_mut_ptr(),
                     self.targets.in_norm.resource.as_mut_ptr(),
                     self.targets.in_raster.resource.as_mut_ptr(),
+                    self.targets.in_screen_raster.resource.as_mut_ptr(),
                     self.targets.in_sky_env.resource.as_mut_ptr(),
                     self.targets.in_terrain_map.resource.as_mut_ptr(),
                 ];
@@ -2211,7 +2253,7 @@ mod imp {
                 // Boost #10: Only transition output UAV planes that will actually be copied
                 // back to wgpu; unused planes stay in COMMON/UAV without barrier flushes.
                 let out_used = [true, dst_guide.is_some(), true, true, dst_albedo.is_some()];
-                let mut pre_barriers: [d12::D3D12_RESOURCE_BARRIER; 11] = zeroed();
+                let mut pre_barriers: [d12::D3D12_RESOURCE_BARRIER; 12] = zeroed();
                 let mut pre_count = 0usize;
                 for res in in_resources {
                     let b = &mut pre_barriers[pre_count];
@@ -2259,10 +2301,10 @@ mod imp {
                 (*list).SetPipelineState(self.pso);
                 (*list).SetComputeRootConstantBufferView(0, self.cbvs[slot_idx].gpu_va);
                 (*list).SetComputeRootDescriptorTable(1, self.gpu_handle(0));
-                (*list).SetComputeRootDescriptorTable(2, self.gpu_handle(8));
+                (*list).SetComputeRootDescriptorTable(2, self.gpu_handle(9));
                 (*list).Dispatch(w.div_ceil(8), h.div_ceil(8), 1); // Opt #13: 8x8 threadgroup
 
-                let mut post_barriers: [d12::D3D12_RESOURCE_BARRIER; 10] = zeroed();
+                let mut post_barriers: [d12::D3D12_RESOURCE_BARRIER; 11] = zeroed();
                 let mut post_count = 0usize;
                 for res in in_resources {
                     let b = &mut post_barriers[post_count];
