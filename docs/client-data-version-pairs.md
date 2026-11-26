@@ -38,13 +38,13 @@ numeric sequence. Regions are shown where the source distinguishes them.
 | `7 / 55` | 1.2.6 | Brazilian official client inventory | Exact |
 | `8 / 55` | 1.2.8 | W2I/Chinese release inventory | Exact |
 | `10 / 55` | 1.3.1 | Russian client inventory; also measured in this repository's matrix | Exact |
-| `12 / 56` | 1.3.4, 1.3.6, 1.3.8 | Russian/Chinese release lists and three distinct 1.3.6 client data sets | **Ambiguous** |
-| `27 / 75` | 1.4.1, 1.4.2 | Modified Brazilian 1.4.1 client based on 1.4.2 data; W2I 1.4.2; this repository measured the pair in a 1.4.2 client | **Ambiguous** |
-| `29 / 78` | 1.4.1, 1.4.2 | Modified PWI-based 1.4.1 client; official Russian 1.4.2 client | **Ambiguous** |
+| `12 / 56` | 1.3.4, 1.3.6, 1.3.8 | Russian/Chinese release lists and three distinct 1.3.6 client data sets | Guessed: 1.3.6 |
+| `27 / 75` | 1.4.1, 1.4.2 | Modified Brazilian 1.4.1 client based on 1.4.2 data; W2I 1.4.2; this repository measured the pair in a 1.4.2 client | Guessed: 1.4.2 |
+| `29 / 78` | 1.4.1, 1.4.2 | Modified PWI-based 1.4.1 client; official Russian 1.4.2 client | Guessed: 1.4.2 |
 | `60 / 93` | 1.4.4 | Russian 1.4.4 client | Exact |
 | `63 / 101` | 1.4.5 | Russian 1.4.5 Underworld client | Exact |
 | `69 / 103` | 1.4.5 | Russian 1.4.5 Reflections client | Exact |
-| `70 / 105` | 1.4.4, 1.4.5, 1.4.6 | This repository's measured 1.4.4 corpus; W2I 1.4.5; Russian 1.4.6 | **Ambiguous** |
+| `70 / 105` | 1.4.4, 1.4.5, 1.4.6 | This repository's measured 1.4.4 corpus; W2I 1.4.5; Russian 1.4.6 | Guessed: 1.4.4 |
 | `80 / 105` | 1.4.7 | PWI 1.4.7 client | Exact |
 | `84 / 106` | 1.4.6 | W2I/Chinese 1.4.6 client | Exact |
 | `85 / 108` | 1.4.8 | PWI and Russian 1.4.8 inventories | Exact |
@@ -69,8 +69,8 @@ numeric sequence. Regions are shown where the source distinguishes them.
 The full matrix used by the project to record local file measurements is
 [Cross-version reading matrix](cross-version-matrix.md). The release-list
 sources below provide additional regional client pairs. Where an exact pair
-is present in both sources but the release names disagree, the scanner keeps
-the candidate list instead of taking the most convenient label.
+is present in both sources but the release names disagree, the scanner displays a concise best-effort guess prefixed with
+`Version is guessed:`; the candidate releases remain listed in this catalogue.
 
 ## The important collision: 1.3.6
 
@@ -87,15 +87,15 @@ the multi-client archive documents three separate client data sets called
 
 The original post explicitly says it is a collection of client files and that 1.3.4/1.3.6 servers do not exist; these should be read as community-labelled client data sets, not proof of official server releases. Those counts are content-level evidence, not header fields. The viewer does
 not currently parse the v12 elements tables or v56 task records deeply enough
-to reproduce these counts. The safe result for `12/56` is therefore
-`unknown game version (ambiguous data pair; candidates: 1.3.4 / 1.3.6 / 1.3.8)`.
+to reproduce these counts. The scanner currently displays
+`Version is guessed: 1.3.6` for `12/56`, while this catalogue records 1.3.4 and
+1.3.8 as other known releases with the same pair.
 A later content-fingerprint pass could count the relevant records or compare
-stable file hashes and narrow the candidates. It would be unsafe to label every
-`12/56` client as 1.3.6 now.
+stable file hashes and confirm or correct the guess. The `Version is
+guessed:` prefix is intentional: the header pair does not prove 1.3.6.
 
-The same approach is taken for `27/75`, `29/78`, and `70/105`: the files are genuine
-client pairs, but more than one marketed release is documented with those
-headers. A known executable fingerprint or its own release marker still wins.
+The same best-effort convention is used for `27/75`, `29/78`, and
+`70/105`. A known executable fingerprint or its own release marker still wins.
 
 ## Known gaps and intentionally excluded evidence
 
