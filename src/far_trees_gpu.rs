@@ -1552,48 +1552,59 @@ impl FarTrees {
         let frustum = normalize_frustum(frustum);
         let key = (camera, scale, bounds, frustum, clip_plane);
         let hiz_enabled = hiz_extent.is_some();
-        if !hiz_enabled {
-            if let Some((prev_cam, prev_scale, prev_bounds, prev_frustum, prev_clip)) =
-                *self.last_resident_update.borrow()
-            {
+        // The spatial broad phase depends on camera/frustum/residency, not on
+        // the depth image. Hi-Z still needs a fresh compute dispatch each frame,
+        // but rebuilding and re-uploading an identical candidate list does not.
+        let same_resident = self
+            .last_resident_update
+            .borrow()
+            .as_ref()
+            .is_some_and(|(prev_cam, prev_scale, prev_bounds, prev_frustum, prev_clip)| {
                 let dx = camera[0] - prev_cam[0];
                 let dy = camera[1] - prev_cam[1];
                 let dz = camera[2] - prev_cam[2];
-                if dx * dx + dy * dy + dz * dz < 1e-4
-                    && prev_scale == scale
-                    && prev_bounds == bounds
-                    && prev_frustum == frustum
-                    && prev_clip == clip_plane
-                {
-                    return;
-                }
-            }
+                dx * dx + dy * dy + dz * dz < 1e-4
+                    && *prev_scale == scale
+                    && *prev_bounds == bounds
+                    && *prev_frustum == frustum
+                    && *prev_clip == clip_plane
+            });
+        if same_resident && !hiz_enabled {
+            return;
         }
         // A cheap spatial-cell test reduces the compute dispatch from the full
         // map's tree count to the subset whose conservative cell bounds overlap
         // this view. The shader still performs exact per-tree frustum, clip,
         // distance/LOD and optional Hi-Z tests.
         let active_count = if let Some(offset) = self.active_index_offset {
-            let mut active_indices = self.active_placement_indices.borrow_mut();
-            active_indices.clear();
-            append_visible_tree_indices(
-                &self.spatial_cells,
-                &frustum,
-                clip_plane,
-                bounds,
-                &mut active_indices,
-            );
-            if active_indices.is_empty() {
+            if !same_resident {
+                let mut active_indices = self.active_placement_indices.borrow_mut();
+                active_indices.clear();
+                append_visible_tree_indices(
+                    &self.spatial_cells,
+                    &frustum,
+                    clip_plane,
+                    bounds,
+                    &mut active_indices,
+                );
+                if active_indices.is_empty() {
+                    queue.write_buffer(&self.lod_args, 0, &self.lod_args_reset);
+                    *self.last_resident_update.borrow_mut() = Some(key);
+                    return;
+                }
+                queue.write_buffer(
+                    &self.placement_buffer,
+                    offset,
+                    bytemuck::cast_slice(active_indices.as_slice()),
+                );
+            }
+            let active_count = self.active_placement_indices.borrow().len();
+            if active_count == 0 {
                 queue.write_buffer(&self.lod_args, 0, &self.lod_args_reset);
                 *self.last_resident_update.borrow_mut() = Some(key);
                 return;
             }
-            queue.write_buffer(
-                &self.placement_buffer,
-                offset,
-                bytemuck::cast_slice(active_indices.as_slice()),
-            );
-            active_indices.len()
+            active_count
         } else {
             // The packed tail would exceed this adapter's binding limit. Keep
             // the correctness path by dispatching over every placement; the
