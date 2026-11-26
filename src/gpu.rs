@@ -599,6 +599,44 @@ struct WaterBatch {
     height: f32,
     bounds: [f32; 4], // min x, max x, min z, max z
 }
+/// Keep the planes used by Raywatcher's 16-entry water classifier representative
+/// of what the camera can actually see. A large lake can contain the camera even
+/// when its rectangle centre is hundreds of units away; centre-distance sorting
+/// used to discard that plane and let its pixels fall through as ordinary GI receivers.
+fn prioritize_raywatcher_water_surfaces(
+    surfaces: &mut Vec<crate::modules::raywatcher::harvest::WaterSurface>,
+    camera_pos: Vec3,
+) {
+    const MAX_SURFACES: usize = 16;
+    if surfaces.len() <= MAX_SURFACES {
+        return;
+    }
+    let contains_camera = |surface: &crate::modules::raywatcher::harvest::WaterSurface| {
+        camera_pos.x >= surface.bounds[0]
+            && camera_pos.x <= surface.bounds[1]
+            && camera_pos.z >= surface.bounds[2]
+            && camera_pos.z <= surface.bounds[3]
+    };
+    let distance_squared = |surface: &crate::modules::raywatcher::harvest::WaterSurface| {
+        let x = camera_pos.x.clamp(surface.bounds[0], surface.bounds[1]);
+        let z = camera_pos.z.clamp(surface.bounds[2], surface.bounds[3]);
+        (camera_pos - Vec3::new(x, surface.height, z)).length_squared()
+    };
+    surfaces.select_nth_unstable_by(MAX_SURFACES, |a, b| {
+        let a_contains_camera = contains_camera(a);
+        let b_contains_camera = contains_camera(b);
+        if a_contains_camera != b_contains_camera {
+            return if a_contains_camera {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+        distance_squared(a).total_cmp(&distance_squared(b))
+    });
+    surfaces.truncate(MAX_SURFACES);
+}
+
 impl WaterBatch {
     // Conservative homogeneous clip-space rejection for the rectangular bounds.
     fn visible(&self, matrix: Mat4) -> bool {
@@ -4362,16 +4400,7 @@ impl Renderer {
                 height: w.height,
             })
             .collect();
-        if active_water.len() > 16 {
-            active_water.select_nth_unstable_by(16, |a, b| {
-                let da = ((a.bounds[0] + a.bounds[1]) * 0.5 - camera.pos.x).powi(2)
-                    + ((a.bounds[2] + a.bounds[3]) * 0.5 - camera.pos.z).powi(2);
-                let db = ((b.bounds[0] + b.bounds[1]) * 0.5 - camera.pos.x).powi(2)
-                    + ((b.bounds[2] + b.bounds[3]) * 0.5 - camera.pos.z).powi(2);
-                da.total_cmp(&db)
-            });
-            active_water.truncate(16);
-        }
+        prioritize_raywatcher_water_surfaces(&mut active_water, camera.pos);
         let need_point_lights = plan.effects.lighting
             || plan.point_light_shadows
             || !layered
@@ -9223,6 +9252,40 @@ pub fn preview(
     drop(bytes);
     buffer.unmap();
     Ok(())
+}
+
+#[cfg(test)]
+mod raywatcher_water_surface_selection_tests {
+    use super::*;
+
+    #[test]
+    fn camera_containing_large_water_plane_survives_the_sixteen_plane_cap() {
+        let camera = Vec3::new(0.0, -12.0, 0.0);
+        let mut surfaces: Vec<crate::modules::raywatcher::harvest::WaterSurface> = (0..16)
+            .map(|i| {
+                let x = 10.0 + i as f32 * 3.0;
+                crate::modules::raywatcher::harvest::WaterSurface {
+                    bounds: [x, x + 1.0, -1.0, 1.0],
+                    height: 0.0,
+                }
+            })
+            .collect();
+        // This lake contains the camera but has a distant rectangle centre.
+        // Centre-distance sorting placed all 16 small patches ahead of it.
+        let camera_lake = crate::modules::raywatcher::harvest::WaterSurface {
+            bounds: [-2_000.0, 50.0, -50.0, 50.0],
+            height: 0.0,
+        };
+        surfaces.push(camera_lake);
+
+        prioritize_raywatcher_water_surfaces(&mut surfaces, camera);
+
+        assert_eq!(surfaces.len(), 16);
+        assert!(
+            surfaces.iter().any(|surface| surface.bounds == camera_lake.bounds),
+            "the water plane under the camera must be available to the G-buffer classifier"
+        );
+    }
 }
 
 #[cfg(test)]
