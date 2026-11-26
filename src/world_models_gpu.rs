@@ -243,6 +243,7 @@ impl World {
             mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let native_instance_count = assets.instances.len();
         Ok(Self {
             assets,
             keep_unbounded: false,
@@ -271,7 +272,7 @@ impl World {
             frustum: None,
             scratch_candidates: Vec::new(),
             scratch_failures: Vec::new(),
-            native_instance_count: assets.instances.len(),
+            native_instance_count,
             editor_placements: Vec::new(),
             editor_asset_cache: HashMap::new(),
         })
