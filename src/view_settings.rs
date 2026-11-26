@@ -641,7 +641,7 @@ impl ViewSettings {
         }
     }
     pub fn load() -> Self {
-        Self::load_with_default_fog(false)
+        Self::load_with_default_fog(true)
     }
     /// Use scene fog enable only as the default for a missing saved choice.
     pub fn load_with_default_fog(fog_enabled: bool) -> Self {
