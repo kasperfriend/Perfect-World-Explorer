@@ -319,7 +319,8 @@ impl World {
 
         self.assets.instances.truncate(self.native_instance_count);
         self.slots.truncate(self.native_instance_count);
-        self.alpha.retain(|candidate| candidate.slot < self.native_instance_count);
+        self.alpha
+            .retain(|candidate| candidate.slot < self.native_instance_count);
         self.editor_placements.clear();
 
         let mut random = crate::model_playback::SceneRandom::new(1);
@@ -368,10 +369,8 @@ impl World {
             let action = self.assets.assets[asset]
                 .descriptor
                 .scene_action(&scene_placement.action);
-            let mut playback = crate::model_playback::Playback::new(
-                &self.assets.assets[asset],
-                action,
-            );
+            let mut playback =
+                crate::model_playback::Playback::new(&self.assets.assets[asset], action);
             if let Ok(clock) = &mut playback {
                 if let Err(error) = clock.tick(random.initial_tick()) {
                     self.reported.push(format!(
