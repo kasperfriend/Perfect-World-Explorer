@@ -478,8 +478,9 @@ impl Scan {
             // These pairs are measured in docs/cross-version-matrix.md.
             (10, 55) => Some("1.3.1"),
             (70, 105) => Some("1.4.4"),
-            // v12/v56 is shared by 1.3.6 and 1.3.9 distributions; the pair
-            // alone cannot identify which executable release is installed.
+            // v12/v56 is measured for 1.3.6. 1.3.9 also has the generic
+            // marker, but its data pair has not been verified here, so this
+            // pair is not assumed to identify either release uniquely.
             _ => None,
         }
     }
