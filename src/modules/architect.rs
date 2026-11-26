@@ -169,10 +169,16 @@ impl Architect {
 
     fn refresh_projects(&mut self) {
         self.project_files.clear();
-        let Ok(entries) = fs::read_dir(&self.project_root) else { return };
+        let Ok(entries) = fs::read_dir(&self.project_root) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pwa")) {
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pwa"))
+            {
                 self.project_files.push(path);
             }
         }
@@ -190,10 +196,16 @@ impl Architect {
             {
                 slug.push('-');
             }
-            if slug.len() >= 48 { break; }
+            if slug.len() >= 48 {
+                break;
+            }
         }
         let slug = slug.trim_matches('-').to_string();
-        if slug.is_empty() { "untitled-world".into() } else { slug }
+        if slug.is_empty() {
+            "untitled-world".into()
+        } else {
+            slug
+        }
     }
 
     fn encode(value: &str) -> String {
@@ -206,7 +218,9 @@ impl Architect {
     }
 
     fn decode(value: &str) -> Result<String, String> {
-        if value.len() % 2 != 0 { return Err("invalid project string".into()); }
+        if value.len() % 2 != 0 {
+            return Err("invalid project string".into());
+        }
         let mut bytes = Vec::with_capacity(value.len() / 2);
         for pair in value.as_bytes().chunks_exact(2) {
             let hex = std::str::from_utf8(pair).map_err(|e| e.to_string())?;
@@ -218,28 +232,47 @@ impl Architect {
     fn write_project(&self, path: &Path) -> Result<(), String> {
         let mut out = String::from("PWE_ARCHITECT\t1\n");
         out.push_str(&format!("name\t{}\n", Self::encode(&self.project.name)));
-        out.push_str(&format!("source_map\t{}\n", Self::encode(&self.project.source_map)));
+        out.push_str(&format!(
+            "source_map\t{}\n",
+            Self::encode(&self.project.source_map)
+        ));
         for object in &self.project.objects {
             out.push_str(&format!(
                 "object\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
                 Self::encode(&object.asset),
-                object.position[0], object.position[1], object.position[2],
-                object.rotation[0], object.rotation[1], object.rotation[2], object.scale
+                object.position[0],
+                object.position[1],
+                object.position[2],
+                object.rotation[0],
+                object.rotation[1],
+                object.rotation[2],
+                object.scale
             ));
         }
         for stroke in &self.project.strokes {
             out.push_str(&format!(
                 "stroke\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
-                match stroke.mode { BrushMode::Raise => "raise", BrushMode::Lower => "lower", BrushMode::Flatten => "flatten", BrushMode::Smooth => "smooth", BrushMode::Paint => "paint" },
-                stroke.position[0], stroke.position[1], stroke.position[2],
-                stroke.radius, stroke.strength
+                match stroke.mode {
+                    BrushMode::Raise => "raise",
+                    BrushMode::Lower => "lower",
+                    BrushMode::Flatten => "flatten",
+                    BrushMode::Smooth => "smooth",
+                    BrushMode::Paint => "paint",
+                },
+                stroke.position[0],
+                stroke.position[1],
+                stroke.position[2],
+                stroke.radius,
+                stroke.strength
             ));
         }
         let parent = path.parent().ok_or("project path has no parent")?;
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         let temp = path.with_extension("pwa.tmp");
         fs::write(&temp, out).map_err(|e| format!("{}: {e}", temp.display()))?;
-        if path.exists() { fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?; }
+        if path.exists() {
+            fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
         fs::rename(&temp, path).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(())
     }
@@ -259,8 +292,12 @@ impl Architect {
                 "object" if fields.len() == 9 => {
                     let mut n = [0f32; 7];
                     for (slot, value) in n.iter_mut().zip(&fields[2..]) {
-                        *slot = value.parse().map_err(|_| format!("invalid object number on line {}", line_no + 2))?;
-                        if !slot.is_finite() { return Err("non-finite object transform".into()); }
+                        *slot = value.parse().map_err(|_| {
+                            format!("invalid object number on line {}", line_no + 2)
+                        })?;
+                        if !slot.is_finite() {
+                            return Err("non-finite object transform".into());
+                        }
                     }
                     project.objects.push(PlacedObject {
                         asset: Self::decode(fields[1])?,
@@ -271,22 +308,36 @@ impl Architect {
                 }
                 "stroke" if fields.len() == 7 => {
                     let mode = match fields[1] {
-                        "raise" => BrushMode::Raise, "lower" => BrushMode::Lower,
-                        "flatten" => BrushMode::Flatten, "smooth" => BrushMode::Smooth,
-                        "paint" => BrushMode::Paint, _ => return Err("unknown terrain brush".into()),
+                        "raise" => BrushMode::Raise,
+                        "lower" => BrushMode::Lower,
+                        "flatten" => BrushMode::Flatten,
+                        "smooth" => BrushMode::Smooth,
+                        "paint" => BrushMode::Paint,
+                        _ => return Err("unknown terrain brush".into()),
                     };
                     let mut n = [0f32; 5];
                     for (slot, value) in n.iter_mut().zip(&fields[2..]) {
-                        *slot = value.parse().map_err(|_| format!("invalid brush number on line {}", line_no + 2))?;
-                        if !slot.is_finite() { return Err("non-finite terrain brush value".into()); }
+                        *slot = value
+                            .parse()
+                            .map_err(|_| format!("invalid brush number on line {}", line_no + 2))?;
+                        if !slot.is_finite() {
+                            return Err("non-finite terrain brush value".into());
+                        }
                     }
                     project.strokes.push(TerrainStroke {
-                        mode, position: [n[0], n[1], n[2]],
-                        radius: n[3].clamp(0.1, 10000.), strength: n[4].clamp(-10000., 10000.),
+                        mode,
+                        position: [n[0], n[1], n[2]],
+                        radius: n[3].clamp(0.1, 10000.),
+                        strength: n[4].clamp(-10000., 10000.),
                     });
                 }
                 "" => {}
-                _ => return Err(format!("invalid Architect project record on line {}", line_no + 2)),
+                _ => {
+                    return Err(format!(
+                        "invalid Architect project record on line {}",
+                        line_no + 2
+                    ))
+                }
             }
         }
         Ok(project)
@@ -299,8 +350,12 @@ impl Architect {
             return false;
         }
         self.project.name = name.to_string();
-        if self.project.source_map.is_empty() && self.selected_map != "__empty__" { self.project.source_map = self.selected_map.clone(); }
-        let path = self.project_root.join(format!("{}.pwa", Self::safe_slug(name)));
+        if self.project.source_map.is_empty() && self.selected_map != "__empty__" {
+            self.project.source_map = self.selected_map.clone();
+        }
+        let path = self
+            .project_root
+            .join(format!("{}.pwa", Self::safe_slug(name)));
         match self.write_project(&path) {
             Ok(()) => {
                 self.status = format!("Saved project: {}", path.display());
@@ -316,23 +371,44 @@ impl Architect {
     }
 
     fn load_selected(&mut self) {
-        let Some(path) = self.selected_project.and_then(|index| self.project_files.get(index)).cloned() else { return };
+        let Some(path) = self
+            .selected_project
+            .and_then(|index| self.project_files.get(index))
+            .cloned()
+        else {
+            return;
+        };
         match Self::read_project(&path) {
             Ok(project) => {
                 self.project_name = project.name.clone();
-                self.selected_map = if project.source_map.is_empty() { "__empty__".into() } else { project.source_map.clone() };
+                self.selected_map = if project.source_map.is_empty() {
+                    "__empty__".into()
+                } else {
+                    project.source_map.clone()
+                };
                 self.project = project;
                 self.selected_placement = None;
                 self.selected_scene_object = None;
                 self.multi_selection.clear();
-                self.status = format!("Loaded {} ({} placements, {} brush operations).", self.project.name, self.project.objects.len(), self.project.strokes.len());
+                self.status = format!(
+                    "Loaded {} ({} placements, {} brush operations).",
+                    self.project.name,
+                    self.project.objects.len(),
+                    self.project.strokes.len()
+                );
             }
             Err(error) => self.status = format!("Could not load project: {error}"),
         }
     }
 
     fn erase_selected(&mut self) {
-        let Some(path) = self.selected_project.and_then(|index| self.project_files.get(index)).cloned() else { return };
+        let Some(path) = self
+            .selected_project
+            .and_then(|index| self.project_files.get(index))
+            .cloned()
+        else {
+            return;
+        };
         match fs::remove_file(&path) {
             Ok(()) => {
                 self.project = Project::default();
@@ -357,7 +433,12 @@ impl Architect {
 
     fn dock_picker(ui: &mut egui::Ui, dock: &mut Dock) {
         egui::ComboBox::from_id_source(ui.next_auto_id())
-            .selected_text(match dock { Dock::Left => "Dock: Left", Dock::Right => "Dock: Right", Dock::Bottom => "Dock: Bottom", Dock::Floating => "Floating" })
+            .selected_text(match dock {
+                Dock::Left => "Dock: Left",
+                Dock::Right => "Dock: Right",
+                Dock::Bottom => "Dock: Bottom",
+                Dock::Floating => "Floating",
+            })
             .show_ui(ui, |ui| {
                 ui.selectable_value(dock, Dock::Left, "Left");
                 ui.selectable_value(dock, Dock::Right, "Right");
@@ -367,15 +448,26 @@ impl Architect {
     }
 
     fn show_tree(&mut self, ui: &mut egui::Ui, path: &Path, depth: usize, camera: Vec3) {
-        if depth > 12 { return; }
-        let Ok(entries) = fs::read_dir(path) else { return };
+        if depth > 12 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
         let mut entries = entries.flatten().collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
         for entry in entries.into_iter().take(500) {
             let child = entry.path();
-            let Ok(kind) = entry.file_type() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             let label = entry.file_name().to_string_lossy().into_owned();
-            if !self.tree_filter.is_empty() && !label.to_lowercase().contains(&self.tree_filter.to_lowercase()) && !kind.is_dir() {
+            if !self.tree_filter.is_empty()
+                && !label
+                    .to_lowercase()
+                    .contains(&self.tree_filter.to_lowercase())
+                && !kind.is_dir()
+            {
                 continue;
             }
             if kind.is_dir() {
@@ -394,11 +486,17 @@ impl Architect {
                     format!("📄 {label}"),
                 );
                 if response.clicked() {
-                    if child.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pck")) {
+                    if child
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("pck"))
+                    {
                         self.open_archive(child.clone());
                     } else {
                         self.selected_asset = Some(child.to_string_lossy().into_owned());
-                        if self.cursor == CursorMode::Place { self.add_selected_asset_at_camera(camera); }
+                        if self.cursor == CursorMode::Place {
+                            self.add_selected_asset_at_camera(camera);
+                        }
                     }
                 }
                 response.context_menu(|ui| {
@@ -436,7 +534,9 @@ impl Architect {
     }
 
     fn add_selected_asset_at_camera(&mut self, camera: Vec3) {
-        let Some(asset) = self.selected_asset.clone() else { return };
+        let Some(asset) = self.selected_asset.clone() else {
+            return;
+        };
         self.project.objects.push(PlacedObject {
             asset: self.portable_asset_path(&asset),
             position: self.placement_position(camera),
@@ -444,11 +544,15 @@ impl Architect {
             scale: 1.,
         });
         self.selected_placement = Some(self.project.objects.len() - 1);
-        self.status = "Custom placement staged in the project. It is not yet drawn by the world renderer.".into();
+        self.status =
+            "Custom placement staged in the project. It is not yet drawn by the world renderer."
+                .into();
     }
 
     fn duplicate_selected_scene_item(&mut self) {
-        let Some(asset) = self.selected_asset.clone() else { return };
+        let Some(asset) = self.selected_asset.clone() else {
+            return;
+        };
         let position = self.selected_scene_transform.unwrap_or([0.; 3]);
         let portable_asset = self.portable_asset_path(&asset);
         self.project.objects.push(PlacedObject {
@@ -461,21 +565,38 @@ impl Architect {
         self.status = "Selected client scene item copied into the editable project layer.".into();
     }
 
-    fn scene_row(&mut self, ui: &mut egui::Ui, index: usize, label: &str, asset: &str, position: [f32; 3], camera: Vec3) {
-        if !self.object_filter.is_empty() && !label.to_lowercase().contains(&self.object_filter.to_lowercase()) {
+    fn scene_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        label: &str,
+        asset: &str,
+        position: [f32; 3],
+        camera: Vec3,
+    ) {
+        if !self.object_filter.is_empty()
+            && !label
+                .to_lowercase()
+                .contains(&self.object_filter.to_lowercase())
+        {
             return;
         }
-        let selected = self.selected_scene_object == Some(index) || self.multi_selection.contains(&index);
+        let selected =
+            self.selected_scene_object == Some(index) || self.multi_selection.contains(&index);
         if ui.selectable_label(selected, label).clicked() {
             self.selected_asset = Some(asset.to_string());
             self.selected_scene_transform = Some(position);
             if self.cursor == CursorMode::MultiSelect {
-                if !self.multi_selection.insert(index) { self.multi_selection.remove(&index); }
+                if !self.multi_selection.insert(index) {
+                    self.multi_selection.remove(&index);
+                }
             } else {
                 self.selected_scene_object = Some(index);
                 self.multi_selection.clear();
             }
-            if self.cursor == CursorMode::Place { self.add_selected_asset_at_camera(camera); }
+            if self.cursor == CursorMode::Place {
+                self.add_selected_asset_at_camera(camera);
+            }
         }
     }
 
@@ -489,7 +610,11 @@ impl Architect {
         match result {
             Ok(entries) => {
                 self.archive_entries = entries.into_iter().map(|entry| entry.name).collect();
-                self.status = format!("Indexed {} archive entries from {}.", self.archive_entries.len(), path.display());
+                self.status = format!(
+                    "Indexed {} archive entries from {}.",
+                    self.archive_entries.len(),
+                    path.display()
+                );
             }
             Err(error) => self.archive_error = Some(error),
         }
@@ -504,17 +629,33 @@ impl Architect {
     fn toolbar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("architect_toolbar")
             .exact_height(46.)
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(27, 31, 39)).inner_margin(egui::Margin::symmetric(8., 5.)))
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(27, 31, 39))
+                    .inner_margin(egui::Margin::symmetric(8., 5.)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("ARCHITECT").strong().color(egui::Color32::from_rgb(120, 190, 255)));
+                    ui.label(
+                        egui::RichText::new("ARCHITECT")
+                            .strong()
+                            .color(egui::Color32::from_rgb(120, 190, 255)),
+                    );
                     ui.separator();
                     ui.selectable_value(&mut self.cursor, CursorMode::Select, "Select");
                     ui.selectable_value(&mut self.cursor, CursorMode::MultiSelect, "Multi-select");
                     ui.selectable_value(&mut self.cursor, CursorMode::Place, "Place");
                     ui.separator();
                     egui::ComboBox::from_id_source("architect_snap")
-                        .selected_text(format!("Snap: {}", match self.snap { SnapMode::Off => "Off", SnapMode::Terrain => "Terrain", SnapMode::Objects => "Objects", SnapMode::Smart => "Smart" }))
+                        .selected_text(format!(
+                            "Snap: {}",
+                            match self.snap {
+                                SnapMode::Off => "Off",
+                                SnapMode::Terrain => "Terrain",
+                                SnapMode::Objects => "Objects",
+                                SnapMode::Smart => "Smart",
+                            }
+                        ))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.snap, SnapMode::Off, "Off");
                             ui.selectable_value(&mut self.snap, SnapMode::Terrain, "Terrain");
@@ -524,7 +665,13 @@ impl Architect {
                     ui.separator();
                     ui.label("Terrain");
                     egui::ComboBox::from_id_source("architect_brush")
-                        .selected_text(match self.brush { BrushMode::Raise => "Raise", BrushMode::Lower => "Lower", BrushMode::Flatten => "Flatten", BrushMode::Smooth => "Smooth", BrushMode::Paint => "Paint" })
+                        .selected_text(match self.brush {
+                            BrushMode::Raise => "Raise",
+                            BrushMode::Lower => "Lower",
+                            BrushMode::Flatten => "Flatten",
+                            BrushMode::Smooth => "Smooth",
+                            BrushMode::Paint => "Paint",
+                        })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.brush, BrushMode::Raise, "Raise");
                             ui.selectable_value(&mut self.brush, BrushMode::Lower, "Lower");
@@ -533,9 +680,21 @@ impl Architect {
                             ui.selectable_value(&mut self.brush, BrushMode::Paint, "Paint");
                         });
                     ui.add(egui::Slider::new(&mut self.brush_radius, 1.0..=250.0).text("Radius"));
-                    ui.add(egui::Slider::new(&mut self.brush_strength, 0.1..=20.0).text("Strength"));
+                    ui.add(
+                        egui::Slider::new(&mut self.brush_strength, 0.1..=20.0).text("Strength"),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new(egui::RichText::new("Turn off Architect").strong().color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(165, 45, 45))).clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Turn off Architect")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(165, 45, 45)),
+                            )
+                            .clicked()
+                        {
                             self.enabled = false;
                         }
                     });
@@ -553,8 +712,12 @@ impl Architect {
         ornaments: &[crate::scene::Ornament],
         camera: Vec3,
     ) -> Option<String> {
-        if !self.enabled { return None; }
-        if self.selected_map.is_empty() { self.selected_map = current_map.id.clone(); }
+        if !self.enabled {
+            return None;
+        }
+        if self.selected_map.is_empty() {
+            self.selected_map = current_map.id.clone();
+        }
         self.toolbar(ctx);
         let screen = ctx.input(|input| input.screen_rect());
         let mut map_request = None;
@@ -568,7 +731,9 @@ impl Architect {
             .default_size(egui::vec2(290., 560.))
             .min_size(egui::vec2(240., 300.))
             .resizable(true);
-        if world_dock_changed { world_panel = world_panel.current_pos(world_pos); }
+        if world_dock_changed {
+            world_panel = world_panel.current_pos(world_pos);
+        }
         world_panel.show(ctx, |ui| {
                 ui.horizontal(|ui| { ui.heading("World selector"); Self::dock_picker(ui, &mut self.left_dock); });
                 ui.label(egui::RichText::new(format!("Loaded: {} ({})", current_map.display_name, current_map.id)).small().weak());
@@ -666,7 +831,9 @@ impl Architect {
             .default_size(egui::vec2(340., 600.))
             .min_size(egui::vec2(250., 300.))
             .resizable(true);
-        if asset_dock_changed { asset_panel = asset_panel.current_pos(asset_pos); }
+        if asset_dock_changed {
+            asset_panel = asset_panel.current_pos(asset_pos);
+        }
         asset_panel.show(ctx, |ui| {
                 ui.horizontal(|ui| { ui.heading("Client explorer"); Self::dock_picker(ui, &mut self.right_dock); });
                 ui.label(egui::RichText::new("Loose client files are browsed lazily. Select a PCK archive to index its internal asset paths on demand.").small().weak());
@@ -723,31 +890,77 @@ impl Architect {
                     ui.checkbox(&mut self.show_scene_objects, "Show");
                 });
                 if self.show_scene_objects {
-                    ui.label(format!("{} blocks · {} trees · {} placed models · {} scenery assets · {} effects",
+                    ui.label(format!(
+                        "{} blocks · {} trees · {} placed models · {} scenery assets · {} effects",
                         scene.blocks.len(),
                         scene.blocks.iter().map(|b| b.trees.len()).sum::<usize>(),
                         scene.blocks.iter().map(|b| b.models.len()).sum::<usize>(),
                         ornaments.len(),
-                        scene.blocks.iter().map(|b| b.effects.len()).sum::<usize>()));
+                        scene.blocks.iter().map(|b| b.effects.len()).sum::<usize>()
+                    ));
                     ui.text_edit_singleline(&mut self.object_filter);
-                    egui::ScrollArea::vertical().max_height(270.).show(ui, |ui| {
-                        let mut index = 0usize;
-                        for block in &scene.blocks {
-                            for model in &block.models {
-                                let label = format!("Model {} · {}", model.export_id, model.path);
-                                self.scene_row(ui, index, &label, &model.path, model.position, camera);
-                                index += 1;
-                            }
-                            for tree in &block.trees {
-                                if let Some(kind) = scene.tree_types.get(tree.tree_type as usize) {
-                                    let label = format!("Tree {} · {}", tree.tree_type, kind.tree);
-                                    self.scene_row(ui, index, &label, &kind.tree, tree.position, camera);
+                    egui::ScrollArea::vertical()
+                        .max_height(270.)
+                        .show(ui, |ui| {
+                            let mut index = 0usize;
+                            for block in &scene.blocks {
+                                for model in &block.models {
+                                    let label =
+                                        format!("Model {} · {}", model.export_id, model.path);
+                                    self.scene_row(
+                                        ui,
+                                        index,
+                                        &label,
+                                        &model.path,
+                                        model.position,
+                                        camera,
+                                    );
                                     index += 1;
-                                    if !kind.composite.is_empty() {
-                                        let composite = format!("Tree composite {} · {}", tree.tree_type, kind.composite);
-                                        self.scene_row(ui, index, &composite, &kind.composite, tree.position, camera);
+                                }
+                                for tree in &block.trees {
+                                    if let Some(kind) =
+                                        scene.tree_types.get(tree.tree_type as usize)
+                                    {
+                                        let label =
+                                            format!("Tree {} · {}", tree.tree_type, kind.tree);
+                                        self.scene_row(
+                                            ui,
+                                            index,
+                                            &label,
+                                            &kind.tree,
+                                            tree.position,
+                                            camera,
+                                        );
                                         index += 1;
+                                        if !kind.composite.is_empty() {
+                                            let composite = format!(
+                                                "Tree composite {} · {}",
+                                                tree.tree_type, kind.composite
+                                            );
+                                            self.scene_row(
+                                                ui,
+                                                index,
+                                                &composite,
+                                                &kind.composite,
+                                                tree.position,
+                                                camera,
+                                            );
+                                            index += 1;
+                                        }
                                     }
+                                }
+                                for effect in &block.effects {
+                                    let label =
+                                        format!("Effect {} · {}", effect.export_id, effect.path);
+                                    self.scene_row(
+                                        ui,
+                                        index,
+                                        &label,
+                                        &effect.path,
+                                        effect.position,
+                                        camera,
+                                    );
+                                    index += 1;
                                 }
                             }
                             for effect in &block.effects {
