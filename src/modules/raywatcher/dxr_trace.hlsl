@@ -1851,9 +1851,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         if (restir_current.radiance_m.w > 0.0 && selected_target > 1e-5) {
             float normalisation = restir_current.sample_pos_weight.w
                 / max(restir_current.radiance_m.w * selected_target, 1e-5);
-            // GI candidates already contain the receiver cosine from the traced path.
-            // Applying it again here would bias the reservoir estimator dark.
-            accum_gi = restir_current.radiance_m.xyz * (normalisation * float(samples));
+            // The path sample stores Li * BRDF / pdf, where cosine cancels
+            // against the cosine-hemisphere proposal. ReSTIR's target still
+            // contains cos(theta), so restore it in the selected integrand here.
+            accum_gi = restir_current.radiance_m.xyz * (normalisation * float(samples) * selected_cosine);
         } else {
             accum_gi = float3(0.0, 0.0, 0.0);
         }

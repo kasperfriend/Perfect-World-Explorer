@@ -2111,10 +2111,12 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         if (restir_current.radiance_m.w > 0.0 && selected_target > 1e-5) {
             let normalisation = restir_current.sample_pos_weight.w
                 / max(restir_current.radiance_m.w * selected_target, 1e-5);
-            // The stored candidate is already the full path contribution (including
-            // the receiver cosine). Do not multiply by cosine a second time.
+            // The path sample stores the cosine-weighted Monte Carlo estimate
+            // (Li * BRDF / pdf), which has the receiver cosine cancelled by the
+            // cosine-hemisphere proposal. ReSTIR's target still contains cos(theta),
+            // so restore it in the selected integrand before dividing by that target.
             let gi_estimate = restir_current.radiance_m.xyz * normalisation;
-            accum_gi = gi_estimate * f32(samples);
+            accum_gi = gi_estimate * (f32(samples) * selected_cosine);
         } else {
             accum_gi = vec3<f32>(0.0);
         }
@@ -5834,6 +5836,34 @@ mod shader_optimization_regression_tests {
         ));
         assert!(dxr.contains(
             "(1.0 - smoothstep(40.0, 220.0, dist)) * 0.50"
+        ));
+    }
+
+    #[test]
+    fn restir_gi_reconstructs_the_cosine_weighted_integrand_without_grazing_blowup() {
+        let dxr = include_str!("dxr_trace.hlsl");
+        let radiance = glam::Vec3::new(0.8, 0.35, 0.12);
+        let luminance = radiance.dot(glam::Vec3::new(0.2126, 0.7152, 0.0722));
+
+        // One candidate: W = target / proposal_pdf, with both target and
+        // proposal containing cos(theta). The selected integrand must restore
+        // that cosine before the 1 / target normalisation is applied.
+        for cosine in [1.0_f32, 0.5, 0.1, 0.01, 0.001] {
+            let target = luminance * cosine;
+            let candidate_weight = target / cosine;
+            let normalisation = candidate_weight / target;
+            let estimate = radiance * (normalisation * cosine);
+            assert!(
+                (estimate - radiance).length() < 1e-4,
+                "cosine {cosine} changed an otherwise identical one-candidate estimate: {estimate:?}"
+            );
+        }
+
+        assert!(RAY_SHADER.contains(
+            "accum_gi = gi_estimate * (f32(samples) * selected_cosine);"
+        ));
+        assert!(dxr.contains(
+            "normalisation * float(samples) * selected_cosine"
         ));
     }
 
