@@ -494,7 +494,9 @@ impl Scan {
             return exe.label();
         }
         let version = self.game_version();
-        if version.starts_with("unknown game version") || version == "no executable" {
+        if version.starts_with("Version is guessed:") {
+            version
+        } else if version.starts_with("unknown game version") || version == "no executable" {
             exe.label()
         } else {
             format!("unverified build {version}")
@@ -2224,6 +2226,18 @@ mod tests {
                 "elements v{elements}/tasks v{tasks}: {}",
                 scan.report()
             );
+            if expected.starts_with("Version is guessed:") {
+                assert!(
+                    scan.headline().contains(expected),
+                    "headline should show the concise guess: {}",
+                    scan.headline()
+                );
+                assert!(
+                    !scan.headline().contains("unverified build Version is guessed:"),
+                    "do not wrap the concise label in another prefix: {}",
+                    scan.headline()
+                );
+            }
             fs::remove_dir_all(root).unwrap();
         }
     }
