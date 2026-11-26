@@ -292,11 +292,11 @@ impl Architect {
         Ok(project)
     }
 
-    fn save_named(&mut self) {
+    fn save_named(&mut self) -> bool {
         let name = self.project_name.trim();
         if name.is_empty() {
             self.status = "Enter a name before saving.".into();
-            return;
+            return false;
         }
         self.project.name = name.to_string();
         if self.project.source_map.is_empty() && self.selected_map != "__empty__" { self.project.source_map = self.selected_map.clone(); }
@@ -306,8 +306,12 @@ impl Architect {
                 self.status = format!("Saved project: {}", path.display());
                 self.refresh_projects();
                 self.selected_project = self.project_files.iter().position(|p| p == &path);
+                true
             }
-            Err(error) => self.status = format!("Save failed: {error}"),
+            Err(error) => {
+                self.status = format!("Save failed: {error}");
+                false
+            }
         }
     }
 
@@ -580,12 +584,15 @@ impl Architect {
                     });
                 if self.selected_map == "__empty__" {
                     ui.label(egui::RichText::new("Empty project: the current loaded world remains a reference viewport; no client map data is modified.").small().weak());
-                } else if ui.button("Load selected client map").clicked() && !self.selected_map.eq_ignore_ascii_case(&current_map.id) {
-                    if !self.project.objects.is_empty() || !self.project.strokes.is_empty() {
-                        if self.project_name.trim().is_empty() { self.project_name = "Untitled World".into(); }
-                        self.save_named();
+                } else if self.selected_map.eq_ignore_ascii_case(&current_map.id) {
+                    if ui.button("Use loaded map as project source").clicked() {
+                        self.project.source_map = current_map.id.clone();
+                        self.status = format!("Project source set to {}. The client map remains unchanged.", current_map.display_name);
                     }
-                    map_request = Some(self.selected_map.clone());
+                } else if ui.button("Load selected client map").clicked() {
+                    let needs_save = !self.project.objects.is_empty() || !self.project.strokes.is_empty();
+                    let saved = !needs_save || self.save_named();
+                    if saved { map_request = Some(self.selected_map.clone()); }
                 }
                 ui.separator();
                 if ui.button("＋ New empty world project").clicked() {
@@ -626,7 +633,7 @@ impl Architect {
                 ui.separator();
                 ui.heading("Save current world as custom");
                 ui.text_edit_singleline(&mut self.project_name);
-                if ui.button("Save custom world").clicked() { self.save_named(); }
+                if ui.button("Save custom world").clicked() { let _ = self.save_named(); }
                 if ui.add(egui::Button::new("Clear current project edits…").fill(egui::Color32::from_rgb(135, 42, 42))).clicked() { self.confirm_clear = true; }
                 if self.confirm_clear {
                     ui.colored_label(egui::Color32::LIGHT_RED, "Clear every unsaved placement and terrain operation in this project?");
