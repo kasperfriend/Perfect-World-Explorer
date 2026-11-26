@@ -125,7 +125,9 @@ pub fn probe_offline(sdk_dir: &Path, platform_supported: bool) -> (Probe, Probe)
     }
 
     let cache = OFFLINE_PROBES.get_or_init(|| Mutex::new(OfflineProbeCache::default()));
-    let mut state = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(&presence) = state.ready.get(sdk_dir) {
         return probes_from_presence(sdk_dir, presence);
     }
@@ -138,7 +140,9 @@ pub fn probe_offline(sdk_dir: &Path, platform_supported: bool) -> (Probe, Probe)
             .spawn(move || {
                 let probes = probe_offline_now(&path, true);
                 let presence = (probes.0.available, probes.1.available);
-                let mut state = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut state = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 state.ready.insert(path.clone(), presence);
                 state.pending.remove(&path);
             });
