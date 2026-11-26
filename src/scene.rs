@@ -161,6 +161,7 @@ pub struct Block {
     pub beziers: Vec<Reference>,
     pub sounds: Vec<Sound>,
 }
+#[derive(Clone)]
 pub struct Scene {
     pub width: f32,
     pub length: f32,
