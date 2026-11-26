@@ -546,12 +546,23 @@ impl LightingRecord {
         }
     }
 
-    /// The environment radiance a ray sees when it escapes the world: fog at
-    /// infinity when the map has fog, the sky tint otherwise. This is what
-    /// makes reflections of the horizon line up with the raster horizon.
+    /// The environment radiance a ray sees when it escapes the world: the
+    /// authored fog horizon when fog is enabled, otherwise the unfogged sky
+    /// ambient. Fog colours are stored in the client's encoded sRGB space.
     pub fn environment(self) -> Vec3 {
-        self.fog_colour.max(self.ambient * 0.85)
+        if self.fog_range.1 > self.fog_range.0 {
+            srgb_to_linear(self.fog_colour).max(self.ambient * 0.85)
+        } else {
+            self.ambient * 0.85
+        }
     }
+}
+
+fn srgb_to_linear(encoded: Vec3) -> Vec3 {
+    encoded.map(|v| {
+        let v = v.max(0.0);
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    })
 }
 
 fn region_direction(light: &crate::environment::RegionalLight) -> Option<Vec3> {
@@ -873,9 +884,12 @@ mod tests {
         let mut record = lighting();
         record.ambient = Vec3::ZERO;
         record.fog_colour = Vec3::ZERO;
-        assert!(record.environment().length() >= 0.);
+        record.fog_range = (0.0, 0.0);
+        assert_eq!(record.environment(), Vec3::ZERO);
         record.fog_colour = Vec3::new(0.6, 0.7, 0.9);
-        assert!(record.environment().z > 0.5);
+        assert_eq!(record.environment(), Vec3::ZERO, "disabled fog must not tint sky misses");
+        record.fog_range = (0.0, 400.0);
+        assert!(record.environment().z > 0.5, "enabled fog supplies the horizon radiance");
     }
 
     #[test]
