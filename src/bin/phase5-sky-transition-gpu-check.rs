@@ -527,30 +527,29 @@ fn main() {
     }
     assert_eq!(machine.counter(), counter, "a view advanced the transition");
 
-    // Regression for the reported displaced red sun halo. Feed deliberately
-    // off-centre art through the production bright-core helper AND shader.
-    // Green identifies the disc and red identifies the glow independently.
-    let disc = image::RgbaImage::from_fn(W, H, |x, y| {
+    // Regression: the sun and moon discs remain visible, but the legacy
+    // shine-strip and flare atlas layers must make no contribution.
+    let sun_disc = image::RgbaImage::from_fn(W, H, |x, y| {
         image::Rgba([
             0,
-            if (24..40).contains(&x) && (24..40).contains(&y) {
-                255
-            } else {
-                0
-            },
+            if (24..40).contains(&x) && (24..40).contains(&y) { 255 } else { 0 },
             0,
             255,
         ])
     });
-    let glow = image::RgbaImage::from_fn(W, H, |x, y| {
+    let moon_disc = image::RgbaImage::from_fn(W, H, |x, y| {
         image::Rgba([
-            if (30..34).contains(&x) && (46..50).contains(&y) {
-                255
-            } else if y > 56 {
-                10
-            } else {
-                0
-            },
+            0,
+            0,
+            if (24..40).contains(&x) && (24..40).contains(&y) { 255 } else { 0 },
+            255,
+        ])
+    });
+    // Deliberately bright red legacy effects: any accidental sampling of the
+    // old sunshine, moon halo, or flare layers becomes an unmistakable red pixel.
+    let removed_celestial_effect = image::RgbaImage::from_fn(W, H, |x, y| {
+        image::Rgba([
+            if (18..46).contains(&x) && (18..46).contains(&y) { 255 } else { 0 },
             0,
             0,
             255,
@@ -559,19 +558,16 @@ fn main() {
     let black = image::RgbaImage::new(W, H);
     for layer in 0..LAYERS {
         let image = match layer {
-            9 => &disc,
-            11 => &glow,
+            9 => &sun_disc,
+            10 => &moon_disc,
+            11..=14 => &removed_celestial_effect,
             _ => &black,
         };
         queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &sky,
                 mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: layer,
-                },
+                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
                 aspect: wgpu::TextureAspect::All,
             },
             image.as_raw(),
@@ -587,8 +583,11 @@ fn main() {
             },
         );
     }
+    let channel_peak = |pixels: &[u8], channel: usize| {
+        pixels.chunks_exact(4).map(|p| p[channel]).max().unwrap()
+    };
     let core_center = |pixels: &[u8], channel: usize| {
-        let peak = pixels.chunks_exact(4).map(|p| p[channel]).max().unwrap() as f32;
+        let peak = channel_peak(pixels, channel) as f32;
         assert!(peak > 0., "missing celestial channel {channel}");
         let mut sum = [0f32; 3];
         for (i, p) in pixels.chunks_exact(4).enumerate() {
@@ -602,7 +601,6 @@ fn main() {
     let el = 0.4f32;
     let az = -0.5f32;
     let sun = Vec3::new(az.cos() * el.cos(), el.sin(), az.sin() * el.cos());
-    let lookup = sky_gpu::glow_lookup_center(&disc, &glow);
     for mirrored in [false, true] {
         for pitch in [-0.025f32, 0., 0.025] {
             let direction = (sun + Vec3::Y * pitch).normalize();
@@ -612,14 +610,6 @@ fn main() {
                 direction
             };
             let view = Mat4::look_to_rh(Vec3::ZERO, direction, Vec3::Y);
-            // 60 degrees, not the 20 the other checks use: the sun's quad hangs
-            // from the emitted point (`template_hang`), so at night strength
-            // 0.45 its centre sits `atan(19 / 100)` = 10.76 degrees below the
-            // camera axis and the disc spans 21.5 degrees, with the shine strip
-            // hanging with it. A 20-degree frame clips both, and the half-peak
-            // centroid of a clipped disc is not the disc's core, so the two
-            // cores would disagree for a reason that has nothing to do with the
-            // shader.
             let projection = Mat4::from_scale(Vec3::new(-1., 1., 1.))
                 * Mat4::perspective_rh(60f32.to_radians(), 1., 1., 16000.);
             let inv = (projection * view).inverse();
@@ -628,54 +618,46 @@ fn main() {
             } else {
                 inv
             };
-            let mut params = uniform(inv, (0., 0., 0.));
-            params[20..24].copy_from_slice(&[1., el, az, 1.]);
-            params[28..32].fill(0.);
-            // Night strength 0.45 sits inside the recovered shine window, so the
-            // strip is drawn at half strength and the sun swells by `1 + 2n`.
-            params[39] = 0.45;
-            params[40..44].copy_from_slice(&lookup);
-            let pixels = render(
-                &device,
-                &queue,
-                &pipeline,
-                &layout,
-                &sky_view,
-                &sampler,
-                &roof_sampler,
-                &t,
-                &params,
+
+            // Sun disc: it must render, and none of the red legacy effect
+            // textures (layers 11..14) may leak into the output.
+            let mut sun_params = uniform(inv, (0., 0., 0.));
+            sun_params[20..24].copy_from_slice(&[1., el, az, 1.]);
+            sun_params[24..28].fill(0.);
+            sun_params[28..32].fill(0.);
+            sun_params[39] = 0.45;
+            sun_params[40..44].fill(0.);
+            let sun_pixels = render(
+                &device, &queue, &pipeline, &layout, &sky_view,
+                &sampler, &roof_sampler, &t, &sun_params,
             );
+            assert!(channel_peak(&sun_pixels, 1) > 0,
+                "missing sun disc: mirrored={mirrored}, pitch={pitch}");
+            let sun_center = core_center(&sun_pixels, 1);
+            assert_eq!(channel_peak(&sun_pixels, 0), 0,
+                "removed sun/moon glow or flare layers still contribute red: mirrored={mirrored}, pitch={pitch}");
+
+            // Moon disc: switch off the sun and activate only the moon lane.
+            let mut moon_params = sun_params;
+            moon_params[20..24].fill(0.);
+            moon_params[24..28].copy_from_slice(&[1., el, az, 0.]);
+            let moon_pixels = render(
+                &device, &queue, &pipeline, &layout, &sky_view,
+                &sampler, &roof_sampler, &t, &moon_params,
+            );
+            assert!(channel_peak(&moon_pixels, 2) > 0,
+                "missing moon disc: mirrored={mirrored}, pitch={pitch}");
+            let moon_center = core_center(&moon_pixels, 2);
+            assert_eq!(channel_peak(&moon_pixels, 0), 0,
+                "removed sun/moon glow or flare layers still contribute red: mirrored={mirrored}, pitch={pitch}");
             assert!(
-                pixels.chunks_exact(4).any(|p| p[1] > 0),
-                "missing sun disc: mirrored={mirrored}, pitch={pitch}"
+                sun_center[0].is_finite() && sun_center[1].is_finite()
+                    && moon_center[0].is_finite() && moon_center[1].is_finite(),
+                "celestial disc centroid is not finite"
             );
-            let d = core_center(&pixels, 1);
-            let g = core_center(&pixels, 0);
-            assert!((d[0]-g[0]).abs()<1.25 && (d[1]-g[1]).abs()<1.25,
-                "sun/glow cores misaligned: disc={d:?}, glow={g:?}, mirrored={mirrored}, pitch={pitch}");
-            if !mirrored && pitch == 0. {
-                params[40..44].copy_from_slice(&[0.5; 4]);
-                let broken = render(
-                    &device,
-                    &queue,
-                    &pipeline,
-                    &layout,
-                    &sky_view,
-                    &sampler,
-                    &roof_sampler,
-                    &t,
-                    &params,
-                );
-                let old = core_center(&broken, 0);
-                assert!(
-                    (old[1] - d[1]).abs() > 8.,
-                    "fixture must expose the old downward glow displacement"
-                );
-            }
         }
     }
-    println!("sun/glow bright-core alignment: 6/6 production renders passed across pitch and reflected views; uncorrected fixture exposes displacement");
+    println!("sun/moon disc-only rendering: 12/12 production renders passed across pitch and reflected views; removed glow/flare layers contributed no pixels");
 
     // Empty terrain must reveal the authored fog, not the sky texture's pale
     // bottom row. All pixels face down so this also catches double encoding.
