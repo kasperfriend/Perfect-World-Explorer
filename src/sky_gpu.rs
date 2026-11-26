@@ -159,8 +159,8 @@ struct Uniform {
     /// set crossfade of `sky_transition` rides here (P5.07): both indices name
     /// one whole three-texture set in the same array.
     sets: [f32; 4],
-    /// `xy` the glow art's own bright-core lookup offset (`glow_lookup_center`),
-    /// `zw` the sun's screen position in NDC for the flare chain.
+    /// `xy` the sunshine art's bright-core lookup offset,
+    /// `zw` the sun's screen position in NDC for the lens-flare chain.
     glow_center: [f32; 4],
     moon_glow: [f32; 4],
     /// `xy` the stage-0 sky texture-matrix translation, `z` the NDC height of
@@ -233,7 +233,6 @@ fn luminous_center(image: &image::RgbaImage) -> [f32; 2] {
     ]
 }
 
-
 fn alpha_center(image: &image::RgbaImage) -> [f32; 2] {
     let mut sum = [0.0f64; 3];
     for (x, y, pixel) in image.enumerate_pixels() {
@@ -252,10 +251,7 @@ fn alpha_center(image: &image::RgbaImage) -> [f32; 2] {
 }
 
 /// Align the larger moon halo's bright core with the painted moon alpha centre.
-pub(crate) fn moon_halo_uv_offset(
-    moon: &image::RgbaImage,
-    halo: &image::RgbaImage,
-) -> [f32; 2] {
+pub(crate) fn moon_halo_uv_offset(moon: &image::RgbaImage, halo: &image::RgbaImage) -> [f32; 2] {
     let moon_core = alpha_center(moon);
     let halo_core = luminous_center(halo);
     let ratio = 1.0 / 1.5;
@@ -469,13 +465,9 @@ fn celestial(color:vec3<f32>,d:vec3<f32>,params:vec4<f32>,disc:i32,glow:i32,nigh
    }
   }
  }
- // The moon draws no halo quad. Every retail moon halo comes from the flare
- // chain (`moonflare.bmp` through the `0x786840` accumulation target), which the
- // moon's own render block never touches, and drawing `moonflare.bmp`
- // concentrically at the recovered 40-unit quad was a viewer invention. It also
- // produced a second, smaller glowing disc inside the moon: `moon.tga`'s art does
- // not sit at the centre of its own quad (alpha bbox 11..438 x 69..493 of 512),
- // so a centred halo lands off the painted disc.
+ // The requested moon halo is a separate radial sprite, sized at 1.5x the
+ // moon disc. Its sampling offset follows moon.tga's authored alpha centroid,
+ // so transparent padding does not pull the halo away from the painted moon.
  // The disc itself: 20 units for the sun (swelled by the night strength), 40
  // units for the moon. Both native templates start at `y == 0` and run down to
  // `-2 * half`, so the emitted point is the quad's *top edge* and the centre
@@ -1046,7 +1038,12 @@ impl SkyGpu {
                     // hour blend untouched until `begin_frame` uploads a frame.
                     sets: [0., 0., 0., 12.],
                     glow_center,
-                    moon_glow: [moon_halo_offset[0], moon_halo_offset[1], if glow_layers[1] { 1. } else { 0. }, 0.],
+                    moon_glow: [
+                        moon_halo_offset[0],
+                        moon_halo_offset[1],
+                        if glow_layers[1] { 1. } else { 0. },
+                        0.,
+                    ],
                     // No rotation until `begin_frame` uploads the first frame:
                     // the sphere's angles start at zero in the client too
                     // (`0x7995e0` clears +0x10..+0x18).
@@ -1678,7 +1675,6 @@ mod reflection_tests {
         assert_eq!(luminous_center(&img), [3.5 / 8., 5.5 / 8.]);
         assert_eq!(luminous_center(&image::RgbaImage::new(8, 8)), [0.5; 2]);
     }
-
 
     #[test]
     fn moon_halo_uv_offset_tracks_the_painted_alpha_centre() {
