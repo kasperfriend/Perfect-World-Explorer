@@ -2209,9 +2209,9 @@ mod tests {
         );
         // A texture that becomes available on the next frame must not trigger a
         // second archive read immediately; the failed path is on cooldown.
-        let mut present_attempts = 0;
+        let present_attempts = std::cell::Cell::new(0);
         let mut present = |_: &str| -> Result<Vec<u8>, String> {
-            present_attempts += 1;
+            present_attempts.set(present_attempts.get() + 1);
             let mut bytes = vec![0; 18];
             bytes[2] = 2;
             bytes[12..14].copy_from_slice(&1u16.to_le_bytes());
@@ -2232,7 +2232,7 @@ mod tests {
             &mut present,
         )
         .unwrap();
-        assert_eq!(present_attempts, 0, "failed paths are not retried each frame");
+        assert_eq!(present_attempts.get(), 0, "failed paths are not retried each frame");
         assert!(draw.buckets.values().next().unwrap().bound_fallback);
 
         // When the retry window arrives, the archive answers and replaces the
@@ -2252,7 +2252,7 @@ mod tests {
             &mut present,
         )
         .unwrap();
-        assert_eq!(present_attempts, 1);
+        assert_eq!(present_attempts.get(), 1);
         assert!(
             !draw.buckets.values().next().unwrap().bound_fallback,
             "a texture that loads after failing must replace the placeholder binding"
