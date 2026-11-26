@@ -560,6 +560,44 @@ mod tests {
         assert!(select(&emitters, &spatial, [f32::NAN, 0., 0.], 0., 0.).is_empty());
     }
     #[test]
+    fn spatial_selection_matches_full_scan_for_short_and_long_ranges() {
+        let mut emitters = Vec::new();
+        for z in -12..=12 {
+            for x in -12..=12 {
+                let mut e = emitter([x as f32 * 173.0, (x - z) as f32 * 3.0, z as f32 * 191.0], 2);
+                e.sound.max_distance = match (x + z).rem_euclid(4) {
+                    0 => 64.0,
+                    1 => 256.0,
+                    2 => 512.0,
+                    _ => 900.0,
+                };
+                e.sound.min_distance = 5.0;
+                emitters.push(e);
+            }
+        }
+        let indexed = SpatialIndex::new(&emitters);
+        let full_scan = SpatialIndex {
+            cells: HashMap::new(),
+            global: (0..emitters.len()).collect(),
+        };
+        for pos in [
+            [0.0, 0.0, 0.0],
+            [512.0, 8.0, -512.0],
+            [-1100.0, 30.0, 900.0],
+            [2200.0, -10.0, 1700.0],
+        ] {
+            let a = select(&emitters, &indexed, pos, 0.73, 0.0);
+            let b = select(&emitters, &full_scan, pos, 0.73, 0.0);
+            assert_eq!(a.len(), b.len());
+            for (a, b) in a.iter().zip(&b) {
+                assert_eq!(a.index, b.index);
+                assert_eq!(a.gain.to_bits(), b.gain.to_bits());
+                assert_eq!(a.pan.to_bits(), b.pan.to_bits());
+            }
+        }
+    }
+
+    #[test]
     fn spatial_index_keeps_nearby_short_range_and_all_long_range_emitters() {
         let emitters = vec![
             emitter([510., 0., 0.], 2),
