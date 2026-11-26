@@ -123,7 +123,7 @@ impl Architect {
             project_files: Vec::new(),
             project_name: "Untitled World".into(),
             selected_project: None,
-            selected_map: "world".into(),
+            selected_map: "__empty__".into(),
             cursor: CursorMode::Select,
             snap: SnapMode::Smart,
             brush: BrushMode::Raise,
@@ -581,12 +581,17 @@ impl Architect {
                 if self.selected_map == "__empty__" {
                     ui.label(egui::RichText::new("Empty project: the current loaded world remains a reference viewport; no client map data is modified.").small().weak());
                 } else if ui.button("Load selected client map").clicked() && !self.selected_map.eq_ignore_ascii_case(&current_map.id) {
+                    if !self.project.objects.is_empty() || !self.project.strokes.is_empty() {
+                        if self.project_name.trim().is_empty() { self.project_name = "Untitled World".into(); }
+                        self.save_named();
+                    }
                     map_request = Some(self.selected_map.clone());
                 }
                 ui.separator();
                 if ui.button("＋ New empty world project").clicked() {
                     self.project = Project::default();
                     self.project_name = "Untitled World".into();
+                    self.selected_map = "__empty__".into();
                     self.selected_project = None;
                     self.selected_placement = None;
                     self.selected_scene_object = None;
