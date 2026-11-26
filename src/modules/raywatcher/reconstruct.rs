@@ -18,7 +18,17 @@
 //! denoiser keeps running. Nothing here is on the critical path of a frame that
 //! does not select it.
 
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+#[derive(Default)]
+struct OfflineProbeCache {
+    ready: HashMap<PathBuf, (bool, bool)>,
+    pending: HashSet<PathBuf>,
+}
+
+static OFFLINE_PROBES: OnceLock<Mutex<OfflineProbeCache>> = OnceLock::new();
 
 /// Which provider a frame will use. Mirrors
 /// [`super::plan::RayReconstruction`] but keeps the module's own vocabulary out
@@ -75,22 +85,72 @@ pub fn dll_present(sdk_dir: &Path, dll: &str) -> bool {
 /// separate from context creation: a DLL can be present and the adapter still
 /// refuse the feature, which is the case the plan's `reconstruction_available`
 /// predicate re-checks once a device exists.
-pub fn probe_offline(sdk_dir: &Path, platform_supported: bool) -> (Probe, Probe) {
-    if !platform_supported {
-        let note = "Windows + DX12 only".to_string();
-        return (Probe::unavailable(note.clone()), Probe::unavailable(note));
-    }
-    let dlss = if dll_present(sdk_dir, DLSS_RR_DLL) {
+fn probes_from_presence(sdk_dir: &Path, (dlss, fsr): (bool, bool)) -> (Probe, Probe) {
+    let dlss = if dlss {
         Probe::available(format!("{DLSS_RR_DLL} found"))
     } else {
         Probe::unavailable(format!("{DLSS_RR_DLL} not found in {}", sdk_dir.display()))
     };
-    let fsr = if dll_present(sdk_dir, FSR_RR_DLL) {
+    let fsr = if fsr {
         Probe::available(format!("{FSR_RR_DLL} found"))
     } else {
         Probe::unavailable(format!("{FSR_RR_DLL} not found in {}", sdk_dir.display()))
     };
     (dlss, fsr)
+}
+
+/// Synchronous implementation used by the background worker and deterministic tests.
+fn probe_offline_now(sdk_dir: &Path, platform_supported: bool) -> (Probe, Probe) {
+    if !platform_supported {
+        let note = "Windows + DX12 only".to_string();
+        return (Probe::unavailable(note.clone()), Probe::unavailable(note));
+    }
+    probes_from_presence(
+        sdk_dir,
+        (
+            dll_present(sdk_dir, DLSS_RR_DLL),
+            dll_present(sdk_dir, FSR_RR_DLL),
+        ),
+    )
+}
+
+/// Non-blocking SDK availability probe. The render thread never touches the
+/// filesystem: the first request schedules the two DLL checks on a worker and
+/// subsequent frames only poll a small in-memory cache. While the check is
+/// pending both probes carry the same sentinel note; the caller must defer
+/// Raywatcher planning until the worker publishes its result.
+pub fn probe_offline(sdk_dir: &Path, platform_supported: bool) -> (Probe, Probe) {
+    if !platform_supported {
+        return probe_offline_now(sdk_dir, false);
+    }
+
+    let cache = OFFLINE_PROBES.get_or_init(|| Mutex::new(OfflineProbeCache::default()));
+    let mut state = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(&presence) = state.ready.get(sdk_dir) {
+        return probes_from_presence(sdk_dir, presence);
+    }
+
+    if state.pending.insert(sdk_dir.to_path_buf()) {
+        let path = sdk_dir.to_path_buf();
+        let cache = OFFLINE_PROBES.get().expect("cache initialized");
+        let spawn = std::thread::Builder::new()
+            .name("pwe-raywatcher-sdk-probe".to_string())
+            .spawn(move || {
+                let probes = probe_offline_now(&path, true);
+                let presence = (probes.0.available, probes.1.available);
+                let mut state = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.ready.insert(path.clone(), presence);
+                state.pending.remove(&path);
+            });
+        if spawn.is_err() {
+            state.pending.remove(sdk_dir);
+            let note = "Could not start SDK availability probe".to_string();
+            return (Probe::unavailable(note.clone()), Probe::unavailable(note));
+        }
+    }
+
+    let note = "Checking SDK files in background...".to_string();
+    (Probe::unavailable(note.clone()), Probe::unavailable(note))
 }
 
 /// Per-frame inputs for [`DlssRayReconstructor::evaluate`].
@@ -1367,7 +1427,7 @@ mod tests {
 
     #[test]
     fn probing_on_an_unsupported_platform_explains_both_providers() {
-        let (dlss, fsr) = probe_offline(Path::new("/nonexistent"), false);
+        let (dlss, fsr) = probe_offline_now(Path::new("/nonexistent"), false);
         assert!(!dlss.available);
         assert!(!fsr.available);
         assert!(dlss.note.contains("Windows"));
@@ -1377,7 +1437,7 @@ mod tests {
     #[test]
     fn a_missing_dll_is_reported_with_the_folder_that_was_searched() {
         let dir = std::env::temp_dir().join("raywatcher-reconstruct-probe-empty");
-        let (_, fsr) = probe_offline(&dir, true);
+        let (_, fsr) = probe_offline_now(&dir, true);
         assert!(!fsr.available);
         assert!(fsr.note.contains("amd_fidelityfx_denoiser_dx12.dll"));
         assert!(fsr.note.contains(&dir.display().to_string()));
