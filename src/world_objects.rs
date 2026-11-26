@@ -8,6 +8,7 @@ use crate::{
 };
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
+use wgpu::util::DeviceExt;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -307,6 +308,332 @@ struct WorldIndirectRun {
 /// culling, indirect packing and draw-call coalescing perform zero heap
 /// allocations after their first use. Normal and SDR commands need distinct
 /// buffers because both lists can be consumed by one encoded render pass.
+const WORLD_GPU_CULL_WGSL: &str = r#"
+struct Bounds {
+    min: vec4<f32>,
+    max: vec4<f32>,
+    index_count: u32,
+    first_index: u32,
+    flags: u32,
+    _pad: u32,
+};
+struct DrawArgs {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+};
+struct Params {
+    frustum: array<vec4<f32>, 6>,
+    eye_proj: vec4<f32>,
+    screen_clip: vec4<f32>,
+    flags: vec4<u32>,
+};
+@group(0) @binding(0) var<storage, read> bounds: array<Bounds>;
+@group(0) @binding(1) var<storage, read_write> draw_args: array<DrawArgs>;
+@group(0) @binding(2) var<uniform> p: Params;
+
+fn finite(v: f32) -> bool {
+    return v >= -3.0e38 && v <= 3.0e38;
+}
+fn finite3(v: vec3<f32>) -> bool {
+    return finite(v.x) && finite(v.y) && finite(v.z);
+}
+fn visible_aabb(b: Bounds) -> bool {
+    let mn = b.min.xyz;
+    let mx = b.max.xyz;
+    // Invalid numerical bounds are uncertainty, not evidence of occlusion.
+    if !finite3(mn) || !finite3(mx) {
+        return true;
+    }
+    if any(mn > mx) {
+        return false;
+    }
+    // Aabb-vs-plane test: reject only when its positive vertex is outside.
+    for (var i = 0u; i < 6u; i += 1u) {
+        let plane = p.frustum[i];
+        let positive = select(mn, mx, plane.xyz >= vec3<f32>(0.0));
+        if dot(plane.xyz, positive) + plane.w < 0.0 {
+            return false;
+        }
+    }
+    if p.screen_clip.y > 0.5 {
+        let water_y = p.screen_clip.z;
+        let sign = p.screen_clip.w;
+        if sign > 0.0 && mx.y < water_y {
+            return false;
+        }
+        if sign < 0.0 && mn.y > water_y {
+            return false;
+        }
+    }
+    if p.flags.y != 0u && (b.flags & 1u) == 0u {
+        return false;
+    }
+    let proj_scale = p.eye_proj.w;
+    let min_screen_px = p.screen_clip.x;
+    if proj_scale > 0.0 && min_screen_px > 0.0 {
+        let center = (mn + mx) * 0.5;
+        let extent = (mx - mn) * 0.5;
+        let radius_sq = dot(extent, extent);
+        let delta = center - p.eye_proj.xyz;
+        let distance_sq = dot(delta, delta);
+        if distance_sq > radius_sq {
+            let lhs = 4.0 * radius_sq * proj_scale * proj_scale;
+            let rhs = min_screen_px * min_screen_px * distance_sq;
+            if lhs < rhs {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= p.flags.x {
+        return;
+    }
+    let b = bounds[id.x];
+    var visible = b.index_count > 0u && visible_aabb(b);
+    draw_args[id.x].index_count = b.index_count;
+    draw_args[id.x].instance_count = select(0u, 1u, visible);
+    draw_args[id.x].first_index = b.first_index;
+    draw_args[id.x].base_vertex = 0;
+    draw_args[id.x].first_instance = 0u;
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct WorldGpuCullBounds {
+    min: [f32; 4],
+    max: [f32; 4],
+    index_count: u32,
+    first_index: u32,
+    flags: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct WorldGpuCullParams {
+    frustum: [[f32; 4]; 6],
+    eye_proj: [f32; 4],
+    screen_clip: [f32; 4],
+    flags: [u32; 4],
+}
+
+impl WorldGpuCullParams {
+    fn new(cull: &CullParams, count: usize, sdr_only: bool) -> Self {
+        let (clip_enabled, water_y, sign) = cull
+            .clip_plane
+            .map_or((0.0, 0.0, 0.0), |(y, sign)| (1.0, y, sign));
+        Self {
+            frustum: cull.frustum,
+            eye_proj: [
+                cull.eye[0],
+                cull.eye[1],
+                cull.eye[2],
+                cull.proj_scale,
+            ],
+            screen_clip: [cull.min_screen_px, clip_enabled, water_y, sign],
+            flags: [count as u32, u32::from(sdr_only), 0, 0],
+        }
+    }
+}
+
+struct WorldGpuCullView {
+    commands: Vec<WorldDrawCmd>,
+    bounds: wgpu::Buffer,
+    indirect: wgpu::Buffer,
+    params: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    runs: Vec<WorldIndirectRun>,
+    ready: bool,
+}
+
+impl WorldGpuCullView {
+    fn new(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        commands: &[WorldDrawCmd],
+    ) -> Option<Self> {
+        if commands.is_empty() {
+            return None;
+        }
+        let mut bounds = Vec::with_capacity(commands.len());
+        let mut args = Vec::with_capacity(commands.len());
+        let mut runs = Vec::<WorldIndirectRun>::new();
+        for (cmd_index, cmd) in commands.iter().enumerate() {
+            bounds.push(WorldGpuCullBounds {
+                min: [cmd.min[0], cmd.min[1], cmd.min[2], 0.0],
+                max: [cmd.max[0], cmd.max[1], cmd.max[2], 0.0],
+                index_count: cmd.end.saturating_sub(cmd.start),
+                first_index: cmd.start,
+                flags: u32::from(cmd.has_sdr),
+                pad: 0,
+            });
+            args.push(PageDrawIndexedArgs {
+                index_count: cmd.end.saturating_sub(cmd.start),
+                instance_count: 1,
+                first_index: cmd.start,
+                base_vertex: 0,
+                first_instance: 0,
+            });
+            let record_index = cmd_index as u32;
+            match runs.last_mut() {
+                Some(run) if run.page == cmd.page => run.record_count += 1,
+                _ => runs.push(WorldIndirectRun {
+                    page: cmd.page,
+                    first_record: record_index,
+                    record_count: 1,
+                    first_cmd: cmd_index,
+                }),
+            }
+        }
+        let bounds = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("whole-world GPU culling bounds"),
+            contents: bytemuck::cast_slice(&bounds),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let indirect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("whole-world GPU-generated indirect commands"),
+            contents: bytemuck::cast_slice(&args),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+        });
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("whole-world GPU culling parameters"),
+            size: std::mem::size_of::<WorldGpuCullParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("whole-world GPU culling bindings"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: bounds.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: indirect.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        Some(Self {
+            commands: commands.to_vec(),
+            bounds,
+            indirect,
+            params,
+            bind_group,
+            runs,
+            ready: false,
+        })
+    }
+}
+
+struct WorldGpuCuller {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    views: [Option<WorldGpuCullView>; WORLD_VIEWS],
+}
+
+impl WorldGpuCuller {
+    fn new(device: &wgpu::Device) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("whole-world GPU culling layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("whole-world GPU culling WGSL"),
+            source: wgpu::ShaderSource::Wgsl(WORLD_GPU_CULL_WGSL.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("whole-world GPU culling pipeline layout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("whole-world GPU culling pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+        });
+        Self {
+            pipeline,
+            layout,
+            views: std::array::from_fn(|_| None),
+        }
+    }
+}
+
+fn world_command_survives_gpu_cull(
+    cmd: &WorldDrawCmd,
+    cull: &CullParams,
+    sdr_only: bool,
+) -> bool {
+    if cmd.start >= cmd.end || (sdr_only && !cmd.has_sdr) {
+        return false;
+    }
+    let finite = cmd
+        .min
+        .iter()
+        .chain(cmd.max.iter())
+        .all(|v| v.is_finite());
+    if !finite {
+        return true;
+    }
+    if (0..3).any(|axis| cmd.min[axis] > cmd.max[axis]) {
+        return false;
+    }
+    aabb_survives_clip(cull.clip_plane, cmd.min, cmd.max)
+        && aabb_in_frustum(&cull.frustum, cmd.min, cmd.max)
+        && aabb_survives_screen_size(
+            cull.eye,
+            cull.proj_scale,
+            cull.min_screen_px,
+            cmd.min,
+            cmd.max,
+        )
+}
+
 #[derive(Default)]
 pub struct WorldDrawScratch {
     pub cmds: Vec<DrawCmd>,
@@ -314,6 +641,7 @@ pub struct WorldDrawScratch {
     indirect_args: Vec<PageDrawIndexedArgs>,
     indirect_runs: Vec<WorldIndirectRun>,
     indirect_buffers: [Option<wgpu::Buffer>; 2],
+    gpu_culler: Option<WorldGpuCuller>,
 }
 
 /// Returns false when an AABB lies completely on the clipped side of a water
@@ -1815,6 +2143,93 @@ impl GpuPage {
         world_culled_commands_from_meta(&metadata)
     }
 
+    /// Encode conservative GPU visibility for a large stable world-page list.
+    /// The resulting indexed-indirect records preserve the list's exact global
+    /// order; commands that are not proven visible receive instance_count=0.
+    /// Unsupported adapters, small lists and all-inside fast paths retain CPU culling.
+    pub fn encode_world_culling(
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        list: &WorldDrawList,
+        cull: &CullParams,
+        view_slot: usize,
+        sdr_only: bool,
+        multi_draw: bool,
+        scratch: &mut WorldDrawScratch,
+    ) -> bool {
+        if view_slot >= WORLD_VIEWS {
+            return false;
+        }
+        if let Some(view) = scratch
+            .gpu_culler
+            .as_mut()
+            .and_then(|culler| culler.views[view_slot].as_mut())
+        {
+            view.ready = false;
+        }
+        // Small lists are cheaper on the CPU. The all-inside opaque fast path
+        // also stays on CPU because only the projected-size check remains there.
+        if !multi_draw
+            || list.cmds.len() < 64
+            || list.chunks.is_empty()
+            || (!sdr_only
+                && cull.clip_plane.is_none()
+                && list
+                    .chunks
+                    .iter()
+                    .all(|chunk| aabb_inside_frustum(&cull.frustum, chunk.min, chunk.max)))
+        {
+            return false;
+        }
+        let limits = device.limits();
+        let bounds_bytes = (list.cmds.len() as u64)
+            .saturating_mul(std::mem::size_of::<WorldGpuCullBounds>() as u64);
+        let args_bytes = (list.cmds.len() as u64).saturating_mul(PAGE_DRAW_ARGS_SIZE);
+        let workgroups = (list.cmds.len() as u32).div_ceil(64);
+        let binding_limit = u64::from(limits.max_storage_buffer_binding_size);
+        if bounds_bytes > binding_limit
+            || args_bytes > binding_limit
+            || bounds_bytes > limits.max_buffer_size
+            || args_bytes > limits.max_buffer_size
+            || workgroups > limits.max_compute_workgroups_per_dimension
+        {
+            return false;
+        }
+
+        let culler = scratch
+            .gpu_culler
+            .get_or_insert_with(|| WorldGpuCuller::new(device));
+        let rebuild = culler.views[view_slot]
+            .as_ref()
+            .is_none_or(|view| view.commands.as_slice() != list.cmds.as_slice());
+        if rebuild {
+            let Some(view) =
+                WorldGpuCullView::new(device, &culler.layout, &list.cmds)
+            else {
+                return false;
+            };
+            culler.views[view_slot] = Some(view);
+        }
+
+        let view = culler.views[view_slot]
+            .as_mut()
+            .expect("world cull view was just created");
+        let params = WorldGpuCullParams::new(cull, list.cmds.len(), sdr_only);
+        queue.write_buffer(&view.params, 0, bytemuck::bytes_of(&params));
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("whole-world placement visibility compaction"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&culler.pipeline);
+            pass.set_bind_group(0, &view.bind_group, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        view.ready = true;
+        true
+    }
+
     pub fn draw_world_culled<'a>(
         pages: &'a [Self],
         list: &WorldDrawList,
@@ -1825,9 +2240,55 @@ impl GpuPage {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         multi_draw: bool,
+        view_slot: usize,
         scratch: &'a mut WorldDrawScratch,
     ) {
         if pages.is_empty() || list.chunks.is_empty() {
+            return;
+        }
+        // A successful compute dispatch writes one valid indexed-indirect
+        // record per stable world command. Keep the original page/run ordering
+        // and bind-group transitions; only the proven-invisible records vanish.
+        let gpu_view = scratch
+            .gpu_culler
+            .as_ref()
+            .and_then(|culler| culler.views.get(view_slot))
+            .and_then(Option::as_ref)
+            .filter(|view| view.ready && view.commands.as_slice() == list.cmds.as_slice());
+        if let Some(view) = gpu_view {
+            let mut bound_page: Option<usize> = None;
+            for run in &view.runs {
+                if bound_page != Some(run.page) {
+                    let page = &pages[run.page];
+                    let same_atlas =
+                        bound_page.is_some_and(|prev| pages[prev].shares_atlas_with(page));
+                    if !same_atlas {
+                        pass.set_bind_group(
+                            0,
+                            if reflected { &page.reflected } else { &page.normal },
+                            &[],
+                        );
+                    }
+                    pass.set_vertex_buffer(0, page.vertex.slice(..));
+                    pass.set_index_buffer(page.index.slice(..), wgpu::IndexFormat::Uint32);
+                    bound_page = Some(run.page);
+                }
+                let offset = u64::from(run.first_record) * PAGE_DRAW_ARGS_SIZE;
+                if run.record_count > 1 && multi_draw {
+                    pass.multi_draw_indexed_indirect(
+                        &view.indirect,
+                        offset,
+                        run.record_count,
+                    );
+                } else {
+                    for record in 0..run.record_count {
+                        pass.draw_indexed_indirect(
+                            &view.indirect,
+                            offset + u64::from(record) * PAGE_DRAW_ARGS_SIZE,
+                        );
+                    }
+                }
+            }
             return;
         }
         // When every 32-command chunk is wholly inside the main frustum, the
@@ -2757,6 +3218,89 @@ mod page_tests {
         assert!(args
             .iter()
             .all(|arg| arg.instance_count == 1 && arg.base_vertex == 0 && arg.first_instance == 0));
+    }
+
+    #[test]
+    fn gpu_world_cull_reference_is_conservative_for_frustum_clip_and_screen_size() {
+        let frustum = [
+            [1., 0., 0., 10.],
+            [-1., 0., 0., 10.],
+            [0., 1., 0., 10.],
+            [0., -1., 0., 10.],
+            [0., 0., 1., 10.],
+            [0., 0., -1., 10.],
+        ];
+        let cull = CullParams {
+            frustum,
+            eye: [0., 0., 0.],
+            proj_scale: 100.,
+            min_screen_px: 2.,
+            clip_plane: Some((0., 1.)),
+        };
+        let command = |min, max, has_sdr| WorldDrawCmd {
+            page: 0,
+            start: 0,
+            end: 36,
+            min,
+            max,
+            has_sdr,
+        };
+        assert!(world_command_survives_gpu_cull(
+            &command([-1., 1., -5.], [1., 3., -3.], true),
+            &cull,
+            false
+        ));
+        // Entirely below the reflection clip plane is rejected.
+        assert!(!world_command_survives_gpu_cull(
+            &command([-1., -5., -5.], [1., -1., -3.], true),
+            &cull,
+            false
+        ));
+        // Straddling the clip plane is kept; the GPU test is conservative.
+        assert!(world_command_survives_gpu_cull(
+            &command([-1., -1., -5.], [1., 1., -3.], true),
+            &cull,
+            false
+        ));
+        // Outside any one frustum plane is rejected.
+        assert!(!world_command_survives_gpu_cull(
+            &command([20., 1., -5.], [22., 3., -3.], true),
+            &cull,
+            false
+        ));
+        // SDR-only compaction must not suppress ordinary opaque-only commands.
+        assert!(!world_command_survives_gpu_cull(
+            &command([-1., 1., -5.], [1., 3., -3.], false),
+            &cull,
+            true
+        ));
+    }
+
+    #[test]
+    fn gpu_world_cull_fails_open_for_non_finite_bounds_and_keeps_near_bounds() {
+        let cull = CullParams::frustum_only([
+            [1., 0., 0., 10.],
+            [-1., 0., 0., 10.],
+            [0., 1., 0., 10.],
+            [0., -1., 0., 10.],
+            [0., 0., 1., 10.],
+            [0., 0., -1., 10.],
+        ]);
+        let mut invalid = WorldDrawCmd {
+            page: 0,
+            start: 0,
+            end: 12,
+            min: [f32::NAN, 0., 0.],
+            max: [1., 1., 1.],
+            has_sdr: false,
+        };
+        assert!(world_command_survives_gpu_cull(&invalid, &cull, false));
+        invalid.min = [0., 0., 0.];
+        invalid.max = [1., 1., 1.];
+        assert!(world_command_survives_gpu_cull(&invalid, &cull, false));
+        invalid.end = invalid.start;
+        assert!(!world_command_survives_gpu_cull(&invalid, &cull, false));
+        assert!(WORLD_GPU_CULL_WGSL.contains("instance_count = select(0u, 1u, visible)"));
     }
 
     #[test]

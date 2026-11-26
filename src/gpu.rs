@@ -3443,6 +3443,36 @@ impl Renderer {
 
         let [opaque_scratch_cell, sdr_scratch_cell] = &self.world_draw_scratch;
         let mut opaque_world_scratch = opaque_scratch_cell.borrow_mut();
+        let mut sdr_world_scratch = sdr_scratch_cell.borrow_mut();
+        if self.world_done {
+            let multi_draw = self
+                .device
+                .features()
+                .contains(wgpu::Features::MULTI_DRAW_INDIRECT);
+            let list = &self.world_draw_cmds[world_slot];
+            crate::world_objects::GpuPage::encode_world_culling(
+                &self.device,
+                e,
+                &self.queue,
+                list,
+                cull,
+                world_slot,
+                false,
+                multi_draw,
+                &mut opaque_world_scratch,
+            );
+            crate::world_objects::GpuPage::encode_world_culling(
+                &self.device,
+                e,
+                &self.queue,
+                list,
+                cull,
+                world_slot,
+                true,
+                multi_draw,
+                &mut sdr_world_scratch,
+            );
+        }
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("opaque scenery occluders after terrain"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3494,6 +3524,7 @@ impl Renderer {
                 self.device
                     .features()
                     .contains(wgpu::Features::MULTI_DRAW_INDIRECT),
+                world_slot,
                 &mut opaque_world_scratch,
             );
         }
@@ -3540,7 +3571,6 @@ impl Renderer {
         // Trees and grass are drawn afterwards, so candidate geometry cannot
         // occlude itself or another candidate. With Hi-Z unavailable, the same
         // compute pass retains its frustum/LOD-only fallback.
-        let mut sdr_world_scratch = sdr_scratch_cell.borrow_mut();
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("trees grass and blended scenery"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3599,6 +3629,7 @@ impl Renderer {
                     self.device
                         .features()
                         .contains(wgpu::Features::MULTI_DRAW_INDIRECT),
+                    world_slot,
                     &mut sdr_world_scratch,
                 );
             }
