@@ -353,8 +353,11 @@ struct EffectStepJob {
     ground: Option<crate::gfx_player::GroundHit>,
 }
 
-const MIN_PARALLEL_EFFECT_ROOTS: usize = 64;
-const EFFECT_ROOTS_PER_WORKER: usize = 32;
+// Scoped OS threads are expensive to create and join on every rendered frame.
+// Parallelize only unusually dense effect clusters; normal city/area loads stay
+// on the caller thread and avoid scheduler churn.
+const MIN_PARALLEL_EFFECT_ROOTS: usize = 256;
+const EFFECT_ROOTS_PER_WORKER: usize = 128;
 const MAX_EFFECT_WORKERS: usize = 4;
 
 fn effect_worker_count(active_roots: usize, available_workers: usize) -> usize {
@@ -395,6 +398,9 @@ pub struct Manager {
     owners: Vec<Owner>,
     /// Live, active owner indices; geometry stepping never scans the full owner list.
     active_owner_indices: Vec<usize>,
+    /// Eligible active roots whose animated Player has not been built yet.
+    /// Drained in O(1) so a fully warmed world does not rescan every owner each frame.
+    player_build_indices: Vec<usize>,
     /// Pending indices, plus the active subset preferred by the one-root loader.
     pending_owner_indices: Vec<usize>,
     active_pending_indices: Vec<usize>,
@@ -601,6 +607,7 @@ impl Manager {
         Self {
             owners: Vec::new(),
             active_owner_indices: Vec::new(),
+            player_build_indices: Vec::new(),
             pending_owner_indices: Vec::new(),
             active_pending_indices: Vec::new(),
             effect_jobs: Vec::new(),
@@ -737,6 +744,7 @@ impl Manager {
         self.index.clear();
         self.index.reserve(self.owners.len());
         self.active_owner_indices.clear();
+        self.player_build_indices.clear();
         self.pending_owner_indices.clear();
         self.active_pending_indices.clear();
         for (index, owner) in self.owners.iter().enumerate() {
@@ -750,6 +758,13 @@ impl Manager {
                 }
                 State::Live { .. } if owner.request.active => {
                     self.active_owner_indices.push(index);
+                    if self.effects
+                        && owner.player.is_none()
+                        && !owner.player_failed
+                        && owner.elapsed >= owner.request.start_ms
+                    {
+                        self.player_build_indices.push(index);
+                    }
                 }
                 State::Live { .. } | State::Failed => {}
             }
@@ -796,7 +811,17 @@ impl Manager {
             set_sorted_owner_index(&mut self.active_pending_indices, index, active);
         } else if live {
             set_sorted_owner_index(&mut self.active_owner_indices, index, active);
-            if !active {
+            if active {
+                let owner = &self.owners[index];
+                if self.effects
+                    && owner.player.is_none()
+                    && !owner.player_failed
+                    && owner.elapsed >= owner.request.start_ms
+                {
+                    set_sorted_owner_index(&mut self.player_build_indices, index, true);
+                }
+            } else {
+                set_sorted_owner_index(&mut self.player_build_indices, index, false);
                 // The previous full-owner pass released an inactive root on the
                 // same frame. Preserve that residency rule with indexed updates.
                 self.owners[index].player = None;
@@ -861,6 +886,7 @@ impl Manager {
         let last_index = self.owners.len() - 1;
         let removed_id = self.owners.swap_remove(index).request.identity;
         swap_remove_sorted_owner_index(&mut self.active_owner_indices, index, last_index);
+        swap_remove_sorted_owner_index(&mut self.player_build_indices, index, last_index);
         swap_remove_sorted_owner_index(&mut self.pending_owner_indices, index, last_index);
         swap_remove_sorted_owner_index(&mut self.active_pending_indices, index, last_index);
         self.index.remove(&removed_id);
@@ -879,6 +905,7 @@ impl Manager {
         self.removed += self.owners.len();
         self.owners.clear();
         self.active_owner_indices.clear();
+        self.player_build_indices.clear();
         self.pending_owner_indices.clear();
         self.active_pending_indices.clear();
         self.effect_jobs.clear();
@@ -904,15 +931,31 @@ impl Manager {
         let limit = self.priority_limit;
         let mut finished = Vec::new();
         let mut failed = Vec::new();
-        for owner in &mut self.owners {
+        let mut newly_buildable = Vec::new();
+        for (owner_index, owner) in self.owners.iter_mut().enumerate() {
             if !matches!(owner.state, State::Live { .. }) {
                 continue;
             }
+            let was_buildable = owner.request.active
+                && owner.player.is_none()
+                && !owner.player_failed
+                && owner.elapsed >= owner.request.start_ms;
             match tick_owner(owner, delta_ms, publications, limit) {
-                Ok(true) => {}
+                Ok(true) => {
+                    let is_buildable = owner.request.active
+                        && owner.player.is_none()
+                        && !owner.player_failed
+                        && owner.elapsed >= owner.request.start_ms;
+                    if !was_buildable && is_buildable {
+                        newly_buildable.push(owner_index);
+                    }
+                }
                 Ok(false) => finished.push(owner.request.identity),
                 Err(e) => failed.push((owner.request.identity, e)),
             }
+        }
+        for index in newly_buildable {
+            set_sorted_owner_index(&mut self.player_build_indices, index, true);
         }
         for identity in finished {
             if let Some(index) = self.position_of(identity) {
@@ -920,6 +963,7 @@ impl Manager {
                 let last_index = self.owners.len() - 1;
                 let removed_id = self.owners.swap_remove(index).request.identity;
                 swap_remove_sorted_owner_index(&mut self.active_owner_indices, index, last_index);
+                swap_remove_sorted_owner_index(&mut self.player_build_indices, index, last_index);
                 swap_remove_sorted_owner_index(&mut self.pending_owner_indices, index, last_index);
                 swap_remove_sorted_owner_index(&mut self.active_pending_indices, index, last_index);
                 self.index.remove(&removed_id);
@@ -935,6 +979,7 @@ impl Manager {
                 let origin = self.owners[index].request.origin.clone();
                 self.owners[index].state = State::Failed;
                 set_sorted_owner_index(&mut self.active_owner_indices, index, false);
+                set_sorted_owner_index(&mut self.player_build_indices, index, false);
                 set_sorted_owner_index(&mut self.pending_owner_indices, index, false);
                 set_sorted_owner_index(&mut self.active_pending_indices, index, false);
                 self.failures.push(format!("{origin}: {error}"));
@@ -968,7 +1013,20 @@ impl Manager {
             return;
         }
         self.effects = enabled;
+        self.player_build_indices.clear();
         if enabled {
+            // Rebuild the queue once on an explicit effects-on transition.
+            // Steady-state frames never have to search for missing Players.
+            for (index, owner) in self.owners.iter().enumerate() {
+                if matches!(owner.state, State::Live { .. })
+                    && owner.request.active
+                    && owner.player.is_none()
+                    && !owner.player_failed
+                    && owner.elapsed >= owner.request.start_ms
+                {
+                    self.player_build_indices.push(index);
+                }
+            }
             return;
         }
         for owner in &mut self.owners {
@@ -1107,6 +1165,7 @@ impl Manager {
                 Err(error) => {
                     failures.push((owner.request.origin.clone(), error));
                     owner.player = None;
+                    owner.player_failed = true;
                     continue;
                 }
             };
@@ -1212,6 +1271,7 @@ impl Manager {
                                 terrain,
                             ) {
                                 owner.player = None;
+                                owner.player_failed = true;
                                 errs.push((job.owner_index, error));
                             }
                         }
@@ -1239,6 +1299,7 @@ impl Manager {
                     terrain,
                 ) {
                     owner.player = None;
+                    owner.player_failed = true;
                     step_errors.push((job.owner_index, error));
                 }
             }
@@ -1285,15 +1346,24 @@ impl Manager {
         if !self.effects {
             return false;
         }
-        let Some(index) = self.active_owner_indices.iter().copied().find(|&index| {
-            let owner = &self.owners[index];
-            matches!(owner.state, State::Live { .. })
+        // Every eligible owner is queued when it becomes live, crosses its
+        // StartTime, or is reactivated. Popping avoids an O(active owners) search
+        // on every frame after the world has finished warming up.
+        let index = loop {
+            let Some(index) = self.player_build_indices.pop() else {
+                return false;
+            };
+            let Some(owner) = self.owners.get(index) else {
+                continue;
+            };
+            if matches!(owner.state, State::Live { .. })
                 && owner.player.is_none()
                 && !owner.player_failed
                 && owner.request.active
                 && owner.elapsed >= owner.request.start_ms
-        }) else {
-            return false;
+            {
+                break index;
+            }
         };
         let path = self.owners[index].request.path.clone();
         let origin = self.owners[index].request.origin.clone();
@@ -1510,6 +1580,14 @@ impl Manager {
         };
         if self.owners[index].request.active {
             set_sorted_owner_index(&mut self.active_owner_indices, index, true);
+            let owner = &self.owners[index];
+            if self.effects
+                && owner.player.is_none()
+                && !owner.player_failed
+                && owner.elapsed >= owner.request.start_ms
+            {
+                set_sorted_owner_index(&mut self.player_build_indices, index, true);
+            }
         }
     }
 
@@ -1588,13 +1666,19 @@ fn tick_owner(
             return Ok(false);
         }
     }
+    let State::Live { lights, .. } = &mut owner.state else {
+        return Ok(true);
+    };
+    // Geometry-only roots can be numerous. Their clocks/lifetimes still advance,
+    // but computing a world matrix and validating it every frame serves no
+    // light producer and used to add avoidable work for the majority of roots.
+    if lights.is_empty() {
+        return Ok(true);
+    }
     let visible = owner.request.active && owner.elapsed >= start;
     let transform = owner.request.world_transform()?;
     let outer = owner.request.outer;
     let serial = owner.serial;
-    let State::Live { lights, .. } = &mut owner.state else {
-        return Ok(true);
-    };
     let emitters = lights;
     for (index, emitter) in emitters.iter_mut().enumerate() {
         let light: Option<DynamicLight> =
@@ -1681,9 +1765,9 @@ mod tests {
     fn sparse_effect_sets_do_not_spawn_transient_worker_threads() {
         assert_eq!(effect_worker_count(0, 8), 1);
         assert_eq!(effect_worker_count(12, 8), 1);
-        assert_eq!(effect_worker_count(63, 8), 1);
-        assert_eq!(effect_worker_count(64, 8), 2);
-        assert_eq!(effect_worker_count(128, 8), 4);
+        assert_eq!(effect_worker_count(255, 8), 1);
+        assert_eq!(effect_worker_count(256, 8), 2);
+        assert_eq!(effect_worker_count(512, 8), 4);
         assert_eq!(effect_worker_count(1024, 16), 4);
         assert_eq!(effect_worker_count(256, 0), 1);
     }
