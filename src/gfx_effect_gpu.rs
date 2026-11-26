@@ -165,6 +165,10 @@ struct Bucket {
 /// How many distinct (layer, state, texture) groups are cached before the pass
 /// drops them all. Retail roots reuse a few hundred at most.
 const BUCKET_CACHE_LIMIT: usize = 1024;
+/// Missing/corrupt effect textures are probed again every five seconds, not
+/// every rendered frame. This preserves recovery if an archive becomes available
+/// later while keeping the steady-state render path free of repeated disk I/O.
+const TEXTURE_RETRY_INTERVAL_FRAMES: u64 = 300;
 
 pub struct Draw {
     device_format: wgpu::TextureFormat,
@@ -174,9 +178,10 @@ pub struct Draw {
     shader: wgpu::ShaderModule,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     textures: HashMap<u32, TextureEntry>,
-    /// Failed archive reads/texture uploads are stable for this renderer's
-    /// lifetime. Remember them so a missing asset is not re-read every frame.
-    failed_textures: std::collections::HashSet<u32>,
+    /// Next frame each failed texture may be retried. A cooldown lets late
+    /// archive availability recover without hammering missing files every frame.
+    failed_textures: HashMap<u32, u64>,
+    frame_index: u64,
     texture_ids: HashMap<String, u32>,
     texture_names: Vec<String>,
     buckets: HashMap<BucketKey, Bucket>,
@@ -456,7 +461,8 @@ impl Draw {
             shader,
             pipelines: HashMap::new(),
             textures: HashMap::new(),
-            failed_textures: std::collections::HashSet::new(),
+            failed_textures: HashMap::new(),
+            frame_index: 0,
             texture_ids: HashMap::new(),
             texture_names: Vec::new(),
             buckets: HashMap::new(),
@@ -573,6 +579,7 @@ impl Draw {
         light: Option<EffectLight>,
         read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
     ) -> Result<(), String> {
+        self.frame_index = self.frame_index.wrapping_add(1);
         if matrix
             .iter()
             .flatten()
@@ -731,9 +738,11 @@ impl Draw {
             if vertices.is_empty() {
                 continue;
             }
-            if !self.textures.contains_key(&key.texture)
-                && !self.failed_textures.contains(&key.texture)
-            {
+            let retry_due = self
+                .failed_textures
+                .get(&key.texture)
+                .map_or(true, |next_frame| self.frame_index >= *next_frame);
+            if !self.textures.contains_key(&key.texture) && retry_due {
                 let tex_name = self.texture_names[key.texture as usize].clone();
                 match read(&tex_name) {
                     Ok(bytes) => {
@@ -747,20 +756,27 @@ impl Draw {
                                 let view = texture.create_view(&Default::default());
                                 self.textures
                                     .insert(key.texture, TextureEntry { texture, view });
+                                self.failed_textures.remove(&key.texture);
                             }
                             Err(error) => {
-                                self.failed_textures.insert(key.texture);
+                                self.failed_textures.insert(
+                                    key.texture,
+                                    self.frame_index.saturating_add(TEXTURE_RETRY_INTERVAL_FRAMES),
+                                );
                                 self.note_failure(&tex_name, &error);
                             }
                         }
                     }
                     // The element still draws, with the white stand-in: the
                     // quads and their authored colour survive (the NOTEX
-                    // vertex-colour law), only the map is lost. Cache the
-                    // failure too: archive reads and decode attempts cannot
-                    // make a permanently missing member appear on the next frame.
+                    // vertex-colour law), only the map is lost. Back off the
+                    // retry: the archive may become available later, but a
+                    // missing member must not trigger a read on every frame.
                     Err(error) => {
-                        self.failed_textures.insert(key.texture);
+                        self.failed_textures.insert(
+                            key.texture,
+                            self.frame_index.saturating_add(TEXTURE_RETRY_INTERVAL_FRAMES),
+                        );
                         self.note_failure(&tex_name, &error);
                     }
                 }
@@ -2191,7 +2207,12 @@ mod tests {
             draw.buckets.values().next().unwrap().bound_fallback,
             "the first frame must bind the placeholder"
         );
-        // The archive answers on the next frame: a 1x1 uncompressed TGA.
+        // The archive answers later. Retry after the five-second backoff
+        // rather than performing the same failed read on every intervening frame.
+        let texture_id = draw.texture_ids["late.png"];
+        let retry_frame = draw.failed_textures[&texture_id];
+        assert!(retry_frame > draw.frame_index);
+        draw.frame_index = retry_frame - 1;
         let mut present = |_: &str| -> Result<Vec<u8>, String> {
             let mut bytes = vec![0; 18];
             bytes[2] = 2;
