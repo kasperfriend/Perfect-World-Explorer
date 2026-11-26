@@ -771,9 +771,9 @@ float3 kind_colour(float kind) {
     return float3(0.95, 0.15, 0.85);                 // magenta: instance proxy
 }
 
-uint adaptive_ray_samples(uint2 pixel, float dist, float3 normal, float roughness, uint base) {
+uint adaptive_ray_samples(uint2 pixel, float dist, float3 normal, float roughness, bool is_water, uint base) {
     uint max_samples = clamp(uint(params.restir.y + 0.5), base, 8u);
-    if (max_samples <= base) return base;
+    if (max_samples <= base || is_water) return base;
     uint width, height;
     src_gbuf_pos.GetDimensions(width, height);
     float centre_luma = luma(src_gbuf_raster.Load(int3(pixel, 0)).rgb);
@@ -797,9 +797,6 @@ uint adaptive_ray_samples(uint2 pixel, float dist, float3 normal, float roughnes
     }
     float complexity = max(normal_edge * 2.0, max(depth_edge * 5.0, colour_edge * 2.0));
     complexity = max(complexity, (1.0 - smoothstep(0.0, 320.0, dist)) * 0.20);
-    // Native water uses a deterministic planar mirror ray. Extra random
-    // samples would trace the identical direction repeatedly.
-    if (roughness <= 0.12) return base;
     complexity = max(complexity, saturate((0.36 - roughness) / 0.36) * 0.20);
     bool gi_enabled = ((uint(round(params.effects.y)) & 16u) != 0u)
         && params.frame.z >= 1.0 && params.tuning.w > 0.0;
@@ -991,10 +988,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     bool bits_weather = (effects & 2048u) != 0u;
     bool bits_twilight_sky = (effects & 4096u) != 0u;
     bool trace_water_reflection = bits_reflections
-        && params.eye.y > world_pos.y + 0.05
         && uint(round(params.counts.w)) == 0u;
-    // Native water remains entirely untouched unless an above-water RT
-    // reflection is available. Underwater and debug views keep legacy behaviour.
+    // Keep native water only when RT reflections are disabled or a debug view owns the output.
     if (is_water && !trace_water_reflection) {
         out_colour[id.xy] = float4(layered ? float3(0.0, 0.0, 0.0) : raster_rgb, 1.0);
         if (params.point_light_meta.w > 0.5) {
@@ -1078,7 +1073,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     }
 
     uint base_samples = max(uint(params.frame.y), 1u);
-    uint samples = adaptive_ray_samples(id.xy, dist, normal, roughness, base_samples);
+    uint samples = adaptive_ray_samples(id.xy, dist, normal, roughness, is_water, base_samples);
     uint max_bounces = min(uint(round(params.frame.z)), 6u);
     uint opaque_offset = uint(round(params.fog.w));
     uint tri_count = uint(params.counts.x);
@@ -1211,7 +1206,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // Features #2 (Water Refraction & Underwater Caustics), #3 (Calibrated Glossy Trims),
         // #8 (Analytical Reflections of World Effects & Point Lights), #10 (Off-Screen Detail).
         float refl_dist = params.lens.y;
-        if (bits_reflections && (eff_roughness <= params.effects.x || metalness > 0.1)) {
+        if (bits_reflections && (eff_roughness <= params.effects.x || metalness > 0.1)
+            && (!is_water || s == 0u)) {
             // Native game water is a flat glossy dielectric: no animated wave
             // normals. Use the raster normal for both water and non-water surfaces.
             float3 refl_base_n = shade_normal;
@@ -1290,9 +1286,13 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 refl_col += fx_refl * (fresnel * trim_scale * (1.0 - fog_t));
             }
 
-            accum_reflection += refl_col;
+            // One deterministic mirror ray is enough for a flat water plane.
+            // Scale it to preserve the loop's later 1/samples averaging.
+            accum_reflection += refl_col * (is_water ? float(samples) : 1.0);
         }
-        accum_refl_dist += refl_dist;
+        if (!is_water || s == 0u) {
+            accum_refl_dist += refl_dist * (is_water ? float(samples) : 1.0);
+        }
 
         // True 1..6 multi-bounce Diffuse GI: every bounce carries sun, sky, point lights,
         // world effects, and emissive meshes smoothly into shadowed open spaces & corners,

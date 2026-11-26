@@ -1227,9 +1227,9 @@ fn kind_colour(kind: f32) -> vec3<f32> {
     return vec3<f32>(0.95, 0.15, 0.85);                     // magenta: instance proxy
 }
 
-fn adaptive_ray_samples(pixel: vec2<i32>, dist: f32, normal: vec3<f32>, roughness: f32, base: u32) -> u32 {
+fn adaptive_ray_samples(pixel: vec2<i32>, dist: f32, normal: vec3<f32>, roughness: f32, is_water: bool, base: u32) -> u32 {
     let maximum = clamp(u32(params.restir.y), base, 8u);
-    if (maximum <= base) { return base; }
+    if (maximum <= base || is_water) { return base; }
     let dimensions = vec2<i32>(textureDimensions(src_gbuf_pos));
     let centre_luma = luminance(textureLoad(src_gbuf_raster, pixel, 0).rgb);
     var normal_edge = 0.0;
@@ -1255,12 +1255,6 @@ fn adaptive_ray_samples(pixel: vec2<i32>, dist: f32, normal: vec3<f32>, roughnes
     }
     var complexity = max(normal_edge * 2.0, max(depth_edge * 5.0, colour_edge * 2.0));
     complexity = max(complexity, (1.0 - smoothstep(0.0, 320.0, dist)) * 0.20);
-    // Native water is a flat dielectric plane. Its RT reflection is an
-    // exact mirror ray, so additional random samples would retrace the same
-    // direction and only add duplicate work/noise.
-    if (roughness <= 0.12) {
-        return base;
-    }
     complexity = max(complexity, clamp((0.36 - roughness) / 0.36, 0.0, 1.0) * 0.20);
     let gi_enabled = (u32(round(params.effects.y)) & 16u) != 0u
         && params.frame.z >= 1.0
@@ -1455,9 +1449,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let bits_moonlit_night = (effects & 512u) != 0u;
     let bits_weather = (effects & 2048u) != 0u;
     let trace_water_reflection = bits_reflections
-        && params.eye.y > point.y + 0.05
         && u32(round(params.counts.w)) == 0u;
-    // Preserve native water for refraction-only, underwater and debug views.
+    // Keep native water only when RT reflections are disabled or a debug view owns the output.
     if (is_water && !trace_water_reflection) {
         textureStore(out_colour, ip, vec4<f32>(select(raster_rgb, vec3<f32>(0.0), layered), 1.0));
         textureStore(out_guide, ip, vec4<f32>(1.0, dist / max(params.lens.y, 1e-4), 1.0, roughness));
@@ -1495,7 +1488,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let base_samples = max(u32(params.frame.y), 1u);
-    let samples = adaptive_ray_samples(ip, dist, normal, roughness, base_samples);
+    let samples = adaptive_ray_samples(ip, dist, normal, roughness, is_water, base_samples);
     let max_bounces = min(u32(round(params.frame.z)), 6u);
     let pl_count = min(u32(round(params.point_light_meta.x)), 128u);
     var state = id.x * 0x9e3779b9u ^ id.y * 0x85ebca6bu ^ u32(params.frame.x) * 0xc2b2ae35u;
@@ -1606,7 +1599,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         accum_open = accum_open + open;
 
         var refl_dist = params.lens.y;
-        if (bits_reflections && roughness <= params.effects.x) {
+        if (bits_reflections && roughness <= params.effects.x && (!is_water || s == 0u)) {
             // Native game water is a flat glossy dielectric: no animated wave
             // normals. Use the raster normal for both water and non-water surfaces.
             let refl_base_n = normal;
@@ -1664,9 +1657,13 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let fx_refl = trace_effect_light_reflections(ray_origin, reflect_dir, eff_max_t, pl_count);
                 refl_col = refl_col + fx_refl * (fresnel * trim_scale * (1.0 - fog_t));
             }
-            accum_reflection = accum_reflection + refl_col;
+            // One deterministic mirror ray is enough for a flat water plane.
+            // Scale it to preserve the loop's later 1/samples averaging.
+            accum_reflection = accum_reflection + refl_col * select(1.0, f32(samples), is_water);
         }
-        accum_refl_dist = accum_refl_dist + refl_dist;
+        if (!is_water || s == 0u) {
+            accum_refl_dist = accum_refl_dist + refl_dist * select(1.0, f32(samples), is_water);
+        }
 
         if (bits_gi && !is_water && max_bounces >= 1u && params.tuning.w > 0.0 && gi_fade > 0.01) {
             let bounce_max_t = min(params.lens.y, 70.0);
@@ -6015,8 +6012,8 @@ mod shader_optimization_regression_tests {
         assert!(RAY_SHADER.contains("select(0.04, 0.0204, is_water)"));
         assert!(!RAY_SHADER.contains("complexity = max(complexity, 0.42)"));
         assert!(dxr.contains("if (roughness <= 0.12) return base;"));
-        assert!(dxr.contains("float3 h = is_water"));
-        assert!(dxr.contains("? refl_base_n"));
+        assert!(dxr.contains("float3 h = refl_base_n;"));
+        assert!(dxr.contains("if (!is_water)"));
         assert!(dxr.contains("is_water ? 0.0204"));
         assert!(!dxr.contains("complexity = max(complexity, 0.42)"));
     }
@@ -6053,14 +6050,29 @@ mod shader_optimization_regression_tests {
         assert!(COMPOSITE_SHADER.contains("raster.rgb + rt.rgb"));
         assert!(COMPOSITE_SHADER.contains("return raster;"));
         assert!(COMPOSITE_SHADER.contains("return textureLoad(src_rt, px, 0);"));
+        assert!(RAY_SHADER.contains("(!is_water || s == 0u)"));
+        assert!(RAY_SHADER.contains("select(1.0, f32(samples), is_water)"));
+        assert!(dxr.contains("(!is_water || s == 0u)"));
     }
 
     #[test]
-    fn water_reflections_are_rt_only_above_water_and_replace_the_native_mirror() {
+    fn planar_water_reflects_into_the_camera_side_above_and_below_the_surface() {
+        let incoming_above = glam::Vec3::new(0.3, -0.8, 0.5).normalize();
+        let incoming_below = glam::Vec3::new(0.3, 0.8, 0.5).normalize();
+        let normal_above = glam::Vec3::Y;
+        let normal_below = glam::Vec3::NEG_Y;
+        let reflected_above = incoming_above - 2.0 * incoming_above.dot(normal_above) * normal_above;
+        let reflected_below = incoming_below - 2.0 * incoming_below.dot(normal_below) * normal_below;
+        assert!(reflected_above.dot(normal_above) > 0.0);
+        assert!(reflected_below.dot(normal_below) > 0.0);
+    }
+
+    #[test]
+    fn water_reflections_use_rt_mirror_rays_on_both_sides_and_replace_the_native_mirror() {
         let dxr = include_str!("dxr_trace.hlsl");
         let water = include_str!("../../water_gpu.rs");
-        assert!(RAY_SHADER.contains("params.eye.y > point.y + 0.05"));
-        assert!(dxr.contains("params.eye.y > world_pos.y + 0.05"));
+        assert!(!RAY_SHADER.contains("params.eye.y > point.y + 0.05"));
+        assert!(!dxr.contains("params.eye.y > world_pos.y + 0.05"));
         assert!(RAY_SHADER.contains("if (is_water && debug_mode_early == 0u)"));
         assert!(dxr.contains("if (is_water && debug_mode_early == 0u)"));
         assert!(water.contains("w.fog.w>0.5"));
