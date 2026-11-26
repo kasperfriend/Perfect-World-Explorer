@@ -22,6 +22,7 @@
 //! so a still camera does not rebuild a BVH every frame.
 
 use glam::{Mat4, Vec3};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::bvh::{RayMaterial, RayTriangle, SceneGeometry};
 
@@ -262,6 +263,10 @@ struct BgBuildResult {
     note: Option<String>,
 }
 
+fn harvest_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
 /// Builds and caches the ray scene.
 #[derive(Default)]
 pub struct Harvester {
@@ -272,6 +277,9 @@ pub struct Harvester {
     last_build_content_hash: u64,
     last_build_config: Option<HarvestConfig>,
     pending_bg: Option<std::sync::mpsc::Receiver<BgBuildResult>>,
+    /// Cooperative stop flag for the detached builder. Dropping the receiver
+    /// alone does not stop its CPU work.
+    pending_bg_cancel: Option<std::sync::Arc<AtomicBool>>,
     last_build_finished: Option<std::time::Instant>,
     /// Why the last build was refused or clipped, for the tab.
     pub note: Option<String>,
@@ -429,6 +437,7 @@ impl Harvester {
         match rx.try_recv() {
             Ok(result) => {
                 self.pending_bg = None;
+                self.pending_bg_cancel = None;
                 self.triangles = result.triangles;
                 self.instances = result.instances;
                 self.note = result.note;
@@ -444,6 +453,7 @@ impl Harvester {
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.pending_bg = None;
+                self.pending_bg_cancel = None;
                 None
             }
         }
@@ -498,16 +508,20 @@ impl Harvester {
         let water_quads = 0usize;
 
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.pending_bg = Some(rx);
-        let _ = std::thread::Builder::new()
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_cancel = std::sync::Arc::clone(&cancel);
+        let spawn = std::thread::Builder::new()
             .name("raywatcher-bvh".to_string())
             .spawn(move || {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
                 // Boost #18: Pre-allocate triangle/material storage to avoid multi-MB Vec reallocations.
                 let mut triangles = Vec::with_capacity(512_000);
                 let mut materials = Vec::with_capacity(2048);
                 let mut terrain_lod_tris = [0usize; 4];
                 if let Some(ground_fn) = ground {
-                    terrain_lod_tris = push_terrain_frustum(
+                    let Some(lod) = push_terrain_frustum_cancellable(
                         &mut triangles,
                         &mut materials,
                         eye,
@@ -516,7 +530,11 @@ impl Harvester {
                         base_cell.max(0.5),
                         config,
                         ground_fn.as_ref(),
-                    );
+                        Some(worker_cancel.as_ref()),
+                    ) else {
+                        return;
+                    };
+                    terrain_lod_tris = lod;
                 }
                 // Unpack O(1)-cloned page Arc slices entirely off the main thread.
                 // Never stride individual triangles (`step > 1` skips every 2nd
@@ -535,10 +553,18 @@ impl Harvester {
                 let eff_page_budget = page_tri_budget.min(remaining_cap);
                 let mut page_added = 0usize;
                 for tris in &page_tris {
+                    if worker_cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
                     if tris.is_empty() || page_added >= eff_page_budget {
                         break;
                     }
-                    for t in tris.iter() {
+                    for (triangle_index, t) in tris.iter().enumerate() {
+                        if triangle_index & 0x3ff == 0
+                            && worker_cancel.load(Ordering::Relaxed)
+                        {
+                            return;
+                        }
                         if page_added >= eff_page_budget {
                             break;
                         }
@@ -566,11 +592,18 @@ impl Harvester {
                     }
                 }
                 let before_mesh = triangles.len();
-                push_real_meshes(&mut triangles, &mut materials, &real_meshes);
+                if !push_real_meshes_cancellable(
+                    &mut triangles,
+                    &mut materials,
+                    &real_meshes,
+                    Some(worker_cancel.as_ref()),
+                ) {
+                    return;
+                }
                 let real_mesh_tris = triangles.len() - before_mesh;
 
                 let before_proxy = triangles.len();
-                let instance_count = push_instances_chunked(
+                let Some(instance_count) = push_instances_chunked_cancellable(
                     &mut triangles,
                     &mut materials,
                     &instances,
@@ -578,8 +611,14 @@ impl Harvester {
                     &frustum,
                     far,
                     config,
-                );
+                    Some(worker_cancel.as_ref()),
+                ) else {
+                    return;
+                };
                 let proxy_tris = triangles.len() - before_proxy;
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
 
                 if triangles.len() > MAX_SCENE_TRIANGLES {
                     triangles.truncate(MAX_SCENE_TRIANGLES);
@@ -591,11 +630,25 @@ impl Harvester {
                     None
                 };
                 let t_bvh = std::time::Instant::now();
-                let scene = std::sync::Arc::new(if skip_cpu_bvh {
+                let scene = if skip_cpu_bvh {
+                    if worker_cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
                     SceneGeometry::build_triangles_only(triangles, materials)
                 } else {
-                    SceneGeometry::build(triangles, materials)
-                });
+                    let Some(scene) = SceneGeometry::build_cancellable(
+                        triangles,
+                        materials,
+                        worker_cancel.as_ref(),
+                    ) else {
+                        return;
+                    };
+                    scene
+                };
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let scene = std::sync::Arc::new(scene);
                 let bvh_ms = t_bvh.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
                 if std::env::var_os("PWE_RT_DEBUG").is_some() {
@@ -617,6 +670,9 @@ impl Harvester {
                         terrain_lod_tris[3],
                     );
                 }
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
                 let _ = tx.send(BgBuildResult {
                     sig,
                     eye,
@@ -630,6 +686,12 @@ impl Harvester {
                     note,
                 });
             });
+        if spawn.is_ok() {
+            self.pending_bg = Some(rx);
+            self.pending_bg_cancel = Some(cancel);
+        } else {
+            self.note = Some("could not start the background ray-scene builder".into());
+        }
     }
 
     /// Build a frustum-wide, chunked multi-LOD ray scene covering the full
@@ -765,6 +827,9 @@ impl Harvester {
         self.cached = None;
         self.last_build_eye = None;
         self.last_build_config = None;
+        if let Some(cancel) = self.pending_bg_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
         self.pending_bg = None;
         self.last_build_finished = None;
     }
@@ -1081,8 +1146,17 @@ fn push_real_meshes(
     materials: &mut Vec<RayMaterial>,
     meshes: &[MeshTriangle],
 ) {
+    let _ = push_real_meshes_cancellable(triangles, materials, meshes, None);
+}
+
+fn push_real_meshes_cancellable(
+    triangles: &mut Vec<RayTriangle>,
+    materials: &mut Vec<RayMaterial>,
+    meshes: &[MeshTriangle],
+    cancel: Option<&AtomicBool>,
+) -> bool {
     if meshes.is_empty() {
-        return;
+        return true;
     }
     // Boost #19: Packed u32 material key + pre-sized HashMap + length_squared normal check
     // (eliminates up to 1.8M sqrt calls per 900k-tri scene build).
@@ -1094,7 +1168,10 @@ fn push_real_meshes(
     triangles.reserve(meshes.len());
     let mut dropped = 0usize;
     let before = triangles.len();
-    for m in meshes {
+    for (mesh_index, m) in meshes.iter().enumerate() {
+        if mesh_index & 0x3ff == 0 && harvest_cancelled(cancel) {
+            return false;
+        }
         if !m.a.is_finite() || !m.b.is_finite() || !m.c.is_finite() {
             dropped += 1;
             continue;
@@ -1162,6 +1239,7 @@ fn push_real_meshes(
             triangles.len() - before
         );
     }
+    true
 }
 
 /// Push reflective water quads across the visible frustum. Water uses low
@@ -1338,8 +1416,25 @@ fn push_instances_chunked(
     far: f32,
     config: HarvestConfig,
 ) -> usize {
+    push_instances_chunked_cancellable(triangles, materials, instances, eye, frustum, far, config, None)
+        .unwrap_or(0)
+}
+
+fn push_instances_chunked_cancellable(
+    triangles: &mut Vec<RayTriangle>,
+    materials: &mut Vec<RayMaterial>,
+    instances: &[InstanceProxy],
+    eye: Vec3,
+    frustum: &Frustum,
+    far: f32,
+    config: HarvestConfig,
+    cancel: Option<&AtomicBool>,
+) -> Option<usize> {
+    if harvest_cancelled(cancel) {
+        return None;
+    }
     if instances.is_empty() || config.max_instances == 0 {
-        return 0;
+        return Some(0);
     }
     let chunk = config.chunk_size.max(32.0);
     let far_sq = far * far;
@@ -1347,6 +1442,9 @@ fn push_instances_chunked(
     let mut chunks: std::collections::HashMap<(i32, i32), Vec<(f32, usize)>> =
         std::collections::HashMap::new();
     for (index, inst) in instances.iter().enumerate() {
+        if index & 0x3ff == 0 && harvest_cancelled(cancel) {
+            return None;
+        }
         if inst.half.min_element() < config.min_instance_size * 0.5
             || inst.half.max_element() <= 0.0
         {
@@ -1368,13 +1466,19 @@ fn push_instances_chunked(
     let mut palette: std::collections::HashMap<(u8, u8, u8), u32> =
         std::collections::HashMap::new();
     for (_, mut list) in chunks {
+        if harvest_cancelled(cancel) {
+            return None;
+        }
         if list.len() > config.max_instances {
             list.select_nth_unstable_by(config.max_instances, |a, b| a.0.total_cmp(&b.0));
             list.truncate(config.max_instances);
             list.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         }
         triangles.reserve(list.len() * 12);
-        for (_, index) in list {
+        for (list_index, (_, index)) in list.into_iter().enumerate() {
+            if list_index & 0x3ff == 0 && harvest_cancelled(cancel) {
+                return None;
+            }
             let instance = instances[index];
             let key = (
                 (instance.albedo[0].clamp(0.0, 1.0) * 31.0).round() as u8,
@@ -1401,7 +1505,7 @@ fn push_instances_chunked(
             pushed += 1;
         }
     }
-    pushed
+    Some(pushed)
 }
 
 /// Chunked multi-LOD terrain harvesting covering the entire visible frustum
@@ -1421,6 +1525,25 @@ fn push_terrain_frustum(
     config: HarvestConfig,
     ground: &dyn Fn(f32, f32) -> f32,
 ) -> [usize; 4] {
+    push_terrain_frustum_cancellable(triangles, materials, eye, frustum, far, base_cell, config, ground, None)
+        .unwrap_or([0; 4])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_terrain_frustum_cancellable(
+    triangles: &mut Vec<RayTriangle>,
+    materials: &mut Vec<RayMaterial>,
+    eye: Vec3,
+    frustum: &Frustum,
+    far: f32,
+    base_cell: f32,
+    config: HarvestConfig,
+    ground: &dyn Fn(f32, f32) -> f32,
+    cancel: Option<&AtomicBool>,
+) -> Option<[usize; 4]> {
+    if harvest_cancelled(cancel) {
+        return None;
+    }
     let mut lod_tris = [0usize; 4];
     let chunk_size = config.chunk_size.max(64.0);
     let near_r = config.radius.max(64.0);
@@ -1441,9 +1564,15 @@ fn push_terrain_frustum(
     let max_cz = ((eye.z + clamped_far) / chunk_size).floor() as i32;
 
     for cz in min_cz..=max_cz {
+        if harvest_cancelled(cancel) {
+            return None;
+        }
         let z0 = cz as f32 * chunk_size;
         let z1 = z0 + chunk_size;
         for cx in min_cx..=max_cx {
+            if harvest_cancelled(cancel) {
+                return None;
+            }
             let x0 = cx as f32 * chunk_size;
             let x1 = x0 + chunk_size;
             // Shortest horizontal distance from eye to chunk AABB.
@@ -1489,6 +1618,9 @@ fn push_terrain_frustum(
             let side = (divs + 1) as usize;
             let mut heights = Vec::with_capacity(side * side);
             for iz in 0..side {
+                if harvest_cancelled(cancel) {
+                    return None;
+                }
                 let wz = z0 + iz as f32 * step;
                 for ix in 0..side {
                     let wx = x0 + ix as f32 * step;
@@ -1517,6 +1649,9 @@ fn push_terrain_frustum(
             } else {
                 let mut he = Vec::with_capacity(side * divs as usize);
                 for iz in 0..side {
+                    if harvest_cancelled(cancel) {
+                        return None;
+                    }
                     let wz = z0 + iz as f32 * step;
                     for ix in 0..divs as usize {
                         he.push(ground(x0 + (ix as f32 + 0.5) * step, wz));
@@ -1524,6 +1659,9 @@ fn push_terrain_frustum(
                 }
                 let mut ve = Vec::with_capacity(divs as usize * side);
                 for iz in 0..divs as usize {
+                    if harvest_cancelled(cancel) {
+                        return None;
+                    }
                     let wzc = z0 + (iz as f32 + 0.5) * step;
                     for ix in 0..side {
                         ve.push(ground(x0 + ix as f32 * step, wzc));
@@ -1534,6 +1672,9 @@ fn push_terrain_frustum(
             triangles.reserve((divs * divs * 2) as usize);
             let divs_u = divs as usize;
             for iz in 0..divs_u {
+                if harvest_cancelled(cancel) {
+                    return None;
+                }
                 let wz0 = z0 + iz as f32 * step;
                 let wz1 = wz0 + step;
                 let wzc = (wz0 + wz1) * 0.5;
@@ -1661,7 +1802,7 @@ fn push_terrain_frustum(
             }
         }
     }
-    lod_tris
+    Some(lod_tris)
 }
 
 /// Sample the vertical height of the harvested RT terrain triangles at `(x, z)`
