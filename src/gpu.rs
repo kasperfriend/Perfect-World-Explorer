@@ -7113,7 +7113,7 @@ pub fn run(
                                 renderer.render_minimap(&full_map_view,&full_map_depth,&camera,0.,true);
                                 map_refresh=Instant::now();
                             }
-                            renderer.modules.prepare_librarian_preview(&renderer.device, &renderer.queue, &mut egui_renderer, format, menu_page==MenuPage::Modules);
+                            renderer.modules.prepare_librarian_preview(&renderer.device, &renderer.queue, &mut egui_renderer, format, menu_page==MenuPage::Modules && !renderer.modules.architect_active());
                             // On-screen mark: the active upscaler / frame-generation
                             // path, so a player can see it is really on. Shown even
                             // with the menu closed (the egui pass runs for it too).
@@ -7284,7 +7284,8 @@ pub fn run(
                                 || fg_failed
                                 || xess_fg_failed
                                 || dlss_fg_failed;
-                            if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
+                            if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || renderer.modules.architect_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
+                                let mut architect_map_request: Option<String> = None;
                                 let input=egui_state.take_egui_input(&window);
                                 let output=egui_ctx.run(input,|ctx| {
                                     // A replacement-process handoff leaves this
@@ -7347,6 +7348,7 @@ pub fn run(
                                     // Clone the message before the window closure: the
                                     // Dismiss button needs a mutable borrow of the
                                     // Option while the label is displayed.
+                                    if !renderer.modules.architect_active() {
                                     if let Some(reason) = world_change_error.clone() {
                                         egui::Window::new("WORLD CHANGE FAILED")
                                             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
@@ -7387,6 +7389,8 @@ pub fn run(
                                                     if ui.add_sized([button_width,52.],egui::Button::new(egui::RichText::new("SETTINGS").size(22.).strong()).fill(egui::Color32::from_rgb(38,83,116))).clicked(){settings_tab=0;menu_page=MenuPage::Settings;}
                                                     ui.add_space(8.);
                                                     if ui.add_sized([button_width,42.],egui::Button::new(egui::RichText::new("MODULES").size(18.).strong())).clicked(){menu_page=MenuPage::Modules;}
+                                                    ui.add_space(8.);
+                                                    if ui.add_sized([button_width,42.],egui::Button::new(egui::RichText::new("ARCHITECT  |  WORLD EDITOR").size(17.).strong()).fill(egui::Color32::from_rgb(38,83,116))).clicked(){renderer.modules.set_architect_active(true);menu_page=MenuPage::Closed;}
                                                     ui.add_space(8.);
                                                     if ui.add_sized([button_width,40.],egui::Button::new(egui::RichText::new("TELEPORT LIST").size(17.))).clicked(){menu_page=MenuPage::Teleports;}
                                                     ui.add_space(8.);
@@ -7598,7 +7602,59 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         );
                                     }
                                     if settings.show_zone_entry {if let Some((name,started))=&zone_banner {let elapsed=started.elapsed().as_secs_f32();if elapsed<4. {let alpha=(elapsed.min(4.-elapsed)*2.).clamp(0.,1.);egui::Area::new(egui::Id::new("zone-entry")).anchor(egui::Align2::CENTER_TOP,egui::vec2(0.,65.)).interactable(false).show(ctx,|ui|{ui.label(egui::RichText::new(format!("Entering {name}")).size(24.).color(egui::Color32::from_white_alpha((alpha*255.) as u8)));});}}}
+                                    } else {
+                                        architect_map_request = renderer.modules.architect_ui(ctx, &catalog, &current_map, &t.scene, &t.objects.ornaments, camera.pos);
+                                    }
                                 });
+                                if let Some(requested) = architect_map_request {
+                                    selected_world_ui = requested.clone();
+                                    if requested.eq_ignore_ascii_case(&current_map.id) {
+                                        world_change_error = Some(format!("{} is already the active world.", current_map.display_name));
+                                    } else {
+                                        match spawn_world_handoff(&client_root, &requested, window_focused) {
+                                            Ok((files, rx)) => {
+                                                settings.selected_world = requested.to_ascii_lowercase();
+                                                if let Err(error) = settings.save() {
+                                                    eprintln!("Settings save before Architect world handoff: {error}");
+                                                } else {
+                                                    saved_settings = settings.clone();
+                                                }
+                                                handoff_files = Some(files);
+                                                handoff_rx = Some(rx);
+                                                world_loading_active = true;
+                                                world_change_error = None;
+                                                world_change_notice = None;
+                                                world_loading_sampler = ThroughputSampler::new();
+                                                if let Some(destination) = catalog.maps.iter().find(|map| map.id.eq_ignore_ascii_case(&requested)) {
+                                                    let size = (window.inner_size().width, window.inner_size().height);
+                                                    let (overlay, status) = build_world_loading_overlay(&egui_ctx, &destination.element, destination, size);
+                                                    world_loading_overlay = Some(overlay);
+                                                    world_loading_status = status;
+                                                } else {
+                                                    world_loading_overlay = None;
+                                                    world_loading_status = format!("Starting {requested}...");
+                                                }
+                                                renderer.modules.set_architect_active(false);
+                                                keys.clear();
+                                                if captured {
+                                                    let _ = window.set_cursor_grab(CursorGrabMode::None);
+                                                    window.set_cursor_visible(true);
+                                                    captured = false;
+                                                }
+                                            }
+                                            Err(error) => {
+                                                settings.selected_world = current_map.id.clone();
+                                                if let Err(save_error) = settings.save() {
+                                                    eprintln!("Settings save after Architect world handoff failure: {save_error}");
+                                                } else {
+                                                    saved_settings = settings.clone();
+                                                }
+                                                selected_world_ui = current_map.id.clone();
+                                                world_change_error = Some(error);
+                                            }
+                                        }
+                                    }
+                                }
                                 egui_state.handle_platform_output(&window,output.platform_output);
                                 let jobs=egui_ctx.tessellate(output.shapes,output.pixels_per_point);
                                 let screen=egui_wgpu::ScreenDescriptor{size_in_pixels:[config.width,config.height],pixels_per_point:output.pixels_per_point};
