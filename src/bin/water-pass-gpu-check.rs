@@ -427,6 +427,9 @@ fn main() {
                     &dv,
                     if cutoff { None } else { Some((&vb, &ib, 0)) },
                     (&vb, &ib, 6),
+                    None,
+                    &[],
+                    &[(0, 6)],
                 );
                 let read = device.create_buffer(&wgpu::BufferDescriptor {
                     label: None,
