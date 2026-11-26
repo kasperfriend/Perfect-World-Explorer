@@ -472,12 +472,11 @@ impl Scan {
         }
         let tasks_version = tasks.raw?;
         match (elements.version(), tasks_version) {
+            // These pairs are measured in docs/cross-version-matrix.md.
             (10, 55) => Some("1.3.1"),
-            // This data revision is used by both 1.3.6 and 1.3.9 client
-            // distributions, so it cannot distinguish those executables.
-            (12, 56) => Some("1.3.6 / 1.3.9"),
-            (60, 93) | (70, 105) => Some("1.4.4"),
-            (85, 108) => Some("1.4.8"),
+            (70, 105) => Some("1.4.4"),
+            // v12/v56 is shared by 1.3.6 and 1.3.9 distributions; the pair
+            // alone cannot identify which executable release is installed.
             _ => None,
         }
     }
