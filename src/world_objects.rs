@@ -2,11 +2,11 @@
 //! globally across geometry chunks, rather than duplicated at every page turn.
 use crate::{
     gpu::Vertex,
-    indirect_args::DrawIndexedArgs,
     objects::Objects,
     scene::Ornament,
     scenery_visibility::{allows_with_context, Pass, RenderContext, Visibility},
 };
+use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use std::{
     collections::HashMap,
@@ -269,6 +269,18 @@ impl CullParams {
 }
 
 /// One consecutive page run in the stable whole-world command order.
+/// wgpu's indexed-indirect ABI: five tightly packed 32-bit words.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PageDrawIndexedArgs {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+}
+const PAGE_DRAW_ARGS_SIZE: u64 = std::mem::size_of::<PageDrawIndexedArgs>() as u64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WorldIndirectRun {
     page: usize,
@@ -285,7 +297,7 @@ struct WorldIndirectRun {
 pub struct WorldDrawScratch {
     pub cmds: Vec<DrawCmd>,
     pub page_visible: Vec<bool>,
-    indirect_args: Vec<DrawIndexedArgs>,
+    indirect_args: Vec<PageDrawIndexedArgs>,
     indirect_runs: Vec<WorldIndirectRun>,
     indirect_buffers: [Option<wgpu::Buffer>; 2],
 }
@@ -1799,7 +1811,7 @@ impl GpuPage {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         multi_draw: bool,
-        scratch: &mut WorldDrawScratch,
+        scratch: &'a mut WorldDrawScratch,
     ) {
         if pages.is_empty() || list.chunks.is_empty() {
             return;
@@ -1921,7 +1933,7 @@ impl GpuPage {
             scratch.indirect_runs.clear();
             for (cmd_index, cmd) in scratch.cmds.iter().enumerate() {
                 let record_index = scratch.indirect_args.len() as u32;
-                scratch.indirect_args.push(DrawIndexedArgs {
+                scratch.indirect_args.push(PageDrawIndexedArgs {
                     index_count: cmd.end - cmd.start,
                     instance_count: 1,
                     first_index: cmd.start,
@@ -1941,48 +1953,48 @@ impl GpuPage {
                 }
             }
 
-            let slot = usize::from(sdr_only);
-            let required_bytes = (scratch.indirect_args.len() as u64)
-                .saturating_mul(crate::indirect_args::DRAW_ARGS);
-            let current_bytes = scratch.indirect_buffers[slot]
-                .as_ref()
-                .map_or(0, wgpu::Buffer::size);
-            let capacity = if current_bytes >= required_bytes {
-                current_bytes
-            } else {
-                required_bytes
-                    .max(current_bytes.saturating_mul(2))
-                    .checked_next_power_of_two()
-                    .unwrap_or(u64::MAX)
-            };
-            if required_bytes > 0
-                && capacity <= device.limits().max_buffer_size
-                && capacity != u64::MAX
-            {
-                if capacity != current_bytes {
-                    scratch.indirect_buffers[slot] = Some(device.create_buffer(
-                        &wgpu::BufferDescriptor {
-                            label: Some(if sdr_only {
-                                "whole-world SDR indirect commands"
-                            } else {
-                                "whole-world opaque indirect commands"
-                            }),
-                            size: capacity.max(crate::indirect_args::DRAW_ARGS),
-                            usage: wgpu::BufferUsages::INDIRECT
-                                | wgpu::BufferUsages::COPY_DST,
-                            mapped_at_creation: false,
-                        },
-                    ));
-                }
-                let buffer = scratch.indirect_buffers[slot]
+            // A multi-draw run only helps when at least two adjacent commands
+            // share the same page. Avoid allocating/writing an indirect buffer
+            // for a list whose page boundaries already force one draw per run.
+            if scratch.indirect_runs.iter().any(|run| run.record_count > 1) {
+                let slot = usize::from(sdr_only);
+                let required_bytes = (scratch.indirect_args.len() as u64)
+                    .saturating_mul(PAGE_DRAW_ARGS_SIZE);
+                let current_bytes = scratch.indirect_buffers[slot]
                     .as_ref()
-                    .expect("whole-world indirect buffer was just allocated");
-                queue.write_buffer(
-                    buffer,
-                    0,
-                    bytemuck::cast_slice(&scratch.indirect_args),
+                    .map_or(0, wgpu::Buffer::size);
+                let max_buffer_size = device.limits().max_buffer_size;
+                let capacity = required_bytes.max(
+                    current_bytes
+                        .saturating_mul(2)
+                        .min(max_buffer_size),
                 );
-                use_multi_draw = true;
+                if required_bytes > 0 && capacity <= max_buffer_size {
+                    if capacity != current_bytes {
+                        scratch.indirect_buffers[slot] = Some(device.create_buffer(
+                            &wgpu::BufferDescriptor {
+                                label: Some(if sdr_only {
+                                    "whole-world SDR indirect commands"
+                                } else {
+                                    "whole-world opaque indirect commands"
+                                }),
+                                size: capacity,
+                                usage: wgpu::BufferUsages::INDIRECT
+                                    | wgpu::BufferUsages::COPY_DST,
+                                mapped_at_creation: false,
+                            },
+                        ));
+                    }
+                    let buffer = scratch.indirect_buffers[slot]
+                        .as_ref()
+                        .expect("whole-world indirect buffer was just allocated");
+                    queue.write_buffer(
+                        buffer,
+                        0,
+                        bytemuck::cast_slice(&scratch.indirect_args),
+                    );
+                    use_multi_draw = true;
+                }
             }
         }
 
@@ -2015,7 +2027,7 @@ impl GpuPage {
                 if run.record_count > 1 {
                     pass.multi_draw_indexed_indirect(
                         indirect_buffer,
-                        u64::from(run.first_record) * crate::indirect_args::DRAW_ARGS,
+                        u64::from(run.first_record) * PAGE_DRAW_ARGS_SIZE,
                         run.record_count,
                     );
                 } else {
@@ -2634,7 +2646,7 @@ mod page_tests {
         let mut runs = Vec::<WorldIndirectRun>::new();
         for (cmd_index, cmd) in cmds.iter().enumerate() {
             let record_index = args.len() as u32;
-            args.push(DrawIndexedArgs {
+            args.push(PageDrawIndexedArgs {
                 index_count: cmd.end - cmd.start,
                 instance_count: 1,
                 first_index: cmd.start,
