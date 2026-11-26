@@ -1800,6 +1800,11 @@ struct Renderer {
     raywatcher_gpu_init: Option<
         std::sync::mpsc::Receiver<Result<crate::modules::raywatcher::gpu::RaywatcherGpu, String>>,
     >,
+    /// Scene snapshot used by the single first-use GPU/DXR initialization worker.
+    /// Newer harvested scenes are applied to its result instead of abandoning it.
+    raywatcher_gpu_init_scene: Option<
+        std::sync::Arc<crate::modules::raywatcher::bvh::SceneGeometry>,
+    >,
     /// The geometry the current `raywatcher_gpu` was built from, so a world
     /// change can drop the tree instead of tracing stale geometry.
     raywatcher_scene: Option<std::sync::Arc<crate::modules::raywatcher::bvh::SceneGeometry>>,
@@ -2593,6 +2598,7 @@ impl Renderer {
             modules: crate::modules::Modules::default(),
             raywatcher_gpu: None,
             raywatcher_gpu_init: None,
+            raywatcher_gpu_init_scene: None,
             raywatcher_scene: None,
             raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester::new(),
             raywatcher_worst_frame_ms: 0.0,
@@ -3895,8 +3901,27 @@ impl Renderer {
             // Holding the GPU state would keep a BVH and a dozen targets alive
             // for a module the user turned off. The harvester also signals any
             // detached CPU worker to cancel before dropping its receiver.
-            self.raywatcher_gpu = None;
-            self.raywatcher_gpu_init = None;
+            // A detached first-use or DXR worker cannot be stopped by
+            // dropping its receiver. Keep ownership until it completes so a
+            // quick re-enable cannot start a second hardware build in parallel.
+            if let Some(rx) = self.raywatcher_gpu_init.as_ref() {
+                match rx.try_recv() {
+                    Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.raywatcher_gpu_init = None;
+                        self.raywatcher_gpu_init_scene = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            } else {
+                self.raywatcher_gpu_init_scene = None;
+            }
+            let can_drop_gpu = self
+                .raywatcher_gpu
+                .as_mut()
+                .map_or(true, |gpu| gpu.discard_completed_background_work());
+            if can_drop_gpu {
+                self.raywatcher_gpu = None;
+            }
             self.raywatcher_scene = None;
             self.modules
                 .raywatcher_mut()
@@ -4224,11 +4249,18 @@ impl Renderer {
             .is_some_and(|old| std::sync::Arc::ptr_eq(old, &scene));
         let depth_extent = (self.depth.width().max(1), self.depth.height().max(1));
         if !same_world {
-            self.raywatcher_gpu_init = None;
             if let Some(gpu) = self.raywatcher_gpu.as_mut() {
                 gpu.set_scene(&self.device, scene.clone());
-                gpu.resize(&self.device, depth_extent, plan.grid);
                 self.raywatcher_scene = Some(scene.clone());
+            } else if self.raywatcher_gpu_init.is_some() {
+                // First-use GPU/DXR initialization is tied to the previous
+                // scene snapshot. Keep its receiver and single worker alive;
+                // when it finishes, apply this newest scene to the returned
+                // tracer rather than launching another full initializer.
+                self.raywatcher_scene = Some(scene.clone());
+                self.modules
+                    .raywatcher_mut()
+                    .set_hardware_initializing(hardware_mode);
             } else {
                 let worker_device = std::sync::Arc::clone(&self.device);
                 let worker_scene = scene.clone();
@@ -4237,27 +4269,43 @@ impl Renderer {
                 let worker_hardware = hardware_mode;
                 let triangle_count = worker_scene.triangles.len();
                 let (tx, rx) = std::sync::mpsc::channel();
-                let spawn = std::thread::Builder::new().name("pwe-raywatcher-gpu-init".to_string()).spawn(move || {
-                    let started = std::time::Instant::now();
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let mut gpu = crate::modules::raywatcher::gpu::RaywatcherGpu::new(
-                            std::sync::Arc::clone(&worker_device), worker_scene, worker_extent, worker_grid,
+                let spawn = std::thread::Builder::new()
+                    .name("pwe-raywatcher-gpu-init".to_string())
+                    .spawn(move || {
+                        let started = std::time::Instant::now();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let mut gpu = crate::modules::raywatcher::gpu::RaywatcherGpu::new(
+                                std::sync::Arc::clone(&worker_device),
+                                worker_scene,
+                                worker_extent,
+                                worker_grid,
+                            );
+                            if worker_hardware {
+                                gpu.initialize_hardware();
+                            }
+                            gpu
+                        }))
+                        .map_err(|_| "Raywatcher GPU initialization panicked".to_string());
+                        eprintln!(
+                            "[Raywatcher] First-use GPU setup took {:.1}s ({} triangles, hardware_requested={}, success={})",
+                            started.elapsed().as_secs_f32(),
+                            triangle_count,
+                            worker_hardware,
+                            result.is_ok()
                         );
-                        if worker_hardware { gpu.initialize_hardware(); }
-                        gpu
-                    })).map_err(|_| "Raywatcher GPU initialization panicked".to_string());
-                    eprintln!("[Raywatcher] First-use GPU setup took {:.1}s ({} triangles, hardware_requested={}, success={})", started.elapsed().as_secs_f32(), triangle_count, worker_hardware, result.is_ok());
-                    let _ = tx.send(result);
-                });
+                        let _ = tx.send(result);
+                    });
                 match spawn {
                     Ok(_) => {
                         self.raywatcher_gpu_init = Some(rx);
+                        self.raywatcher_gpu_init_scene = Some(scene.clone());
                         self.raywatcher_scene = Some(scene.clone());
                         self.modules
                             .raywatcher_mut()
                             .set_hardware_initializing(worker_hardware);
                     }
                     Err(err) => {
+                        self.raywatcher_gpu_init_scene = None;
                         self.raywatcher_scene = None;
                         self.modules
                             .raywatcher_mut()
@@ -4267,18 +4315,33 @@ impl Renderer {
                 }
                 return;
             }
-        } else if self.raywatcher_gpu.is_none() {
+        }
+
+        if self.raywatcher_gpu.is_none() {
             match self.raywatcher_gpu_init.as_ref().map(|rx| rx.try_recv()) {
                 Some(Ok(Ok(mut gpu))) => {
                     self.raywatcher_gpu_init = None;
+                    let built_scene = self.raywatcher_gpu_init_scene.take();
+                    if !built_scene
+                        .as_ref()
+                        .is_some_and(|built| std::sync::Arc::ptr_eq(built, &scene))
+                    {
+                        // The worker finished an obsolete scene. Reuse its
+                        // expensive GPU/DXR state and queue one serialized
+                        // scene rebuild for the current world snapshot.
+                        gpu.set_scene(&self.device, scene.clone());
+                    }
                     gpu.resize(&self.device, depth_extent, plan.grid);
+                    let still_initializing = gpu.hardware_initializing();
                     self.raywatcher_gpu = Some(gpu);
+                    self.raywatcher_scene = Some(scene.clone());
                     self.modules
                         .raywatcher_mut()
-                        .set_hardware_initializing(false);
+                        .set_hardware_initializing(still_initializing);
                 }
                 Some(Ok(Err(err))) => {
                     self.raywatcher_gpu_init = None;
+                    self.raywatcher_gpu_init_scene = None;
                     self.raywatcher_scene = None;
                     self.modules
                         .raywatcher_mut()
@@ -4294,6 +4357,7 @@ impl Renderer {
                 }
                 Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) | None => {
                     self.raywatcher_gpu_init = None;
+                    self.raywatcher_gpu_init_scene = None;
                     self.raywatcher_scene = None;
                     self.modules
                         .raywatcher_mut()
