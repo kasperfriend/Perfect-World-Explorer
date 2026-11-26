@@ -131,7 +131,10 @@ impl Architect {
                 .and_then(|path| path.parent().map(Path::to_path_buf))
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
         });
-        let project_root = base.join("PerfectWorldExplorer").join("Architect").join("Worlds");
+        let project_root = base
+            .join("PerfectWorldExplorer")
+            .join("Architect")
+            .join("Worlds");
         let client_root = element.parent().unwrap_or(&element).to_path_buf();
         let mut editor = Self {
             enabled: false,
@@ -513,7 +516,8 @@ impl Architect {
                 })
                 .collect::<Vec<_>>();
             entries.sort_by_key(|entry| entry.name.to_lowercase());
-            self.directory_cache.insert(path.to_path_buf(), entries.clone());
+            self.directory_cache
+                .insert(path.to_path_buf(), entries.clone());
             entries
         };
         for entry in entries {
@@ -703,7 +707,10 @@ impl Architect {
         self.archive_error = None;
         if let Some(entries) = self.archive_cache.get(&path) {
             self.archive_entries = entries.clone();
-            self.status = format!("Loaded {} cached archive entries.", self.archive_entries.len());
+            self.status = format!(
+                "Loaded {} cached archive entries.",
+                self.archive_entries.len()
+            );
             return;
         }
         let result = std::fs::File::open(&path)
@@ -712,7 +719,8 @@ impl Architect {
         match result {
             Ok(entries) => {
                 self.archive_entries = entries.into_iter().map(|entry| entry.name).collect();
-                self.archive_cache.insert(path.clone(), self.archive_entries.clone());
+                self.archive_cache
+                    .insert(path.clone(), self.archive_entries.clone());
                 self.status = format!(
                     "Indexed {} archive entries from {}.",
                     self.archive_entries.len(),
