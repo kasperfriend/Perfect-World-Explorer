@@ -510,9 +510,9 @@ impl Architect {
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                     self.show_tree(ui, &self.element.clone(), 0);
                 });
-                if let Some(asset) = &self.selected_asset {
+                if let Some(asset) = self.selected_asset.clone() {
                     ui.separator();
-                    ui.label(egui::RichText::new(asset).small().strong());
+                    ui.label(egui::RichText::new(&asset).small().strong());
                     if ui.button("Add to quick bar").clicked() { self.pin(asset.clone()); }
                     if ui.button("Record placement at camera").clicked() {
                         self.project.objects.push(PlacedObject {
