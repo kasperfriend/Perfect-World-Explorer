@@ -494,7 +494,7 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
     // Phase 8: Relative depth-jump guard prevents thin geometry (fences,
     // branches, grass blades) from differentiating across background depth
     // discontinuities and producing grazing/inverted normals.
-    let max_rel_dz = 0.08;
+    let max_rel_dz = 0.18;
     let inv_z = 1.0 / max(z, 1e-4);
     let dz_l = abs(z_l - z);
     let dz_r = abs(z_r - z);
@@ -2213,7 +2213,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let night_dark_scale = mix(0.28, 1.0, smoothstep(0.0, 0.25, sun_strength));
         let separated_lf = (amb_base * v_ao * amb_keep * night_dark_scale + sun_base * v_sun) * point_shadow_mod;
         out_lf = mix(separated_lf, 1.0, fog_t);
-        out_rgb = avg_gi + point_lighting;
+        // The raster base is already fogged by the client shader. Attenuate every
+        // additive RT contribution by the same eye-distance transmittance or GI
+        // and point lights remain visible beyond the client's fog end.
+        out_rgb = (avg_gi + point_lighting) * (1.0 - fog_t);
     } else {
         let direct = select(vec3<f32>(0.0), params.sun_colour.xyz * (n_dot_l * avg_shadow), bits_lighting);
         let ambient = params.ambient.xyz * (avg_open * params.tuning.z);
@@ -2468,7 +2471,10 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let cur_raw = textureLoad(src_colour, gp, 0);
     // Boost #15: Skip loading src_reflection on matte land pixels (saves 8 RGBA16F loads/px).
     let is_glossy = textureLoad(src_normals, gp, 0).w <= 0.12;
-    let current = select(cur_raw.rgb, cur_raw.rgb + textureLoad(src_reflection, gp, 0).rgb, is_glossy);
+    var current = cur_raw.rgb;
+    if (is_glossy) {
+        current = current + textureLoad(src_reflection, gp, 0).rgb;
+    }
     let current_lf = cur_raw.a;
     let depth = textureLoad(src_depth, pixel, 0);
     if (depth <= 1e-6) {
@@ -2506,7 +2512,10 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let p = clamp(gp + vec2<i32>(dx, dy), vec2<i32>(0), gmax);
                 let raw = textureLoad(src_colour, p, 0);
                 let tap_is_glossy = textureLoad(src_normals, p, 0).w <= 0.12;
-                let c = select(raw.rgb, raw.rgb + textureLoad(src_reflection, p, 0).rgb, tap_is_glossy);
+                var c = raw.rgb;
+                if (tap_is_glossy) {
+                    c = c + textureLoad(src_reflection, p, 0).rgb;
+                }
                 sum = sum + c;
                 sum_sq = sum_sq + c * c;
                 sum_lf = sum_lf + raw.a;
@@ -2516,7 +2525,16 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let inv9 = 1.0 / 9.0;
         let mean = sum * inv9;
         let stddev = sqrt(max(sum_sq * inv9 - mean * mean, vec3<f32>(0.0))) * params.weights.w;
-        let history = clamp(prev.colour, mean - stddev, mean + stddev);
+        // Water reflections are stochastic one-sample signals. Clamping their
+        // reprojected history to the current 3x3 sample neighbourhood discards
+        // valid temporal energy whenever a reflected edge crosses that kernel,
+        // which reads as reflection popping. Keep valid water history; land
+        // lighting continues to use the variance clamp.
+        let history = select(
+            clamp(prev.colour, mean - stddev, mean + stddev),
+            prev.colour,
+            is_glossy,
+        );
         let current_clamped = min(current, mean * 1.75 + vec3<f32>(0.12));
         let mean_lf = sum_lf * inv9;
         let std_lf = sqrt(max(sum_lf_sq * inv9 - mean_lf * mean_lf, 0.0)) * params.weights.w;
@@ -2542,7 +2560,10 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 let p = clamp(gp + vec2<i32>(dx, dy), vec2<i32>(0), gmax);
                 let raw = textureLoad(src_colour, p, 0);
                 let tap_is_glossy = textureLoad(src_normals, p, 0).w <= 0.12;
-                let c = select(raw.rgb, raw.rgb + textureLoad(src_reflection, p, 0).rgb, tap_is_glossy);
+                var c = raw.rgb;
+                if (tap_is_glossy) {
+                    c = c + textureLoad(src_reflection, p, 0).rgb;
+                }
                 let l = luminance(c);
                 l_sum = l_sum + l;
                 l2_sum = l2_sum + l * l;
@@ -6430,5 +6451,20 @@ mod reflection_sampling_regression_tests {
     fn sky_and_cloud_reflection_atlas_uses_four_times_the_previous_edge_resolution() {
         assert_eq!(SKY_ENV_FACE, 512);
         assert!(DXR_SHADER.contains("SKY_ENV_FACE_F = 512.0"));
+    }
+
+    #[test]
+    fn layered_rt_radiance_is_attenuated_by_client_fog() {
+        assert!(RAY_SHADER.contains("out_rgb = (avg_gi + point_lighting) * (1.0 - fog_t)"));
+    }
+
+    #[test]
+    fn water_reflection_history_is_not_clamped_to_noisy_neighbourhood_samples() {
+        assert!(DENOISE_SHADER.contains("prev.colour,\n            is_glossy,"));
+    }
+
+    #[test]
+    fn steep_terrain_depth_gradients_are_not_rejected_as_discontinuities() {
+        assert!(GBUF_PREP_SHADER.contains("let max_rel_dz = 0.18;"));
     }
 }
