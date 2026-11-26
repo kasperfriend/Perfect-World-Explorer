@@ -36,6 +36,11 @@ heavy stutter when rotating the camera with the whole-world preload resident.
   coarse cell stores the minimum depth of its complete source footprint, this
   is conservative: larger footprints can retain an actually hidden tree, but
   cannot turn an uncovered hole into occlusion evidence.
+- Far-tree candidates are now prefiltered by 256-unit XZ cells. Each cell's
+  AABB includes the authored tree sphere; a cell is uploaded only when that
+  conservative bound intersects the view frustum, optional water clip plane,
+  and optional resident-world bounds. The GPU still tests each selected tree
+  individually, including its exact sphere/frustum and Hi-Z logic.
 - Added a regression covering a clear-depth hole inside a rectangle whose
   coverage is tested at a coarser mip.
 

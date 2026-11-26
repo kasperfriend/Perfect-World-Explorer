@@ -85,8 +85,16 @@ fn build_tree_spatial_cells(
             continue;
         }
         let radius = group.height.max(5.0) * 2.0;
-        let min = [position[0] - radius, position[1] - radius, position[2] - radius];
-        let max = [position[0] + radius, position[1] + radius, position[2] + radius];
+        let min = [
+            position[0] - radius,
+            position[1] - radius,
+            position[2] - radius,
+        ];
+        let max = [
+            position[0] + radius,
+            position[1] + radius,
+            position[2] + radius,
+        ];
         let key = (
             (position[0] / TREE_SPATIAL_CELL_SIZE).floor() as i32,
             (position[2] / TREE_SPATIAL_CELL_SIZE).floor() as i32,
@@ -160,7 +168,8 @@ pub(crate) struct LodParams {
 /// The LOD selection pass.
 ///
 /// This is `tree_lod::client_distance` + `tree_lod::select` transcribed into
-/// WGSL and run once per placement on the GPU, so a camera move no longer costs
+/// WGSL and run for the view's spatially selected candidates on the GPU, so a
+/// camera move no longer costs
 /// a walk over every tree placement in the world plus a full instance-buffer
 /// upload. Both functions are pure arithmetic and are reproduced operation for
 /// operation: the same fast square root on the squared distance
@@ -1483,7 +1492,7 @@ impl FarTrees {
     #[allow(clippy::too_many_arguments)]
     pub fn encode_resident_lods(
         &self,
-        device: &wgpu::Device,
+        _device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         camera: [f32; 3],
@@ -1781,9 +1790,21 @@ mod tests {
             capacity: 3,
         }];
         let placements = [
-            Placement { pos_height: [95.0, 0.0, 0.0, 0.0], group: 0, pad: [0; 3] },
-            Placement { pos_height: [120.0, 0.0, 0.0, 0.0], group: 0, pad: [0; 3] },
-            Placement { pos_height: [1024.0, 0.0, 0.0, 0.0], group: 0, pad: [0; 3] },
+            Placement {
+                pos_height: [95.0, 0.0, 0.0, 0.0],
+                group: 0,
+                pad: [0; 3],
+            },
+            Placement {
+                pos_height: [120.0, 0.0, 0.0, 0.0],
+                group: 0,
+                pad: [0; 3],
+            },
+            Placement {
+                pos_height: [1024.0, 0.0, 0.0, 0.0],
+                group: 0,
+                pad: [0; 3],
+            },
         ];
         let cells = build_tree_spatial_cells(&placements, &groups);
         let cube = [
@@ -1799,6 +1820,7 @@ mod tests {
         // The first two trees share a cell. The second tree's sphere reaches
         // the view, so retaining that entire cell is intentionally conservative.
         assert_eq!(visible, vec![0, 1]);
+        assert!(LOD_COMPUTE.contains("active_indices[active_slot]"));
     }
 
     #[test]
