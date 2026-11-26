@@ -1148,6 +1148,7 @@ mod imp {
             }
 
             let cached_pso = load_pso_cache(cache_key);
+            let mut cache_rejected = false;
             if cached_pso.is_some() {
                 eprintln!("[Raywatcher] DXR driver PSO cache hit ({cache_key:016x})");
             }
@@ -1182,6 +1183,7 @@ mod imp {
                 eprintln!(
                     "[Raywatcher] DXR PSO cache rejected by driver; recompiling without cache"
                 );
+                cache_rejected = true;
                 remove_pso_cache(cache_key);
                 pso_desc.CachedPSO = d12::D3D12_CACHED_PIPELINE_STATE {
                     pCachedBlob: null(),
@@ -1202,7 +1204,10 @@ mod imp {
                     "DXR CreateComputePipelineState failed (0x{hr:08x})"
                 ));
             }
-            if cached_pso.is_none() {
+            // A stale driver blob was removed above; save the freshly
+            // compiled replacement now instead of forcing another cold compile
+            // on the next launch.
+            if cached_pso.is_none() || cache_rejected {
                 let mut cached_blob: *mut ID3DBlob = null_mut();
                 let cache_hr = (*pso).GetCachedBlob(&mut cached_blob);
                 if cache_hr >= 0 && !cached_blob.is_null() {
