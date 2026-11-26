@@ -878,19 +878,10 @@ mod imp {
     unsafe impl Send for DxrTracer {}
 
     // Descriptor heap slots:
-    // 0: t0 TLAS SRV
-    // 1: t1 tris StructuredBuffer SRV
-    // 2: t2 materials StructuredBuffer SRV
-    // 3: t3 in_pos Texture2D SRV
-    // 4: t4 in_norm Texture2D SRV
-    // 5: t5 in_raster Texture2D SRV
-    // 6: u0 out_colour UAV
-    // 7: u1 out_guide UAV
-    // 8: u2 out_reflection UAV
-    // 9: u3 out_normals UAV
-    // 10: u4 out_albedo UAV
-    // 11: u5 radiance cache UAV
-    // 12: u6 two-frame ReSTIR GI reservoir UAV
+    // 0: t0 TLAS SRV; 1: t1 triangles; 2: t2 materials
+    // 3: t3 world position; 4: t4 normal; 5: t5 ray-grid raster colour
+    // 6: t6 sky/cloud atlas; 7: t7 terrain albedo; 8: t8 full-resolution raster colour
+    // 9..13: u0..u4 output planes; 14: u5 radiance cache; 15: u6 ReSTIR reservoirs
     const RADIANCE_CACHE_CELLS: u32 = 65_536;
     const HEAP_SLOTS: u32 = 16;
 
@@ -1740,7 +1731,7 @@ mod imp {
                     (*dev).CreateShaderResourceView(res, &srv, self.cpu_handle(3 + i as u32));
                 }
 
-                // Slots 6..10: u0..u4 output Texture2D UAVs.
+                // Slots 9..13: u0..u4 output Texture2D UAVs.
                 let mut uav: d12::D3D12_UNORDERED_ACCESS_VIEW_DESC = zeroed();
                 uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
                 uav.ViewDimension = d12::D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -1760,7 +1751,7 @@ mod imp {
                     );
                 }
 
-                // Slot 13: u5 additive atomic radiance cache (`RWStructuredBuffer<uint4>`).
+                // Slot 14: u5 additive atomic radiance cache (`RWStructuredBuffer<uint4>`).
                 let mut rc_uav: d12::D3D12_UNORDERED_ACCESS_VIEW_DESC = zeroed();
                 rc_uav.Format = DXGI_FORMAT_UNKNOWN;
                 rc_uav.ViewDimension = d12::D3D12_UAV_DIMENSION_BUFFER;
@@ -1778,7 +1769,7 @@ mod imp {
                     self.cpu_handle(14),
                 );
 
-                // Slot 14: u6 ReSTIR GI reservoirs (two pixel-sized frames, 64-byte records).
+                // Slot 15: u6 ReSTIR GI reservoirs (two pixel-sized frames, 64-byte records).
                 let mut restir_uav: d12::D3D12_UNORDERED_ACCESS_VIEW_DESC = zeroed();
                 restir_uav.Format = DXGI_FORMAT_UNKNOWN;
                 restir_uav.ViewDimension = d12::D3D12_UAV_DIMENSION_BUFFER;
