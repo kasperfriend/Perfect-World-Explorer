@@ -4673,12 +4673,8 @@ impl Renderer {
             let reflection_scissor =
                 water_view_scissor(matrix * flip, w, h, batch.bounds, plane, water_margin);
             self.queue_reflected_runs(matrix * flip, (w, h), reflection_scissor);
-            let reflection_frustum = water_view_frustum(
-                matrix * flip,
-                (w, h),
-                reflection_scissor,
-                reflected_frustum,
-            );
+            let reflection_frustum =
+                water_view_frustum(matrix * flip, (w, h), reflection_scissor, reflected_frustum);
             let refl_cull = crate::world_objects::CullParams {
                 frustum: reflection_frustum,
                 eye: [camera.pos.x, 2.0 * plane - camera.pos.y, camera.pos.z],
