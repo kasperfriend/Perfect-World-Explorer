@@ -1814,7 +1814,9 @@ struct Renderer {
     world_pages: Vec<crate::world_objects::GpuPage>,
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
     world_draw_cmds: [crate::world_objects::WorldDrawList; crate::world_objects::WORLD_VIEWS],
-    world_draw_scratch: std::cell::RefCell<crate::world_objects::WorldDrawScratch>,
+    /// Separate scratch/buffer lifetimes let the opaque and SDR indirect
+    /// buffers remain borrowed by one render pass at the same time.
+    world_draw_scratch: [std::cell::RefCell<crate::world_objects::WorldDrawScratch>; 2],
     /// Reused upload staging pages; all whole-world geometry copies are
     /// encoded together and submitted once per frame.
     world_upload_belt: wgpu::util::StagingBelt,
@@ -2734,9 +2736,9 @@ impl Renderer {
             world_draw_cmds: std::array::from_fn(|_| {
                 crate::world_objects::WorldDrawList::default()
             }),
-            world_draw_scratch: std::cell::RefCell::new(
-                crate::world_objects::WorldDrawScratch::default(),
-            ),
+            world_draw_scratch: std::array::from_fn(|_| {
+                std::cell::RefCell::new(crate::world_objects::WorldDrawScratch::default())
+            }),
             world_upload_belt: wgpu::util::StagingBelt::new(16 * 1024 * 1024),
             world_done: false,
             local_scenery_skipped: m.local_scenery_skipped,
@@ -3451,6 +3453,12 @@ impl Renderer {
                 extent,
             );
         }
+        // The render pass retains references to the indirect argument
+        // buffers until it ends. Hold independent scratch borrows for the
+        // opaque and SDR lists so each can bind its own persistent buffer.
+        let [opaque_scratch_cell, sdr_scratch_cell] = &self.world_draw_scratch;
+        let mut opaque_world_scratch = opaque_scratch_cell.borrow_mut();
+        let mut sdr_world_scratch = sdr_scratch_cell.borrow_mut();
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("opaque scenery after terrain"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3502,7 +3510,6 @@ impl Renderer {
         // caused depth flicker. Switch atomically only after all pages arrive.
         let world_slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
         if self.world_done {
-            let mut scratch = self.world_draw_scratch.borrow_mut();
             crate::world_objects::GpuPage::draw_world_culled(
                 &self.world_pages,
                 &self.world_draw_cmds[world_slot],
@@ -3513,7 +3520,7 @@ impl Renderer {
                 &self.device,
                 &self.queue,
                 self.device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT),
-                &mut scratch,
+                &mut opaque_world_scratch,
             );
         }
         // The `.sdr.` water/lava curtains draw in their own blended pass over
@@ -3543,7 +3550,6 @@ impl Renderer {
                 }
             }
             if self.world_done {
-                let mut scratch = self.world_draw_scratch.borrow_mut();
                 crate::world_objects::GpuPage::draw_world_culled(
                     &self.world_pages,
                     &self.world_draw_cmds[world_slot],
@@ -3554,7 +3560,7 @@ impl Renderer {
                     &self.device,
                     &self.queue,
                     self.device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT),
-                    &mut scratch,
+                    &mut sdr_world_scratch,
                 );
             }
         }
