@@ -118,11 +118,20 @@ pub struct Architect {
 
 impl Architect {
     pub fn new(element: PathBuf, map: Option<crate::navigation::MapSpace>) -> Self {
-        let base = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let project_root = base.join("Architect").join("Worlds");
+        let data_root = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local").join("share"))
+            });
+        let base = data_root.unwrap_or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        });
+        let project_root = base.join("PerfectWorldExplorer").join("Architect").join("Worlds");
         let client_root = element.parent().unwrap_or(&element).to_path_buf();
         let mut editor = Self {
             enabled: false,
@@ -279,6 +288,9 @@ impl Architect {
                 stroke.strength
             ));
         }
+        if out.len() > 64 * 1024 * 1024 {
+            return Err("Architect project exceeds the 64 MiB safety limit".into());
+        }
         let parent = path.parent().ok_or("project path has no parent")?;
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         let temp = path.with_extension("pwa.tmp");
@@ -291,6 +303,10 @@ impl Architect {
     }
 
     fn read_project(path: &Path) -> Result<Project, String> {
+        let metadata = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if metadata.len() > 64 * 1024 * 1024 {
+            return Err("Architect project exceeds the 64 MiB safety limit".into());
+        }
         let source = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut lines = source.lines();
         if lines.next() != Some("PWE_ARCHITECT\t1") {
@@ -303,6 +319,9 @@ impl Architect {
                 "name" if fields.len() == 2 => project.name = Self::decode(fields[1])?,
                 "source_map" if fields.len() == 2 => project.source_map = Self::decode(fields[1])?,
                 "object" if fields.len() == 9 => {
+                    if project.objects.len() >= 100_000 {
+                        return Err("Architect project has too many object placements".into());
+                    }
                     let mut n = [0f32; 7];
                     for (slot, value) in n.iter_mut().zip(&fields[2..]) {
                         *slot = value.parse().map_err(|_| {
@@ -320,6 +339,9 @@ impl Architect {
                     });
                 }
                 "stroke" if fields.len() == 7 => {
+                    if project.strokes.len() >= 100_000 {
+                        return Err("Architect project has too many terrain operations".into());
+                    }
                     let mode = match fields[1] {
                         "raise" => BrushMode::Raise,
                         "lower" => BrushMode::Lower,
@@ -940,6 +962,11 @@ impl Architect {
                         let archive_entries = self.archive_entries.clone();
                         egui::ScrollArea::vertical().max_height(180.).show(ui, |ui| {
                             for entry in archive_entries.iter().take(2000) {
+                                if !self.tree_filter.is_empty()
+                                    && !entry.to_lowercase().contains(&self.tree_filter.to_lowercase())
+                                {
+                                    continue;
+                                }
                                 let label = Path::new(entry).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| entry.clone());
                                 let response = ui.selectable_label(false, format!("📦 {label}"));
                                 if response.clicked() {
