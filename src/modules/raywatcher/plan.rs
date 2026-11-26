@@ -400,7 +400,7 @@ impl Default for Settings {
             effects: Effects::default(),
             bounces: 2,
             samples: 1,
-            denoise_iterations: 1,
+            denoise_iterations: 2,
             sun_radius_degrees: 0.6,
             ray_length: DEFAULT_RAY_LENGTH,
             ambient_strength: 1.,
@@ -528,12 +528,10 @@ impl Plan {
         debug_view: DebugView::None,
     };
 
-    /// Software ray budget. At 1080p this keeps the BVH trace to 960x540;
-    /// the temporal filter reconstructs the remaining spatial detail.
+    /// Original, quality-preserving Software grid: half resolution at 1080p.
     pub const SOFTWARE_GRID_BUDGET: u64 = 960 * 540;
-    /// Hardware ray budget. At 1080p this permits a full-resolution trace.
-    /// The shader's adaptive sample ceiling is separately clamped to the
-    /// sample count included in this budget.
+    /// Original Hardware grid: full render resolution. Adaptive samples and
+    /// denoising retain their original high-quality settings independently.
     pub const HARDWARE_GRID_BUDGET: u64 = 1920 * 1080;
 
     /// Decide one frame.
