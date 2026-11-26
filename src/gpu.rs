@@ -3906,15 +3906,15 @@ impl Renderer {
         }
         let mut overrides = RasterOverrides::for_plan(&plan);
         if overrides.reflection_pass {
-            let hardware_requested = self.modules.raywatcher().effective_mode()
-                == crate::modules::raywatcher::plan::RayTracingMode::Hardware;
+            // Replace the native mirror as soon as this frame's RT output is
+            // actually available. Hardware mode may be temporarily running the
+            // Software fallback while its DXR acceleration structure rebuilds.
             let ready = self
                 .raywatcher_gpu
                 .as_ref()
-                .is_some_and(|gpu| gpu.can_replace_water_reflections(hardware_requested));
-            overrides.reflection_pass &= ready
-                && self.raywatcher_gpu_init.is_none()
-                && !self.raywatcher_harvest.is_building_in_background();
+                .is_some_and(|gpu| gpu.can_replace_water_reflections());
+            overrides.reflection_pass &=
+                ready && !self.raywatcher_harvest.is_building_in_background();
         }
         overrides
     }
