@@ -6017,7 +6017,7 @@ mod shader_optimization_regression_tests {
         assert!(RAY_SHADER.contains("is_water && dot(base_normal, view_dir) > 0.0"));
         assert!(RAY_SHADER.contains("select(0.04, 0.0204, is_water)"));
         assert!(!RAY_SHADER.contains("complexity = max(complexity, 0.42)"));
-        assert!(dxr.contains("if (roughness <= 0.12) return base;"));
+        assert!(dxr.contains("if (is_water && !trace_water_reflection)"));
         assert!(dxr.contains("float3 h = refl_base_n;"));
         assert!(dxr.contains("if (!is_water)"));
         assert!(dxr.contains("if (is_water && dot(normal, view_dir) > 0.0)"));
