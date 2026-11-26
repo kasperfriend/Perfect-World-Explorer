@@ -4735,11 +4735,20 @@ impl RaywatcherGpu {
         self.dxr_init.is_some()
     }
 
-    /// Whether the previous frame produced a complete RT output. During DXR
-    /// preparation the host may keep displaying that stable image, but must
-    /// not claim a newly resized or never-produced target is ready.
+    /// DXR failed and the renderer must harvest a CPU-BVH scene before the
+    /// Software fallback can safely replace native raster lighting.
+    pub fn hardware_failed(&self) -> bool {
+        self.dxr_failed
+    }
+
+    /// Whether the previous frame produced a complete RT output. A
+    /// triangles-only Hardware scene is not a valid Software replacement after
+    /// DXR failure: it has no CPU BVH to provide occlusion or shadows.
     pub fn can_replace_raster_effects(&self) -> bool {
         self.traced_last_frame
+            && (!self.dxr_failed
+                || self.scene_geom.triangles.is_empty()
+                || !self.scene_geom.nodes.is_empty())
     }
 
     pub fn can_replace_water_reflections(&self) -> bool {
