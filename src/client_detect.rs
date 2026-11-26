@@ -431,36 +431,34 @@ impl Scan {
     /// thing to a game version, and a build that has neither says so instead of
     /// inventing a number.
     pub fn game_version(&self) -> String {
-        let Some(exe) = &self.executable else {
-            return "no executable".into();
-        };
-        if exe.is_known() {
-            return exe.label().trim_start_matches("PW ").to_string();
-        }
-        if let Some(version) = exe
-            .release_version
-            .as_deref()
-            .and_then(display_release_version)
-            .or_else(|| resource_game_version(exe))
-        {
-            return version;
-        }
-        // Legacy clients commonly ship the generic 1 0 marker. It is not a
-        // release number: several distinct game releases use it. Only use a
-        // data profile when both independently-versioned headers match a
-        // measured pair; otherwise keep the result explicitly unresolved.
-        if exe.release_version.as_deref() == Some("1 0") {
-            if let Some(version) = self.legacy_data_profile() {
-                return format!("{version} (data-version profile)");
+        if let Some(exe) = &self.executable {
+            if exe.is_known() {
+                return exe.label().trim_start_matches("PW ").to_string();
+            }
+            if let Some(version) = exe
+                .release_version
+                .as_deref()
+                .and_then(display_release_version)
+                .or_else(|| resource_game_version(exe))
+            {
+                return version;
             }
         }
-        exe.version_row()
+        // Data files are independent evidence. Use them only when no usable
+        // release string or executable fingerprint already named the build.
+        if let Some(profile) = self.data_pair_profile() {
+            return profile.game_version();
+        }
+        self.executable
+            .as_ref()
+            .map(ExecutableInfo::version_row)
+            .unwrap_or_else(|| "no executable".into())
     }
 
-    /// A legacy 1 0 marker can be narrowed by the paired data revisions.
-    /// These are identification profiles only; they do not select parser
-    /// layouts, and ambiguous data pairs remain explicitly ambiguous.
-    fn legacy_data_profile(&self) -> Option<&'static str> {
+    /// Identify a release from the exact pair of client data headers when
+    /// executable identity and self-declared release metadata are unavailable.
+    /// This does not select parser layouts; shared pairs remain ambiguous.
+    fn data_pair_profile(&self) -> Option<DataVersionProfile> {
         let elements = self.elements.as_ref()?.header?;
         if elements.family() != 0x3000 {
             return None;
@@ -477,15 +475,15 @@ impl Scan {
             return None;
         }
         let tasks_version = tasks.raw?;
-        match (elements.version(), tasks_version) {
-            // These pairs are measured in docs/cross-version-matrix.md.
-            (10, 55) => Some("1.3.1"),
-            (70, 105) => Some("1.4.4"),
-            // v12/v56 is measured for 1.3.6. 1.3.9 also has the generic
-            // marker, but its data pair has not been verified here, so this
-            // pair is not assumed to identify either release uniquely.
-            _ => None,
-        }
+        // Exact pairs only: do not interpolate missing revisions from either
+        // sequence, and never treat task_npc/dyn_tasks versions as tasks.data.
+        // The catalogue records the actual client side of each pair where
+        // public release inventories distinguish it from the server data.
+        // Regional builds sometimes reuse both header numbers across releases.
+        // In those cases the returned candidate list is intentionally not a
+        // selected marketing version; content fingerprints could narrow it.
+        // Unknown pairs remain unknown until another client is measured.
+        data_version_profile(elements.version(), tasks_version)
     }
 
     fn executable_label(&self) -> String {
@@ -2835,5 +2833,140 @@ mod tests {
             assert_eq!(build.sha256.len(), 64);
             assert!(!build.data_versions.is_empty());
         }
+    }
+
+    #[test]
+    fn client_data_pair_catalog_covers_published_releases() {
+        use DataVersionProfile::Exact;
+
+        let cases = [
+            ((6, 52), "1.1.3"),
+            ((7, 55), "1.2.6"),
+            ((8, 55), "1.2.8"),
+            ((10, 55), "1.3.1"),
+            ((29, 78), "1.4.2"),
+            ((60, 93), "1.4.4"),
+            ((63, 101), "1.4.5"),
+            ((69, 103), "1.4.5"),
+            ((80, 105), "1.4.7"),
+            ((84, 106), "1.4.6"),
+            ((85, 108), "1.4.8"),
+            ((88, 111), "1.5.0"),
+            ((99, 116), "1.5.0"),
+            ((101, 118), "1.5.1"),
+            ((123, 120), "1.5.2"),
+            ((127, 121), "1.5.2"),
+            ((145, 124), "1.5.3"),
+            ((153, 127), "1.5.3"),
+            ((156, 128), "1.5.5"),
+            ((181, 135), "1.5.5"),
+            ((190, 140), "1.5.6"),
+            ((204, 146), "1.5.7"),
+            ((230, 156), "1.6.2"),
+            ((233, 157), "1.6.2"),
+            ((244, 162), "1.6.4"),
+            ((253, 167), "1.6.5"),
+            ((267, 176), "1.6.6"),
+            ((386, 191), "1.7.6"),
+        ];
+
+        for ((elements, tasks), expected) in cases {
+            assert_eq!(
+                data_version_profile(elements, tasks),
+                Some(Exact(expected)),
+                "elements v{elements} / tasks v{tasks}"
+            );
+        }
+    }
+
+    #[test]
+    fn reused_data_pairs_are_reported_as_ambiguous_not_misidentified() {
+        use DataVersionProfile::Ambiguous;
+
+        let cases = [
+            ((12, 56), "1.3.4 / 1.3.6 / 1.3.8"),
+            ((27, 75), "1.4.1 / 1.4.2"),
+            ((70, 105), "1.4.4 / 1.4.5 / 1.4.6"),
+        ];
+        for ((elements, tasks), candidates) in cases {
+            assert_eq!(
+                data_version_profile(elements, tasks),
+                Some(Ambiguous(candidates)),
+                "elements v{elements} / tasks v{tasks}"
+            );
+        }
+        assert_eq!(
+            Ambiguous("1.3.4 / 1.3.6 / 1.3.8").game_version(),
+            "unknown game version (ambiguous data pair; candidates: 1.3.4 / 1.3.6 / 1.3.8)"
+        );
+    }
+
+    #[test]
+    fn unknown_or_partial_data_pairs_do_not_guess() {
+        for pair in [(0, 0), (12, 55), (27, 76), (386, 190), (620, 247)] {
+            assert_eq!(data_version_profile(pair.0, pair.1), None, "{pair:?}");
+        }
+    }
+}
+
+
+/// The result of matching both client data headers against the public corpus.
+/// An ambiguous signature is surfaced as candidates, never as a single game
+/// version. This is separate from parser support and client compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataVersionProfile {
+    Exact(&'static str),
+    Ambiguous(&'static str),
+}
+
+impl DataVersionProfile {
+    fn game_version(self) -> String {
+        match self {
+            Self::Exact(version) => format!("{version} (data-version profile)"),
+            Self::Ambiguous(candidates) => format!(
+                "unknown game version (ambiguous data pair; candidates: {candidates})"
+            ),
+        }
+    }
+}
+
+/// Exact (elements.data, tasks.data) client-header pairs collected from the
+/// documented client inventories and this repository's measured corpus.
+/// The first word is elements.data's low u16 revision; the second is the
+/// tasks.data version after its 0x93858361 magic. Do not add guessed ranges.
+fn data_version_profile(elements: u32, tasks: u32) -> Option<DataVersionProfile> {
+    use DataVersionProfile::{Ambiguous, Exact};
+
+    match (elements, tasks) {
+        (6, 52) => Some(Exact("1.1.3")),
+        (7, 55) => Some(Exact("1.2.6")),
+        (8, 55) => Some(Exact("1.2.8")),
+        (10, 55) => Some(Exact("1.3.1")),
+        // The same pair appears in 1.3.4, all three known 1.3.6 data sets,
+        // and 1.3.8. Their full contents/counts differ, but header versions do not.
+        (12, 56) => Some(Ambiguous("1.3.4 / 1.3.6 / 1.3.8")),
+        // A modified Brazilian 1.4.1 client and the W2I 1.4.2 client share
+        // this data pair. The executable or its release marker can disambiguate.
+        (27, 75) => Some(Ambiguous("1.4.1 / 1.4.2")),
+        (29, 78) => Some(Exact("1.4.2")),
+        (60, 93) => Some(Exact("1.4.4")),
+        (63, 101) | (69, 103) => Some(Exact("1.4.5")),
+        (70, 105) => Some(Ambiguous("1.4.4 / 1.4.5 / 1.4.6")),
+        (80, 105) => Some(Exact("1.4.7")),
+        (84, 106) => Some(Exact("1.4.6")),
+        (85, 108) => Some(Exact("1.4.8")),
+        (88, 111) | (99, 116) => Some(Exact("1.5.0")),
+        (101, 118) => Some(Exact("1.5.1")),
+        (123, 120) | (127, 121) => Some(Exact("1.5.2")),
+        (145, 124) | (153, 127) => Some(Exact("1.5.3")),
+        (156, 128) | (181, 135) => Some(Exact("1.5.5")),
+        (190, 140) => Some(Exact("1.5.6")),
+        (204, 146) => Some(Exact("1.5.7")),
+        (230, 156) | (233, 157) => Some(Exact("1.6.2")),
+        (244, 162) => Some(Exact("1.6.4")),
+        (253, 167) => Some(Exact("1.6.5")),
+        (267, 176) => Some(Exact("1.6.6")),
+        (386, 191) => Some(Exact("1.7.6")),
+        _ => None,
     }
 }
