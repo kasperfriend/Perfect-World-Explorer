@@ -895,10 +895,22 @@ impl Architect {
                     ui.label(format!(
                         "{} blocks · {} trees · {} placed models · {} scenery assets · {} effects",
                         scene.blocks.len(),
-                        scene.blocks.iter().map(|block| block.trees.len()).sum::<usize>(),
-                        scene.blocks.iter().map(|block| block.models.len()).sum::<usize>(),
+                        scene
+                            .blocks
+                            .iter()
+                            .map(|block| block.trees.len())
+                            .sum::<usize>(),
+                        scene
+                            .blocks
+                            .iter()
+                            .map(|block| block.models.len())
+                            .sum::<usize>(),
                         ornaments.len(),
-                        scene.blocks.iter().map(|block| block.effects.len()).sum::<usize>()
+                        scene
+                            .blocks
+                            .iter()
+                            .map(|block| block.effects.len())
+                            .sum::<usize>()
                     ));
                     ui.text_edit_singleline(&mut self.object_filter);
                     egui::ScrollArea::vertical()
@@ -989,51 +1001,99 @@ impl Architect {
             .resizable(true)
             .show(ctx, |ui| {
                 if let Some(index) = self.selected_scene_object {
-                    ui.label(format!("Client scene item {index} selected. Native placements are read-only."));
+                    ui.label(format!(
+                        "Client scene item {index} selected. Native placements are read-only."
+                    ));
                 } else {
                     ui.label("Select a client scene item or a custom placement.");
                 }
-                ui.label(format!("Camera position: {:.1}, {:.1}, {:.1}", camera.x, camera.y, camera.z));
+                ui.label(format!(
+                    "Camera position: {:.1}, {:.1}, {:.1}",
+                    camera.x, camera.y, camera.z
+                ));
                 if ui.button("Place selected asset at camera").clicked() {
                     self.add_selected_asset_at_camera(camera);
                 }
-                if self.selected_scene_object.is_some() && ui.button("Duplicate selected scene item").clicked() {
+                if self.selected_scene_object.is_some()
+                    && ui.button("Duplicate selected scene item").clicked()
+                {
                     self.duplicate_selected_scene_item();
                 }
                 ui.separator();
                 ui.heading("Custom placements");
                 let mut delete_placement = None;
-                let placement_rows = self.project.objects.iter().enumerate().map(|(index, object)| {
-                    let label = format!("{} · ({:.1}, {:.1}, {:.1})", Path::new(&object.asset).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| object.asset.clone()), object.position[0], object.position[1], object.position[2]);
-                    (index, label)
-                }).collect::<Vec<_>>();
-                egui::ScrollArea::vertical().max_height(100.).show(ui, |ui| {
-                    for (index, label) in &placement_rows {
-                        if ui.selectable_label(self.selected_placement == Some(*index), label).clicked() {
-                            self.selected_placement = Some(*index);
+                let placement_rows = self
+                    .project
+                    .objects
+                    .iter()
+                    .enumerate()
+                    .map(|(index, object)| {
+                        let label = format!(
+                            "{} · ({:.1}, {:.1}, {:.1})",
+                            Path::new(&object.asset)
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| object.asset.clone()),
+                            object.position[0],
+                            object.position[1],
+                            object.position[2]
+                        );
+                        (index, label)
+                    })
+                    .collect::<Vec<_>>();
+                egui::ScrollArea::vertical()
+                    .max_height(100.)
+                    .show(ui, |ui| {
+                        for (index, label) in &placement_rows {
+                            if ui
+                                .selectable_label(self.selected_placement == Some(*index), label)
+                                .clicked()
+                            {
+                                self.selected_placement = Some(*index);
+                            }
                         }
-                    }
-                });
+                    });
                 if let Some(index) = self.selected_placement {
                     if let Some(object) = self.project.objects.get_mut(index) {
                         ui.label(egui::RichText::new(&object.asset).small().weak());
                         ui.horizontal(|ui| {
                             ui.label("Position");
-                            for axis in 0..3 { ui.add(egui::DragValue::new(&mut object.position[axis]).speed(0.5).prefix(["X ", "Y ", "Z "][axis])); }
+                            for axis in 0..3 {
+                                ui.add(
+                                    egui::DragValue::new(&mut object.position[axis])
+                                        .speed(0.5)
+                                        .prefix(["X ", "Y ", "Z "][axis]),
+                                );
+                            }
                         });
                         ui.horizontal(|ui| {
                             ui.label("Rotation");
-                            for axis in 0..3 { ui.add(egui::DragValue::new(&mut object.rotation[axis]).speed(0.01).prefix(["X ", "Y ", "Z "][axis])); }
+                            for axis in 0..3 {
+                                ui.add(
+                                    egui::DragValue::new(&mut object.rotation[axis])
+                                        .speed(0.01)
+                                        .prefix(["X ", "Y ", "Z "][axis]),
+                                );
+                            }
                         });
-                        ui.add(egui::Slider::new(&mut object.scale, 0.01..=100.0).logarithmic(true).text("Scale"));
-                        if ui.button("Delete custom placement").clicked() { delete_placement = Some(index); }
+                        ui.add(
+                            egui::Slider::new(&mut object.scale, 0.01..=100.0)
+                                .logarithmic(true)
+                                .text("Scale"),
+                        );
+                        if ui.button("Delete custom placement").clicked() {
+                            delete_placement = Some(index);
+                        }
                     }
                 }
                 if let Some(index) = delete_placement {
                     self.project.objects.remove(index);
                     self.selected_placement = None;
                 }
-                ui.label(format!("Pending custom placements: {}", self.project.objects.len()));
+                ui.label(format!(
+                    "Pending custom placements: {}",
+                    self.project.objects.len()
+                ));
             });
 
         let terrain_pos = Self::dock_position(self.bottom_dock, screen, 560., 230.);
@@ -1045,7 +1105,9 @@ impl Architect {
             .default_size(egui::vec2(560., 230.))
             .min_size(egui::vec2(360., 160.))
             .resizable(true);
-        if terrain_dock_changed { terrain_panel = terrain_panel.current_pos(terrain_pos); }
+        if terrain_dock_changed {
+            terrain_panel = terrain_panel.current_pos(terrain_pos);
+        }
         terrain_panel.show(ctx, |ui| {
                 ui.horizontal(|ui| { ui.heading("Terrain sculpt"); Self::dock_picker(ui, &mut self.bottom_dock); });
                 ui.add(egui::Slider::new(&mut self.flatten_height, -500.0..=500.0).text("Flatten target"));
@@ -1069,12 +1131,19 @@ impl Architect {
 
         egui::TopBottomPanel::bottom("architect_quick_bar")
             .exact_height(42.)
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(27, 31, 39)).inner_margin(egui::Margin::symmetric(8., 4.)))
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(27, 31, 39))
+                    .inner_margin(egui::Margin::symmetric(8., 4.)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("QUICK BAR").strong());
                     for item in self.quick_bar.clone() {
-                        let label = Path::new(&item).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| item.clone());
+                        let label = Path::new(&item)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| item.clone());
                         if ui.small_button(label).on_hover_text(&item).clicked() {
                             self.selected_asset = Some(item);
                         }
