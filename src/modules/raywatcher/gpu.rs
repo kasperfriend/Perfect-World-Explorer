@@ -4735,6 +4735,23 @@ impl RaywatcherGpu {
         self.dxr_init.is_some()
     }
 
+    /// The host calls this while the module is disabled. Keep the GPU state
+    /// alive until its detached DXR worker has finished, so re-enabling the
+    /// module cannot start a second full initialization in parallel.
+    pub fn discard_completed_background_work(&mut self) -> bool {
+        let Some(rx) = self.dxr_init.as_ref() else {
+            return true;
+        };
+        match rx.try_recv() {
+            Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.dxr_init = None;
+                self.dxr_init_scene = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+        }
+    }
+
     /// DXR failed and the renderer must harvest a CPU-BVH scene before the
     /// Software fallback can safely replace native raster lighting.
     pub fn hardware_failed(&self) -> bool {
