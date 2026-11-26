@@ -135,20 +135,31 @@ fn main() {
         let _ = tx.send(result);
     });
     device.poll(wgpu::Maintain::Wait);
-    rx.recv().expect("readback callback dropped").expect("Hi-Z readback mapping failed");
+    rx.recv()
+        .expect("readback callback dropped")
+        .expect("Hi-Z readback mapping failed");
     let bytes = slice.get_mapped_range().to_vec();
     let values = bytemuck::cast_slice::<u8, f32>(&bytes);
 
     let expected = [(13u32, 7u32), (7, 4), (4, 2), (2, 1), (1, 1)];
     assert_eq!(pyramid.levels().len(), expected.len());
     for (index, (level, (width, height))) in pyramid.levels().iter().zip(expected).enumerate() {
-        assert_eq!((level.width, level.height), (width, height), "mip {index}");
+        assert_eq!(
+            (level.width, level.height),
+            (width, height),
+            "mip {index}"
+        );
         let count = (width * height) as usize;
         let mip = &values[level.offset as usize..level.offset as usize + count];
-        assert!(mip.iter().all(|v| (*v - 0.8).abs() < 1.0e-5 || *v == 0.0),
-            "mip {index} contains unexpected depth values: {mip:?}");
+        assert!(
+            mip.iter().all(|v| (*v - 0.8).abs() < 1.0e-5 || *v == 0.0),
+            "mip {index} contains unexpected depth values: {mip:?}"
+        );
         let edge_index = (height as usize - 1) * width as usize + width as usize - 1;
-        assert_eq!(mip[edge_index], 0.0, "clear hole must propagate through mip {index}");
+        assert_eq!(
+            mip[edge_index], 0.0,
+            "clear hole must propagate through mip {index}"
+        );
         if index == 0 {
             assert_eq!(mip[0], 0.8);
             assert_eq!(mip[WIDTH as usize - 2], 0.8);

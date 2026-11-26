@@ -1294,12 +1294,30 @@ impl FarTrees {
             label: Some("tree LOD with current Hi-Z buffer"),
             layout: &self.lod_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.lod_params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.placement_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.group_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.instances.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.lod_args.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.lod_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.placement_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.group_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.instances.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.lod_args.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: buffer.as_entire_binding(),
+                },
             ],
         });
     }
@@ -1320,9 +1338,17 @@ impl FarTrees {
             label: Some("tree LOD diagnostic encoder"),
         });
         self.encode_resident_lods(
-            device, queue, &mut encoder, camera, scale, bounds, frustum, clip_plane,
+            device,
+            queue,
+            &mut encoder,
+            camera,
+            scale,
+            bounds,
+            frustum,
+            clip_plane,
             glam::Mat4::IDENTITY.to_cols_array_2d(),
-            [[1, 1, 0, 0]; 16], None,
+            [[1, 1, 0, 0]; 16],
+            None,
         );
         queue.submit(Some(encoder.finish()));
     }
@@ -1345,7 +1371,9 @@ impl FarTrees {
         hiz_mips: [[u32; 4]; 16],
         hiz_extent: Option<(u32, u32, u32)>,
     ) {
-        if self.placements == 0 { return; }
+        if self.placements == 0 {
+            return;
+        }
         let frustum = normalize_frustum(frustum);
         let key = (camera, scale, bounds, frustum, clip_plane);
         let hiz_enabled = hiz_extent.is_some();
