@@ -181,6 +181,8 @@ struct Slot {
     transform: Result<glam::Mat4, String>,
     /// Last evaluated pose, reused by every pass of the same frame.
     posed: Option<Result<SlotPose, String>>,
+    /// Static bind poses are queued only until first evaluated or evicted.
+    static_pose_pending: bool,
     geometry_dirty: bool,
     vertex_fog: Option<f32>,
     visible: bool,
@@ -208,6 +210,10 @@ pub struct World {
     keep_unbounded: bool,
     slots: Vec<Slot>,
     model_spatial_cells: Vec<ModelSpatialCell>,
+    /// Static models needing one bind-pose evaluation (not a per-frame scan).
+    pending_static_pose_slots: Vec<usize>,
+    /// Models with actual animation playback; these alone are ticked each frame.
+    animated_pose_slots: Vec<usize>,
     /// Indices of slots visible in the most recently prepared view.
     visible_slots: Vec<usize>,
     /// Reused candidate storage for the spatial-cell query.
@@ -317,17 +323,29 @@ impl World {
                 .enumerate()
                 .map(|(index, instance)| (index, instance.placement.position)),
         );
+        let mut pending_static_pose_slots = Vec::new();
+        let mut animated_pose_slots = Vec::new();
         let slots = assets
             .instances
             .iter()
-            .map(|i| Slot {
-                draw: None,
-                failed: false,
-                transform: crate::world_models::transform(&i.placement),
-                posed: None,
-                geometry_dirty: true,
-                vertex_fog: None,
-                visible: true,
+            .enumerate()
+            .map(|(index, instance)| {
+                let static_pose_pending = instance.action.is_none();
+                if static_pose_pending {
+                    pending_static_pose_slots.push(index);
+                } else {
+                    animated_pose_slots.push(index);
+                }
+                Slot {
+                    draw: None,
+                    failed: false,
+                    transform: crate::world_models::transform(&instance.placement),
+                    posed: None,
+                    static_pose_pending,
+                    geometry_dirty: true,
+                    vertex_fog: None,
+                    visible: true,
+                }
             })
             .collect();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -344,6 +362,8 @@ impl World {
             keep_unbounded: false,
             slots,
             model_spatial_cells,
+            pending_static_pose_slots,
+            animated_pose_slots,
             visible_slots: Vec::new(),
             scratch_model_candidates: Vec::new(),
             read: Box::new(read),
@@ -709,11 +729,26 @@ impl World {
             return;
         }
         self.resident_bounds = bounds;
-        for (instance, slot) in self.assets.instances.iter().zip(&mut self.slots) {
+        for (index, (instance, slot)) in self
+            .assets
+            .instances
+            .iter()
+            .zip(&mut self.slots)
+            .enumerate()
+        {
             if !cutoff_residency::contains(bounds, instance.placement.position) {
                 slot.draw = None;
                 slot.posed = None;
                 slot.geometry_dirty = true;
+                // No static pose work is needed while this object is evicted.
+                // It is queued again only if a later resident window includes it.
+                slot.static_pose_pending = false;
+            } else if instance.action.is_none()
+                && slot.posed.is_none()
+                && !slot.static_pose_pending
+            {
+                slot.static_pose_pending = true;
+                self.pending_static_pose_slots.push(index);
             }
         }
         if bounds.is_some() {
@@ -1198,98 +1233,78 @@ impl World {
     /// (main, reflection, refraction) reuses it.
     fn advance_poses(&mut self, delta_ms: u32) {
         let bounds = self.resident_bounds;
-        let len = self.slots.len();
-        let threads = if len >= 64 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(16)
-        } else {
-            1
-        };
-        if len >= 64 && threads > 1 {
-            let assets = &self.assets.assets;
-            let chunk_size = (len + threads - 1) / threads;
-            std::thread::scope(|s| {
-                for (inst_chunk, slot_chunk) in self
-                    .assets
-                    .instances
-                    .chunks_mut(chunk_size)
-                    .zip(self.slots.chunks_mut(chunk_size))
-                {
-                    s.spawn(move || {
-                        for (instance, slot) in inst_chunk.iter_mut().zip(slot_chunk.iter_mut()) {
-                            if !cutoff_residency::contains(bounds, instance.placement.position) {
-                                continue;
-                            }
-                            if slot.failed {
-                                continue;
-                            }
-                            let asset = &assets[instance.asset];
-                            let sample = match instance.playback.as_mut() {
-                                Ok(clock) => {
-                                    if delta_ms != 0 {
-                                        if let Err(e) = clock.tick(delta_ms) {
-                                            slot.posed = Some(Err(e));
-                                            continue;
-                                        }
-                                    }
-                                    clock.sample()
-                                }
-                                Err(e) => {
-                                    slot.posed = Some(Err(e.clone()));
-                                    continue;
-                                }
-                            };
-                            if let Some(Ok(previous)) = &slot.posed {
-                                if previous.sample == sample {
-                                    continue;
-                                }
-                            }
-                            let result = (|| -> Result<SlotPose, String> {
-                                let transform = *slot.transform.as_ref().map_err(Clone::clone)?;
-                                let pose = match sample {
-                                    Some((action, time)) => {
-                                        asset.action_pose(action, time, transform)?
-                                    }
-                                    None => asset.bind_pose(transform)?,
-                                };
-                                let meshes = asset.meshes_from_pose(&pose)?;
-                                Ok(SlotPose {
-                                    sample,
-                                    pose,
-                                    meshes,
-                                })
-                            })();
-                            slot.geometry_dirty = true;
-                            slot.posed = Some(result);
-                        }
-                    });
-                }
-            });
-            return;
-        }
+        let Self {
+            assets,
+            slots,
+            pending_static_pose_slots,
+            animated_pose_slots,
+            ..
+        } = self;
 
-        for (instance, slot) in self.assets.instances.iter_mut().zip(&mut self.slots) {
+        // Static world props never change pose. Evaluate a bind pose once when
+        // first resident, instead of ticking every one of them on every frame.
+        let pending = std::mem::take(pending_static_pose_slots);
+        pending_static_pose_slots.reserve(pending.len());
+        for index in pending {
+            let Some(instance) = assets.instances.get(index) else {
+                continue;
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                continue;
+            };
+            if !slot.static_pose_pending {
+                continue;
+            }
             if !cutoff_residency::contains(bounds, instance.placement.position) {
+                slot.static_pose_pending = false;
                 continue;
             }
             if slot.failed {
+                slot.static_pose_pending = false;
                 continue;
             }
-            let asset = &self.assets.assets[instance.asset];
+            let asset = &assets.assets[instance.asset];
+            let result = (|| -> Result<SlotPose, String> {
+                let transform = *slot.transform.as_ref().map_err(Clone::clone)?;
+                let pose = asset.bind_pose(transform)?;
+                let meshes = asset.meshes_from_pose(&pose)?;
+                Ok(SlotPose {
+                    sample: None,
+                    pose,
+                    meshes,
+                })
+            })();
+            slot.geometry_dirty = true;
+            slot.posed = Some(result);
+            slot.static_pose_pending = false;
+        }
+
+        // Only placements with a real action reach this loop. The old path
+        // walked every placement and created up to 16 scoped OS threads every
+        // frame, even though most map props have no playback clock to advance.
+        for &index in animated_pose_slots.iter() {
+            let Some(instance) = assets.instances.get_mut(index) else {
+                continue;
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                continue;
+            };
+            if !cutoff_residency::contains(bounds, instance.placement.position) || slot.failed {
+                continue;
+            }
+            let asset = &assets.assets[instance.asset];
             let sample = match instance.playback.as_mut() {
                 Ok(clock) => {
                     if delta_ms != 0 {
-                        if let Err(e) = clock.tick(delta_ms) {
-                            slot.posed = Some(Err(e));
+                        if let Err(error) = clock.tick(delta_ms) {
+                            slot.posed = Some(Err(error));
                             continue;
                         }
                     }
                     clock.sample()
                 }
-                Err(e) => {
-                    slot.posed = Some(Err(e.clone()));
+                Err(error) => {
+                    slot.posed = Some(Err(error.clone()));
                     continue;
                 }
             };

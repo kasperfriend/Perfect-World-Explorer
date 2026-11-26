@@ -85,3 +85,14 @@ effect roots depend on current parent poses.
 A physical-GPU frame-time capture at the reported 3440x1369 / RTX 3060
 configuration is still required to measure the actual FPS gain. CI validates
 correctness, not a specific runtime frame rate.
+
+## Static world-model pose work
+
+Most map ECM placements are static. The prior pose update nevertheless scanned
+all of them and created up to 16 scoped operating-system threads every frame,
+then discovered that their bind-pose sample had not changed. Static props now
+receive one bind-pose evaluation while resident; only actual action-playback
+slots are visited by the per-frame clock/pose update. Static slots are queued
+again if a residency-window change evicts and later re-admits them. Pose
+advancement and hook resolution still happen before the main view, so
+hook-attached GFX keeps the same frame-consistent parent pose.
