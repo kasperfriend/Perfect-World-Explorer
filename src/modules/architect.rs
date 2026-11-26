@@ -893,10 +893,10 @@ impl Architect {
                     ui.label(format!(
                         "{} blocks · {} trees · {} placed models · {} scenery assets · {} effects",
                         scene.blocks.len(),
-                        scene.blocks.iter().map(|b| b.trees.len()).sum::<usize>(),
-                        scene.blocks.iter().map(|b| b.models.len()).sum::<usize>(),
+                        scene.blocks.iter().map(|block| block.trees.len()).sum::<usize>(),
+                        scene.blocks.iter().map(|block| block.models.len()).sum::<usize>(),
                         ornaments.len(),
-                        scene.blocks.iter().map(|b| b.effects.len()).sum::<usize>()
+                        scene.blocks.iter().map(|block| block.effects.len()).sum::<usize>()
                     ));
                     ui.text_edit_singleline(&mut self.object_filter);
                     egui::ScrollArea::vertical()
@@ -963,18 +963,20 @@ impl Architect {
                                     index += 1;
                                 }
                             }
-                            for effect in &block.effects {
-                                let label = format!("Effect {} · {}", effect.export_id, effect.path);
-                                self.scene_row(ui, index, &label, &effect.path, effect.position, camera);
+                            for ornament in ornaments {
+                                let label =
+                                    format!("Scenery {} · {}", ornament.export_id, ornament.path);
+                                self.scene_row(
+                                    ui,
+                                    index,
+                                    &label,
+                                    &ornament.path,
+                                    ornament.position,
+                                    camera,
+                                );
                                 index += 1;
                             }
-                        }
-                        for ornament in ornaments {
-                            let label = format!("Scenery {} · {}", ornament.export_id, ornament.path);
-                            self.scene_row(ui, index, &label, &ornament.path, ornament.position, camera);
-                            index += 1;
-                        }
-                    });
+                        });
                 }
             });
 
