@@ -2031,7 +2031,7 @@ fn resize_world_targets(renderer: &mut Renderer, w: u32, h: u32) {
         Ok(mut pyramid) => {
             pyramid.set_depth_view(&renderer.device, &hiz_depth_view);
             Some(pyramid)
-        },
+        }
         Err(error) => {
             eprintln!(
                 "Hi-Z disabled after resize; frustum-only tree culling remains active: {error}"
@@ -4109,11 +4109,7 @@ impl Renderer {
         // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
         // the same block walk the client runs before the level rule.
         // Both buffers are reused: this runs for every view of every frame.
-        crate::terrain_residency::visible_runs_into(
-            &self.spans,
-            matrix,
-            &mut self.terrain_runs,
-        );
+        crate::terrain_residency::visible_runs_into(&self.spans, matrix, &mut self.terrain_runs);
         self.terrain_gpu
             .visible_far_runs_into(matrix, &mut self.far_terrain_runs);
         // One indirect record per run, so the terrain itself is one call per mesh

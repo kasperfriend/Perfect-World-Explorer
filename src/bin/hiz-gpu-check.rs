@@ -281,7 +281,8 @@ fn main() {
             let row = &half_bytes[row_start..row_start + width as usize * 4];
             let mip = bytemuck::cast_slice::<u8, f32>(row);
             assert!(
-                mip.iter().all(|value| (*value - 0.8).abs() < 1.0e-5 || *value == 0.0),
+                mip.iter()
+                    .all(|value| (*value - 0.8).abs() < 1.0e-5 || *value == 0.0),
                 "half mip {index} contains unexpected depths: {mip:?}"
             );
             if y + 1 == height as usize {

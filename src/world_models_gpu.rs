@@ -115,7 +115,8 @@ fn model_cell_intersects_frustum(planes: &[[f32; 4]; 6], min: [f32; 3], max: [f3
             if plane[1] >= 0.0 { max[1] } else { min[1] },
             if plane[2] >= 0.0 { max[2] } else { min[2] },
         ];
-        if plane[0] * positive[0] + plane[1] * positive[1] + plane[2] * positive[2] + plane[3] < 0.0 {
+        if plane[0] * positive[0] + plane[1] * positive[1] + plane[2] * positive[2] + plane[3] < 0.0
+        {
             return false;
         }
     }
@@ -134,7 +135,8 @@ fn append_visible_model_slots(
                 continue;
             }
         }
-        if frustum.is_some_and(|planes| !model_cell_intersects_frustum(planes, cell.min, cell.max)) {
+        if frustum.is_some_and(|planes| !model_cell_intersects_frustum(planes, cell.min, cell.max))
+        {
             continue;
         }
         out.extend_from_slice(&cell.slots);
@@ -743,9 +745,7 @@ impl World {
                 // No static pose work is needed while this object is evicted.
                 // It is queued again only if a later resident window includes it.
                 slot.static_pose_pending = false;
-            } else if instance.action.is_none()
-                && slot.posed.is_none()
-                && !slot.static_pose_pending
+            } else if instance.action.is_none() && slot.posed.is_none() && !slot.static_pose_pending
             {
                 slot.static_pose_pending = true;
                 self.pending_static_pose_slots.push(index);

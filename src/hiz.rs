@@ -342,8 +342,16 @@ impl Pyramid {
             let dst = levels[index];
             let (src_width, src_height, src_offset, mode) = if index == 0 {
                 (
-                    if downsample_depth { source_width } else { width },
-                    if downsample_depth { source_height } else { height },
+                    if downsample_depth {
+                        source_width
+                    } else {
+                        width
+                    },
+                    if downsample_depth {
+                        source_height
+                    } else {
+                        height
+                    },
                     0,
                     if downsample_depth { 2 } else { 0 },
                 )

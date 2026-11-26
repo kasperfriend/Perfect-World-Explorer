@@ -127,7 +127,8 @@ fn tree_cell_intersects_frustum(planes: &[[f32; 4]; 6], min: [f32; 3], max: [f32
             if plane[1] >= 0.0 { max[1] } else { min[1] },
             if plane[2] >= 0.0 { max[2] } else { min[2] },
         ];
-        if plane[0] * positive[0] + plane[1] * positive[1] + plane[2] * positive[2] + plane[3] < 0.0 {
+        if plane[0] * positive[0] + plane[1] * positive[1] + plane[2] * positive[2] + plane[3] < 0.0
+        {
             return false;
         }
     }
