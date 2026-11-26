@@ -703,7 +703,7 @@ mod imp {
         /// Deferred retirement lists freed once `ring.completed_fence() >= fence`.
         retired_scenes: Vec<(u64, DxrScene)>,
         retired_buffers: Vec<(u64, Vec<RawBuffer>)>,
-        /// Persistent 65,536-cell packed atomic world-space radiance cache (`u5`, 256 KB VRAM)
+        /// Persistent 65,536-cell additive atomic world-space radiance cache (`u5`, 1 MB VRAM)
         /// updated and queried by hardware RT cores for low-noise multi-bounce GI.
         radiance_cache: RawBuffer,
         /// Two-frame ReSTIR GI reservoir history, shared with the DXR compute shader at u6.
@@ -805,7 +805,7 @@ mod imp {
             let radiance_cache = unsafe {
                 RawBuffer::create(
                     dev_ptr,
-                    (RADIANCE_CACHE_CELLS as u64) * 4,
+                    (RADIANCE_CACHE_CELLS as u64) * 16,
                     d12::D3D12_HEAP_TYPE_DEFAULT,
                     d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                     d12::D3D12_RESOURCE_STATE_COPY_DEST,
@@ -1527,14 +1527,14 @@ mod imp {
                     );
                 }
 
-                // Slot 13: u5 packed atomic radiance cache (`RWStructuredBuffer<uint>`).
+                // Slot 13: u5 additive atomic radiance cache (`RWStructuredBuffer<uint4>`).
                 let mut rc_uav: d12::D3D12_UNORDERED_ACCESS_VIEW_DESC = zeroed();
                 rc_uav.Format = DXGI_FORMAT_UNKNOWN;
                 rc_uav.ViewDimension = d12::D3D12_UAV_DIMENSION_BUFFER;
                 *rc_uav.u.Buffer_mut() = d12::D3D12_BUFFER_UAV {
                     FirstElement: 0,
                     NumElements: RADIANCE_CACHE_CELLS,
-                    StructureByteStride: 4,
+                    StructureByteStride: 16,
                     CounterOffsetInBytes: 0,
                     Flags: d12::D3D12_BUFFER_UAV_FLAG_NONE,
                 };
