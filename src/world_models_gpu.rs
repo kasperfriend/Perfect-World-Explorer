@@ -955,13 +955,14 @@ impl World {
             || self.attenuation_targets.len() != self.producers.len()
         {
             self.attenuation_targets.clear();
-            self.attenuation_targets.extend(self.producers.iter().map(|producer| {
-                if producer.attenuation && !off {
-                    attenuation_target(effect_distance, producer.position, eye)
-                } else {
-                    1.
-                }
-            }));
+            self.attenuation_targets
+                .extend(self.producers.iter().map(|producer| {
+                    if producer.attenuation && !off {
+                        attenuation_target(effect_distance, producer.position, eye)
+                    } else {
+                        1.
+                    }
+                }));
             self.attenuation_key = Some(key);
             self.attenuation_settled = false;
         }
