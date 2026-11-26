@@ -368,8 +368,36 @@ fn effect_worker_count(active_roots: usize, available_workers: usize) -> usize {
         .max(1)
 }
 
+/// Keep a Vec of owner indices sorted, making activation changes logarithmic
+/// to locate and allowing the frame loop to visit only active owners.
+fn set_sorted_owner_index(indices: &mut Vec<usize>, index: usize, present: bool) {
+    match indices.binary_search(&index) {
+        Ok(position) if !present => {
+            indices.remove(position);
+        }
+        Err(position) if present => indices.insert(position, index),
+        _ => {}
+    }
+}
+
+/// Update a sorted owner-index list after Vec::swap_remove moved the last owner.
+fn swap_remove_sorted_owner_index(indices: &mut Vec<usize>, removed: usize, last: usize) {
+    set_sorted_owner_index(indices, removed, false);
+    if removed != last {
+        if let Ok(position) = indices.binary_search(&last) {
+            indices[position] = removed;
+            indices.sort_unstable();
+        }
+    }
+}
+
 pub struct Manager {
     owners: Vec<Owner>,
+    /// Live, active owner indices; geometry stepping never scans the full owner list.
+    active_owner_indices: Vec<usize>,
+    /// Pending indices, plus the active subset preferred by the one-root loader.
+    pending_owner_indices: Vec<usize>,
+    active_pending_indices: Vec<usize>,
     /// Reused sparse job list: only owners with an active player occupy a slot.
     effect_jobs: Vec<EffectStepJob>,
     /// Cached once at construction; the frame loop never queries the OS.
@@ -572,6 +600,9 @@ impl Manager {
     pub fn new() -> Self {
         Self {
             owners: Vec::new(),
+            active_owner_indices: Vec::new(),
+            pending_owner_indices: Vec::new(),
+            active_pending_indices: Vec::new(),
             effect_jobs: Vec::new(),
             effect_worker_limit: std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -677,6 +708,7 @@ impl Manager {
         self.next_serial = self.next_serial.wrapping_add(1);
         let identity = request.identity;
         let index = self.owners.len();
+        let active = request.active;
         self.owners.push(Owner {
             serial,
             request,
@@ -688,6 +720,10 @@ impl Manager {
             cached_ground: None,
         });
         self.index.insert(identity, index);
+        self.pending_owner_indices.push(index);
+        if active {
+            self.active_pending_indices.push(index);
+        }
         Ok(())
     }
 
@@ -700,8 +736,23 @@ impl Manager {
     fn reindex(&mut self) {
         self.index.clear();
         self.index.reserve(self.owners.len());
+        self.active_owner_indices.clear();
+        self.pending_owner_indices.clear();
+        self.active_pending_indices.clear();
         for (index, owner) in self.owners.iter().enumerate() {
             self.index.insert(owner.request.identity, index);
+            match owner.state {
+                State::Pending => {
+                    self.pending_owner_indices.push(index);
+                    if owner.request.active {
+                        self.active_pending_indices.push(index);
+                    }
+                }
+                State::Live { .. } if owner.request.active => {
+                    self.active_owner_indices.push(index);
+                }
+                State::Live { .. } | State::Failed => {}
+            }
         }
     }
 
@@ -735,7 +786,17 @@ impl Manager {
         let Some(index) = self.position_of(identity) else {
             return false;
         };
+        if self.owners[index].request.active == active {
+            return true;
+        }
+        let pending = matches!(self.owners[index].state, State::Pending);
+        let live = matches!(self.owners[index].state, State::Live { .. });
         self.owners[index].request.active = active;
+        if pending {
+            set_sorted_owner_index(&mut self.active_pending_indices, index, active);
+        } else if live {
+            set_sorted_owner_index(&mut self.active_owner_indices, index, active);
+        }
         true
     }
 
@@ -792,7 +853,11 @@ impl Manager {
             return false;
         };
         self.unregister(&self.owners[index], publications);
+        let last_index = self.owners.len() - 1;
         let removed_id = self.owners.swap_remove(index).request.identity;
+        swap_remove_sorted_owner_index(&mut self.active_owner_indices, index, last_index);
+        swap_remove_sorted_owner_index(&mut self.pending_owner_indices, index, last_index);
+        swap_remove_sorted_owner_index(&mut self.active_pending_indices, index, last_index);
         self.index.remove(&removed_id);
         if let Some(moved) = self.owners.get(index) {
             self.index.insert(moved.request.identity, index);
@@ -808,6 +873,10 @@ impl Manager {
         }
         self.removed += self.owners.len();
         self.owners.clear();
+        self.active_owner_indices.clear();
+        self.pending_owner_indices.clear();
+        self.active_pending_indices.clear();
+        self.effect_jobs.clear();
         self.index.clear();
     }
 
@@ -843,7 +912,11 @@ impl Manager {
         for identity in finished {
             if let Some(index) = self.position_of(identity) {
                 self.unregister(&self.owners[index], publications);
+                let last_index = self.owners.len() - 1;
                 let removed_id = self.owners.swap_remove(index).request.identity;
+                swap_remove_sorted_owner_index(&mut self.active_owner_indices, index, last_index);
+                swap_remove_sorted_owner_index(&mut self.pending_owner_indices, index, last_index);
+                swap_remove_sorted_owner_index(&mut self.active_pending_indices, index, last_index);
                 self.index.remove(&removed_id);
                 if let Some(moved) = self.owners.get(index) {
                     self.index.insert(moved.request.identity, index);
@@ -856,6 +929,9 @@ impl Manager {
                 self.unregister(&self.owners[index], publications);
                 let origin = self.owners[index].request.origin.clone();
                 self.owners[index].state = State::Failed;
+                set_sorted_owner_index(&mut self.active_owner_indices, index, false);
+                set_sorted_owner_index(&mut self.pending_owner_indices, index, false);
+                set_sorted_owner_index(&mut self.active_pending_indices, index, false);
                 self.failures.push(format!("{origin}: {error}"));
             }
         }
@@ -987,8 +1063,11 @@ impl Manager {
         // Retain capacity from the previous frame, but store only active players.
         let mut jobs = std::mem::take(&mut self.effect_jobs);
         jobs.clear();
-        for (owner_index, owner) in self.owners.iter_mut().enumerate() {
-            if !matches!(owner.state, State::Live { .. }) {
+        for &owner_index in &self.active_owner_indices {
+            let Some(owner) = self.owners.get_mut(owner_index) else {
+                continue;
+            };
+            if !matches!(owner.state, State::Live { .. }) || !owner.request.active {
                 continue;
             }
             if !owner.request.active || owner.elapsed < owner.request.start_ms {
@@ -1201,7 +1280,8 @@ impl Manager {
         if !self.effects {
             return false;
         }
-        let Some(index) = self.owners.iter().position(|owner| {
+        let Some(index) = self.active_owner_indices.iter().copied().find(|&index| {
+            let owner = &self.owners[index];
             matches!(owner.state, State::Live { .. })
                 && owner.player.is_none()
                 && !owner.player_failed
@@ -1352,15 +1432,16 @@ impl Manager {
         // while the handful around the player waited their turn in install
         // order. Sorting by "would this draw now" first drains the visible set
         // in a few frames, which is what the status line's playing count means.
-        let pending = |o: &Owner| matches!(o.state, State::Pending);
-        let index = self
-            .owners
-            .iter()
-            .position(|o| pending(o) && o.request.active)
-            .or_else(|| self.owners.iter().position(pending));
-        let Some(index) = index else {
+        let Some(index) = self
+            .active_pending_indices
+            .first()
+            .copied()
+            .or_else(|| self.pending_owner_indices.first().copied())
+        else {
             return;
         };
+        set_sorted_owner_index(&mut self.pending_owner_indices, index, false);
+        set_sorted_owner_index(&mut self.active_pending_indices, index, false);
         let path = self.owners[index].request.path.clone();
         let origin = self.owners[index].request.origin.clone();
         let result = match &mut self.read {
@@ -1422,6 +1503,9 @@ impl Manager {
             lights,
             light_error,
         };
+        if self.owners[index].request.active {
+            set_sorted_owner_index(&mut self.active_owner_indices, index, true);
+        }
     }
 
     fn decode(text: &str) -> Result<Vec<Emitter>, String> {
@@ -1522,6 +1606,40 @@ mod tests {
     use super::*;
     use crate::scene_lights::StaticGrid;
     use glam::Vec3;
+
+    #[test]
+    fn sorted_owner_indices_track_activation_and_swap_remove() {
+        let mut active = Vec::new();
+        set_sorted_owner_index(&mut active, 4, true);
+        set_sorted_owner_index(&mut active, 1, true);
+        set_sorted_owner_index(&mut active, 7, true);
+        assert_eq!(active, [1, 4, 7]);
+
+        set_sorted_owner_index(&mut active, 4, false);
+        assert_eq!(active, [1, 7]);
+        set_sorted_owner_index(&mut active, 2, true);
+        assert_eq!(active, [1, 2, 7]);
+
+        // Removing owner 1 swaps owner 7 into slot 1; it remains active.
+        swap_remove_sorted_owner_index(&mut active, 1, 7);
+        assert_eq!(active, [1, 2]);
+        // Removing an inactive last slot leaves the active set untouched.
+        swap_remove_sorted_owner_index(&mut active, 6, 6);
+        assert_eq!(active, [1, 2]);
+    }
+
+    #[test]
+    fn pending_loader_indices_prefer_active_then_fall_back_without_a_world_scan() {
+        let mut pending = vec![0, 1, 2, 3, 4];
+        let mut active_pending = vec![2, 4];
+        assert_eq!(active_pending.first(), Some(&2));
+        swap_remove_sorted_owner_index(&mut pending, 2, 4);
+        swap_remove_sorted_owner_index(&mut active_pending, 2, 4);
+        assert_eq!(pending, [0, 1, 2, 3]);
+        assert_eq!(active_pending, [2]);
+        swap_remove_sorted_owner_index(&mut pending, 2, 3);
+        assert_eq!(pending, [0, 1, 2]);
+    }
 
     fn root(path: &str, text: &str) -> impl FnMut(&str) -> Result<String, String> + 'static {
         let path = path.to_string();

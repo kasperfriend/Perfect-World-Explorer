@@ -142,3 +142,19 @@ hook-attached GFX keeps the same frame-consistent parent pose.
 - These changes preserve effect clock advancement, root order, quad order, and
   model lookup order. They have compile/unit-test coverage but still need a
   target-machine frame-time capture; no specific FPS gain is claimed.
+
+
+## Active-owner indexing
+
+- The effect manager now maintains sorted indices for live/active and pending
+  owners. Activation changes update those indices only when a root's active
+  flag changes; loading promotes a pending owner to the live/active list,
+  while failure, lifetime expiry, explicit removal and region clear keep all
+  indices in sync.
+- The geometry pass and lazy-player warm-up now visit active owners only.
+  The one-root-per-frame loader uses the first active pending owner, then the
+  first pending fallback, instead of searching the full owner vector twice on
+  every frame after the world is loaded.
+- Swap-removal repairs the moved owner's index in each sorted list. Tests cover
+  activation toggles, active-owner movement, pending preference and fallback.
+  The existing full CI suite validates the complete owner lifecycle.
