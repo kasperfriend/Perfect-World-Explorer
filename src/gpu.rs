@@ -5064,6 +5064,7 @@ fn spawn_world_handoff(
     client_root: &std::path::Path,
     map_id: &str,
     focused: bool,
+    reopen_architect: bool,
 ) -> Result<
     (
         crate::world_handoff::Files,
@@ -5078,6 +5079,7 @@ fn spawn_world_handoff(
     files.set_focused(focused);
     let mut command = std::process::Command::new(exe);
     command.arg(client_root).arg("--world").arg(&id);
+    if reopen_architect { command.env("PWE_START_ARCHITECT", "1"); }
     files.configure(&mut command);
     #[cfg(windows)]
     {
@@ -5544,6 +5546,9 @@ pub fn run(
         &t.scene,
         whole_ornaments.to_vec(),
     );
+    if std::env::var_os("PWE_START_ARCHITECT").is_some() {
+        renderer.modules.set_architect_active(true);
+    }
     // Add-ons get read access to the world's effect catalogue the moment the
     // world has one: the same grouped index the World tab's census uses, so a
     // module can look up what the map ships without opening the archive
@@ -7471,7 +7476,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                 if selected_world_ui.eq_ignore_ascii_case(&current_map.id) {
                                                     world_change_error = Some(format!("{} is already the active world.", current_map.display_name));
                                                 } else {
-                                                    match spawn_world_handoff(&client_root, &selected_world_ui, window_focused) {
+                                                    match spawn_world_handoff(&client_root, &selected_world_ui, window_focused, false) {
                                                         Ok((files, rx)) => {
                                                             settings.selected_world = selected_world_ui.to_ascii_lowercase();
                                                             if let Err(error) = settings.save() {
@@ -7615,7 +7620,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     if requested.eq_ignore_ascii_case(&current_map.id) {
                                         world_change_error = Some(format!("{} is already the active world.", current_map.display_name));
                                     } else {
-                                        match spawn_world_handoff(&client_root, &requested, window_focused) {
+                                        match spawn_world_handoff(&client_root, &requested, window_focused, true) {
                                             Ok((files, rx)) => {
                                                 settings.selected_world = requested.to_ascii_lowercase();
                                                 if let Err(error) = settings.save() {
