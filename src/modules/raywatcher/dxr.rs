@@ -1124,8 +1124,7 @@ mod imp {
             }
             // Capture the serialized signature before releasing the D3D blob
             // below. The cache key must never read from a released COM object.
-            let mut adapter_luid: winapi::shared::ntdef::LUID = zeroed();
-            let _ = (*dev_ptr).GetAdapterLuid(&mut adapter_luid);
+            let adapter_luid: winapi::shared::ntdef::LUID = (*dev_ptr).GetAdapterLuid();
             let mut adapter_luid_bytes = [0u8; 8];
             adapter_luid_bytes[..4].copy_from_slice(&adapter_luid.LowPart.to_le_bytes());
             adapter_luid_bytes[4..].copy_from_slice(&adapter_luid.HighPart.to_le_bytes());
