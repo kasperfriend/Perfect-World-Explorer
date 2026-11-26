@@ -520,7 +520,11 @@ fn main() {
         image::Rgba([
             0,
             0,
-            if (24..40).contains(&x) && (24..40).contains(&y) { 255 } else { 0 },
+            if (24..40).contains(&x) && (24..40).contains(&y) {
+                255
+            } else {
+                0
+            },
             255,
         ])
     });
