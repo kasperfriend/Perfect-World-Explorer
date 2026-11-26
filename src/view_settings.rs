@@ -788,6 +788,7 @@ mod tests {
 
     #[test]
     fn scene_fog_default_respects_an_explicit_saved_choice() {
+        assert!(ViewSettings::default().atmospheric_fog);
         assert!(ViewSettings::decode_with_fog_default("", true).atmospheric_fog);
         assert!(!ViewSettings::decode_with_fog_default("", false).atmospheric_fog);
         assert!(
