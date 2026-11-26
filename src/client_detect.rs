@@ -255,8 +255,16 @@ impl ExecutableInfo {
         if let Some(known) = self.known {
             return known.to_string();
         }
-        if let Some(release) = &self.release_version {
-            return format!("unverified build {}", display_release_version(release));
+        if let Some(version) = self
+            .release_version
+            .as_deref()
+            .and_then(display_release_version)
+            .or_else(|| resource_game_version(self))
+        {
+            return format!("unverified build {version}");
+        }
+        if let Some(marker) = &self.release_version {
+            return format!("unverified build (client marker {marker})");
         }
         format!(
             "unverified build ({} bytes, sha256 {}…)",
@@ -288,10 +296,18 @@ impl ExecutableInfo {
     /// retail engine version is not recorded anywhere in that executable and is
     /// not invented here.
     pub fn version_row(&self) -> String {
-        if let Some(release) = &self.release_version {
-            return display_release_version(release).to_string();
+        if let Some(version) = self
+            .release_version
+            .as_deref()
+            .and_then(display_release_version)
+            .or_else(|| resource_game_version(self))
+        {
+            return version;
         }
-        "unknown game version (no config/element/version.sw in folder or configs.pck)".into()
+        match &self.release_version {
+            Some(marker) => format!("unknown game version (unmapped client marker {marker})"),
+            None => "unknown game version (no config/element/version.sw or usable PE version resource)".into(),
+        }
     }
 
     /// Data revisions this fingerprint was inspected with, as
@@ -400,7 +416,7 @@ impl Scan {
         let exe = self
             .executable
             .as_ref()
-            .map(ExecutableInfo::label)
+            .map(|_| self.executable_label())
             .unwrap_or_else(|| "unknown executable".into());
         format!("{exe} · {}", self.data_version_summary())
     }
@@ -412,10 +428,72 @@ impl Scan {
     /// thing to a game version, and a build that has neither says so instead of
     /// inventing a number.
     pub fn game_version(&self) -> String {
-        match &self.executable {
-            Some(exe) if exe.is_known() => exe.label().trim_start_matches("PW ").to_string(),
-            Some(exe) => exe.version_row(),
-            None => "no executable".into(),
+        let Some(exe) = &self.executable else {
+            return "no executable".into();
+        };
+        if exe.is_known() {
+            return exe.label().trim_start_matches("PW ").to_string();
+        }
+        if let Some(version) = exe
+            .release_version
+            .as_deref()
+            .and_then(display_release_version)
+            .or_else(|| resource_game_version(exe))
+        {
+            return version;
+        }
+        // Legacy clients commonly ship the generic 1 0 marker. It is not a
+        // release number: several distinct game releases use it. Only use a
+        // data profile when both independently-versioned headers match a
+        // measured pair; otherwise keep the result explicitly unresolved.
+        if exe.release_version.as_deref() == Some("1 0") {
+            if let Some(version) = self.legacy_data_profile() {
+                return format!("{version} (data-version profile)");
+            }
+        }
+        exe.version_row()
+    }
+
+    /// A legacy 1 0 marker can be narrowed by the paired data revisions.
+    /// These are identification profiles only; they do not select parser
+    /// layouts, and ambiguous data pairs remain explicitly ambiguous.
+    fn legacy_data_profile(&self) -> Option<&'static str> {
+        let elements = self.elements.as_ref()?.header?;
+        if elements.family() != 0x3000 {
+            return None;
+        }
+        let tasks = self.data_files.iter().find(|info| info.name == "tasks.data")?;
+        if !tasks
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("header magic 0x93858361"))
+        {
+            return None;
+        }
+        let tasks_version = tasks.raw?;
+        match (elements.version(), tasks_version) {
+            (10, 55) => Some("1.3.1"),
+            // This data revision is used by both 1.3.6 and 1.3.9 client
+            // distributions, so it cannot distinguish those executables.
+            (12, 56) => Some("1.3.6 / 1.3.9"),
+            (60, 93) | (70, 105) => Some("1.4.4"),
+            (85, 108) => Some("1.4.8"),
+            _ => None,
+        }
+    }
+
+    fn executable_label(&self) -> String {
+        let Some(exe) = &self.executable else {
+            return "unknown executable".into();
+        };
+        if exe.is_known() {
+            return exe.label();
+        }
+        let version = self.game_version();
+        if version.starts_with("unknown game version") || version == "no executable" {
+            exe.label()
+        } else {
+            format!("unverified build {version}")
         }
     }
 
@@ -497,7 +575,7 @@ impl Scan {
                         .release_version_source
                         .as_deref()
                         .unwrap_or("config/element/version.sw");
-                    out.push_str(&format!("  release   {release} ({source})\n"));
+                    out.push_str(&format!("  client marker   {release} ({source})\n"));
                 }
                 out.push_str(&format!("  identity  {}\n", exe.label()));
                 if let Some(versions) = exe.known_data_versions() {
@@ -729,11 +807,57 @@ fn scan_executable(element: &Path) -> (Option<ExecutableInfo>, Option<String>) {
 /// picking which digits "are" the version would be a guess. A file that is
 /// absent, empty or not text is simply not reported, and the row falls back to
 /// the executable's own resource version.
-fn display_release_version(raw: &str) -> &str {
-    match raw {
-        "1432 0" => "1.8.4",
-        other => other,
-    }
+/// Convert numeric version.sw values to the marketing release players
+/// recognise. These are release identifiers, not decimal fragments: deriving
+/// a dotted version by splitting or dividing the number would be incorrect.
+/// The old 1 0 marker is shared by several releases and has no direct mapping.
+fn display_release_version(raw: &str) -> Option<String> {
+    let version = match raw {
+        "1432 0" | "1432" => "1.8.4",
+        "1352 0" | "1352" => "1.8.0",
+        "1311 0" => "1.7.8",
+        "1233 0" => "1.7.2",
+        "1163 0" => "1.6.6",
+        "962 0" => "1.5.5",
+        "920 0" => "1.5.2",
+        "1 0" => return None,
+        other if is_dotted_game_version(other) => other,
+        _ => return None,
+    };
+    Some(version.to_string())
+}
+
+/// Accept an already dotted release version, but never reinterpret a build
+/// counter or a generic 1 0 protocol marker as a marketing version.
+fn is_dotted_game_version(value: &str) -> bool {
+    let parts: Vec<_> = value.split('.').collect();
+    parts.len() >= 3
+        && parts.len() <= 4
+        && parts.iter().all(|part| {
+            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && parts[0] == "1"
+        && parts[1].parse::<u32>().is_ok_and(|minor| minor >= 3)
+}
+
+/// Some older executables carry an actual dotted release in VS_VERSIONINFO.
+/// 1.8.4's 1,0,0,6154 is a resource build number, not a game release, so only
+/// a plausible 1.x.y release tuple is accepted here.
+fn resource_game_version(exe: &ExecutableInfo) -> Option<String> {
+    [exe.product_version.as_deref(), exe.file_version.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(|raw| {
+            let normalized = raw.trim().replace(',', ".");
+            if !is_dotted_game_version(&normalized) {
+                return None;
+            }
+            let mut parts = normalized.split('.');
+            let major = parts.next()?;
+            let minor = parts.next()?;
+            let patch = parts.next()?;
+            Some(format!("{major}.{minor}.{patch}"))
+        })
 }
 
 fn parse_release_version_bytes(bytes: &[u8]) -> Option<String> {
