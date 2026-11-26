@@ -376,6 +376,9 @@ impl ViewSettings {
         Self::decode_with_fog_default(text, false)
     }
     fn decode_with_fog_default(text: &str, fog_enabled: bool) -> Self {
+        let legacy_v1 = text
+            .lines()
+            .any(|line| line.trim() == "# Perfect World Explorer settings, version 1");
         let mut s = Self::default();
         s.atmospheric_fog = fog_enabled;
         // Legacy `upscaling=fsr` (pre-FSR-version-selector settings) carries
@@ -595,7 +598,10 @@ impl ViewSettings {
                 _ => {}
             }
         }
-        if !s.atmospheric_fog_explicit {
+        if !s.atmospheric_fog_explicit && (!legacy_v1 || !s.atmospheric_fog) {
+            // Version 1 wrote `false` even when the user had never touched the
+            // checkbox. Migrate that old default to the native scene flag, but
+            // preserve a legacy `true` choice; version 2 tracks explicit edits.
             s.atmospheric_fog = fog_enabled;
         }
         if legacy_fsr_bare {
@@ -801,6 +807,11 @@ mod tests {
         assert!(ViewSettings::decode_with_fog_default("", true).atmospheric_fog);
         assert!(!ViewSettings::decode_with_fog_default("", false).atmospheric_fog);
         assert!(ViewSettings::decode_with_fog_default("atmospheric_fog=false", true).atmospheric_fog);
+        assert!(ViewSettings::decode_with_fog_default(
+            "# Perfect World Explorer settings, version 1\\natmospheric_fog=false",
+            true
+        )
+        .atmospheric_fog);
         assert!(
             !ViewSettings::decode_with_fog_default(
                 "atmospheric_fog=false\natmospheric_fog_explicit=true",
