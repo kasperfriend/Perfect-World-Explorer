@@ -34,13 +34,13 @@ numeric sequence. Regions are shown where the source distinguishes them.
 
 | elements/tasks | Client release(s) | Evidence / context | Scanner result |
 |---|---|---|---|
-| `6 / 52` | 1.1.3 | W2I/Chinese release inventory | Exact |
-| `7 / 55` | 1.2.6 | Historical multi-client inventory | Exact |
+| `6 / 52` | 1.1.3 | Client set based on the Beimei 1.1.6 package; client task revision is v52 (server task revision is v53) | Exact |
+| `7 / 55` | 1.2.6 | Brazilian official client inventory | Exact |
 | `8 / 55` | 1.2.8 | W2I/Chinese release inventory | Exact |
 | `10 / 55` | 1.3.1 | Russian client inventory; also measured in this repository's matrix | Exact |
 | `12 / 56` | 1.3.4, 1.3.6, 1.3.8 | Russian/Chinese release lists and three distinct 1.3.6 client data sets | **Ambiguous** |
 | `27 / 75` | 1.4.1, 1.4.2 | Modified Brazilian 1.4.1 client based on 1.4.2 data; W2I 1.4.2; this repository measured the pair in a 1.4.2 client | **Ambiguous** |
-| `29 / 78` | 1.4.1, 1.4.2 | Modified PWI-based 1.4.1 client; Russian 1.4.2 client | **Ambiguous** |
+| `29 / 78` | 1.4.1, 1.4.2 | Modified PWI-based 1.4.1 client; official Russian 1.4.2 client | **Ambiguous** |
 | `60 / 93` | 1.4.4 | Russian 1.4.4 client | Exact |
 | `63 / 101` | 1.4.5 | Russian 1.4.5 Underworld client | Exact |
 | `69 / 103` | 1.4.5 | Russian 1.4.5 Reflections client | Exact |
@@ -139,10 +139,10 @@ headers. A known executable fingerprint or its own release marker still wins.
 6. Project-local [Cross-version reading matrix](cross-version-matrix.md),
    which records pairs read from the staged 1.3.1, 1.3.6, 1.4.2, 1.4.4, and
    1.5.2 client corpora.
-7. [Perfect World 1.7.6 offline server/client build 4311](https://github.com/vladyslav-tmf/perfect-world-offline-server),
-   whose client requirements confirm that the Russian build's client and server
-   must use the matching data files. The `386/191` pair is documented in the
-   associated 1.7.6 client release discussion.
+7. RaGEZONE, [1.7.6 server + client, page 6](https://forum.ragezone.com/threads/1-7-6-server-client.1246869/page-6),
+   which explicitly lists the Russian 1.7.6 build 4311 client as
+   `elements.data v386 / tasks.data v191`. The [offline server/client project](https://github.com/vladyslav-tmf/perfect-world-offline-server)
+   independently warns that the PWI English build uses different data.
 8. RaGEZONE, [Oriental PW 1.8.9 development thread](https://forum.ragezone.com/threads/release-wip-pw-1-7-6-source-1-8-0-now-running-the-1-8-9-client-pw-oriental-build-10469-%E2%80%94-reaper-azure-dragon-log-in.1275720/),
    a community WIP reference only; its reported `620/247` pair is not enabled
    in the scanner.
