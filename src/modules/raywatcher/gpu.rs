@@ -4332,6 +4332,14 @@ impl RaywatcherGpu {
         }
         let grid_changed = grid_extent != self.grid_extent;
         let render_changed = (w, h) != self.render_extent;
+        if render_changed {
+            // The full-resolution output texture is recreated below. It no
+            // longer contains a completed frame, even when resize() is called
+            // by the renderer before record() can observe the changed extent.
+            // Keep the native raster path enabled until a new RT frame lands.
+            self.traced_last_frame = false;
+            self.last_traced_hardware = None;
+        }
         if grid_changed {
             self.grid = GridTargets::new(device, grid_extent.0, grid_extent.1);
             self.grid_extent = grid_extent;
