@@ -165,6 +165,9 @@ struct Bucket {
 /// How many distinct (layer, state, texture) groups are cached before the pass
 /// drops them all. Retail roots reuse a few hundred at most.
 const BUCKET_CACHE_LIMIT: usize = 1024;
+/// Retain scratch buffers for all normal effect buckets, under a total vertex
+/// capacity budget so a burst cannot pin unbounded CPU memory.
+const MAX_SCRATCH_POOL_VERTICES: usize = 262_144;
 /// Missing/corrupt effect textures are probed again every five seconds at 60 FPS,
 /// not every rendered frame. This preserves recovery if an archive becomes available
 /// later while keeping the steady-state render path free of repeated disk I/O.
@@ -217,6 +220,7 @@ pub struct Draw {
     group_scratch: Vec<(BucketKey, Vec<Vertex>)>,
     scratch_index: HashMap<BucketKey, usize>,
     scratch_pool: Vec<Vec<Vertex>>,
+    scratch_pool_vertices: usize,
     failed: Vec<String>,
     failed_set: std::collections::HashSet<String>,
 }
@@ -480,6 +484,7 @@ impl Draw {
             group_scratch: Vec::new(),
             scratch_index: HashMap::new(),
             scratch_pool: Vec::new(),
+            scratch_pool_vertices: 0,
             failed: Vec::new(),
             failed_set: std::collections::HashSet::new(),
         })
@@ -664,7 +669,14 @@ impl Draw {
             } else if let Some(&pos) = self.scratch_index.get(&key) {
                 pos
             } else {
-                let mut verts = self.scratch_pool.pop().unwrap_or_default();
+                let mut verts = if let Some(verts) = self.scratch_pool.pop() {
+                    self.scratch_pool_vertices = self
+                        .scratch_pool_vertices
+                        .saturating_sub(verts.capacity());
+                    verts
+                } else {
+                    Vec::new()
+                };
                 verts.clear();
                 let pos = groups.len();
                 self.scratch_index.insert(key, pos);
@@ -867,14 +879,18 @@ impl Draw {
         {
             self.staging_vertices.shrink_to(STAGING_TRIM_THRESHOLD);
         }
-        const MAX_SCRATCH_POOL: usize = 64;
         const MAX_SCRATCH_VERTS: usize = 8_192;
         for (_, mut verts) in groups.drain(..) {
-            if self.scratch_pool.len() < MAX_SCRATCH_POOL {
-                verts.clear();
-                if verts.capacity() > MAX_SCRATCH_VERTS {
-                    verts.shrink_to(MAX_SCRATCH_VERTS);
-                }
+            verts.clear();
+            if verts.capacity() > MAX_SCRATCH_VERTS {
+                verts.shrink_to(MAX_SCRATCH_VERTS);
+            }
+            let capacity = verts.capacity();
+            if self.scratch_pool.len() < BUCKET_CACHE_LIMIT
+                && self.scratch_pool_vertices.saturating_add(capacity)
+                    <= MAX_SCRATCH_POOL_VERTICES
+            {
+                self.scratch_pool_vertices += capacity;
                 self.scratch_pool.push(verts);
             }
         }
