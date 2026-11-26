@@ -5583,11 +5583,7 @@ mod phase_r1_tests {
             0.06
         );
         assert_eq!(
-            classify_surface_roughness(
-                underside_normal,
-                glam::Vec3::new(0.0, 10.0, 0.0),
-                &water
-            ),
+            classify_surface_roughness(underside_normal, glam::Vec3::new(0.0, 10.0, 0.0), &water),
             0.06,
             "the underside of native water must stay tagged when viewed underwater"
         );
@@ -5831,12 +5827,8 @@ mod shader_optimization_regression_tests {
     #[test]
     fn gi_adaptive_sampling_increases_near_field_rays_on_both_backends() {
         let dxr = include_str!("dxr_trace.hlsl");
-        assert!(RAY_SHADER.contains(
-            "(1.0 - smoothstep(40.0, 220.0, dist)) * 0.50"
-        ));
-        assert!(dxr.contains(
-            "(1.0 - smoothstep(40.0, 220.0, dist)) * 0.50"
-        ));
+        assert!(RAY_SHADER.contains("(1.0 - smoothstep(40.0, 220.0, dist)) * 0.50"));
+        assert!(dxr.contains("(1.0 - smoothstep(40.0, 220.0, dist)) * 0.50"));
     }
 
     #[test]
@@ -5859,12 +5851,8 @@ mod shader_optimization_regression_tests {
             );
         }
 
-        assert!(RAY_SHADER.contains(
-            "accum_gi = gi_estimate * (f32(samples) * selected_cosine);"
-        ));
-        assert!(dxr.contains(
-            "normalisation * float(samples) * selected_cosine"
-        ));
+        assert!(RAY_SHADER.contains("accum_gi = gi_estimate * (f32(samples) * selected_cosine);"));
+        assert!(dxr.contains("normalisation * float(samples) * selected_cosine"));
     }
 
     #[test]
