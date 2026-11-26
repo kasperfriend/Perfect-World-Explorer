@@ -995,6 +995,33 @@ mod tests {
     }
 
     #[test]
+    fn native_table_fog_uses_projected_view_z_not_euclidean_ray_length() {
+        let mut params = params((8, 8));
+        // A simple perspective-like projection whose clip.w is forward view Z.
+        params.view_projection = glam::Mat4::from_cols_array(&[
+            1., 0., 0., 0.,
+            0., 1., 0., 0.,
+            0., 0., 1., 1.,
+            0., 0., 0., 0.,
+        ]);
+        let point = Vec3::new(30., 0., 40.);
+        let view_z = (params.view_projection * point.extend(1.)).w;
+        let ray_length = point.length();
+        assert!((view_z - 40.).abs() < 1e-5);
+        assert!(ray_length > view_z + 5.);
+
+        params.lighting.fog_range = (45., 55.);
+        let correct = apply_fog(Vec3::splat(0.1), &params, view_z);
+        let euclidean_bug = apply_fog(Vec3::splat(0.1), &params, ray_length);
+        assert_eq!(correct, Vec3::splat(0.1));
+        assert!(euclidean_bug.x > correct.x, "Euclidean distance would fog this off-axis point too early");
+
+        let shader = super::super::gpu::RAY_SHADER;
+        assert!(shader.contains("let fog_view_z = max((params.vp * vec4<f32>(point, 1.0)).w, 0.0);"));
+        assert!(shader.contains("linear_to_srgb(relit), params.fog_colour.xyz"));
+    }
+
+    #[test]
     fn the_sun_radius_widens_the_penumbra_and_a_hard_sun_has_none() {
         let scene = plane_scene();
         let mut params = params((64, 64));
