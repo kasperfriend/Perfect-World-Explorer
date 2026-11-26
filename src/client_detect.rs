@@ -2191,26 +2191,10 @@ mod tests {
     fn shared_legacy_marker_labels_ambiguous_profiles_as_guesses() {
         let cases = [
             (10, 55, "1.3.1 (data-version profile)"),
-            (
-                12,
-                56,
-                "Version is guessed: 1.3.6",
-            ),
-            (
-                27,
-                75,
-                "Version is guessed: 1.4.2",
-            ),
-            (
-                29,
-                78,
-                "Version is guessed: 1.4.2",
-            ),
-            (
-                70,
-                105,
-                "Version is guessed: 1.4.4",
-            ),
+            (12, 56, "Version is guessed: 1.3.6"),
+            (27, 75, "Version is guessed: 1.4.2"),
+            (29, 78, "Version is guessed: 1.4.2"),
+            (70, 105, "Version is guessed: 1.4.4"),
             (85, 176, "unknown game version (unmapped client marker 1 0)"),
         ];
         for (elements, tasks, expected) in cases {
@@ -2233,7 +2217,9 @@ mod tests {
                     scan.headline()
                 );
                 assert!(
-                    !scan.headline().contains("unverified build Version is guessed:"),
+                    !scan
+                        .headline()
+                        .contains("unverified build Version is guessed:"),
                     "do not wrap the concise label in another prefix: {}",
                     scan.headline()
                 );
