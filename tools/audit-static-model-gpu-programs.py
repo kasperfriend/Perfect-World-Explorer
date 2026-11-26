@@ -28,6 +28,7 @@ EXCLUDED = {
     "terrain-view-gpu-check": "terrain per-view pass state / LOD continuity, not static BMD scenery",
     "terrain-refraction-gpu-check": "terrain refraction/fog, not static BMD",
     "tree-gpu-mip-check": "asset-dependent viewer check requires user trees.pck and baked PWTREE cache; the synthetic authored-chain check is wired in CI",
+    "hiz-gpu-check": "reversed-Z depth hierarchy and tree occlusion compute validation, not a static-model BMD pipeline",
     "water-fog-gpu-check": "water fog",
     "water-pass-gpu-check": "overlapping water-plane depth ordering, not static BMD",
 
