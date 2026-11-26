@@ -1936,7 +1936,14 @@ pub fn harvest_rt_tree_species(
     out: &mut Vec<RtTreeTriangle>,
 ) -> (usize, usize, usize) {
     harvest_rt_tree_species_cancellable(
-        species_list, eye, view_direction, max_dist, lod_scale, tri_budget, out, None,
+        species_list,
+        eye,
+        view_direction,
+        max_dist,
+        lod_scale,
+        tri_budget,
+        out,
+        None,
     )
 }
 
