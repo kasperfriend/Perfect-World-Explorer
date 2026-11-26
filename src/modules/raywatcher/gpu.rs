@@ -4426,12 +4426,17 @@ impl RaywatcherGpu {
 
     /// Initialize DXR on the startup worker before moving this GPU state to the render thread.
     pub fn initialize_hardware(&mut self) {
-        if self.dxr.is_some() || self.dxr_failed { return; }
+        if self.dxr.is_some() || self.dxr_failed {
+            return;
+        }
         let started = std::time::Instant::now();
         match super::dxr::DxrTracer::new(&self.device, &self.scene_geom, self.grid_extent) {
             Ok(tracer) => {
                 self.dxr = Some(tracer);
-                eprintln!("[Raywatcher] Hardware backend prepared in {:.1}s on initialization worker", started.elapsed().as_secs_f32());
+                eprintln!(
+                    "[Raywatcher] Hardware backend prepared in {:.1}s on initialization worker",
+                    started.elapsed().as_secs_f32()
+                );
             }
             Err(err) => {
                 eprintln!("[Raywatcher] DXR 1.1 init failed ({err}); falling back to Software");
@@ -4441,7 +4446,9 @@ impl RaywatcherGpu {
     }
 
     fn begin_dxr_initialization(&mut self) {
-        if self.dxr.is_some() || self.dxr_failed || self.dxr_init.is_some() { return; }
+        if self.dxr.is_some() || self.dxr_failed || self.dxr_init.is_some() {
+            return;
+        }
         let worker_device = std::sync::Arc::clone(&self.device);
         let scene = self.scene_geom.clone();
         let grid_extent = self.grid_extent;
@@ -4455,34 +4462,47 @@ impl RaywatcherGpu {
         });
         match spawn {
             Ok(_) => self.dxr_init = Some(rx),
-            Err(err) => { self.dxr_failed = true; eprintln!("[Raywatcher] Could not start DXR initialization worker ({err}); using Software"); }
+            Err(err) => {
+                self.dxr_failed = true;
+                eprintln!("[Raywatcher] Could not start DXR initialization worker ({err}); using Software");
+            }
         }
     }
 
     fn poll_dxr_initialization(&mut self, device: &wgpu::Device) -> bool {
-        let Some(rx) = self.dxr_init.as_ref() else { return true; };
+        let Some(rx) = self.dxr_init.as_ref() else {
+            return true;
+        };
         match rx.try_recv() {
             Ok(Ok(mut tracer)) => {
                 self.dxr_init = None;
                 if let Err(err) = tracer.resize(device, self.grid_extent) {
                     self.dxr_failed = true;
                     eprintln!("[Raywatcher] DXR target resize after background init failed ({err}); using Software");
-                } else { self.dxr = Some(tracer); }
+                } else {
+                    self.dxr = Some(tracer);
+                }
                 true
             }
             Ok(Err(err)) => {
-                self.dxr_init = None; self.dxr_failed = true;
-                eprintln!("[Raywatcher] DXR 1.1 init failed ({err}); falling back to Software"); true
+                self.dxr_init = None;
+                self.dxr_failed = true;
+                eprintln!("[Raywatcher] DXR 1.1 init failed ({err}); falling back to Software");
+                true
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.dxr_init = None; self.dxr_failed = true;
-                eprintln!("[Raywatcher] DXR initialization worker exited without a result; falling back to Software"); true
+                self.dxr_init = None;
+                self.dxr_failed = true;
+                eprintln!("[Raywatcher] DXR initialization worker exited without a result; falling back to Software");
+                true
             }
         }
     }
 
-    pub fn hardware_initializing(&self) -> bool { self.dxr_init.is_some() }
+    pub fn hardware_initializing(&self) -> bool {
+        self.dxr_init.is_some()
+    }
 
     pub fn can_replace_water_reflections(&self, hardware_requested: bool) -> bool {
         self.traced_last_frame
@@ -4510,7 +4530,11 @@ impl RaywatcherGpu {
                 .spawn(move || {
                     let started = std::time::Instant::now();
                     let result = dxr.set_scene(&worker_scene).map(|()| dxr);
-                    eprintln!("[Raywatcher] Background DXR scene/AS rebuild took {:.1}s (success={})", started.elapsed().as_secs_f32(), result.is_ok());
+                    eprintln!(
+                        "[Raywatcher] Background DXR scene/AS rebuild took {:.1}s (success={})",
+                        started.elapsed().as_secs_f32(),
+                        result.is_ok()
+                    );
                     let _ = tx.send(result);
                 });
             match spawn {
@@ -4560,7 +4584,9 @@ impl RaywatcherGpu {
         walker_rt_verts: &[[f32; 3]],
     ) {
         self.traced_last_frame = false;
-        if !plan.trace { return; }
+        if !plan.trace {
+            return;
+        }
         // Compare against the backend that can actually be used this frame.
         // Once DXR initialization has failed, a hardware-mode setting must not
         // keep invalidating the software path's history on every frame.
@@ -6002,8 +6028,11 @@ mod shader_optimization_regression_tests {
         let dxr = include_str!("dxr_trace.hlsl");
         assert!(RAY_SHADER.contains("maximum <= base || is_water"));
         assert!(dxr.contains("max_samples <= base || is_water"));
-        assert!(RAY_SHADER.contains("adaptive_ray_samples(ip, dist, normal, roughness, is_water, base_samples)"));
-        assert!(dxr.contains("adaptive_ray_samples(id.xy, dist, normal, roughness, is_water, base_samples)"));
+        assert!(RAY_SHADER
+            .contains("adaptive_ray_samples(ip, dist, normal, roughness, is_water, base_samples)"));
+        assert!(dxr.contains(
+            "adaptive_ray_samples(id.xy, dist, normal, roughness, is_water, base_samples)"
+        ));
         assert!(RAY_SHADER.contains("(!is_water || s == 0u)"));
         assert!(dxr.contains("(!is_water || s == 0u)"));
     }
@@ -6069,8 +6098,10 @@ mod shader_optimization_regression_tests {
         let incoming_below = glam::Vec3::new(0.3, 0.8, 0.5).normalize();
         let normal_above = glam::Vec3::Y;
         let normal_below = glam::Vec3::NEG_Y;
-        let reflected_above = incoming_above - 2.0 * incoming_above.dot(normal_above) * normal_above;
-        let reflected_below = incoming_below - 2.0 * incoming_below.dot(normal_below) * normal_below;
+        let reflected_above =
+            incoming_above - 2.0 * incoming_above.dot(normal_above) * normal_above;
+        let reflected_below =
+            incoming_below - 2.0 * incoming_below.dot(normal_below) * normal_below;
         assert!(reflected_above.dot(normal_above) > 0.0);
         assert!(reflected_below.dot(normal_below) > 0.0);
     }
