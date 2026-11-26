@@ -3067,7 +3067,7 @@ impl Populator {
             let unchanged = live.uploaded_stamp.is_some() && live.uploaded_stamp == live.pose_stamp;
             let new_pose = posed.get_mut(index).and_then(Option::take);
             match (live.draw.take(), new_pose) {
-                (Some(draw), Some(meshes)) if unchanged => {
+                (Some(mut draw), Some(meshes)) if unchanged => {
                     drop(meshes);
                     match draw.update_constants(queue, asset, frame) {
                         Ok(()) => live.draw = Some(draw),
@@ -3086,7 +3086,7 @@ impl Populator {
                         Err(error) => live.failure = Some(error),
                     }
                 }
-                (Some(draw), None) => {
+                (Some(mut draw), None) => {
                     // Posed by an earlier pass of this frame: only this pass's
                     // view matrix and light are new.
                     match draw.update_constants(queue, asset, frame) {

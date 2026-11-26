@@ -1195,7 +1195,7 @@ impl Walker {
             .as_ref()
             .is_some_and(|gpu| gpu.pose_generation == self.pose_generation);
         let update = (|| -> Result<Option<Vec<gfx_decal::Quad>>, String> {
-            let gpu = self.gpu.as_ref().ok_or("Walker GPU draws missing")?;
+            let gpu = self.gpu.as_mut().ok_or("Walker GPU draws missing")?;
             let character = self.character.as_ref().ok_or("Walker character missing")?;
             let models = render_models(character, &character.posed.meshes)?;
             if models.len() != gpu.draws.len() {
