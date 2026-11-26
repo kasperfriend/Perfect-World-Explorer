@@ -48,10 +48,16 @@ DWORD_FORMATS = {
     ".ecwld": ("world", 4, (0, 0x45435744)),
     ".ecbsd": ("EC-BSD manifest", 8, (0, 0x42584F4D)),
     ".dat": ("BSData", 4, (0, 0x42584F4D)),
-    # `elements.data` and `task_npc.data` put `(family << 16) | version` at 0,
-    # which is what `designer::catalog::unsupported_layout` decodes. No magic to
-    # check, so every `.data` that is not a BSData table lands here.
-    ".data": ("elements/task data", 0, None),
+}
+
+# A .data extension does not define a shared header. Survey only the files
+# whose version fields are known from the production readers. In particular,
+# tasks.data starts with a magic at 0; its version is the dword at offset 4.
+DATA_DWORD_FORMATS = {
+    "elements.data": ("elements data", 0, None),
+    "tasks.data": ("tasks data", 4, (0, 0x93858361)),
+    "tasks_sample.data": ("tasks data", 4, (0, 0x93858361)),
+    "aipolicy.data": ("AI policy trigger", 4, None),
 }
 
 TEXT_FORMATS = {
