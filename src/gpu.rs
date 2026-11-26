@@ -6176,7 +6176,6 @@ fn restore_old_window(window: &winit::window::Window) {
     window.focus_window();
 }
 
-
 /// Distinguish a real camera cut from legal free-flight movement. The position
 /// allowance includes simultaneous X/Y/Z input and the current boost speed;
 /// large continuous steps therefore do not repeatedly invalidate temporal RT.
@@ -6188,9 +6187,7 @@ fn camera_cut_detected(
     frame_dt: f32,
     movement_speed: f32,
 ) -> bool {
-    let max_continuous_step = movement_speed.max(0.0)
-        * frame_dt.clamp(0.0, 0.1)
-        * 3.0f32.sqrt();
+    let max_continuous_step = movement_speed.max(0.0) * frame_dt.clamp(0.0, 0.1) * 3.0f32.sqrt();
     let position_cut_threshold = 64.0f32.max(max_continuous_step * 1.5 + 8.0);
     let turned_around = previous_direction
         .normalize_or_zero()
