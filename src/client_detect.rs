@@ -2181,6 +2181,31 @@ mod tests {
     }
 
     #[test]
+    fn shared_legacy_marker_uses_only_unique_measured_data_profiles() {
+        let cases = [
+            (10, 55, "1.3.1 (data-version profile)"),
+            (70, 105, "1.4.4 (data-version profile)"),
+            (12, 56, "unknown game version (unmapped client marker 1 0)"),
+            (85, 176, "unknown game version (unmapped client marker 1 0)"),
+        ];
+        for (elements, tasks, expected) in cases {
+            let tag = format!("legacy-profile-{elements}-{tasks}");
+            let root = synthetic_client(&tag, elements, tasks);
+            let marker = root.join("element/config/element/version.sw");
+            fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            fs::write(&marker, "1 0\n").unwrap();
+            let scan = scan(&root);
+            assert_eq!(
+                scan.game_version(),
+                expected,
+                "elements v{elements}/tasks v{tasks}: {}",
+                scan.report()
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn scan_reports_data_versions_independently_of_the_executable() {
         let root = synthetic_client("v27", 27, 75);
         let scan = scan(&root);
