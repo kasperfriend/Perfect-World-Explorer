@@ -165,6 +165,14 @@ pub fn frustum_planes_from_matrix(m: [f32; 16]) -> [[f32; 4]; 6] {
     ]
 }
 
+#[inline]
+fn all_chunks_inside_frustum(chunks: &[WorldDrawChunk], planes: &[[f32; 4]; 6]) -> bool {
+    !chunks.is_empty()
+        && chunks
+            .iter()
+            .all(|chunk| aabb_inside_frustum(planes, chunk.min, chunk.max))
+}
+
 pub fn aabb_in_frustum(planes: &[[f32; 4]; 6], min: [f32; 3], max: [f32; 3]) -> bool {
     if min[0] > max[0] {
         return false;
@@ -1624,74 +1632,109 @@ impl GpuPage {
         if pages.is_empty() || list.chunks.is_empty() {
             return;
         }
-        // 1. Hierarchical page-level rejection: test each GpuPage AABB once
-        // against clip plane, frustum, and sub-pixel size into a reused buffer.
-        scratch.page_visible.clear();
-        scratch
-            .page_visible
-            .reserve(pages.len().saturating_sub(scratch.page_visible.capacity()));
-        let mut any_page_visible = false;
-        for page in pages {
-            let vis = page.count > 0
-                && (!sdr_only || page.page_has_sdr)
-                && aabb_survives_clip(cull.clip_plane, page.page_min, page.page_max)
-                && aabb_in_frustum(&cull.frustum, page.page_min, page.page_max)
-                && aabb_survives_screen_size(
-                    cull.eye,
-                    cull.proj_scale,
-                    cull.min_screen_px,
-                    page.page_min,
-                    page.page_max,
-                );
-            any_page_visible |= vis;
-            scratch.page_visible.push(vis);
-        }
-        if !any_page_visible {
-            return;
-        }
+        // When every 32-command chunk is wholly inside the main frustum, the
+        // chunk bounds already prove that every command is inside it. Avoid the
+        // page-AABB pass and the repeated chunk/placement frustum tests in this
+        // common "whole world fits on screen" view. Keep the per-command
+        // projected-size test, so this fast path changes no visible-detail
+        // threshold; it only removes redundant hierarchy checks.
+        let all_chunks_inside = cull.clip_plane.is_none()
+            && !sdr_only
+            && list
+                .chunks
+                .iter()
+                .all(|chunk| aabb_inside_frustum(&cull.frustum, chunk.min, chunk.max));
 
-        // 2. Chunk + placement culling and aggressive gap-bridging draw-call
-        // coalescing into the persistent scratch command buffer (zero allocs).
         scratch.cmds.clear();
-        let max_gap = if sdr_only { 0 } else { MAX_COALESCE_GAP };
-        for chunk in &list.chunks {
-            if (sdr_only && !chunk.has_sdr)
-                || !aabb_survives_clip(cull.clip_plane, chunk.min, chunk.max)
-                || !aabb_in_frustum(&cull.frustum, chunk.min, chunk.max)
-                || !aabb_survives_screen_size(
-                    cull.eye,
-                    cull.proj_scale,
-                    cull.min_screen_px,
-                    chunk.min,
-                    chunk.max,
-                )
-            {
-                continue;
+        if all_chunks_inside {
+            for cmd in &list.cmds {
+                if cmd.start < cmd.end
+                    && aabb_survives_screen_size(
+                        cull.eye,
+                        cull.proj_scale,
+                        cull.min_screen_px,
+                        cmd.min,
+                        cmd.max,
+                    )
+                {
+                    push_coalesced_draw(
+                        &mut scratch.cmds,
+                        cmd.page,
+                        cmd.start,
+                        cmd.end,
+                        MAX_COALESCE_GAP,
+                    );
+                }
             }
-            let fully_inside = aabb_inside_frustum(&cull.frustum, chunk.min, chunk.max);
-            for cmd in &list.cmds[chunk.start..chunk.end] {
-                if !scratch.page_visible[cmd.page]
-                    || (sdr_only && !cmd.has_sdr)
-                    || cmd.start >= cmd.end
+        } else {
+            // 1. Hierarchical page-level rejection: test each GpuPage AABB once
+            // against clip plane, frustum, and sub-pixel size into a reused buffer.
+            scratch.page_visible.clear();
+            scratch
+                .page_visible
+                .reserve(pages.len().saturating_sub(scratch.page_visible.capacity()));
+            let mut any_page_visible = false;
+            for page in pages {
+                let vis = page.count > 0
+                    && (!sdr_only || page.page_has_sdr)
+                    && aabb_survives_clip(cull.clip_plane, page.page_min, page.page_max)
+                    && aabb_in_frustum(&cull.frustum, page.page_min, page.page_max)
+                    && aabb_survives_screen_size(
+                        cull.eye,
+                        cull.proj_scale,
+                        cull.min_screen_px,
+                        page.page_min,
+                        page.page_max,
+                    );
+                any_page_visible |= vis;
+                scratch.page_visible.push(vis);
+            }
+            if !any_page_visible {
+                return;
+            }
+
+            // 2. Chunk + placement culling and aggressive gap-bridging draw-call
+            // coalescing into the persistent scratch command buffer (zero allocs).
+            let max_gap = if sdr_only { 0 } else { MAX_COALESCE_GAP };
+            for chunk in &list.chunks {
+                if (sdr_only && !chunk.has_sdr)
+                    || !aabb_survives_clip(cull.clip_plane, chunk.min, chunk.max)
+                    || !aabb_in_frustum(&cull.frustum, chunk.min, chunk.max)
+                    || !aabb_survives_screen_size(
+                        cull.eye,
+                        cull.proj_scale,
+                        cull.min_screen_px,
+                        chunk.min,
+                        chunk.max,
+                    )
                 {
                     continue;
                 }
-                if !aabb_survives_clip(cull.clip_plane, cmd.min, cmd.max) {
-                    continue;
+                let fully_inside = aabb_inside_frustum(&cull.frustum, chunk.min, chunk.max);
+                for cmd in &list.cmds[chunk.start..chunk.end] {
+                    if !scratch.page_visible[cmd.page]
+                        || (sdr_only && !cmd.has_sdr)
+                        || cmd.start >= cmd.end
+                    {
+                        continue;
+                    }
+                    if !aabb_survives_clip(cull.clip_plane, cmd.min, cmd.max) {
+                        continue;
+                    }
+                    if !fully_inside && !aabb_in_frustum(&cull.frustum, cmd.min, cmd.max) {
+                        continue;
+                    }
+                    if !aabb_survives_screen_size(
+                        cull.eye,
+                        cull.proj_scale,
+                        cull.min_screen_px,
+                        cmd.min,
+                        cmd.max,
+                    ) {
+                        continue;
+                    }
+                    push_coalesced_draw(&mut scratch.cmds, cmd.page, cmd.start, cmd.end, max_gap);
                 }
-                if !fully_inside && !aabb_in_frustum(&cull.frustum, cmd.min, cmd.max) {
-                    continue;
-                }
-                if !aabb_survives_screen_size(
-                    cull.eye,
-                    cull.proj_scale,
-                    cull.min_screen_px,
-                    cmd.min,
-                    cmd.max,
-                ) {
-                    continue;
-                }
-                push_coalesced_draw(&mut scratch.cmds, cmd.page, cmd.start, cmd.end, max_gap);
             }
         }
 
@@ -2247,6 +2290,35 @@ mod page_tests {
         let pages = pages(&[&[]], &[512]);
         let cmds = fold_commands(&pages, &[(0, usize::MAX)], Pass::Reflection);
         assert_eq!(cmds, vec![cmd(0, 0, 512)]);
+    }
+
+    #[test]
+    fn whole_world_fast_path_requires_every_chunk_inside_frustum() {
+        let cube = [
+            [1., 0., 0., 10.],
+            [-1., 0., 0., 10.],
+            [0., 1., 0., 10.],
+            [0., -1., 0., 10.],
+            [0., 0., 1., 10.],
+            [0., 0., -1., 10.],
+        ];
+        let inside = WorldDrawChunk {
+            min: [-5., -5., -5.],
+            max: [5., 5., 5.],
+            has_sdr: false,
+            start: 0,
+            end: 1,
+        };
+        let outside = WorldDrawChunk {
+            min: [11., -1., -1.],
+            max: [12., 1., 1.],
+            has_sdr: false,
+            start: 1,
+            end: 2,
+        };
+        assert!(all_chunks_inside_frustum(&[inside], &cube));
+        assert!(!all_chunks_inside_frustum(&[inside, outside], &cube));
+        assert!(!all_chunks_inside_frustum(&[], &cube));
     }
 
     #[test]
