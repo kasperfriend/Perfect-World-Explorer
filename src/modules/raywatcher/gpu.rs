@@ -3523,6 +3523,18 @@ fn depth_plane(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::T
     (texture, view)
 }
 
+/// Whether this frame can actually dispatch through DXR. A Hardware mode
+/// request alone is insufficient while the acceleration structure is being
+/// rebuilt on a worker; the Software tracer remains active during that window.
+fn hardware_trace_ready(
+    hardware_mode: bool,
+    dxr_failed: bool,
+    dxr_ready: bool,
+    dxr_initializing: bool,
+) -> bool {
+    hardware_mode && !dxr_failed && dxr_ready && !dxr_initializing
+}
+
 /// Everything Raywatcher owns on the GPU.
 pub struct RaywatcherGpu {
     device: std::sync::Arc<wgpu::Device>,
@@ -4587,20 +4599,6 @@ impl RaywatcherGpu {
         if !plan.trace {
             return;
         }
-        // Compare against the backend that can actually be used this frame.
-        // Once DXR initialization has failed, a hardware-mode setting must not
-        // keep invalidating the software path's history on every frame.
-        let requested_hardware = hardware_mode && !self.dxr_failed;
-        if self
-            .last_traced_hardware
-            .is_some_and(|previous| previous != requested_hardware)
-        {
-            self.frames = 0;
-            self.prev_view_projection = None;
-            if let Some(dxr) = self.dxr.as_mut() {
-                dxr.invalidate_restir_history();
-            }
-        }
         // Copy hardware depth FIRST so both the 1:1 G-buffer prep pass and the
         // denoiser/DLSS RR consume the exact raster depth from the world pass.
         // WebGPU/wgpu requires depth-texture copies to cover the ENTIRE source
@@ -4754,12 +4752,34 @@ impl RaywatcherGpu {
         let mut traced_hw = false;
         if hardware_mode && !self.dxr_failed && self.dxr.is_none() {
             self.begin_dxr_initialization();
-            if !self.poll_dxr_initialization(device) {
-                // Keep native raster visible until the DXR scene and targets are ready.
-                return;
+            // DXR construction/rebuild is asynchronous. Keep dispatching the
+            // already-available Software tracer while it runs; returning here
+            // would skip the entire RT composite for a frame and flash every
+            // replaced raster effect back on.
+            let _ = self.poll_dxr_initialization(device);
+        }
+
+        // Track the backend actually used for this frame, not the requested
+        // mode. During a scene/AS rebuild DXR is temporarily unavailable, so
+        // Software remains live until the replacement tracer is ready.
+        let requested_hardware = hardware_trace_ready(
+            hardware_mode,
+            self.dxr_failed,
+            self.dxr.is_some(),
+            self.dxr_init.is_some(),
+        );
+        if self
+            .last_traced_hardware
+            .is_some_and(|previous| previous != requested_hardware)
+        {
+            self.frames = 0;
+            self.prev_view_projection = None;
+            if let Some(dxr) = self.dxr.as_mut() {
+                dxr.invalidate_restir_history();
             }
         }
-        if hardware_mode && !self.dxr_failed {
+
+        if requested_hardware {
             if let Some(dxr) = self.dxr.as_mut() {
                 let _ = dxr.update_dynamic_character(walker_rt_verts);
                 // Copy the freshly built G-buffer planes into the shared DX12
@@ -6222,5 +6242,19 @@ mod shader_optimization_regression_tests {
         assert!(dxr.contains("float mie_glow = sun_cos4 * sun_cos2 * 0.85 + sun_cos2 * 0.35;"));
         assert!(!dxr.contains("pow(sun_cos, 6.0)"));
         assert!(!dxr.contains("pow(sun_cos, 2.0)"));
+    }
+}
+
+#[cfg(test)]
+mod dxr_backend_selection_tests {
+    use super::hardware_trace_ready;
+
+    #[test]
+    fn hardware_scene_rebuild_keeps_software_path_available_until_dxr_is_ready() {
+        assert!(!hardware_trace_ready(true, false, false, true));
+        assert!(!hardware_trace_ready(true, false, false, false));
+        assert!(hardware_trace_ready(true, false, true, false));
+        assert!(!hardware_trace_ready(true, true, true, false));
+        assert!(!hardware_trace_ready(false, false, true, false));
     }
 }

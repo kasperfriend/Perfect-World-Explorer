@@ -13,6 +13,61 @@
 //!   `NativeTexture2D` planes (`colour`, `guide`, `reflection`, `normals`,
 //!   `albedo`).
 
+// Versioned envelope for the opaque D3D12 driver PSO cache blob.
+const DXR_PSO_CACHE_MAGIC: &[u8; 8] = b"PWEDXRP1";
+const DXR_PSO_CACHE_VERSION: u32 = 1;
+const DXR_PSO_CACHE_HEADER_BYTES: usize = 28;
+const DXR_PSO_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+fn dxr_pso_cache_key(
+    shader_bytecode: &[u8],
+    root_signature: &[u8],
+    adapter_luid: [u8; 8],
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in b"pwe-dxr-pso-cache-v1"
+        .iter()
+        .chain(adapter_luid.iter())
+        .chain(root_signature.iter())
+        .chain(shader_bytecode.iter())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn encode_dxr_pso_cache(key: u64, payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.is_empty() || payload.len() > DXR_PSO_CACHE_MAX_BYTES {
+        return None;
+    }
+    let mut encoded = Vec::with_capacity(DXR_PSO_CACHE_HEADER_BYTES + payload.len());
+    encoded.extend_from_slice(DXR_PSO_CACHE_MAGIC);
+    encoded.extend_from_slice(&DXR_PSO_CACHE_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&key.to_le_bytes());
+    encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    encoded.extend_from_slice(payload);
+    Some(encoded)
+}
+
+fn decode_dxr_pso_cache(key: u64, bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < DXR_PSO_CACHE_HEADER_BYTES
+        || &bytes[..8] != DXR_PSO_CACHE_MAGIC
+        || u32::from_le_bytes(bytes[8..12].try_into().ok()?) != DXR_PSO_CACHE_VERSION
+        || u64::from_le_bytes(bytes[12..20].try_into().ok()?) != key
+    {
+        return None;
+    }
+    let payload_len = usize::try_from(u64::from_le_bytes(bytes[20..28].try_into().ok()?)).ok()?;
+    if payload_len == 0
+        || payload_len > DXR_PSO_CACHE_MAX_BYTES
+        || bytes.len() != DXR_PSO_CACHE_HEADER_BYTES.checked_add(payload_len)?
+    {
+        return None;
+    }
+    Some(&bytes[DXR_PSO_CACHE_HEADER_BYTES..])
+}
+
 #[cfg(not(windows))]
 use std::sync::Arc;
 
@@ -109,6 +164,7 @@ impl DxrTracer {
 #[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
+    use std::io::Write;
     use std::mem::{size_of, zeroed};
     use std::ptr::{null, null_mut};
     use std::sync::Arc;
@@ -130,6 +186,65 @@ mod imp {
         RayParams, RestirReservoir, COLOUR_FORMAT, GUIDE_FORMAT, SKY_ENV_HEIGHT, SKY_ENV_WIDTH,
         TERRAIN_MAP_SIZE,
     };
+
+    fn pso_cache_path(key: u64) -> std::path::PathBuf {
+        crate::diagnostics::explorer_root()
+            .join("cache")
+            .join("raywatcher")
+            .join(format!("dxr-pso-v1-{key:016x}.bin"))
+    }
+
+    fn load_pso_cache(key: u64) -> Option<Vec<u8>> {
+        let path = pso_cache_path(key);
+        let bytes = std::fs::read(&path).ok()?;
+        match super::decode_dxr_pso_cache(key, &bytes) {
+            Some(payload) => Some(payload.to_vec()),
+            None => {
+                let _ = std::fs::remove_file(path);
+                None
+            }
+        }
+    }
+
+    fn remove_pso_cache(key: u64) {
+        let _ = std::fs::remove_file(pso_cache_path(key));
+    }
+
+    fn store_pso_cache(key: u64, payload: &[u8]) {
+        let Some(encoded) = super::encode_dxr_pso_cache(key, payload) else {
+            return;
+        };
+        let path = pso_cache_path(key);
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!("[Raywatcher] Could not create DXR PSO cache folder ({}): {err}", parent.display());
+            return;
+        }
+        let temp = path.with_file_name(format!(
+            "dxr-pso-v1-{key:016x}.{}.tmp",
+            std::process::id()
+        ));
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&temp)?;
+            file.write_all(&encoded)?;
+            file.sync_all()?;
+            drop(file);
+            match std::fs::rename(&temp, &path) {
+                Ok(()) => Ok(()),
+                Err(err) if path.is_file() => {
+                    let _ = std::fs::remove_file(&temp);
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }
+        })();
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&temp);
+            eprintln!("[Raywatcher] Could not write DXR PSO cache ({}): {err}", path.display());
+        }
+    }
 
     const D3D12_FEATURE_D3D12_OPTIONS5: u32 = 27;
     const D3D12_RAYTRACING_TIER_1_1: u32 = 11;
@@ -1013,7 +1128,28 @@ mod imp {
                 return Err(format!("DXR CreateRootSignature failed (0x{hr:08x})"));
             }
 
-            let pso_desc = d12::D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // D3D12's cached PSO is the driver-compiled compute pipeline
+            // representation. Scope it to this adapter and exact shader/root
+            // signature; the driver still validates the opaque blob.
+            let mut adapter_luid: winapi::shared::ntdef::LUID = zeroed();
+            let _ = (*dev_ptr).GetAdapterLuid(&mut adapter_luid);
+            let mut adapter_luid_bytes = [0u8; 8];
+            adapter_luid_bytes[..4].copy_from_slice(&adapter_luid.LowPart.to_le_bytes());
+            adapter_luid_bytes[4..].copy_from_slice(&adapter_luid.HighPart.to_le_bytes());
+            let root_signature_bytes = std::slice::from_raw_parts(
+                (*blob).GetBufferPointer() as *const u8,
+                (*blob).GetBufferSize(),
+            );
+            let cache_key = super::dxr_pso_cache_key(
+                DXR_TRACE_DXIL,
+                root_signature_bytes,
+                adapter_luid_bytes,
+            );
+            let cached_pso = load_pso_cache(cache_key);
+            if cached_pso.is_some() {
+                eprintln!("[Raywatcher] DXR driver PSO cache hit ({cache_key:016x})");
+            }
+            let mut pso_desc = d12::D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: root_sig,
                 CS: d12::D3D12_SHADER_BYTECODE {
                     pShaderBytecode: DXR_TRACE_DXIL.as_ptr() as *const c_void,
@@ -1021,22 +1157,61 @@ mod imp {
                 },
                 NodeMask: 0,
                 CachedPSO: d12::D3D12_CACHED_PIPELINE_STATE {
-                    pCachedBlob: null(),
-                    CachedBlobSizeInBytes: 0,
+                    pCachedBlob: cached_pso
+                        .as_ref()
+                        .map_or(null(), |bytes| bytes.as_ptr() as *const c_void),
+                    CachedBlobSizeInBytes: cached_pso.as_ref().map_or(0, |bytes| bytes.len()),
                 },
                 Flags: d12::D3D12_PIPELINE_STATE_FLAG_NONE,
             };
             let mut pso: *mut d12::ID3D12PipelineState = null_mut();
-            let hr = (*dev_ptr).CreateComputePipelineState(
+            let mut hr = (*dev_ptr).CreateComputePipelineState(
                 &pso_desc,
                 &IID_ID3D12_PIPELINE_STATE,
                 &mut pso as *mut *mut d12::ID3D12PipelineState as *mut *mut c_void,
             );
+            if (hr < 0 || pso.is_null()) && cached_pso.is_some() {
+                // Cached blobs can become stale after a driver update. Discard
+                // the entry and retry once with a normal cold compilation.
+                if !pso.is_null() {
+                    com_release(pso as *mut c_void);
+                    pso = null_mut();
+                }
+                eprintln!("[Raywatcher] DXR PSO cache rejected by driver; recompiling without cache");
+                remove_pso_cache(cache_key);
+                pso_desc.CachedPSO = d12::D3D12_CACHED_PIPELINE_STATE {
+                    pCachedBlob: null(),
+                    CachedBlobSizeInBytes: 0,
+                };
+                hr = (*dev_ptr).CreateComputePipelineState(
+                    &pso_desc,
+                    &IID_ID3D12_PIPELINE_STATE,
+                    &mut pso as *mut *mut d12::ID3D12PipelineState as *mut *mut c_void,
+                );
+            }
             if hr < 0 || pso.is_null() {
+                if !pso.is_null() {
+                    com_release(pso as *mut c_void);
+                }
                 com_release(root_sig as *mut c_void);
                 return Err(format!(
                     "DXR CreateComputePipelineState failed (0x{hr:08x})"
                 ));
+            }
+            if cached_pso.is_none() {
+                let mut cached_blob: *mut ID3DBlob = null_mut();
+                let cache_hr = (*pso).GetCachedBlob(&mut cached_blob);
+                if cache_hr >= 0 && !cached_blob.is_null() {
+                    let blob_len = (*cached_blob).GetBufferSize();
+                    if blob_len > 0 && blob_len <= super::DXR_PSO_CACHE_MAX_BYTES {
+                        let blob_bytes = std::slice::from_raw_parts(
+                            (*cached_blob).GetBufferPointer() as *const u8,
+                            blob_len,
+                        );
+                        store_pso_cache(cache_key, blob_bytes);
+                    }
+                    com_release(cached_blob as *mut c_void);
+                }
             }
 
             let heap_desc = d12::D3D12_DESCRIPTOR_HEAP_DESC {
@@ -2156,5 +2331,39 @@ mod imp {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod dxr_pso_cache_tests {
+    use super::{
+        decode_dxr_pso_cache, dxr_pso_cache_key, encode_dxr_pso_cache,
+    };
+
+    #[test]
+    fn cached_pso_round_trips_and_is_bound_to_its_key() {
+        let key = dxr_pso_cache_key(b"shader", b"root-signature", [1, 2, 3, 4, 5, 6, 7, 8]);
+        let encoded = encode_dxr_pso_cache(key, b"driver-pso").unwrap();
+        assert_eq!(decode_dxr_pso_cache(key, &encoded), Some(&b"driver-pso"[..]));
+        assert_eq!(decode_dxr_pso_cache(key.wrapping_add(1), &encoded), None);
+    }
+
+    #[test]
+    fn cached_pso_rejects_corrupt_headers_and_payload_lengths() {
+        let encoded = encode_dxr_pso_cache(7, b"driver-pso").unwrap();
+        let mut bad_magic = encoded.clone();
+        bad_magic[0] ^= 0xff;
+        assert_eq!(decode_dxr_pso_cache(7, &bad_magic), None);
+        let mut bad_length = encoded;
+        bad_length[20..28].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(decode_dxr_pso_cache(7, &bad_length), None);
+    }
+
+    #[test]
+    fn cached_pso_key_changes_with_shader_root_signature_or_adapter() {
+        let base = dxr_pso_cache_key(b"shader", b"root", [0; 8]);
+        assert_ne!(base, dxr_pso_cache_key(b"shader2", b"root", [0; 8]));
+        assert_ne!(base, dxr_pso_cache_key(b"shader", b"root2", [0; 8]));
+        assert_ne!(base, dxr_pso_cache_key(b"shader", b"root", [1; 8]));
     }
 }
