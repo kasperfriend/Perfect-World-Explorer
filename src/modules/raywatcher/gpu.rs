@@ -613,6 +613,15 @@ struct RestirReservoir {
     receiver_normal_flags: vec4<f32>,
 };
 
+// Separate integer sums and count use only atomicAdd/atomicLoad, which are
+// supported by wgpu 0.19's HLSL translator. One vec4-sized cache cell.
+struct RadianceCacheCell {
+    r: atomic<u32>,
+    g: atomic<u32>,
+    b: atomic<u32>,
+    count: atomic<u32>,
+};
+
 struct Tri {
     a: vec4<f32>,
     b: vec4<f32>,
@@ -652,7 +661,7 @@ struct Material {
 @group(0) @binding(12) var src_gbuf_raster: texture_2d<f32>;
 @group(0) @binding(13) var src_sky_env: texture_2d<f32>;
 @group(0) @binding(14) var src_terrain_map: texture_2d<f32>;
-@group(0) @binding(15) var<storage, read_write> radiance_cache: array<atomic<u32>>;
+@group(0) @binding(15) var<storage, read_write> radiance_cache: array<RadianceCacheCell>;
 @group(0) @binding(16) var<storage, read_write> restir_reservoirs: array<RestirReservoir>;
 
 const PI: f32 = 3.14159265;
@@ -1053,67 +1062,32 @@ const RC_MASK: u32 = 65535u;
 // Pack RGB into 10 bits/channel and a 2-bit confidence count. A single
 // atomic word makes colliding screen-space writers race-free while preserving
 // a small running average followed by a responsive 1/4 EMA.
-fn rc_pack(rgb: vec3<f32>, confidence: u32) -> u32 {
-    let q = vec3<u32>(round(clamp(rgb, vec3<f32>(0.0), vec3<f32>(2.5)) * (1023.0 / 2.5)));
-    return (q.x & 1023u) | ((q.y & 1023u) << 10u) | ((q.z & 1023u) << 20u)
-        | ((min(confidence, 3u) & 3u) << 30u);
-}
-
-fn rc_unpack(packed: u32) -> vec4<f32> {
-    let rgb = vec3<f32>(
-        f32(packed & 1023u),
-        f32((packed >> 10u) & 1023u),
-        f32((packed >> 20u) & 1023u)
-    ) * (2.5 / 1023.0);
-    return vec4<f32>(rgb, f32(packed >> 30u));
-}
-
-fn rc_slot(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> u32 {
-    let cell_size = select(12.0, 4.0, cam_dist < 64.0);
-    let cell = vec3<i32>(floor(world_pos / cell_size));
-    let an = abs(normal);
-    var ndir = 0u;
-    if (an.x >= an.y && an.x >= an.z) {
-        ndir = select(1u, 0u, normal.x >= 0.0);
-    } else if (an.y >= an.x && an.y >= an.z) {
-        ndir = select(3u, 2u, normal.y >= 0.0);
-    } else {
-        ndir = select(5u, 4u, normal.z >= 0.0);
-    }
-    let scale_bit = select(1u, 0u, cam_dist < 64.0);
-    var h = bitcast<u32>(cell.x) * 73856093u
-        ^ bitcast<u32>(cell.y) * 19349663u
-        ^ bitcast<u32>(cell.z) * 83492791u
-        ^ (ndir * 2654435761u)
-        ^ (scale_bit * 374761393u);
-    h = h ^ (h >> 16u);
-    h = h * 0x85ebca6bu;
-    h = h ^ (h >> 13u);
-    return h & RC_MASK;
-}
-
 fn rc_query(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> vec4<f32> {
-    return rc_unpack(atomicLoad(&radiance_cache[rc_slot(world_pos, normal, cam_dist)]));
+    let cell = &radiance_cache[rc_slot(world_pos, normal, cam_dist)];
+    let count = atomicLoad(&cell.count);
+    if (count == 0u) {
+        return vec4<f32>(0.0);
+    }
+    // Count is published after the three channel sums. Querying it last gives
+    // a consistent lower bound if a writer overlaps this read.
+    let r = atomicLoad(&cell.r);
+    let g = atomicLoad(&cell.g);
+    let b = atomicLoad(&cell.b);
+    let scale = 2.5 / (255.0 * f32(count));
+    return vec4<f32>(vec3<f32>(f32(r), f32(g), f32(b)) * scale, f32(count));
 }
 
 fn rc_update(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32, rad: vec3<f32>) {
-    let slot = rc_slot(world_pos, normal, cam_dist);
+    let cell = &radiance_cache[rc_slot(world_pos, normal, cam_dist)];
     let sample = clamp(rad, vec3<f32>(0.0), vec3<f32>(2.5));
-    var observed = atomicLoad(&radiance_cache[slot]);
-    // Bounded CAS retries avoid a lock/spin-wait on heavily contended voxels.
-    // Losing an update is preferable to blocking a whole GPU wave.
-    for (var attempt = 0u; attempt < 16u; attempt = attempt + 1u) {
-        let previous_count = observed >> 30u;
-        let next_count = min(previous_count + 1u, 3u);
-        let alpha = select(0.25, 1.0 / f32(next_count), previous_count < 3u);
-        let previous = rc_unpack(observed);
-        let updated = rc_pack(mix(previous.rgb, sample, alpha), next_count);
-        let result = atomicCompareExchangeWeak(&radiance_cache[slot], observed, updated);
-        if (result.exchanged) {
-            return;
-        }
-        observed = result.old_value;
-    }
+    let q = vec3<u32>(round(sample * (255.0 / 2.5)));
+    // Additive accumulation is race-free and maps to InterlockedAdd in both
+    // native HLSL and wgpu's D3D12 shader translation. The 8-bit sample scale
+    // leaves over 16 million maximum-intensity updates before sum overflow.
+    atomicAdd(&cell.r, q.x);
+    atomicAdd(&cell.g, q.y);
+    atomicAdd(&cell.b, q.z);
+    atomicAdd(&cell.count, 1u);
 }
 
 fn detail_offscreen_albedo(hit_pos: vec3<f32>, hit_normal: vec3<f32>, base_albedo: vec3<f32>, opacity: f32) -> vec3<f32> {
@@ -3706,7 +3680,7 @@ impl RaywatcherGpu {
         });
         // Explicitly initialise cache confidence to zero. Hardware DXR mirrors
         // this packed layout and performs its own upload-heap clear on creation.
-        let radiance_cache_zeroes = vec![0u8; RADIANCE_CACHE_CELLS * std::mem::size_of::<u32>()];
+        let radiance_cache_zeroes = vec![0u8; RADIANCE_CACHE_CELLS * 16];
         let radiance_cache = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("raywatcher world-space radiance cache (packed atomic)"),
             contents: &radiance_cache_zeroes,
@@ -5853,17 +5827,17 @@ mod shader_optimization_regression_tests {
     fn shared_radiance_cache_is_packed_atomic_and_race_free_in_both_backends() {
         let dxr = include_str!("dxr_trace.hlsl");
         assert!(RAY_SHADER.contains("array<atomic<u32>>"));
-        assert!(RAY_SHADER.contains("atomicCompareExchangeWeak"));
-        assert!(dxr.contains("RWStructuredBuffer<uint> radiance_cache"));
-        assert!(dxr.contains("InterlockedCompareExchange"));
+        assert!(RAY_SHADER.contains("atomicAdd(&cell.r, q.x)"));
+        assert!(RAY_SHADER.contains("atomicAdd(&cell.count, 1u)"));
+        assert!(dxr.contains("RWStructuredBuffer<uint4> radiance_cache"));
+        assert!(dxr.contains("InterlockedAdd(radiance_cache[slot].x"));
+        assert!(!RAY_SHADER.contains("atomicCompareExchange"));
+        assert!(!dxr.contains("InterlockedCompareExchange"));
         assert!(RAY_SHADER.contains("Confidence-gated radiance-cache tail"));
         assert!(dxr.contains("Confidence-gated radiance-cache tail"));
         assert!(!RAY_SHADER.contains("array<vec4<f32>> radiance_cache"));
         assert!(!dxr.contains("RWStructuredBuffer<float4> radiance_cache"));
-        assert_eq!(
-            super::RADIANCE_CACHE_CELLS * std::mem::size_of::<u32>(),
-            256 * 1024
-        );
+        assert_eq!(super::RADIANCE_CACHE_CELLS * 16, 1024 * 1024);
     }
 
     #[test]
