@@ -3337,6 +3337,9 @@ mod page_tests {
             [0.0, 0.0, 1.0, 100.0],
             [0.0, 0.0, -1.0, 100.0],
         ];
+        // Keep the GPU path active even though the wider frustum now contains
+        // the full chunk: this view-local clip still requires a fresh dispatch.
+        cull.clip_plane = Some((0.0, 1.0));
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("world culling second-view encoder"),
         });
