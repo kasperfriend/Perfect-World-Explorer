@@ -561,7 +561,11 @@ impl LightingRecord {
 fn srgb_to_linear(encoded: Vec3) -> Vec3 {
     let convert = |v: f32| {
         let v = v.max(0.0);
-        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
     };
     Vec3::new(convert(encoded.x), convert(encoded.y), convert(encoded.z))
 }
