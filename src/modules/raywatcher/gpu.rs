@@ -71,7 +71,7 @@ pub struct RayParams {
 /// Maximum active point lights + luminous world effects packed for ReSTIR DI.
 pub const MAX_RAY_LIGHTS: usize = 128;
 
-/// Persistent 3D World-Space Radiance Cache cell count (65,536 * 4-byte packed atomic entries = 256 KB VRAM).
+/// Legacy cache allocation retained for descriptor compatibility (65,536 16-byte cells = 1 MiB); shader reads/writes are disabled because hash slots are untagged.
 pub const RADIANCE_CACHE_CELLS: usize = 65_536;
 
 /// Uniform per-frame scene-illumination albedo recovery gain (`1 / max(scene_illum, 0.08)`).
@@ -1086,31 +1086,13 @@ fn rc_slot(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> u32 {
 }
 
 fn rc_query(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> vec4<f32> {
-    let slot = rc_slot(world_pos, normal, cam_dist);
-    // Index storage-struct members directly: this avoids an unsupported
-    // pointer-to-struct member access in the wgpu 0.19 WGSL frontend.
-    let r = atomicLoad(&radiance_cache[slot].r);
-    let g = atomicLoad(&radiance_cache[slot].g);
-    let b = atomicLoad(&radiance_cache[slot].b);
-    let count = atomicLoad(&radiance_cache[slot].count);
-    if (count == 0u) {
-        return vec4<f32>(0.0);
-    }
-    let scale = 2.5 / (255.0 * f32(count));
-    return vec4<f32>(vec3<f32>(f32(r), f32(g), f32(b)) * scale, f32(count));
+    // Disabled: this 16-bit spatial hash stores no key/tag, so unrelated
+    // world cells can alias and feed one another's radiance into GI.
+    return vec4<f32>(0.0);
 }
 
 fn rc_update(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32, rad: vec3<f32>) {
-    let slot = rc_slot(world_pos, normal, cam_dist);
-    let sample = clamp(rad, vec3<f32>(0.0), vec3<f32>(2.5));
-    let q = vec3<u32>(round(sample * (255.0 / 2.5)));
-    // Additive accumulation is race-free and maps to InterlockedAdd in both
-    // native HLSL and wgpu's D3D12 shader translation. The 8-bit sample scale
-    // leaves over 16 million maximum-intensity updates before sum overflow.
-    atomicAdd(&radiance_cache[slot].r, q.x);
-    atomicAdd(&radiance_cache[slot].g, q.y);
-    atomicAdd(&radiance_cache[slot].b, q.z);
-    atomicAdd(&radiance_cache[slot].count, 1u);
+    // Disabled until cache slots can validate the full world-cell key.
 }
 
 fn detail_offscreen_albedo(hit_pos: vec3<f32>, hit_normal: vec3<f32>, base_albedo: vec3<f32>, opacity: f32) -> vec3<f32> {
@@ -1812,42 +1794,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Feature #1: True World-Space Ray-Marched Volumetric God-Rays & Light Shafts.
-    var god_rays = vec3<f32>(0.0);
-    if (bits_shadows && params.sun_dir.y > 0.04 && dist > 10.0 && fog_t < 0.92) {
-        let cos_view_sun = dot(view_dir, params.sun_dir.xyz);
-        if (cos_view_sun > 0.08) {
-            let phase = hg_phase(cos_view_sun, 0.84) * 0.72 + hg_phase(cos_view_sun, 0.42) * 0.28;
-            let march_len = min(dist, 210.0) - 2.5;
-            if (march_len > 6.0 && phase > 0.04) {
-                var lit_steps = 0.0;
-                var occ_steps = 0.0;
-                let vol_steps = select(select(8u, 6u, dist > 140.0), 5u, march_len < 40.0);
-                let inv_steps = 1.0 / f32(vol_steps);
-                for (var vi = 0u; vi < vol_steps; vi = vi + 1u) {
-                    let u = (f32(vi) + ign_v) * inv_steps;
-                    let t_vol = 2.5 + (u * u * 0.55 + u * 0.45) * march_len;
-                    let p_vol = params.eye.xyz + view_dir * t_vol;
-                    let h_density = exp(-max(p_vol.y - params.eye.y + 30.0, 0.0) * 0.0045);
-                    if (occluded(p_vol, params.sun_dir.xyz, 0.5, 260.0, state ^ (vi * 53u))) {
-                        occ_steps = occ_steps + 1.0;
-                    } else {
-                        lit_steps = lit_steps + h_density;
-                    }
-                }
-                let shaft_vis = lit_steps * inv_steps;
-                let occ_frac = occ_steps * inv_steps;
-                let shaft_contrast = mix(0.16, 1.0, smoothstep(0.05, 0.34, occ_frac));
-                let dist_w = smoothstep(8.0, 85.0, march_len);
-                let low_sun_boost = mix(1.38, 1.0, smoothstep(0.12, 0.52, params.sun_dir.y));
-                let shaft_col = mix(vec3<f32>(0.32, 0.46, 0.72), params.sun_colour.xyz * vec3<f32>(1.06, 0.98, 0.86), sun_strength);
-                let shaft_intensity = mix(0.055, 0.145, sun_strength) * low_sun_boost;
-                god_rays = shaft_col * (shaft_vis * shaft_contrast * min(phase, 1.65) * dist_w * shaft_intensity * (1.0 - fog_t * 0.65));
-            }
-        }
-    }
-
-
+    // Sun/moon volumetric shafts are intentionally removed. Local point-light halos remain.
+    var point_light_halos = vec3<f32>(0.0);
 
     // Enhancement #18: Water-to-Wall caustic indirect bounce onto bridges, piers & cliffs.
     // Enhancement #3: Subtle, smooth edge-free Volumetric Light Halos (no camera-light orb, no balloon).
@@ -1901,7 +1849,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
                 halo_sum = halo_sum + best_h_col * vis_h;
             }
-            god_rays = god_rays + min(halo_sum * dark_fog_w, vec3<f32>(0.12));
+            point_light_halos = point_light_halos + min(halo_sum * dark_fog_w, vec3<f32>(0.12));
         }
     }
 
@@ -2164,7 +2112,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let inv = 1.0 / f32(samples);
     let avg_shadow = accum_shadow * inv;
     let avg_open = accum_open * inv;
-    let avg_refl = accum_reflection * inv + god_rays;
+    let avg_refl = accum_reflection * inv + point_light_halos;
     let bent_normal = select(normal, normalize(accum_bent_n), dot(accum_bent_n, accum_bent_n) > 1e-4);
     let avg_refl_dist = accum_refl_dist * inv;
     var avg_gi = accum_gi * inv + sss_light;
@@ -2213,7 +2161,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     } else {
         let direct = select(vec3<f32>(0.0), params.sun_colour.xyz * (n_dot_l * avg_shadow), bits_lighting);
         let ambient = params.ambient.xyz * (avg_open * params.tuning.z);
-        let relit = raster_rgb * (direct + ambient + avg_gi + point_lighting) + god_rays;
+        let relit = raster_rgb * (direct + ambient + avg_gi + point_lighting) + point_light_halos;
         out_rgb = mix(relit, params.fog_colour.xyz, fog_t);
         out_lf = 1.0;
     }
@@ -5847,22 +5795,39 @@ mod shader_optimization_regression_tests {
     use super::RAY_SHADER;
 
     #[test]
-    fn shared_radiance_cache_is_packed_atomic_and_race_free_in_both_backends() {
+    fn collision_prone_radiance_cache_is_disabled_in_both_backends() {
         let dxr = include_str!("dxr_trace.hlsl");
-        assert!(RAY_SHADER.contains("array<RadianceCacheCell>"));
-        assert!(RAY_SHADER.contains("fn rc_slot("));
-        assert!(!RAY_SHADER.contains("array<atomic<u32>>"));
-        assert!(RAY_SHADER.contains("atomicAdd(&radiance_cache[slot].r, q.x)"));
-        assert!(RAY_SHADER.contains("atomicAdd(&radiance_cache[slot].count, 1u)"));
-        assert!(dxr.contains("RWStructuredBuffer<uint4> radiance_cache"));
-        assert!(dxr.contains("InterlockedAdd(radiance_cache[slot].x"));
-        assert!(!RAY_SHADER.contains("atomicCompareExchange"));
-        assert!(!dxr.contains("InterlockedCompareExchange"));
-        assert!(RAY_SHADER.contains("Confidence-gated radiance-cache tail"));
-        assert!(dxr.contains("Confidence-gated radiance-cache tail"));
-        assert!(!RAY_SHADER.contains("array<vec4<f32>> radiance_cache"));
-        assert!(!dxr.contains("RWStructuredBuffer<float4> radiance_cache"));
+        assert!(RAY_SHADER.contains("fn rc_query("));
+        assert!(RAY_SHADER.contains("Disabled: this 16-bit spatial hash stores no key/tag"));
+        assert!(!RAY_SHADER.contains("atomicLoad(&radiance_cache"));
+        assert!(!RAY_SHADER.contains("atomicAdd(&radiance_cache"));
+        assert!(dxr.contains("float4 rc_query("));
+        assert!(dxr.contains("Disabled: this 16-bit spatial hash stores no key/tag"));
+        assert!(!dxr.contains("InterlockedAdd(radiance_cache[slot]"));
         assert_eq!(super::RADIANCE_CACHE_CELLS * 16, 1024 * 1024);
+    }
+
+    #[test]
+    fn sun_and_moon_volumetric_shafts_and_celestial_flares_are_not_rendered() {
+        let dxr = include_str!("dxr_trace.hlsl");
+        assert!(!RAY_SHADER.contains("True World-Space Ray-Marched Volumetric God-Rays"));
+        assert!(!dxr.contains("True World-Space Ray-Marched Volumetric God-Rays"));
+        assert!(RAY_SHADER.contains("point_light_halos"));
+        assert!(dxr.contains("point_light_halos"));
+
+        let sky_source = include_str!("../../sky_gpu.rs");
+        let shader = sky_source
+            .split("pub(crate) const SHADER: &str = r#\"")
+            .nth(1)
+            .and_then(|tail| tail.split("\"#;").next())
+            .expect("sky shader literal");
+        assert!(shader.contains("textureSampleLevel(skies,smp,uv,disc,0.)"));
+        assert!(!shader.contains("flare_chain("));
+        assert!(!shader.contains("shine_ramp("));
+        assert!(!shader.contains("sunshine.bmp"));
+        assert!(!shader.contains("moonflare.bmp"));
+        assert!(!shader.contains("sunflare.bmp"));
+        assert!(!shader.contains("flares.bmp"));
     }
 
     #[test]

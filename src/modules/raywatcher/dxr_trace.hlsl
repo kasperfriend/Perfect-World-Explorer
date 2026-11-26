@@ -148,26 +148,13 @@ uint rc_slot(float3 world_pos, float3 normal, float cam_dist) {
 }
 
 float4 rc_query(float3 world_pos, float3 normal, float cam_dist) {
-    uint slot = rc_slot(world_pos, normal, cam_dist);
-    uint r, g, b, count;
-    InterlockedAdd(radiance_cache[slot].x, 0u, r);
-    InterlockedAdd(radiance_cache[slot].y, 0u, g);
-    InterlockedAdd(radiance_cache[slot].z, 0u, b);
-    InterlockedAdd(radiance_cache[slot].w, 0u, count);
-    if (count == 0u) return float4(0.0, 0.0, 0.0, 0.0);
-    float scale = 2.5 / (255.0 * float(count));
-    return float4(float3(float(r), float(g), float(b)) * scale, float(count));
+    // Disabled: this 16-bit spatial hash stores no key/tag, so unrelated
+    // world cells can alias and feed one another's radiance into GI.
+    return float4(0.0, 0.0, 0.0, 0.0);
 }
 
 void rc_update(float3 world_pos, float3 normal, float cam_dist, float3 rad) {
-    uint slot = rc_slot(world_pos, normal, cam_dist);
-    float3 sample = clamp(rad, float3(0.0, 0.0, 0.0), float3(2.5, 2.5, 2.5));
-    uint3 q = (uint3)round(sample * (255.0 / 2.5));
-    uint ignored;
-    InterlockedAdd(radiance_cache[slot].x, q.x, ignored);
-    InterlockedAdd(radiance_cache[slot].y, q.y, ignored);
-    InterlockedAdd(radiance_cache[slot].z, q.z, ignored);
-    InterlockedAdd(radiance_cache[slot].w, 1u, ignored);
+    // Disabled until cache slots can validate the full world-cell key.
 }
 
 uint unpack_alpha_mask25(float f) {
@@ -1515,58 +1502,8 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
     }
 
-    // Feature #1: True World-Space Ray-Marched Volumetric God-Rays & Light Shafts.
-    // Marches along the 3D camera ray against the DXR TLAS with IGN jitter + SVGF smoothing:
-    // near steps use alpha-aware shadow queries so shafts slice through individual tree leaves,
-    // while far steps use fast opaque queries for high FPS. Works for sunbeams and moonbeams!
-    float3 god_rays = float3(0.0, 0.0, 0.0);
-    if (bits_shadows && params.sun_dir.y > 0.04 && dist > 10.0 && fog_t < 0.92) {
-        float cos_view_sun = dot(view_dir, params.sun_dir.xyz);
-        if (cos_view_sun > 0.08) {
-            // Dual-lobe Henyey-Greenstein: tight sunlit shaft core + wide atmospheric scatter
-            float phase = hg_phase(cos_view_sun, 0.84) * 0.72 + hg_phase(cos_view_sun, 0.42) * 0.28;
-            float march_len = min(dist, 210.0) - 2.5;
-            if (march_len > 6.0 && phase > 0.04) {
-                uint vol_steps = (march_len < 40.0) ? 5u : ((dist > 140.0) ? 6u : 8u);
-                float inv_steps = 1.0 / float(vol_steps);
-                float lit_steps = 0.0;
-                float occ_steps = 0.0;
-                for (uint vi = 0u; vi < vol_steps; vi = vi + 1u) {
-                    float u = (float(vi) + ign_v) * inv_steps;
-                    // Exponential-stratified distribution concentrates detail near canopies & gates
-                    float t_vol = 2.5 + (u * u * 0.55 + u * 0.45) * march_len;
-                    float3 p_vol = params.eye.xyz + view_dir * t_vol;
-                    bool blocked = false;
-                    if (vi < 3u && t_vol < 85.0) {
-                        ShadowResult vsr = trace_sun_shadow(
-                            p_vol, params.sun_dir.xyz, 0.4, 240.0,
-                            state ^ (vi * 31u), opaque_offset, tri_count, false, 0.0, 0.0);
-                        blocked = vsr.occluded;
-                    } else {
-                        blocked = occluded_fast(p_vol, params.sun_dir.xyz, 0.5, 280.0);
-                    }
-                    // Height-based atmospheric mist density (richer in valleys, forest floors, water basins)
-                    float h_density = exp(-max(p_vol.y - params.eye.y + 30.0, 0.0) * 0.0045);
-                    if (blocked) {
-                        occ_steps += 1.0;
-                    } else {
-                        lit_steps += h_density;
-                    }
-                }
-                float shaft_vis = lit_steps * inv_steps;
-                float occ_frac = occ_steps * inv_steps;
-                // Carve crisp shafts where canopies/arches/cliffs slice the beam, keeping open sky clean
-                float shaft_contrast = lerp(0.16, 1.0, smoothstep(0.05, 0.34, occ_frac));
-                float dist_w = smoothstep(8.0, 85.0, march_len);
-                float low_sun_boost = lerp(1.38, 1.0, smoothstep(0.12, 0.52, params.sun_dir.y));
-                float3 shaft_col = lerp(float3(0.32, 0.46, 0.72), params.sun_colour.xyz * float3(1.06, 0.98, 0.86), sun_strength);
-                float shaft_intensity = lerp(0.055, 0.145, sun_strength) * low_sun_boost;
-                god_rays = shaft_col * (shaft_vis * shaft_contrast * min(phase, 1.65) * dist_w * shaft_intensity * (1.0 - fog_t * 0.65));
-            }
-        }
-    }
-
-
+    // Sun/moon volumetric shafts are intentionally removed. Local point-light halos remain.
+    float3 point_light_halos = float3(0.0, 0.0, 0.0);
 
     // Enhancement #3: Subtle, smooth edge-free Volumetric Light Halos around world lanterns/portals
     // (excludes camera light < 3.5u from eye and uses strictly zero-at-boundary cubic falloff).
@@ -1621,7 +1558,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 }
                 halo_sum += best_h_col * vis_h;
             }
-            god_rays += min(halo_sum * dark_fog_w, float3(0.12, 0.12, 0.12));
+            point_light_halos += min(halo_sum * dark_fog_w, float3(0.12, 0.12, 0.12));
         }
     }
 
@@ -1924,7 +1861,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float avg_shadow = accum_shadow * inv;
     float avg_open = accum_open * inv;
     float3 bent_normal = (dot(accum_bent_n, accum_bent_n) > 1e-4) ? normalize(accum_bent_n) : normal;
-    float3 avg_refl = accum_reflection * inv + god_rays;
+    float3 avg_refl = accum_reflection * inv + point_light_halos;
     float avg_refl_dist = accum_refl_dist * inv;
     float3 avg_gi = accum_gi * inv + sss_light;
 
@@ -1973,7 +1910,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     } else {
         float3 direct = bits_lighting ? (params.sun_colour.xyz * (n_dot_l * avg_shadow)) : float3(0.0, 0.0, 0.0);
         float3 ambient = params.ambient.xyz * (avg_open * params.tuning.z);
-        float3 relit = raster_rgb * (direct + ambient + avg_gi + point_lighting) + god_rays;
+        float3 relit = raster_rgb * (direct + ambient + avg_gi + point_lighting) + point_light_halos;
         out_rgb = lerp(relit, params.fog_colour.xyz, fog_t);
         out_lf = 1.0;
     }
