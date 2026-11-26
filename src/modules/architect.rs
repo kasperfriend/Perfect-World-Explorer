@@ -84,6 +84,9 @@ pub struct Architect {
     brush_strength: f32,
     flatten_height: f32,
     selected_asset: Option<String>,
+    selected_archive: Option<PathBuf>,
+    archive_entries: Vec<String>,
+    archive_error: Option<String>,
     selected_scene_object: Option<usize>,
     selected_placement: Option<usize>,
     multi_selection: HashSet<usize>,
@@ -127,6 +130,9 @@ impl Architect {
             brush_strength: 2.,
             flatten_height: 0.,
             selected_asset: None,
+            selected_archive: None,
+            archive_entries: Vec::new(),
+            archive_error: None,
             selected_scene_object: None,
             selected_placement: None,
             multi_selection: HashSet::new(),
@@ -382,8 +388,12 @@ impl Architect {
                     format!("📄 {label}"),
                 );
                 if response.clicked() {
-                    self.selected_asset = Some(child.to_string_lossy().into_owned());
-                    if self.cursor == CursorMode::Place { self.add_selected_asset_at_camera(camera); }
+                    if child.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pck")) {
+                        self.open_archive(child.clone());
+                    } else {
+                        self.selected_asset = Some(child.to_string_lossy().into_owned());
+                        if self.cursor == CursorMode::Place { self.add_selected_asset_at_camera(camera); }
+                    }
                 }
                 response.context_menu(|ui| {
                     if ui.button("Pin to quick bar").clicked() {
@@ -438,6 +448,22 @@ impl Architect {
                 self.multi_selection.clear();
             }
             if self.cursor == CursorMode::Place { self.add_selected_asset_at_camera(camera); }
+        }
+    }
+
+    fn open_archive(&mut self, path: PathBuf) {
+        self.selected_archive = Some(path.clone());
+        self.archive_entries.clear();
+        self.archive_error = None;
+        let result = std::fs::File::open(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|mut file| crate::pck::directory(&mut file));
+        match result {
+            Ok(entries) => {
+                self.archive_entries = entries.into_iter().map(|entry| entry.name).collect();
+                self.status = format!("Indexed {} archive entries from {}.", self.archive_entries.len(), path.display());
+            }
+            Err(error) => self.archive_error = Some(error),
         }
     }
 
@@ -611,6 +637,31 @@ impl Architect {
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                     self.show_tree(ui, &self.client_root.clone(), 0, camera);
                 });
+                if let Some(archive) = self.selected_archive.clone() {
+                    ui.separator();
+                    ui.heading("Archive contents");
+                    ui.label(egui::RichText::new(archive.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| archive.display().to_string())).small().weak());
+                    if let Some(error) = &self.archive_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    } else {
+                        ui.label(format!("{} indexed entries", self.archive_entries.len()));
+                        egui::ScrollArea::vertical().max_height(180.).show(ui, |ui| {
+                            for entry in self.archive_entries.iter().take(2000) {
+                                let label = Path::new(entry).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| entry.clone());
+                                let response = ui.selectable_label(false, format!("📦 {label}"));
+                                if response.clicked() {
+                                    self.selected_asset = Some(format!("{}::{}", archive.display(), entry));
+                                }
+                                response.context_menu(|ui| {
+                                    if ui.button("Pin archive entry to quick bar").clicked() {
+                                        self.pin(format!("{}::{}", archive.display(), entry));
+                                        ui.close_menu();
+                                    }
+                                });
+                            }
+                        });
+                    }
+                }
                 if let Some(asset) = self.selected_asset.clone() {
                     ui.separator();
                     ui.label(egui::RichText::new(&asset).small().strong());
@@ -810,6 +861,9 @@ mod tests {
             brush_strength: 2.,
             flatten_height: 0.,
             selected_asset: None,
+            selected_archive: None,
+            archive_entries: Vec::new(),
+            archive_error: None,
             selected_scene_object: None,
             selected_placement: None,
             multi_selection: HashSet::new(),
