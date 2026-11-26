@@ -5826,7 +5826,8 @@ mod shader_optimization_regression_tests {
     #[test]
     fn shared_radiance_cache_is_packed_atomic_and_race_free_in_both_backends() {
         let dxr = include_str!("dxr_trace.hlsl");
-        assert!(RAY_SHADER.contains("array<atomic<u32>>"));
+        assert!(RAY_SHADER.contains("array<RadianceCacheCell>"));
+        assert!(!RAY_SHADER.contains("array<atomic<u32>>"));
         assert!(RAY_SHADER.contains("atomicAdd(&cell.r, q.x)"));
         assert!(RAY_SHADER.contains("atomicAdd(&cell.count, 1u)"));
         assert!(dxr.contains("RWStructuredBuffer<uint4> radiance_cache"));
