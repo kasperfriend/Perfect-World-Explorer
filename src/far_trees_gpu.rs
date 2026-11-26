@@ -64,6 +64,8 @@ pub(crate) struct LodParams {
     pub(crate) bounds: [f32; 4],
     /// Normalized view-frustum planes; tree spheres are tested conservatively.
     pub(crate) frustum: [[f32; 4]; 6],
+    /// Optional water clip plane: height, sign, enabled, unused.
+    pub(crate) clip: [f32; 4],
     /// `placements, groups, bounds_active, 0`.
     pub(crate) counts: [u32; 4],
 }
@@ -81,7 +83,7 @@ pub(crate) struct LodParams {
 /// which can move a distance by ~1e-7 relative — inside a transition window that
 /// changes the fade fraction, never whether the tree is drawn.
 pub(crate) const LOD_COMPUTE: &str = r#"
-struct LodParamsGpu {camera:vec4<f32>,bounds:vec4<f32>,frustum:array<vec4<f32>,6>,counts:vec4<u32>};
+struct LodParamsGpu {camera:vec4<f32>,bounds:vec4<f32>,frustum:array<vec4<f32>,6>,clip:vec4<f32>,counts:vec4<u32>};
 struct Placement {pos_height:vec4<f32>,group:u32,pad0:u32,pad1:u32,pad2:u32};
 struct GroupInfo {height:f32,args_base:u32,first_instance:u32,capacity:u32};
 struct Args {index_count:u32,instance_count:atomic<u32>,first_index:u32,base_vertex:i32,first_instance:u32};
@@ -153,6 +155,10 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {
  let constants=groups[placement.group];
  let radius=max(constants.height,5.)*2.;
  if !sphere_in_frustum(position,radius) {return;}
+ if p.clip.z>0.5 {
+  if p.clip.y>0. && position.y+radius<p.clip.x {return;}
+  if p.clip.y<0. && position.y>p.clip.x {return;}
+ }
  let distance=client_distance(position,p.camera.xyz);
  if distance<0. {return;}
  let selection=select_level(distance,constants.height,p.camera.w);
@@ -230,7 +236,7 @@ pub struct FarTrees {
     groups: Vec<Group>,
     /// Slots in the instance buffer: three level slices per placement.
     capacity: usize,
-    last_resident_update: Option<([f32; 3], f32, Option<[f32; 4]>, [[f32; 4]; 6])>,
+    last_resident_update: Option<([f32; 3], f32, Option<[f32; 4]>, [[f32; 4]; 6], Option<(f32, f32)>)>,
     /// The LOD selection pass: a camera move dispatches this instead of walking
     /// every placement on the CPU and re-uploading the instance buffer.
     lod_pipeline: wgpu::ComputePipeline,
@@ -1190,13 +1196,14 @@ impl FarTrees {
         scale: f32,
         bounds: Option<[f32; 4]>,
         frustum: [[f32; 4]; 6],
+        clip_plane: Option<(f32, f32)>,
     ) {
         if self.placements == 0 {
             return;
         }
         let frustum = normalize_frustum(frustum);
-        let key = (camera, scale, bounds, frustum);
-        if let Some((prev_cam, prev_scale, prev_bounds, prev_frustum)) = self.last_resident_update {
+        let key = (camera, scale, bounds, frustum, clip_plane);
+        if let Some((prev_cam, prev_scale, prev_bounds, prev_frustum, prev_clip)) = self.last_resident_update {
             let dx = camera[0] - prev_cam[0];
             let dy = camera[1] - prev_cam[1];
             let dz = camera[2] - prev_cam[2];
@@ -1204,6 +1211,7 @@ impl FarTrees {
                 && prev_scale == scale
                 && prev_bounds == bounds
                 && prev_frustum == frustum
+                && prev_clip == clip_plane
             {
                 return;
             }
@@ -1212,6 +1220,7 @@ impl FarTrees {
             camera: [camera[0], camera[1], camera[2], scale],
             bounds: bounds.unwrap_or([0.; 4]),
             frustum,
+            clip: clip_plane.map_or([0.; 4], |(height, sign)| [height, sign, 1., 0.]),
             counts: [
                 self.placements,
                 self.groups.len() as u32,
