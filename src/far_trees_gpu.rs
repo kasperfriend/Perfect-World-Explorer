@@ -62,6 +62,8 @@ pub(crate) struct LodParams {
     pub(crate) camera: [f32; 4],
     /// Admitted XZ square (`x0, x1, z0, z1`); ignored when `counts.z` is 0.
     pub(crate) bounds: [f32; 4],
+    /// Normalized view-frustum planes; tree spheres are tested conservatively.
+    pub(crate) frustum: [[f32; 4]; 6],
     /// `placements, groups, bounds_active, 0`.
     pub(crate) counts: [u32; 4],
 }
@@ -79,7 +81,7 @@ pub(crate) struct LodParams {
 /// which can move a distance by ~1e-7 relative — inside a transition window that
 /// changes the fade fraction, never whether the tree is drawn.
 pub(crate) const LOD_COMPUTE: &str = r#"
-struct LodParamsGpu {camera:vec4<f32>,bounds:vec4<f32>,counts:vec4<u32>};
+struct LodParamsGpu {camera:vec4<f32>,bounds:vec4<f32>,frustum:array<vec4<f32>,6>,counts:vec4<u32>};
 struct Placement {pos_height:vec4<f32>,group:u32,pad0:u32,pad1:u32,pad2:u32};
 struct GroupInfo {height:f32,args_base:u32,first_instance:u32,capacity:u32};
 struct Args {index_count:u32,instance_count:atomic<u32>,first_index:u32,base_vertex:i32,first_instance:u32};
@@ -117,6 +119,15 @@ fn select_level(distance:f32,height:f32,scale:f32)->vec4<f32> {
  if distance<a {primary=0.;} else if distance<b {primary=1.;}
  return vec4<f32>(primary,3.,0.,0.);
 }
+// Plane normals are normalized on the CPU. The radius uses twice the
+// authored tree height, conservatively enclosing the trunk and broad canopies.
+fn sphere_in_frustum(position:vec3<f32>,radius:f32)->bool {
+ for(var i=0u;i<6u;i=i+1u) {
+  let plane=p.frustum[i];
+  if dot(plane.xyz,position)+plane.w < -radius {return false;}
+ }
+ return true;
+}
 fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>) {
  let g=groups[group_index];
  if level>2u {return;}
@@ -140,6 +151,8 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {
   if position.z<p.bounds.z || position.z>=p.bounds.w {return;}
  }
  let constants=groups[placement.group];
+ let radius=max(constants.height,5.)*2.;
+ if !sphere_in_frustum(position,radius) {return;}
  let distance=client_distance(position,p.camera.xyz);
  if distance<0. {return;}
  let selection=select_level(distance,constants.height,p.camera.w);
@@ -217,7 +230,7 @@ pub struct FarTrees {
     groups: Vec<Group>,
     /// Slots in the instance buffer: three level slices per placement.
     capacity: usize,
-    last_resident_update: Option<([f32; 3], f32, Option<[f32; 4]>)>,
+    last_resident_update: Option<([f32; 3], f32, Option<[f32; 4]>, [[f32; 4]; 6])>,
     /// The LOD selection pass: a camera move dispatches this instead of walking
     /// every placement on the CPU and re-uploading the instance buffer.
     lod_pipeline: wgpu::ComputePipeline,
@@ -1176,22 +1189,29 @@ impl FarTrees {
         camera: [f32; 3],
         scale: f32,
         bounds: Option<[f32; 4]>,
+        frustum: [[f32; 4]; 6],
     ) {
         if self.placements == 0 {
             return;
         }
-        let key = (camera, scale, bounds);
-        if let Some((prev_cam, prev_scale, prev_bounds)) = self.last_resident_update {
+        let frustum = normalize_frustum(frustum);
+        let key = (camera, scale, bounds, frustum);
+        if let Some((prev_cam, prev_scale, prev_bounds, prev_frustum)) = self.last_resident_update {
             let dx = camera[0] - prev_cam[0];
             let dy = camera[1] - prev_cam[1];
             let dz = camera[2] - prev_cam[2];
-            if dx * dx + dy * dy + dz * dz < 1e-4 && prev_scale == scale && prev_bounds == bounds {
+            if dx * dx + dy * dy + dz * dz < 1e-4
+                && prev_scale == scale
+                && prev_bounds == bounds
+                && prev_frustum == frustum
+            {
                 return;
             }
         }
         let params = LodParams {
             camera: [camera[0], camera[1], camera[2], scale],
             bounds: bounds.unwrap_or([0.; 4]),
+            frustum,
             counts: [
                 self.placements,
                 self.groups.len() as u32,
@@ -1385,9 +1405,53 @@ impl FarTrees {
     }
 }
 
+/// Normalize extracted frustum planes once per view so the compute shader
+/// can compare sphere radii without six square roots per tree.
+fn normalize_frustum(mut planes: [[f32; 4]; 6]) -> [[f32; 4]; 6] {
+    for plane in &mut planes {
+        let length = (plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]).sqrt();
+        if length > 1e-8 && length.is_finite() {
+            for value in plane {
+                *value /= length;
+            }
+        }
+    }
+    planes
+}
+
+/// CPU reference for the conservative sphere/frustum test mirrored in WGSL.
+fn sphere_visible(position: [f32; 3], radius: f32, planes: &[[f32; 4]; 6]) -> bool {
+    planes.iter().all(|p| {
+        p[0] * position[0] + p[1] * position[1] + p[2] * position[2] + p[3] >= -radius
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_frustum_spheres_reject_outside_and_keep_intersecting_canopies() {
+        let cube = [
+            [1., 0., 0., 10.],
+            [-1., 0., 0., 10.],
+            [0., 1., 0., 10.],
+            [0., -1., 0., 10.],
+            [0., 0., 1., 10.],
+            [0., 0., -1., 10.],
+        ];
+        assert!(sphere_visible([0., 0., 0.], 2., &cube));
+        assert!(sphere_visible([12., 0., 0.], 3., &cube));
+        assert!(!sphere_visible([14., 0., 0.], 2., &cube));
+    }
+
+    #[test]
+    fn frustum_normalization_scales_plane_distance_too() {
+        let mut planes = [[0.; 4]; 6];
+        planes[0] = [3., 0., 0., 30.];
+        let normalized = normalize_frustum(planes);
+        assert_eq!(normalized[0], [1., 0., 0., 10.]);
+    }
 
     #[test]
     fn legacy_cutout_still_covers_fronds_and_leaves_without_native_refs() {
