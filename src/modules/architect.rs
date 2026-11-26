@@ -623,8 +623,7 @@ impl Architect {
             asset
         };
         let normalized = crate::ecmodel::normalize(path);
-        (normalized.starts_with("models/") && normalized.ends_with(".ecm"))
-            .then_some(normalized)
+        (normalized.starts_with("models/") && normalized.ends_with(".ecm")).then_some(normalized)
     }
 
     /// Current project's supported ECM placements, for the native GPU model
@@ -1428,9 +1427,7 @@ mod tests {
     #[test]
     fn renderer_asset_paths_only_accept_models_pck_ecm_entries() {
         assert_eq!(
-            Architect::renderer_asset_path(
-                "element/models.pck::Models/NPCs/Guard/guard.ecm"
-            ),
+            Architect::renderer_asset_path("element/models.pck::Models/NPCs/Guard/guard.ecm"),
             Some("models/npcs/guard/guard.ecm".into())
         );
         assert_eq!(
