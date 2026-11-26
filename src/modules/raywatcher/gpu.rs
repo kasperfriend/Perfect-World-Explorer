@@ -3606,9 +3606,11 @@ fn depth_plane(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::T
     (texture, view)
 }
 
-/// Adaptive samples may never exceed the count included in Plan::grid_scale.
-fn adaptive_sample_ceiling(samples: u32) -> f32 {
-    samples.clamp(1, 8) as f32
+/// Preserve Raywatcher's original adaptive quality ceiling. The planner's
+/// ray grid is an independent spatial-quality control; it must not silently
+/// clamp the shader's authored adaptive sampling based on that grid.
+fn adaptive_sample_ceiling(_samples: u32) -> f32 {
+    4.0
 }
 
 /// Whether this frame can actually dispatch through DXR. A Hardware mode
@@ -4965,10 +4967,9 @@ impl RaywatcherGpu {
         } else {
             0.0
         };
-        // Plan::grid_scale budgets pixels * plan.samples. Allowing the shader
-        // to adapt up to four samples here silently multiplied that budget by
-        // as much as 4x, causing GPU spikes. Keep the shader ceiling inside the
-        // exact sample count used by the planner (for both Software and DXR).
+        // Keep the original adaptive ray quality; performance is addressed
+        // through the asynchronous scene/AS path and reduced redundant work,
+        // never by lowering the per-pixel adaptive sample ceiling.
         packed.restir[1] = adaptive_sample_ceiling(plan.samples);
         packed.restir[2] = 4.0;
         packed.restir[3] = (self.frames & 1) as f32;
@@ -6525,12 +6526,9 @@ mod dxr_backend_selection_tests {
     use super::{adaptive_sample_ceiling, hardware_trace_ready};
 
     #[test]
-    fn adaptive_ray_ceiling_is_the_sample_count_included_in_the_plan() {
-        for samples in 0..=10 {
-            assert_eq!(
-                adaptive_sample_ceiling(samples),
-                samples.clamp(1, 8) as f32
-            );
+    fn adaptive_ray_ceiling_preserves_original_visual_quality() {
+        for samples in [0, 1, 2, 4, 8, 16] {
+            assert_eq!(adaptive_sample_ceiling(samples), 4.0);
         }
     }
 
