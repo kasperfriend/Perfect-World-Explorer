@@ -798,6 +798,9 @@ uint adaptive_ray_samples(uint2 pixel, float dist, float3 normal, float roughnes
     float complexity = max(normal_edge * 2.0, max(depth_edge * 5.0, colour_edge * 2.0));
     complexity = max(complexity, (1.0 - smoothstep(0.0, 320.0, dist)) * 0.20);
     complexity = max(complexity, saturate((0.36 - roughness) / 0.36) * 0.20);
+    if (roughness <= 0.12) {
+        complexity = max(complexity, 0.42);
+    }
     bool gi_enabled = ((uint(round(params.effects.y)) & 16u) != 0u)
         && params.frame.z >= 1.0 && params.tuning.w > 0.0;
     if (gi_enabled) {

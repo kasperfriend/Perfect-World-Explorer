@@ -1825,7 +1825,7 @@ struct Renderer {
     models: Option<crate::world_models_gpu::World>,
     model_lights: std::sync::Arc<crate::scene_lights::SceneLights>,
     model_scene: std::sync::Arc<crate::scene::Scene>,
-    device: wgpu::Device,
+    device: std::sync::Arc<wgpu::Device>,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     scenery_pipeline: wgpu::RenderPipeline,
@@ -2615,7 +2615,7 @@ impl Renderer {
             world_width: t.width,
             world_height: t.height,
             world_spacing: t.grid_spacing,
-            device,
+            device: std::sync::Arc::new(device),
             queue,
             pipeline,
             scenery_pipeline,
@@ -4197,7 +4197,7 @@ impl Renderer {
                 gpu.resize(&self.device, depth_extent, plan.grid);
                 self.raywatcher_scene = Some(scene.clone());
             } else {
-                let worker_device = self.device.clone();
+                let worker_device = std::sync::Arc::clone(&self.device);
                 let worker_scene = scene.clone();
                 let worker_extent = depth_extent;
                 let worker_grid = plan.grid;
@@ -4208,9 +4208,9 @@ impl Renderer {
                     let started = std::time::Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let mut gpu = crate::modules::raywatcher::gpu::RaywatcherGpu::new(
-                            &worker_device, worker_scene, worker_extent, worker_grid,
+                            std::sync::Arc::clone(&worker_device), worker_scene, worker_extent, worker_grid,
                         );
-                        if worker_hardware { gpu.initialize_hardware(&worker_device); }
+                        if worker_hardware { gpu.initialize_hardware(); }
                         gpu
                     })).map_err(|_| "Raywatcher GPU initialization panicked".to_string());
                     eprintln!("[Raywatcher] First-use GPU setup took {:.1}s ({} triangles, hardware_requested={}, success={})", started.elapsed().as_secs_f32(), triangle_count, worker_hardware, result.is_ok());

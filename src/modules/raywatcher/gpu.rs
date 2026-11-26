@@ -1256,6 +1256,9 @@ fn adaptive_ray_samples(pixel: vec2<i32>, dist: f32, normal: vec3<f32>, roughnes
     var complexity = max(normal_edge * 2.0, max(depth_edge * 5.0, colour_edge * 2.0));
     complexity = max(complexity, (1.0 - smoothstep(0.0, 320.0, dist)) * 0.20);
     complexity = max(complexity, clamp((0.36 - roughness) / 0.36, 0.0, 1.0) * 0.20);
+    if (roughness <= 0.12) {
+        complexity = max(complexity, 0.42);
+    }
     let gi_enabled = (u32(round(params.effects.y)) & 16u) != 0u
         && params.frame.z >= 1.0
         && params.tuning.w > 0.0;
@@ -2836,8 +2839,16 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
                 let w_depth = exp(-dz * inv_depth_scale);
 
                 let tap_ncoord = clamp(vec2<i32>(tap_uv * vec2<f32>(ndim)), vec2<i32>(0), ndim - vec2<i32>(1));
-                let n_tap = load_unit_normal(tap_ncoord);
-                let ndot = max(dot(n_center, n_tap), 0.0);
+                let tap_norm_raw = textureLoad(src_normals, tap_ncoord, 0);
+                if ((tap_norm_raw.w <= 0.12) != is_water) {
+                    continue;
+                }
+                let tap_n = select(
+                    vec3<f32>(0.0, 1.0, 0.0),
+                    normalize(tap_norm_raw.xyz),
+                    length(tap_norm_raw.xyz) > 1e-4,
+                );
+                let ndot = max(dot(n_center, tap_n), 0.0);
                 let n2 = ndot * ndot;
                 let n4 = n2 * n2;
                 let n8 = n4 * n4;
@@ -3504,6 +3515,7 @@ fn depth_plane(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::T
 
 /// Everything Raywatcher owns on the GPU.
 pub struct RaywatcherGpu {
+    device: std::sync::Arc<wgpu::Device>,
     pipelines: Pipelines,
     gbuf_prep_uniforms: wgpu::Buffer,
     gbuf_prep_bind_group: Option<wgpu::BindGroup>,
@@ -3609,11 +3621,13 @@ unsafe impl Send for RaywatcherGpu {}
 
 impl RaywatcherGpu {
     pub fn new(
-        device: &wgpu::Device,
+        device: std::sync::Arc<wgpu::Device>,
         scene: Arc<super::bvh::SceneGeometry>,
         render_extent: (u32, u32),
         grid_extent: (u32, u32),
     ) -> Self {
+        let device_handle = device;
+        let device = device_handle.as_ref();
         let pipelines = Pipelines::new(device);
         let gbuf_prep_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("raywatcher gbuf prep params"),
@@ -3792,6 +3806,7 @@ impl RaywatcherGpu {
         ];
         let blit_bind_group = Self::blit_binding(device, &pipelines, &output_view);
         Self {
+            device: device_handle,
             pipelines,
             gbuf_prep_uniforms,
             gbuf_prep_bind_group: None,
@@ -4400,10 +4415,10 @@ impl RaywatcherGpu {
     }
 
     /// Initialize DXR on the startup worker before moving this GPU state to the render thread.
-    pub fn initialize_hardware(&mut self, device: &wgpu::Device) {
+    pub fn initialize_hardware(&mut self) {
         if self.dxr.is_some() || self.dxr_failed { return; }
         let started = std::time::Instant::now();
-        match super::dxr::DxrTracer::new(device, &self.scene_geom, self.grid_extent) {
+        match super::dxr::DxrTracer::new(&self.device, &self.scene_geom, self.grid_extent) {
             Ok(tracer) => {
                 self.dxr = Some(tracer);
                 eprintln!("[Raywatcher] Hardware backend prepared in {:.1}s on initialization worker", started.elapsed().as_secs_f32());
@@ -4415,9 +4430,9 @@ impl RaywatcherGpu {
         }
     }
 
-    fn begin_dxr_initialization(&mut self, device: &wgpu::Device) {
+    fn begin_dxr_initialization(&mut self) {
         if self.dxr.is_some() || self.dxr_failed || self.dxr_init.is_some() { return; }
-        let worker_device = device.clone();
+        let worker_device = std::sync::Arc::clone(&self.device);
         let scene = self.scene_geom.clone();
         let grid_extent = self.grid_extent;
         let triangle_count = scene.triangles.len();
@@ -4702,7 +4717,7 @@ impl RaywatcherGpu {
 
         let mut traced_hw = false;
         if hardware_mode && !self.dxr_failed && self.dxr.is_none() {
-            self.begin_dxr_initialization(device);
+            self.begin_dxr_initialization();
             if !self.poll_dxr_initialization(device) {
                 // Keep native raster visible until the DXR scene and targets are ready.
                 return;
@@ -5973,6 +5988,17 @@ mod shader_optimization_regression_tests {
     }
 
     #[test]
+    fn water_reflections_receive_a_higher_but_bounded_ray_budget_on_both_backends() {
+        let dxr = include_str!("dxr_trace.hlsl");
+        assert!(RAY_SHADER.contains("if (roughness <= 0.12)"));
+        assert!(dxr.contains("if (roughness <= 0.12)"));
+        assert!(RAY_SHADER.contains("complexity = max(complexity, 0.42)"));
+        assert!(dxr.contains("complexity = max(complexity, 0.42)"));
+        assert!(RAY_SHADER.contains("clamp(base + extra, base, maximum)"));
+        assert!(dxr.contains("clamp(base + extra, base, max_samples)"));
+    }
+
+    #[test]
     fn restir_gi_reconstructs_the_cosine_weighted_integrand_without_grazing_blowup() {
         let dxr = include_str!("dxr_trace.hlsl");
         let radiance = glam::Vec3::new(0.8, 0.35, 0.12);
@@ -6000,6 +6026,7 @@ mod shader_optimization_regression_tests {
     fn composite_keeps_native_water_until_rt_reflections_are_ready() {
         assert!(COMPOSITE_SHADER.contains("if (is_water && comp_params.z <= 0.5)"));
         assert!(COMPOSITE_SHADER.contains("if (comp_params.y > 0.5)"));
+        assert!(COMPOSITE_SHADER.contains("(tap_norm_raw.w <= 0.12) != is_water"));
         assert!(COMPOSITE_SHADER.contains("raster.rgb + rt.rgb"));
         assert!(COMPOSITE_SHADER.contains("return raster;"));
         assert!(COMPOSITE_SHADER.contains("return textureLoad(src_rt, px, 0);"));
