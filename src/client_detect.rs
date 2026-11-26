@@ -2844,7 +2844,6 @@ mod tests {
             ((7, 55), "1.2.6"),
             ((8, 55), "1.2.8"),
             ((10, 55), "1.3.1"),
-            ((29, 78), "1.4.2"),
             ((60, 93), "1.4.4"),
             ((63, 101), "1.4.5"),
             ((69, 103), "1.4.5"),
@@ -2886,6 +2885,7 @@ mod tests {
         let cases = [
             ((12, 56), "1.3.4 / 1.3.6 / 1.3.8"),
             ((27, 75), "1.4.1 / 1.4.2"),
+            ((29, 78), "1.4.1 / 1.4.2"),
             ((70, 105), "1.4.4 / 1.4.5 / 1.4.6"),
         ];
         for ((elements, tasks), candidates) in cases {
@@ -2948,7 +2948,7 @@ fn data_version_profile(elements: u32, tasks: u32) -> Option<DataVersionProfile>
         // A modified Brazilian 1.4.1 client and the W2I 1.4.2 client share
         // this data pair. The executable or its release marker can disambiguate.
         (27, 75) => Some(Ambiguous("1.4.1 / 1.4.2")),
-        (29, 78) => Some(Exact("1.4.2")),
+        (29, 78) => Some(Ambiguous("1.4.1 / 1.4.2")),
         (60, 93) => Some(Exact("1.4.4")),
         (63, 101) | (69, 103) => Some(Exact("1.4.5")),
         (70, 105) => Some(Ambiguous("1.4.4 / 1.4.5 / 1.4.6")),
