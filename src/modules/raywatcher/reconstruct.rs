@@ -1449,7 +1449,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join(FSR_RR_DLL);
         std::fs::write(&path, b"placeholder").expect("write");
-        let (_, fsr) = probe_offline(&dir, true);
+        let (_, fsr) = probe_offline_now(&dir, true);
         assert!(fsr.available, "{}", fsr.note);
         assert!(fsr.note.contains("found"));
         let _ = std::fs::remove_file(&path);
