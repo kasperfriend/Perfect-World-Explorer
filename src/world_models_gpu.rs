@@ -1869,7 +1869,7 @@ mod tests {
     fn model_spatial_cells_preserve_original_indices_and_keep_sphere_overlaps() {
         let cells = super::build_model_spatial_cells([
             (0, [100.0, 0.0, 0.0]),
-            (1, [330.0, 0.0, 0.0]),
+            (1, [200.0, 0.0, 0.0]),
             (2, [1024.0, 0.0, 0.0]),
         ]);
         let frustum = [

@@ -50,3 +50,15 @@ These changes are based on renderer/code-path evidence and conservative CPU
 reference tests. A physical-GPU frame-time capture is not available from this
 repository session, so no numerical FPS or frame-time gain is claimed. CI and
 the software-Vulkan rendering regressions are the validation gate for this pass.
+
+## Receiving-model submission scan
+
+The main/reflection/refraction update path also walked every ECM placement for
+each view before drawing. Added a second XZ cell index over world models using
+the same 128-unit conservative sphere radius already used by the exact model
+frustum test. Each view builds a reusable, source-order-sorted list of only
+cells intersecting its frustum and resident bounds; exact per-model residency
+and sphere tests still run before drawing. The opaque/alpha submission and alpha
+sort now iterate the visible index list instead of the full model slot array.
+Pose ticking and hook resolution are intentionally unchanged because attached
+effect roots depend on current parent poses.
