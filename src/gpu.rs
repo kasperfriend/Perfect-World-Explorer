@@ -6160,6 +6160,31 @@ fn handoff_ready_exit_plan() -> HandoffReadyExit {
         exit_event_loop: true,
     }
 }
+
+/// Distinguish a real camera cut from legal free-flight movement. The position
+/// allowance includes simultaneous X/Y/Z input and the current boost speed;
+/// large continuous steps therefore do not repeatedly invalidate temporal RT.
+fn camera_cut_detected(
+    previous_position: Vec3,
+    current_position: Vec3,
+    previous_direction: Vec3,
+    current_direction: Vec3,
+    frame_dt: f32,
+    movement_speed: f32,
+) -> bool {
+    let max_continuous_step = movement_speed.max(0.0)
+        * frame_dt.clamp(0.0, 0.1)
+        * 3.0f32.sqrt();
+    let position_cut_threshold = 64.0f32.max(max_continuous_step * 1.5 + 8.0);
+    let turned_around = previous_direction
+        .normalize_or_zero()
+        .dot(current_direction.normalize_or_zero())
+        < 0.0;
+    current_position.distance_squared(previous_position)
+        > position_cut_threshold * position_cut_threshold
+        || turned_around
+}
+
 fn close_old_window_after_handoff_ready<T: 'static>(
     target: &winit::event_loop::EventLoopWindowTarget<T>,
     window: &winit::window::Window,
@@ -7536,19 +7561,22 @@ pub fn run(
                             }
                         }
                     }
-                    // Any discontinuous camera move invalidates the upscaler
-                    // history. Position alone is not enough: a respawn that keeps
-                    // the position, a look-behind snap or a cut that turns the
-                    // view most of the way round reprojects every pixel to the
-                    // wrong place, and the history takes many frames to wash out.
-                    //
-                    // Thirty degrees in one frame is far past anything a hand
-                    // produces — a 1000 deg/s flick is 16 deg at 60 Hz — and well
-                    // under the turn of a cut, so the threshold separates them
-                    // without resetting on ordinary fast play.
-                    let turned = last_fsr_camera_dir.dot(camera.direction()) < 0.866_025_4;
-                    let camera_jumped = camera.pos.distance_squared(last_fsr_camera_pos) > 64.0 * 64.0
-                        || turned;
+                    // Use the same clamped frame time as camera movement. A fixed
+                    // 64-unit cutoff falsely classified high-speed/boosted movement
+                    // as a teleport, clearing every temporal RT/upscaler history
+                    // while the camera was still moving normally.
+                    let dt = last.elapsed().as_secs_f32().min(0.1);
+                    last = Instant::now();
+                    let movement_speed = settings.camera_speed
+                        * if keys.contains(&KeyCode::ShiftLeft) { settings.boost } else { 1.0 };
+                    let camera_jumped = camera_cut_detected(
+                        last_fsr_camera_pos,
+                        camera.pos,
+                        last_fsr_camera_dir,
+                        camera.direction(),
+                        dt,
+                        movement_speed,
+                    );
                     if camera_jumped {
                         if let Some(fsr) = fsr_upscaler.as_mut() {
                             fsr.reset_history();
@@ -7566,8 +7594,6 @@ pub fn run(
                         if let Err(e)=settings.save(){eprintln!("Settings save: {e}");} else {saved_settings=settings.clone();}
                         last_settings_save=Instant::now();
                     }
-                    let dt = last.elapsed().as_secs_f32().min(0.1);
-                    last = Instant::now();
                     // Add-ons get an optional camera-owner hook. `None` leaves
                     // the original free-flight controls completely untouched.
                     let input_allowed = normal_input_allowed(
@@ -10106,3 +10132,59 @@ mod raywatcher_fog_preservation_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod raywatcher_camera_cut_tests {
+    use super::*;
+
+    #[test]
+    fn boosted_continuous_flight_does_not_reset_temporal_history() {
+        let moved = Vec3::new(240.0 * 4.0 * 0.1, 240.0 * 4.0 * 0.1, 0.0);
+        assert!(!camera_cut_detected(
+            Vec3::ZERO,
+            moved,
+            Vec3::NEG_Z,
+            Vec3::NEG_Z,
+            0.1,
+            240.0 * 4.0,
+        ));
+    }
+
+    #[test]
+    fn a_teleport_still_resets_temporal_history_during_fast_flight() {
+        assert!(camera_cut_detected(
+            Vec3::ZERO,
+            Vec3::new(900.0, 0.0, 0.0),
+            Vec3::NEG_Z,
+            Vec3::NEG_Z,
+            0.1,
+            240.0 * 4.0,
+        ));
+    }
+
+    #[test]
+    fn ordinary_fast_look_motion_is_not_a_camera_cut() {
+        let turned_45_degrees = Vec3::new(1.0, 0.0, -1.0).normalize();
+        assert!(!camera_cut_detected(
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::NEG_Z,
+            turned_45_degrees,
+            1.0 / 60.0,
+            240.0,
+        ));
+    }
+
+    #[test]
+    fn a_full_reverse_view_is_still_a_camera_cut() {
+        assert!(camera_cut_detected(
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::NEG_Z,
+            Vec3::Z,
+            1.0 / 60.0,
+            240.0,
+        ));
+    }
+}
+
