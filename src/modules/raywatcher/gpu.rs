@@ -4610,8 +4610,15 @@ impl RaywatcherGpu {
     /// The raster mirror can be suppressed once either RT backend has
     /// produced the previous frame. A pending DXR rebuild does not make the
     /// active Software fallback unready.
-    pub fn can_replace_water_reflections(&self) -> bool {
+    /// Whether the previous frame produced a complete RT output. The host
+    /// queries this before the raster pass, so it is also the safety gate for
+    /// removing any raster term that the following RT pass will replace.
+    pub fn can_replace_raster_effects(&self) -> bool {
         self.traced_last_frame
+    }
+
+    pub fn can_replace_water_reflections(&self) -> bool {
+        self.can_replace_raster_effects()
     }
 
     /// Replace the scene. Called when the resident terrain set, tree set or
