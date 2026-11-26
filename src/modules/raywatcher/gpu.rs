@@ -1086,13 +1086,13 @@ fn rc_slot(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> u32 {
 }
 
 fn rc_query(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> vec4<f32> {
-    let cell = &radiance_cache[rc_slot(world_pos, normal, cam_dist)];
-    // Read sums before count: writers add all channels before incrementing
-    // count, so a concurrent query can only briefly underestimate confidence.
-    let r = atomicLoad(&cell.r);
-    let g = atomicLoad(&cell.g);
-    let b = atomicLoad(&cell.b);
-    let count = atomicLoad(&cell.count);
+    let slot = rc_slot(world_pos, normal, cam_dist);
+    // Index storage-struct members directly: this avoids an unsupported
+    // pointer-to-struct member access in the wgpu 0.19 WGSL frontend.
+    let r = atomicLoad(&radiance_cache[slot].r);
+    let g = atomicLoad(&radiance_cache[slot].g);
+    let b = atomicLoad(&radiance_cache[slot].b);
+    let count = atomicLoad(&radiance_cache[slot].count);
     if (count == 0u) {
         return vec4<f32>(0.0);
     }
@@ -1101,16 +1101,16 @@ fn rc_query(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32) -> vec4<f32>
 }
 
 fn rc_update(world_pos: vec3<f32>, normal: vec3<f32>, cam_dist: f32, rad: vec3<f32>) {
-    let cell = &radiance_cache[rc_slot(world_pos, normal, cam_dist)];
+    let slot = rc_slot(world_pos, normal, cam_dist);
     let sample = clamp(rad, vec3<f32>(0.0), vec3<f32>(2.5));
     let q = vec3<u32>(round(sample * (255.0 / 2.5)));
     // Additive accumulation is race-free and maps to InterlockedAdd in both
     // native HLSL and wgpu's D3D12 shader translation. The 8-bit sample scale
     // leaves over 16 million maximum-intensity updates before sum overflow.
-    atomicAdd(&cell.r, q.x);
-    atomicAdd(&cell.g, q.y);
-    atomicAdd(&cell.b, q.z);
-    atomicAdd(&cell.count, 1u);
+    atomicAdd(&radiance_cache[slot].r, q.x);
+    atomicAdd(&radiance_cache[slot].g, q.y);
+    atomicAdd(&radiance_cache[slot].b, q.z);
+    atomicAdd(&radiance_cache[slot].count, 1u);
 }
 
 fn detail_offscreen_albedo(hit_pos: vec3<f32>, hit_normal: vec3<f32>, base_albedo: vec3<f32>, opacity: f32) -> vec3<f32> {
