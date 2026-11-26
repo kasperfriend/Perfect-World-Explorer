@@ -6,7 +6,7 @@
 //! exporter exists.
 use glam::Vec3;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -74,6 +74,8 @@ pub struct Architect {
     project_root: PathBuf,
     project: Project,
     project_files: Vec<PathBuf>,
+    directory_cache: HashMap<PathBuf, Vec<ExplorerEntry>>,
+    archive_cache: HashMap<PathBuf, Vec<String>>,
     project_name: String,
     selected_project: Option<usize>,
     selected_map: String,
@@ -121,6 +123,10 @@ impl Architect {
             project_root,
             project: Project::default(),
             project_files: Vec::new(),
+            directory_cache: HashMap::new(),
+            archive_cache: HashMap::new(),
+            directory_cache: HashMap::new(),
+            archive_cache: HashMap::new(),
             project_name: "Untitled World".into(),
             selected_project: None,
             selected_map: "__empty__".into(),
@@ -451,26 +457,44 @@ impl Architect {
         if depth > 12 {
             return;
         }
-        let Ok(entries) = fs::read_dir(path) else {
-            return;
-        };
-        let mut entries = entries.flatten().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
-        for entry in entries.into_iter().take(500) {
-            let child = entry.path();
-            let Ok(kind) = entry.file_type() else {
-                continue;
+        let entries = if let Some(cached) = self.directory_cache.get(path) {
+            cached.clone()
+        } else {
+            let Ok(directory) = fs::read_dir(path) else {
+                return;
             };
-            let label = entry.file_name().to_string_lossy().into_owned();
+            let mut entries = directory
+                .flatten()
+                .take(500)
+                .filter_map(|entry| {
+                    let kind = entry.file_type().ok()?;
+                    if kind.is_symlink() {
+                        return None;
+                    }
+                    Some(ExplorerEntry {
+                        path: entry.path(),
+                        name: entry.file_name().to_string_lossy().into_owned(),
+                        is_dir: kind.is_dir(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.name.to_lowercase());
+            self.directory_cache.insert(path.to_path_buf(), entries.clone());
+            entries
+        };
+        for entry in entries {
+            let child = entry.path;
+            let label = entry.name;
+            let is_dir = entry.is_dir;
             if !self.tree_filter.is_empty()
                 && !label
                     .to_lowercase()
                     .contains(&self.tree_filter.to_lowercase())
-                && !kind.is_dir()
+                && !is_dir
             {
                 continue;
             }
-            if kind.is_dir() {
+            if is_dir {
                 let response = egui::CollapsingHeader::new(format!("📁 {label}"))
                     .id_source(child.to_string_lossy().to_string())
                     .show(ui, |ui| self.show_tree(ui, &child, depth + 1, camera));
@@ -511,9 +535,24 @@ impl Architect {
 
     fn placement_position(&self, camera: Vec3) -> [f32; 3] {
         let mut position = camera.to_array();
-        if matches!(self.snap, SnapMode::Terrain | SnapMode::Smart) {
-            if let Some(map) = &self.map {
-                position[1] = map.ground(position[0], position[2]) + 0.5;
+        match self.snap {
+            SnapMode::Off => {}
+            SnapMode::Objects => {
+                if let Some(selected) = self.selected_scene_transform {
+                    position = selected;
+                }
+            }
+            SnapMode::Terrain => {
+                if let Some(map) = &self.map {
+                    position[1] = map.ground(position[0], position[2]) + 0.5;
+                }
+            }
+            SnapMode::Smart => {
+                if let Some(selected) = self.selected_scene_transform {
+                    position = selected;
+                } else if let Some(map) = &self.map {
+                    position[1] = map.ground(position[0], position[2]) + 0.5;
+                }
             }
         }
         position
@@ -606,12 +645,18 @@ impl Architect {
         self.selected_archive = Some(path.clone());
         self.archive_entries.clear();
         self.archive_error = None;
+        if let Some(entries) = self.archive_cache.get(&path) {
+            self.archive_entries = entries.clone();
+            self.status = format!("Loaded {} cached archive entries.", self.archive_entries.len());
+            return;
+        }
         let result = std::fs::File::open(&path)
             .map_err(|error| error.to_string())
             .and_then(|mut file| crate::pck::directory(&mut file));
         match result {
             Ok(entries) => {
                 self.archive_entries = entries.into_iter().map(|entry| entry.name).collect();
+                self.archive_cache.insert(path.clone(), self.archive_entries.clone());
                 self.status = format!(
                     "Indexed {} archive entries from {}.",
                     self.archive_entries.len(),
@@ -774,7 +819,9 @@ impl Architect {
                     self.status = "New empty project. Choose a client map as its source when ready.".into();
                 }
                 ui.heading("Custom worlds");
-                self.refresh_projects();
+                if ui.small_button("Refresh saved worlds").clicked() {
+                    self.refresh_projects();
+                }
                 if self.project_files.is_empty() {
                     ui.label(egui::RichText::new("No saved Architect worlds yet.").weak().small());
                 }
@@ -839,7 +886,15 @@ impl Architect {
         asset_panel.show(ctx, |ui| {
                 ui.horizontal(|ui| { ui.heading("Client explorer"); Self::dock_picker(ui, &mut self.right_dock); });
                 ui.label(egui::RichText::new("Loose client files are browsed lazily. Select a PCK archive to index its internal asset paths on demand.").small().weak());
-                ui.text_edit_singleline(&mut self.tree_filter);
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.tree_filter);
+                    if ui.small_button("Refresh files").clicked() {
+                        self.directory_cache.clear();
+                        self.archive_cache.clear();
+                        self.selected_archive = None;
+                        self.archive_entries.clear();
+                    }
+                });
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                     self.show_tree(ui, &self.client_root.clone(), 0, camera);
                 });
