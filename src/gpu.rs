@@ -4445,17 +4445,25 @@ impl Renderer {
             return;
         };
         // --- The frame parameters.
-        // Share the same effective fog gate as the raster, water and shoreline
-        // passes. Reading camera.air_fog directly would ignore the user's
-        // atmospheric-fog checkbox and leave RT fog enabled after it is turned off.
-        let fog = camera.active_fog();
-        let fog_range =
-            crate::modules::raywatcher::frame::effective_fog_range(fog.enabled, fog.start, fog.end);
+        // Use the exact fog range/color already published to raster passes.
+        // That snapshot includes the user's enable gate and (when terrain
+        // cutoff is active) the resident-window fog cap. Re-sampling the raw
+        // camera fog here made RT and raster disagree at the world boundary.
+        let fog_range = crate::modules::raywatcher::frame::effective_fog_range(
+            self.frame.active_fog_range[2] > 0.5,
+            self.frame.active_fog_range[0],
+            self.frame.active_fog_range[1],
+        );
+        let fog_colour = Vec3::new(
+            self.frame.active_fog_color[0],
+            self.frame.active_fog_color[1],
+            self.frame.active_fog_color[2],
+        );
         let lighting = LightingRecord::derive(
             camera.time_of_day,
             crate::environment::daylight(camera.time_of_day),
             camera.regional_light.as_ref(),
-            Vec3::from_array(fog.color),
+            fog_colour,
             fog_range,
         );
         let region_light_rw = camera.regional_light.or(self.retained_regional_light);
