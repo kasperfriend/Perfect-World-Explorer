@@ -1215,7 +1215,7 @@ mod tests {
         let mut m = Raywatcher::new(&wrong_dir);
         m.sync_sdk_dir(&upscale_dir);
         assert_eq!(m.sdk_dir(), upscale_dir.as_path());
-        let (dlss, _) = super::reconstruct::probe_offline(m.sdk_dir(), true);
+        let (dlss, _) = super::reconstruct::probe_offline_now(m.sdk_dir(), true);
         assert!(
             dlss.available,
             "DLSS RR should be available once synced to upscale_sdk_dir"
