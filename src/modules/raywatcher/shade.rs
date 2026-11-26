@@ -452,7 +452,29 @@ pub fn apply_fog(colour: Vec3, params: &FrameParams, distance: f32) -> Vec3 {
         return colour;
     }
     let t = ((distance - start) / (end - start)).clamp(0., 1.);
-    colour.lerp(params.lighting.fog_colour, t)
+    // The client blends fog in encoded sRGB space, then writes the result to
+    // the linear render target. Keep the CPU reference on the same transfer.
+    let encoded = Vec3::new(
+        linear_to_srgb(colour.x),
+        linear_to_srgb(colour.y),
+        linear_to_srgb(colour.z),
+    );
+    let mixed = encoded.lerp(params.lighting.fog_colour, t);
+    Vec3::new(
+        srgb_to_linear(mixed.x),
+        srgb_to_linear(mixed.y),
+        srgb_to_linear(mixed.z),
+    )
+}
+
+fn linear_to_srgb(v: f32) -> f32 {
+    let v = v.max(0.0);
+    if v <= 0.0031308 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+}
+
+fn srgb_to_linear(v: f32) -> f32 {
+    let v = v.max(0.0);
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
 }
 
 fn material_of(scene: &SceneGeometry, triangle: u32) -> RayMaterial {
@@ -959,9 +981,10 @@ mod tests {
         let near = apply_fog(Vec3::splat(0.1), &params, 0.);
         assert_eq!(near, Vec3::splat(0.1));
         let far = apply_fog(Vec3::splat(0.1), &params, 1000.);
-        assert!((far - params.lighting.fog_colour).length() < 1e-5);
+        let fog_linear = Vec3::new(0.6, 0.7, 0.9).map(srgb_to_linear);
+        assert!((far - fog_linear).length() < 1e-5);
         let mid = apply_fog(Vec3::splat(0.1), &params, 60.);
-        assert!(mid.x > 0.1 && mid.x < params.lighting.fog_colour.x);
+        assert!(mid.x > 0.1 && mid.x < fog_linear.x);
         // A range that is not ordered is "no fog", not a division by zero.
         let mut disabled = params;
         disabled.lighting.fog_range = (10., 10.);
