@@ -237,10 +237,7 @@ fn water_view_scissor(
 /// Narrow a water view's CPU/GPU culling frustum to the exact scissor
 /// rectangle that the surface can sample. The scissor still clips rasterization;
 /// this additionally avoids submitting and vertex-processing objects outside it.
-fn water_scissor_ndc_rect(
-    extent: (u32, u32),
-    scissor: Option<[u32; 4]>,
-) -> Option<[f32; 4]> {
+fn water_scissor_ndc_rect(extent: (u32, u32), scissor: Option<[u32; 4]>) -> Option<[f32; 4]> {
     let [x, y, width, height] = scissor?;
     let (w, h) = (extent.0.max(1) as f32, extent.1.max(1) as f32);
     Some([
@@ -3878,7 +3875,8 @@ impl Renderer {
                 matrix,
                 &mut self.water_terrain_runs,
             );
-            self.terrain_gpu.visible_far_runs_into(matrix, &mut self.water_far_terrain_runs);
+            self.terrain_gpu
+                .visible_far_runs_into(matrix, &mut self.water_far_terrain_runs);
         }
         self.terrain_gpu.prepare_runs(
             &self.device,
@@ -3903,11 +3901,8 @@ impl Renderer {
                 rect,
                 &mut self.reflected_terrain_runs,
             );
-            self.terrain_gpu.visible_far_runs_rect_into(
-                matrix,
-                rect,
-                &mut self.reflected_far_runs,
-            );
+            self.terrain_gpu
+                .visible_far_runs_rect_into(matrix, rect, &mut self.reflected_far_runs);
         } else {
             crate::terrain_residency::visible_runs_into(
                 &self.spans,
