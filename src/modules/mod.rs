@@ -2,6 +2,7 @@
 //! GPU resources. The host only supplies narrow input/camera, terrain and draw
 //! hooks; a disabled module has no effect on core features.
 
+mod architect;
 mod designer;
 mod librarian;
 mod package;
@@ -31,6 +32,7 @@ fn extend_fonts(ctx: &egui::Context, extend: impl FnOnce(&mut egui::FontDefiniti
 pub struct Modules {
     walker: Walker,
     librarian: librarian::Librarian,
+    architect: architect::Architect,
     populator: Populator,
     packages: Registry,
     selected: usize,
@@ -47,6 +49,7 @@ impl Default for Modules {
         Self {
             walker: Walker::default(),
             librarian: librarian::Librarian::new(PathBuf::new()),
+            architect: architect::Architect::new(PathBuf::new()),
             populator: Populator::default(),
             packages: Registry::discover(package::default_root()),
             selected: 0,
@@ -69,12 +72,33 @@ impl Modules {
         let populator = Populator::new(element.clone(), map.clone(), map_dir);
         Self {
             walker: Walker::with_host(element.clone(), map, water, scene, ornaments),
-            librarian: librarian::Librarian::new(element),
+            librarian: librarian::Librarian::new(element.clone()),
+            architect: architect::Architect::new(element),
             populator,
             packages: Registry::discover(package::default_root()),
             selected: 0,
             effect_catalog: None,
         }
+    }
+
+    pub fn architect_active(&self) -> bool {
+        self.architect.active()
+    }
+
+    pub fn set_architect_active(&mut self, enabled: bool) {
+        self.architect.set_active(enabled);
+    }
+
+    pub fn architect_ui(
+        &mut self,
+        ctx: &egui::Context,
+        catalog: &crate::world_catalog::Catalog,
+        current_map: &crate::world_catalog::WorldMap,
+        scene: &crate::scene::Scene,
+        ornaments: &[crate::scene::Ornament],
+        camera: Vec3,
+    ) -> Option<String> {
+        self.architect.ui(ctx, catalog, current_map, scene, ornaments, camera)
     }
 
     pub fn prepare_librarian_preview(
@@ -96,6 +120,7 @@ impl Modules {
             "walker" => self.walker.is_active(),
             "populator" => self.populator.is_active(),
             "librarian" => self.librarian.active(),
+            "architect" => self.architect.active(),
             _ => false,
         }
     }
