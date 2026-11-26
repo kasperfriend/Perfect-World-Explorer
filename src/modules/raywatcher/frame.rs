@@ -745,7 +745,10 @@ mod tests {
         settings.effects.reflections = true;
         let plan = Plan::decide(&settings, (1920, 1080), true, |_| true);
         assert!(plan.trace);
-        assert_eq!(RasterOverrides::for_plan_when_ready(&plan, false), RasterOverrides::NONE);
+        assert_eq!(
+            RasterOverrides::for_plan_when_ready(&plan, false),
+            RasterOverrides::NONE
+        );
         assert_eq!(
             RasterOverrides::for_plan_when_ready(&plan, true),
             RasterOverrides::for_plan(&plan),
