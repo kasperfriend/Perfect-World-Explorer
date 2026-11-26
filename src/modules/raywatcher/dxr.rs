@@ -703,7 +703,7 @@ mod imp {
         /// Deferred retirement lists freed once `ring.completed_fence() >= fence`.
         retired_scenes: Vec<(u64, DxrScene)>,
         retired_buffers: Vec<(u64, Vec<RawBuffer>)>,
-        /// Persistent 65,536-cell 3D world-space radiance cache (`u5`, 1 MB VRAM)
+        /// Persistent 65,536-cell packed atomic world-space radiance cache (`u5`, 256 KB VRAM)
         /// updated and queried by hardware RT cores for low-noise multi-bounce GI.
         radiance_cache: RawBuffer,
         /// Two-frame ReSTIR GI reservoir history, shared with the DXR compute shader at u6.
@@ -805,10 +805,10 @@ mod imp {
             let radiance_cache = unsafe {
                 RawBuffer::create(
                     dev_ptr,
-                    (RADIANCE_CACHE_CELLS as u64) * 16,
+                    (RADIANCE_CACHE_CELLS as u64) * 4,
                     d12::D3D12_HEAP_TYPE_DEFAULT,
                     d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                    d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    d12::D3D12_RESOURCE_STATE_COPY_DEST,
                 )?
             };
             let targets = DxrTargets::new(device, &raw_device, grid_extent)?;
@@ -863,7 +863,50 @@ mod imp {
             };
             tracer.write_scene_descriptors();
             tracer.write_target_descriptors();
+            tracer.initialize_radiance_cache()?;
             Ok(tracer)
+        }
+
+        /// Clear the DXR cache before its first query. DEFAULT-heap resources are
+        /// not implicitly zeroed; leaving this packed atomic array undefined lets
+        /// arbitrary VRAM bits masquerade as valid confidence and coloured GI.
+        fn initialize_radiance_cache(&mut self) -> Result<(), String> {
+            let size = self.radiance_cache.size;
+            let mut staging = unsafe {
+                RawBuffer::create(
+                    self.raw_device.as_mut_ptr(),
+                    size,
+                    d12::D3D12_HEAP_TYPE_UPLOAD,
+                    d12::D3D12_RESOURCE_FLAG_NONE,
+                    d12::D3D12_RESOURCE_STATE_GENERIC_READ,
+                )?
+            };
+            unsafe {
+                staging.map_persistent()?;
+                staging.write_upload(&vec![0u8; size as usize])?;
+                let slot_idx = self.ring.acquire("DXR-Radiance-Cache-Init")?;
+                let list = self.ring.slot_mut(slot_idx).list.as_mut_ptr();
+                (*list).CopyBufferRegion(
+                    self.radiance_cache.resource,
+                    0,
+                    staging.resource,
+                    0,
+                    size,
+                );
+                let mut barrier: d12::D3D12_RESOURCE_BARRIER = zeroed();
+                barrier.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                *barrier.u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: self.radiance_cache.resource,
+                    Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: d12::D3D12_RESOURCE_STATE_COPY_DEST,
+                    StateAfter: d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                };
+                (*list).ResourceBarrier(1, &barrier);
+                self.ring.retire(slot_idx, &self.raw_queue, "DXR-Radiance-Cache-Init")?;
+                let fence = self.ring.current_fence();
+                self.retired_buffers.push((fence, vec![staging]));
+            }
+            Ok(())
         }
 
         unsafe fn create_pipeline(
@@ -1483,14 +1526,14 @@ mod imp {
                     );
                 }
 
-                // Slot 13: u5 persistent 3D world-space radiance cache (`RWStructuredBuffer<float4>`).
+                // Slot 13: u5 packed atomic radiance cache (`RWStructuredBuffer<uint>`).
                 let mut rc_uav: d12::D3D12_UNORDERED_ACCESS_VIEW_DESC = zeroed();
                 rc_uav.Format = DXGI_FORMAT_UNKNOWN;
                 rc_uav.ViewDimension = d12::D3D12_UAV_DIMENSION_BUFFER;
                 *rc_uav.u.Buffer_mut() = d12::D3D12_BUFFER_UAV {
                     FirstElement: 0,
                     NumElements: RADIANCE_CACHE_CELLS,
-                    StructureByteStride: 16,
+                    StructureByteStride: 4,
                     CounterOffsetInBytes: 0,
                     Flags: d12::D3D12_BUFFER_UAV_FLAG_NONE,
                 };
