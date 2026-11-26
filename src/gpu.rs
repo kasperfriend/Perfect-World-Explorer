@@ -3904,17 +3904,20 @@ impl Renderer {
             self.raywatcher_harvest.invalidate();
             return RasterOverrides::NONE;
         }
-        let mut overrides = RasterOverrides::for_plan(&plan);
+        // This plan is decided before the raster pass, but its replacement
+        // pixels are produced afterwards. Keep every original raster term until
+        // a complete RT frame from the previous iteration exists. That closes
+        // the one-frame hole during first-use initialization and scene/AS swaps.
+        let rt_output_ready = self
+            .raywatcher_gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.can_replace_raster_effects());
+        let mut overrides = RasterOverrides::for_plan_when_ready(&plan, rt_output_ready);
         if overrides.reflection_pass {
-            // Replace the native mirror as soon as this frame's RT output is
-            // actually available. Hardware mode may be temporarily running the
-            // Software fallback while its DXR acceleration structure rebuilds.
-            let ready = self
-                .raywatcher_gpu
-                .as_ref()
-                .is_some_and(|gpu| gpu.can_replace_water_reflections());
-            overrides.reflection_pass &=
-                ready && !self.raywatcher_harvest.is_building_in_background();
+            // Keep the native mirror while the scene harvester has invalidated
+            // its reflected-object coverage; other RT lighting terms can still
+            // use the completed RT frame.
+            overrides.reflection_pass &= !self.raywatcher_harvest.is_building_in_background();
         }
         overrides
     }
