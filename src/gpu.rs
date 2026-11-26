@@ -1802,9 +1802,8 @@ struct Renderer {
     >,
     /// Scene snapshot used by the single first-use GPU/DXR initialization worker.
     /// Newer harvested scenes are applied to its result instead of abandoning it.
-    raywatcher_gpu_init_scene: Option<
-        std::sync::Arc<crate::modules::raywatcher::bvh::SceneGeometry>,
-    >,
+    raywatcher_gpu_init_scene:
+        Option<std::sync::Arc<crate::modules::raywatcher::bvh::SceneGeometry>>,
     /// The geometry the current `raywatcher_gpu` was built from, so a world
     /// change can drop the tree instead of tracing stale geometry.
     raywatcher_scene: Option<std::sync::Arc<crate::modules::raywatcher::bvh::SceneGeometry>>,
