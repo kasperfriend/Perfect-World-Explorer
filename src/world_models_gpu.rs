@@ -120,6 +120,38 @@ pub struct AlphaStatus {
     pub slots: usize,
 }
 
+fn editor_scene_transform(
+    placement: &EditorPlacement,
+    export_id: u32,
+) -> Result<(crate::scene::SceneModel, glam::Mat4), String> {
+    if !placement.position.iter().all(|value| value.is_finite())
+        || !placement.rotation.iter().all(|value| value.is_finite())
+        || !placement.scale.is_finite()
+        || !(0.001..=1000.).contains(&placement.scale)
+    {
+        return Err("non-finite or out-of-range editor transform".into());
+    }
+    let rotation = glam::Quat::from_euler(
+        glam::EulerRot::XYZ,
+        placement.rotation[0],
+        placement.rotation[1],
+        placement.rotation[2],
+    );
+    let direction = rotation * glam::Vec3::Z;
+    let up = rotation * glam::Vec3::Y;
+    let scene_placement = crate::scene::SceneModel {
+        export_id,
+        position: placement.position,
+        direction: direction.to_array(),
+        up: up.to_array(),
+        path: crate::ecmodel::normalize(&placement.path),
+        action: String::new(),
+    };
+    let transform = crate::world_models::transform(&scene_placement)?
+        * glam::Mat4::from_scale(glam::Vec3::splat(placement.scale));
+    Ok((scene_placement, transform))
+}
+
 pub struct World {
     assets: Assets,
     keep_unbounded: bool,
@@ -293,14 +325,9 @@ impl World {
         let mut random = crate::model_playback::SceneRandom::new(1);
         for (index, placement) in placements.iter().enumerate() {
             let path = crate::ecmodel::normalize(&placement.path);
-            if !path.ends_with(".ecm")
-                || !placement.position.iter().all(|value| value.is_finite())
-                || !placement.rotation.iter().all(|value| value.is_finite())
-                || !placement.scale.is_finite()
-                || !(0.001..=1000.).contains(&placement.scale)
-            {
+            if !path.ends_with(".ecm") {
                 self.reported.push(format!(
-                    "Architect placement {index} has an unsupported asset or invalid transform: {}",
+                    "Architect placement {index} is not a supported ECM asset: {}",
                     placement.path
                 ));
                 continue;
@@ -328,22 +355,16 @@ impl World {
                 }
             };
 
-            let rotation = glam::Quat::from_euler(
-                glam::EulerRot::XYZ,
-                placement.rotation[0],
-                placement.rotation[1],
-                placement.rotation[2],
-            );
-            let direction = rotation * glam::Vec3::Z;
-            let up = rotation * glam::Vec3::Y;
-            let scene_placement = crate::scene::SceneModel {
-                export_id: u32::try_from(index).unwrap_or(u32::MAX),
-                position: placement.position,
-                direction: direction.to_array(),
-                up: up.to_array(),
-                path: path.clone(),
-                action: String::new(),
-            };
+            let (scene_placement, transform) =
+                match editor_scene_transform(placement, u32::try_from(index).unwrap_or(u32::MAX)) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.reported.push(format!(
+                            "Architect placement {index} has an invalid transform: {error}"
+                        ));
+                        continue;
+                    }
+                };
             let action = self.assets.assets[asset]
                 .descriptor
                 .scene_action(&scene_placement.action);
@@ -364,8 +385,6 @@ impl World {
                 action,
                 playback,
             });
-            let transform = crate::world_models::transform(&scene_placement)
-                .map(|matrix| matrix * glam::Mat4::from_scale(glam::Vec3::splat(placement.scale)));
             self.slots.push(Slot {
                 draw: None,
                 failed: false,
@@ -1668,6 +1687,47 @@ fn event_milliseconds(event: &crate::ecmodel::EcmEvent, key: &str) -> Result<f32
         return Err(format!("nonfinite GFX event {key}"));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod architect_placement_tests {
+    use super::*;
+
+    #[test]
+    fn editor_transform_preserves_position_and_applies_rotation_and_scale() {
+        let placement = EditorPlacement {
+            path: "models/test.ecm".into(),
+            position: [12., 3., -8.],
+            rotation: [0., std::f32::consts::FRAC_PI_2, 0.],
+            scale: 2.5,
+        };
+        let (scene, matrix) = editor_scene_transform(&placement, 7).unwrap();
+        assert_eq!(scene.export_id, 7);
+        assert_eq!(scene.position, placement.position);
+        assert!((scene.direction[0] - 1.).abs() < 1e-5);
+        assert!(scene.direction[2].abs() < 1e-5);
+        assert!((matrix.w_axis.x - 12.).abs() < 1e-5);
+        assert!((matrix.w_axis.y - 3.).abs() < 1e-5);
+        assert!((matrix.w_axis.z + 8.).abs() < 1e-5);
+        assert!((matrix.x_axis.truncate().length() - 2.5).abs() < 1e-5);
+        assert!((matrix.y_axis.truncate().length() - 2.5).abs() < 1e-5);
+        assert!((matrix.z_axis.truncate().length() - 2.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn editor_transform_rejects_non_finite_and_extreme_values() {
+        let mut placement = EditorPlacement {
+            path: "models/test.ecm".into(),
+            position: [0.; 3],
+            rotation: [0.; 3],
+            scale: 1.,
+        };
+        placement.position[1] = f32::NAN;
+        assert!(editor_scene_transform(&placement, 0).is_err());
+        placement.position = [0.; 3];
+        placement.scale = 1001.;
+        assert!(editor_scene_transform(&placement, 0).is_err());
+    }
 }
 
 #[cfg(test)]
