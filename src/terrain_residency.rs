@@ -394,11 +394,34 @@ pub fn visible_runs(spans: &[Span], matrix: Mat4) -> Vec<(u32, u32)> {
 /// handing out a fresh `Vec` each time. The result is identical: `runs` is
 /// emptied first and refilled in span order.
 pub fn visible_runs_into(spans: &[Span], matrix: Mat4, runs: &mut Vec<(u32, u32)>) {
+    visible_runs_with_planes_into(spans, &planes(matrix), runs);
+}
+
+/// Restrict a view's terrain block runs to a scissor rectangle in NDC
+/// (left, right, bottom, top). Used by water views whose render targets are
+/// sampled only in the expanded water-surface rectangle.
+pub fn visible_runs_rect_into(
+    spans: &[Span],
+    matrix: Mat4,
+    rect: [f32; 4],
+    runs: &mut Vec<(u32, u32)>,
+) {
+    let planes = crate::world_objects::frustum_planes_from_matrix_rect(
+        matrix.to_cols_array(),
+        rect,
+    );
+    visible_runs_with_planes_into(spans, &planes, runs);
+}
+
+fn visible_runs_with_planes_into(
+    spans: &[Span],
+    planes: &[[f32; 4]; 6],
+    runs: &mut Vec<(u32, u32)>,
+) {
     runs.clear();
     runs.reserve(spans.len().min(256));
-    let planes = planes(matrix);
     for span in spans {
-        if span.count == 0 || !intersects(&planes, span.bounds) {
+        if span.count == 0 || !intersects(planes, span.bounds) {
             continue;
         }
         match runs.last_mut() {
@@ -591,6 +614,32 @@ mod tests {
         assert!(!in_frustum(identity, [2., -0.5, 0.25, 3., 0.5, 0.75]));
         // Straddling the right plane is still drawn.
         assert!(in_frustum(identity, [0.5, -0.5, 0.25, 1.5, 0.5, 0.75]));
+    }
+
+    #[test]
+    fn scissored_visible_runs_drop_terrain_outside_the_water_rectangle() {
+        let spans = [
+            Span {
+                block: (0, 0),
+                start: 0,
+                count: 6,
+                bounds: [-0.1, -0.1, 0.1, 0.1, 0.1, 0.9],
+            },
+            Span {
+                block: (1, 0),
+                start: 6,
+                count: 6,
+                bounds: [0.6, -0.1, 0.1, 0.8, 0.1, 0.9],
+            },
+        ];
+        let mut runs = Vec::new();
+        visible_runs_rect_into(
+            &spans,
+            Mat4::IDENTITY,
+            [-0.5, 0.5, -0.25, 0.75],
+            &mut runs,
+        );
+        assert_eq!(runs, vec![(0, 6)]);
     }
 
     #[test]
