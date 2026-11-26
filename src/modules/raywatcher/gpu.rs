@@ -6389,3 +6389,26 @@ mod dxr_backend_selection_tests {
         assert!(!hardware_trace_ready(false, false, true, false));
     }
 }
+
+#[cfg(test)]
+mod reflection_sampling_regression_tests {
+    use super::*;
+
+    const DXR_SHADER: &str = include_str!("dxr_trace.hlsl");
+
+    #[test]
+    fn reflections_fetch_colour_from_full_resolution_raster() {
+        assert!(RAY_SHADER.contains("@group(1) @binding(0) var src_screen_raster"));
+        assert!(RAY_SHADER.contains("textureLoad(src_screen_raster, screen_px, 0)"));
+        assert!(!RAY_SHADER.contains("textureLoad(src_gbuf_raster, hp, 0).rgb"));
+        assert!(DXR_SHADER.contains("src_screen_raster : register(t8)"));
+        assert!(DXR_SHADER.contains("src_screen_raster.GetDimensions"));
+        assert!(DXR_SHADER.contains("src_screen_raster.Load(int3(screen_px, 0))"));
+    }
+
+    #[test]
+    fn sky_and_cloud_reflection_atlas_uses_four_times_the_previous_edge_resolution() {
+        assert_eq!(SKY_ENV_FACE, 512);
+        assert!(DXR_SHADER.contains("SKY_ENV_FACE_F = 512.0"));
+    }
+}
