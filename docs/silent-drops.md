@@ -30,8 +30,8 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/client_detect.rs` | 1361 | `ok-question` | **probe** | `bytes.get(offset..offset + 4)?.try_into().ok()?,` |
 | `src/client_detect.rs` | 1367 | `ok-question` | **probe** | `bytes.get(offset..offset + 2)?.try_into().ok()?,` |
 | `src/client_detect.rs` | 1503 | `ok-question` | **probe** | `let size = fs::metadata(&pck).ok()?.len();` |
-| `src/client_detect.rs` | 1509 | `ok-question` | **probe** | `fs::File::open(&pck).ok()?.read_exact(&mut prefix).ok()?;` |
-| `src/client_detect.rs` | 1505 | `ok-question` | **probe** | `let declared = u32::from_le_bytes(prefix[4..8].try_into().ok()?) as u64;` |
+| `src/client_detect.rs` | 1505 | `ok-question` | **probe** | `fs::File::open(&pck).ok()?.read_exact(&mut prefix).ok()?;` |
+| `src/client_detect.rs` | 1509 | `ok-question` | **probe** | `let declared = u32::from_le_bytes(prefix[4..8].try_into().ok()?) as u64;` |
 | `src/client_detect.rs` | 1601 | `ok-question` | **probe** | `let mut file = fs::File::open(path).ok()?;` |
 | `src/client_detect.rs` | 1602 | `ok-question` | **probe** | `let size = file.seek(SeekFrom::End(0)).ok()?;` |
 | `src/client_detect.rs` | 1612 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(0)).ok()?;` |
