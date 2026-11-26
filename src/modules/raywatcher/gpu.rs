@@ -4516,10 +4516,11 @@ impl RaywatcherGpu {
         self.dxr_init.is_some()
     }
 
-    pub fn can_replace_water_reflections(&self, hardware_requested: bool) -> bool {
+    /// The raster mirror can be suppressed once either RT backend has
+    /// produced the previous frame. A pending DXR rebuild does not make the
+    /// active Software fallback unready.
+    pub fn can_replace_water_reflections(&self) -> bool {
         self.traced_last_frame
-            && (!hardware_requested
-                || (self.dxr.is_some() || self.dxr_failed) && self.dxr_init.is_none())
     }
 
     /// Replace the scene. Called when the resident terrain set, tree set or
