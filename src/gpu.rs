@@ -4392,9 +4392,13 @@ impl Renderer {
             );
         }
         gpu.capture_raster(&self.device, encoder, destination);
+        // The G-buffer only needs planes that can contribute pixels in this view.
+        // Filtering before the 16-plane cap prevents off-screen batches from
+        // evicting a visible lake/river plane from the water classifier.
         let mut active_water: Vec<crate::modules::raywatcher::harvest::WaterSurface> = self
             .water_batches
             .iter()
+            .filter(|w| w.visible(matrix))
             .map(|w| crate::modules::raywatcher::harvest::WaterSurface {
                 bounds: w.bounds,
                 height: w.height,
