@@ -196,6 +196,13 @@ mod imp {
 
     fn load_pso_cache(key: u64) -> Option<Vec<u8>> {
         let path = pso_cache_path(key);
+        let metadata = std::fs::metadata(&path).ok()?;
+        if metadata.len() > (super::DXR_PSO_CACHE_HEADER_BYTES + super::DXR_PSO_CACHE_MAX_BYTES) as u64
+            || metadata.len() < super::DXR_PSO_CACHE_HEADER_BYTES as u64
+        {
+            let _ = std::fs::remove_file(path);
+            return None;
+        }
         let bytes = std::fs::read(&path).ok()?;
         match super::decode_dxr_pso_cache(key, &bytes) {
             Some(payload) => Some(payload.to_vec()),
@@ -233,7 +240,7 @@ mod imp {
             drop(file);
             match std::fs::rename(&temp, &path) {
                 Ok(()) => Ok(()),
-                Err(err) if path.is_file() => {
+                Err(_err) if path.is_file() => {
                     let _ = std::fs::remove_file(&temp);
                     Ok(())
                 }
@@ -1115,22 +1122,8 @@ mod imp {
                     "DXR D3D12SerializeRootSignature failed (0x{hr:08x})"
                 ));
             }
-            let mut root_sig: *mut d12::ID3D12RootSignature = null_mut();
-            let hr = (*dev_ptr).CreateRootSignature(
-                0,
-                (*blob).GetBufferPointer(),
-                (*blob).GetBufferSize(),
-                &IID_ID3D12_ROOT_SIGNATURE,
-                &mut root_sig as *mut *mut d12::ID3D12RootSignature as *mut *mut c_void,
-            );
-            com_release(blob as *mut c_void);
-            if hr < 0 || root_sig.is_null() {
-                return Err(format!("DXR CreateRootSignature failed (0x{hr:08x})"));
-            }
-
-            // D3D12's cached PSO is the driver-compiled compute pipeline
-            // representation. Scope it to this adapter and exact shader/root
-            // signature; the driver still validates the opaque blob.
+            // Capture the serialized signature before releasing the D3D blob
+            // below. The cache key must never read from a released COM object.
             let mut adapter_luid: winapi::shared::ntdef::LUID = zeroed();
             let _ = (*dev_ptr).GetAdapterLuid(&mut adapter_luid);
             let mut adapter_luid_bytes = [0u8; 8];
@@ -1145,6 +1138,19 @@ mod imp {
                 root_signature_bytes,
                 adapter_luid_bytes,
             );
+            let mut root_sig: *mut d12::ID3D12RootSignature = null_mut();
+            let hr = (*dev_ptr).CreateRootSignature(
+                0,
+                (*blob).GetBufferPointer(),
+                (*blob).GetBufferSize(),
+                &IID_ID3D12_ROOT_SIGNATURE,
+                &mut root_sig as *mut *mut d12::ID3D12RootSignature as *mut *mut c_void,
+            );
+            com_release(blob as *mut c_void);
+            if hr < 0 || root_sig.is_null() {
+                return Err(format!("DXR CreateRootSignature failed (0x{hr:08x})"));
+            }
+
             let cached_pso = load_pso_cache(cache_key);
             if cached_pso.is_some() {
                 eprintln!("[Raywatcher] DXR driver PSO cache hit ({cache_key:016x})");

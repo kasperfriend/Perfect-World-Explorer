@@ -3968,12 +3968,11 @@ impl Renderer {
         } else {
             self.local_pages.len() as u64
         };
-        let hw_probed = settings.mode == crate::modules::raywatcher::plan::RayTracingMode::Hardware
-            && self.raywatcher_hw_probe.as_ref().is_some_and(|(ok, _)| *ok);
-        let skip_cpu_bvh = self
-            .raywatcher_gpu
-            .as_ref()
-            .map_or(hw_probed, |g| g.dxr_active());
+        // Keep the CPU BVH available even in Hardware mode. When a camera
+        // traversal replaces the scene, DXR's BLAS/TLAS rebuild runs in the
+        // background and the renderer temporarily traces this same scene with
+        // the Software compute path to avoid dropping a frame of all RT effects.
+        let skip_cpu_bvh = false;
         let content_hash = (active_pages_len << 16)
             ^ (self.water_batches.len() as u64)
             ^ (u64::from(skip_cpu_bvh) << 61)
