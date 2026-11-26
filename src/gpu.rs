@@ -3420,12 +3420,6 @@ impl Renderer {
         if let Some(source) = terrain_depth_source {
             self.water.copy_terrain_depth(e, source);
         }
-        if let Some(source) = terrain_depth_source {
-            // The water-edge reconstruction intentionally consumes terrain-only
-            // depth. Copy it before opaque scenery adds buildings and objects.
-            self.water.copy_terrain_depth(e, source);
-        }
-
         // Terrain is already in depth. Add static opaque scenery before building
         // Hi-Z so mountains, buildings and large world objects can also occlude
         // far-tree candidates. The standard scenery shader retains alpha cutout
