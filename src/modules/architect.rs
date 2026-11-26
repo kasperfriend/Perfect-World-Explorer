@@ -418,6 +418,13 @@ impl Architect {
     }
 
     fn portable_asset_path(&self, asset: &str) -> String {
+        if let Some((archive, entry)) = asset.split_once("::") {
+            let relative = Path::new(archive)
+                .strip_prefix(&self.client_root)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| archive.to_string());
+            return format!("{}::{}", relative.replace('\\', "/"), entry);
+        }
         Path::new(asset)
             .strip_prefix(&self.client_root)
             .map(|relative| relative.to_string_lossy().replace('\\', "/"))
