@@ -637,6 +637,37 @@ mod tests {
     }
 
     #[test]
+    fn opaque_building_occludes_covered_bounds_but_clear_holes_stay_visible() {
+        // Reversed-Z: terrain is farther (0.35); a large opaque structure writes
+        // a nearer surface (0.9). A tree behind its fully covered rectangle is
+        // safely occluded, but one clear-depth hole invalidates that evidence.
+        let mut depth = vec![0.35; 64 * 64];
+        for y in 8..56 {
+            for x in 8..56 {
+                depth[(y * 64 + x) as usize] = 0.9;
+            }
+        }
+        let (levels, dimensions) = pyramid(depth.clone(), 64, 64);
+        assert!(rectangle_occluded(
+            &levels,
+            &dimensions,
+            [12, 12, 20, 20],
+            0.7,
+            0.001
+        ));
+
+        depth[16 * 64 + 16] = 0.0;
+        let (levels, dimensions) = pyramid(depth, 64, 64);
+        assert!(!rectangle_occluded(
+            &levels,
+            &dimensions,
+            [12, 12, 20, 20],
+            0.7,
+            0.001
+        ));
+    }
+
+    #[test]
     fn mip_selection_bounds_sample_work_without_dropping_edge_cells() {
         let (levels, dimensions) = pyramid(vec![0.9; 1024 * 512], 1024, 512);
         assert!(rectangle_occluded(

@@ -3420,9 +3420,97 @@ impl Renderer {
         if let Some(source) = terrain_depth_source {
             self.water.copy_terrain_depth(e, source);
         }
-        // Terrain is the first opaque depth producer in this view. Build the
-        // matching hierarchy now, then compact this view's tree instances in
-        // the same command buffer before the tree draw consumes indirect args.
+        if let Some(source) = terrain_depth_source {
+            // The water-edge reconstruction intentionally consumes terrain-only
+            // depth. Copy it before opaque scenery adds buildings and objects.
+            self.water.copy_terrain_depth(e, source);
+        }
+
+        // Terrain is already in depth. Add static opaque scenery before building
+        // Hi-Z so mountains, buildings and large world objects can also occlude
+        // far-tree candidates. The standard scenery shader retains alpha cutout
+        // handling; blended SDR materials are deliberately excluded.
+        let world_slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
+        let local_end = if self.world_done {
+            self.object_start
+        } else {
+            self.water_start
+        };
+        let has_sdr = local_end > self.terrain_end
+            || if self.world_done {
+                self.world_draw_cmds[world_slot].chunks.iter().any(|c| {
+                    c.has_sdr
+                        && crate::world_objects::aabb_survives_clip(cull.clip_plane, c.min, c.max)
+                        && crate::world_objects::aabb_in_frustum(&cull.frustum, c.min, c.max)
+                })
+            } else {
+                !self.local_pages.is_empty()
+            };
+
+        let [opaque_scratch_cell, sdr_scratch_cell] = &self.world_draw_scratch;
+        let mut opaque_world_scratch = opaque_scratch_cell.borrow_mut();
+        let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("opaque scenery occluders after terrain"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        if let Some([x, y, w, h]) = scissor {
+            p.set_scissor_rect(x, y, w, h);
+        }
+        p.set_pipeline(&self.scenery_pipeline);
+        p.set_bind_group(0, bind, &[]);
+        p.set_vertex_buffer(0, self.vertex.slice(..));
+        p.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
+        if local_end > self.terrain_end {
+            p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
+        }
+        if !self.world_done {
+            for page in &self.local_pages {
+                page.draw_selected_culled(&mut p, reflected, pass_kind, cull, false);
+            }
+        }
+        // Avoid drawing both the local preload and its final world pages:
+        // their coplanar duplicates otherwise cause depth flicker.
+        if self.world_done {
+            crate::world_objects::GpuPage::draw_world_culled(
+                &self.world_pages,
+                &self.world_draw_cmds[world_slot],
+                &mut p,
+                reflected,
+                cull,
+                false,
+                &self.device,
+                &self.queue,
+                self.device
+                    .features()
+                    .contains(wgpu::Features::MULTI_DRAW_INDIRECT),
+                &mut opaque_world_scratch,
+            );
+        }
+        drop(p);
+        drop(opaque_world_scratch);
+
+        // The view-local hierarchy now contains depth-writing terrain and
+        // opaque static scenery only. It excludes transparent curtains, water,
+        // particles and animated receiving-model effects. Generate and consume
+        // it in this command buffer so no prior-frame visibility can leak across
+        // camera cuts, streaming changes or a different water view.
         if !ui_test() && !skip_trees_test() {
             let pyramid = if use_hiz { self.hiz.as_ref() } else { None };
             if let Some(pyramid) = pyramid {
@@ -3453,14 +3541,14 @@ impl Renderer {
                 extent,
             );
         }
-        // The render pass retains references to the indirect argument
-        // buffers until it ends. Hold independent scratch borrows for the
-        // opaque and SDR lists so each can bind its own persistent buffer.
-        let [opaque_scratch_cell, sdr_scratch_cell] = &self.world_draw_scratch;
-        let mut opaque_world_scratch = opaque_scratch_cell.borrow_mut();
+
+        // Tree candidates are tested against the completed opaque hierarchy.
+        // Trees and grass are drawn afterwards, so candidate geometry cannot
+        // occlude itself or another candidate. With Hi-Z unavailable, the same
+        // compute pass retains its frustum/LOD-only fallback.
         let mut sdr_world_scratch = sdr_scratch_cell.borrow_mut();
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("opaque scenery after terrain"),
+            label: Some("trees grass and blended scenery"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 resolve_target: None,
@@ -3488,56 +3576,9 @@ impl Renderer {
         }
         self.grass
             .draw(&mut p, bind, Some(&self.terrain_gpu.grass_light_bind));
-        p.set_pipeline(&self.scenery_pipeline);
-        p.set_bind_group(0, bind, &[]);
-        p.set_vertex_buffer(0, self.vertex.slice(..));
-        p.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
-        let local_end = if self.world_done {
-            self.object_start
-        } else {
-            self.water_start
-        };
-        if local_end > self.terrain_end {
-            p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
-        }
-        if !self.world_done {
-            for page in &self.local_pages {
-                page.draw_selected_culled(&mut p, reflected, pass_kind, cull, false);
-            }
-        }
-        // Do not submit world pages on top of the same locally streamed
-        // ornaments while preload is in progress: the coplanar duplicates
-        // caused depth flicker. Switch atomically only after all pages arrive.
-        let world_slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
-        if self.world_done {
-            crate::world_objects::GpuPage::draw_world_culled(
-                &self.world_pages,
-                &self.world_draw_cmds[world_slot],
-                &mut p,
-                reflected,
-                cull,
-                false,
-                &self.device,
-                &self.queue,
-                self.device
-                    .features()
-                    .contains(wgpu::Features::MULTI_DRAW_INDIRECT),
-                &mut opaque_world_scratch,
-            );
-        }
-        // The `.sdr.` water/lava curtains draw in their own blended pass over
-        // the finished scene: skip the entire pipeline bind & traversal when
-        // neither local geometry nor any visible world/local chunk carries SDR.
-        let has_sdr = local_end > self.terrain_end
-            || if self.world_done {
-                self.world_draw_cmds[world_slot].chunks.iter().any(|c| {
-                    c.has_sdr
-                        && crate::world_objects::aabb_survives_clip(cull.clip_plane, c.min, c.max)
-                        && crate::world_objects::aabb_in_frustum(&cull.frustum, c.min, c.max)
-                })
-            } else {
-                !self.local_pages.is_empty()
-            };
+
+        // Blended SDR curtains do not write depth and must never become Hi-Z
+        // occluders. Keep them in their existing post-opaque composition slot.
         if has_sdr {
             p.set_pipeline(&self.sdr_blend_pipeline);
             if local_end > self.terrain_end {
