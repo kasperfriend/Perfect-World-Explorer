@@ -157,8 +157,8 @@ struct Bucket {
     pipeline: PipelineKey,
     binding: wgpu::BindGroup,
     /// Whether `binding` points at the placeholder rather than the real
-    /// texture. A bucket built while the texture was missing must rebind
-    /// once it loads — the cache key matches, so nothing else would.
+    /// texture. A bucket built before a texture is successfully uploaded must
+    /// rebind if a real entry later becomes available under the same key.
     bound_fallback: bool,
 }
 
@@ -174,6 +174,9 @@ pub struct Draw {
     shader: wgpu::ShaderModule,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     textures: HashMap<u32, TextureEntry>,
+    /// Failed archive reads/texture uploads are stable for this renderer's
+    /// lifetime. Remember them so a missing asset is not re-read every frame.
+    failed_textures: std::collections::HashSet<u32>,
     texture_ids: HashMap<String, u32>,
     texture_names: Vec<String>,
     buckets: HashMap<BucketKey, Bucket>,
@@ -204,6 +207,9 @@ pub struct Draw {
     prev_motion_vp: Option<[[f32; 4]; 4]>,
     /// This frame's groups in draw order: `(key, first_vertex, vertex_count)`.
     order: Vec<(BucketKey, u32, u32)>,
+    /// Reused outer bucket vector; allocating this once per frame caused
+    /// persistent allocator churn in the animated-effects render path.
+    group_scratch: Vec<(BucketKey, Vec<Vertex>)>,
     scratch_index: HashMap<BucketKey, usize>,
     scratch_pool: Vec<Vec<Vertex>>,
     failed: Vec<String>,
@@ -450,6 +456,7 @@ impl Draw {
             shader,
             pipelines: HashMap::new(),
             textures: HashMap::new(),
+            failed_textures: std::collections::HashSet::new(),
             texture_ids: HashMap::new(),
             texture_names: Vec::new(),
             buckets: HashMap::new(),
@@ -464,6 +471,7 @@ impl Draw {
             sampler_clamp,
             fallback,
             order: Vec::new(),
+            group_scratch: Vec::new(),
             scratch_index: HashMap::new(),
             scratch_pool: Vec::new(),
             failed: Vec::new(),
@@ -616,7 +624,9 @@ impl Draw {
         }
         // Group and order: `RenderLayer` first, then depth-tested quads, then
         // the blend pair and the texture so a group reuses one pipeline.
-        let mut groups: Vec<(BucketKey, Vec<Vertex>)> = Vec::with_capacity(self.order.len().max(8));
+        let mut groups = std::mem::take(&mut self.group_scratch);
+        groups.clear();
+        groups.reserve(self.order.len().max(8));
         self.scratch_index.clear();
         let mut last_tex: Option<(&str, u32)> = None;
         for quad in quads {
@@ -721,7 +731,9 @@ impl Draw {
             if vertices.is_empty() {
                 continue;
             }
-            if !self.textures.contains_key(&key.texture) {
+            if !self.textures.contains_key(&key.texture)
+                && !self.failed_textures.contains(&key.texture)
+            {
                 let tex_name = self.texture_names[key.texture as usize].clone();
                 match read(&tex_name) {
                     Ok(bytes) => {
@@ -736,14 +748,21 @@ impl Draw {
                                 self.textures
                                     .insert(key.texture, TextureEntry { texture, view });
                             }
-                            Err(error) => self.note_failure(&tex_name, &error),
+                            Err(error) => {
+                                self.failed_textures.insert(key.texture);
+                                self.note_failure(&tex_name, &error);
+                            }
                         }
                     }
                     // The element still draws, with the white stand-in: the
                     // quads and their authored colour survive (the NOTEX
-                    // vertex-colour law), only the map is lost. Returning here
-                    // instead would delete the bucket and the element with it.
-                    Err(error) => self.note_failure(&tex_name, &error),
+                    // vertex-colour law), only the map is lost. Cache the
+                    // failure too: archive reads and decode attempts cannot
+                    // make a permanently missing member appear on the next frame.
+                    Err(error) => {
+                        self.failed_textures.insert(key.texture);
+                        self.note_failure(&tex_name, &error);
+                    }
                 }
             }
             let entry = self.textures.get(&key.texture).unwrap_or(&self.fallback);
@@ -834,7 +853,7 @@ impl Draw {
         }
         const MAX_SCRATCH_POOL: usize = 64;
         const MAX_SCRATCH_VERTS: usize = 8_192;
-        for (_, mut verts) in groups {
+        for (_, mut verts) in groups.drain(..) {
             if self.scratch_pool.len() < MAX_SCRATCH_POOL {
                 verts.clear();
                 if verts.capacity() > MAX_SCRATCH_VERTS {
@@ -843,6 +862,7 @@ impl Draw {
                 self.scratch_pool.push(verts);
             }
         }
+        self.group_scratch = groups;
         Ok(())
     }
 
