@@ -5613,6 +5613,8 @@ pub fn run(
     // almost never changes them.
     // The last element says whether the whole-world preload owns the scenery, so
     // the worker can leave the local half of the mesh out (see `build`).
+    let architect_scene = t.scene.clone();
+    let architect_ornaments = t.objects.ornaments.clone();
     let (request_tx, request_rx) =
         std::sync::mpsc::channel::<(f32, f32, DetailSettings, u64, bool)>();
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<MeshData, String>>(1);
@@ -7605,7 +7607,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     if settings.show_zone_entry {if let Some((name,started))=&zone_banner {let elapsed=started.elapsed().as_secs_f32();if elapsed<4. {let alpha=(elapsed.min(4.-elapsed)*2.).clamp(0.,1.);egui::Area::new(egui::Id::new("zone-entry")).anchor(egui::Align2::CENTER_TOP,egui::vec2(0.,65.)).interactable(false).show(ctx,|ui|{ui.label(egui::RichText::new(format!("Entering {name}")).size(24.).color(egui::Color32::from_white_alpha((alpha*255.) as u8)));});}}}
                                     } else {
                                         menu_page = MenuPage::Closed;
-                                        architect_map_request = renderer.modules.architect_ui(ctx, &catalog, &current_map, &t.scene, &t.objects.ornaments, camera.pos);
+                                        architect_map_request = renderer.modules.architect_ui(ctx, &catalog, &current_map, &architect_scene, &architect_ornaments, camera.pos);
                                     }
                                 });
                                 if let Some(requested) = architect_map_request {
