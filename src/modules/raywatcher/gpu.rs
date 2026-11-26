@@ -3632,6 +3632,9 @@ pub struct RaywatcherGpu {
     dxr: Option<super::dxr::DxrTracer>,
     dxr_failed: bool,
     dxr_init: Option<std::sync::mpsc::Receiver<Result<super::dxr::DxrTracer, String>>>,
+    /// Scene snapshot owned by the single in-flight DXR build. Newer scenes
+    /// are coalesced and rebuilt sequentially when this worker completes.
+    dxr_init_scene: Option<Arc<super::bvh::SceneGeometry>>,
     dlss_rr: Option<super::reconstruct::DlssRayReconstructor>,
     dlss_rr_failed: bool,
     dlss_rr_error: Option<String>,
@@ -3943,6 +3946,7 @@ impl RaywatcherGpu {
             dxr: None,
             dxr_failed: false,
             dxr_init: None,
+            dxr_init_scene: None,
             dlss_rr: None,
             dlss_rr_failed: false,
             dlss_rr_error: None,
@@ -4589,6 +4593,48 @@ impl RaywatcherGpu {
         }
     }
 
+    /// Rebuild an existing DXR tracer for the newest scene. At most one DXR
+    /// worker is allowed in flight; its result is tagged with the Arc snapshot
+    /// it built so intermediate scene changes can be coalesced.
+    fn begin_dxr_scene_rebuild(
+        &mut self,
+        mut tracer: super::dxr::DxrTracer,
+        scene: Arc<super::bvh::SceneGeometry>,
+    ) {
+        debug_assert!(self.dxr_init.is_none());
+        if self.dxr_init.is_some() {
+            self.dxr_failed = true;
+            eprintln!("[Raywatcher] Refusing overlapping DXR scene rebuild; using Software");
+            return;
+        }
+        let worker_scene = scene.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawn = std::thread::Builder::new()
+            .name("pwe-raywatcher-dxr-scene".to_string())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let result = tracer.set_scene(&worker_scene).map(|()| tracer);
+                eprintln!(
+                    "[Raywatcher] Background DXR scene/AS rebuild took {:.1}s ({} triangles, success={})",
+                    started.elapsed().as_secs_f32(),
+                    worker_scene.triangles.len(),
+                    result.is_ok()
+                );
+                let _ = tx.send(result);
+            });
+        match spawn {
+            Ok(_) => {
+                self.dxr_init = Some(rx);
+                self.dxr_init_scene = Some(scene);
+            }
+            Err(err) => {
+                self.dxr_init_scene = None;
+                self.dxr_failed = true;
+                eprintln!("[Raywatcher] Could not start DXR scene rebuild worker ({err}); using Software");
+            }
+        }
+    }
+
     fn begin_dxr_initialization(&mut self) {
         if self.dxr.is_some() || self.dxr_failed || self.dxr_init.is_some() {
             return;
@@ -4599,28 +4645,60 @@ impl RaywatcherGpu {
         let render_extent = self.render_extent;
         let triangle_count = scene.triangles.len();
         let (tx, rx) = std::sync::mpsc::channel();
-        let spawn = std::thread::Builder::new().name("pwe-raywatcher-dxr-init".to_string()).spawn(move || {
-            let started = std::time::Instant::now();
-            let result = super::dxr::DxrTracer::new(&worker_device, &scene, grid_extent, render_extent);
-            eprintln!("[Raywatcher] Background DXR build finished in {:.1}s ({} triangles, success={})", started.elapsed().as_secs_f32(), triangle_count, result.is_ok());
-            let _ = tx.send(result);
-        });
+        let worker_scene = scene.clone();
+        let spawn = std::thread::Builder::new()
+            .name("pwe-raywatcher-dxr-init".to_string())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let result = super::dxr::DxrTracer::new(
+                    &worker_device,
+                    &worker_scene,
+                    grid_extent,
+                    render_extent,
+                );
+                eprintln!(
+                    "[Raywatcher] Background DXR build finished in {:.1}s ({} triangles, success={})",
+                    started.elapsed().as_secs_f32(),
+                    triangle_count,
+                    result.is_ok()
+                );
+                let _ = tx.send(result);
+            });
         match spawn {
-            Ok(_) => self.dxr_init = Some(rx),
+            Ok(_) => {
+                self.dxr_init = Some(rx);
+                self.dxr_init_scene = Some(scene);
+            }
             Err(err) => {
+                self.dxr_init_scene = None;
                 self.dxr_failed = true;
                 eprintln!("[Raywatcher] Could not start DXR initialization worker ({err}); using Software");
             }
         }
     }
 
+    /// false means the sole in-flight worker is still running, or a stale
+    /// result was immediately queued against the latest scene.
     fn poll_dxr_initialization(&mut self, device: &wgpu::Device) -> bool {
         let Some(rx) = self.dxr_init.as_ref() else {
             return true;
         };
+        let built_scene = self.dxr_init_scene.clone();
         match rx.try_recv() {
             Ok(Ok(mut tracer)) => {
                 self.dxr_init = None;
+                self.dxr_init_scene = None;
+                if !built_scene
+                    .as_ref()
+                    .is_some_and(|built| std::sync::Arc::ptr_eq(built, &self.scene_geom))
+                {
+                    // The camera/world changed during the build. Reuse the now
+                    // initialised tracer, but build only the latest scene; do
+                    // not throw away the expensive tracer or start another
+                    // independent DxrTracer::new() worker.
+                    self.begin_dxr_scene_rebuild(tracer, self.scene_geom.clone());
+                    return false;
+                }
                 if let Err(err) = tracer.resize(device, self.grid_extent, self.render_extent) {
                     self.dxr_failed = true;
                     eprintln!("[Raywatcher] DXR target resize after background init failed ({err}); using Software");
@@ -4631,6 +4709,7 @@ impl RaywatcherGpu {
             }
             Ok(Err(err)) => {
                 self.dxr_init = None;
+                self.dxr_init_scene = None;
                 self.dxr_failed = true;
                 eprintln!("[Raywatcher] DXR 1.1 init failed ({err}); falling back to Software");
                 true
@@ -4638,6 +4717,7 @@ impl RaywatcherGpu {
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.dxr_init = None;
+                self.dxr_init_scene = None;
                 self.dxr_failed = true;
                 eprintln!("[Raywatcher] DXR initialization worker exited without a result; falling back to Software");
                 true
@@ -4649,10 +4729,15 @@ impl RaywatcherGpu {
         self.dxr_init.is_some()
     }
 
-    /// Whether the previous frame produced a complete RT output. The host
-    /// queries this before the raster pass, so no raster term is removed until
-    /// its RT replacement is available. A pending DXR rebuild does not make
-    /// the active Software fallback unready.
+    /// Render output extent. The host must keep raster terms enabled if the
+    /// previous RT image belongs to a different viewport size.
+    pub fn render_extent(&self) -> (u32, u32) {
+        self.render_extent
+    }
+
+    /// Whether the previous frame produced a complete RT output. During DXR
+    /// preparation the host may keep displaying that stable image, but must
+    /// not claim a newly resized or never-produced target is ready.
     pub fn can_replace_raster_effects(&self) -> bool {
         self.traced_last_frame
     }
@@ -4664,37 +4749,20 @@ impl RaywatcherGpu {
     /// Replace the scene. Called when the resident terrain set, tree set or
     /// water areas change.
     pub fn set_scene(&mut self, device: &wgpu::Device, scene: Arc<super::bvh::SceneGeometry>) {
-        // Drop the previous receiver before replacing its scene. A completed
-        // stale build is dropped on its worker if its receiver has disappeared.
-        self.dxr_init = None;
+        // Do not drop dxr_init: dropping the receiver does not stop its detached
+        // worker, and the next frame would start another full acceleration-
+        // structure build. Keep the sole worker and let poll_dxr_initialization
+        // notice that its scene snapshot is stale, then rebuild the newest one.
         let old_dxr = self.dxr.take();
         self.scene_geom = scene.clone();
         self.scene = SceneBuffers::upload(device, scene.clone());
         self.prev_view_projection = None;
         self.frames = 0;
-        self.traced_last_frame = false;
-        if let Some(mut dxr) = old_dxr {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let worker_scene = scene;
-            let spawn = std::thread::Builder::new()
-                .name("pwe-raywatcher-dxr-scene".to_string())
-                .spawn(move || {
-                    let started = std::time::Instant::now();
-                    let result = dxr.set_scene(&worker_scene).map(|()| dxr);
-                    eprintln!(
-                        "[Raywatcher] Background DXR scene/AS rebuild took {:.1}s (success={})",
-                        started.elapsed().as_secs_f32(),
-                        result.is_ok()
-                    );
-                    let _ = tx.send(result);
-                });
-            match spawn {
-                Ok(_) => self.dxr_init = Some(rx),
-                Err(err) => {
-                    self.dxr_failed = true;
-                    eprintln!("[Raywatcher] Could not start DXR scene rebuild worker ({err}); using Software");
-                }
-            }
+        // Keep the last complete output available while a replacement AS builds.
+        // record() freezes it and returns to the raster pass instead of running
+        // a full Software trace in parallel with an expensive Hardware build.
+        if let Some(dxr) = old_dxr {
+            self.begin_dxr_scene_rebuild(dxr, scene);
         }
         self.trace_bind_group = Self::trace_bindings(
             device,
@@ -4734,6 +4802,7 @@ impl RaywatcherGpu {
         walker_pos: Option<(glam::Vec3, bool)>,
         walker_rt_verts: &[[f32; 3]],
     ) {
+        let output_was_ready = self.traced_last_frame;
         self.traced_last_frame = false;
         if !plan.trace {
             return;
@@ -4744,8 +4813,20 @@ impl RaywatcherGpu {
         // texture (`Transfer(InvalidDepthTextureExtent)` otherwise). Resize
         // internal render targets first if the incoming depth extent differs.
         let depth_ext = (depth.width().max(1), depth.height().max(1));
-        if depth_ext != self.render_extent {
+        let resized = depth_ext != self.render_extent;
+        if resized {
             self.resize(device, depth_ext, plan.grid);
+        }
+        // Build/poll DXR before recording the G-buffer or trace dispatch. While
+        // Hardware is preparing a new AS, retain the previous complete RT image
+        // (or leave the raster untouched on first use) instead of doubling the
+        // load with a Software trace on every frame.
+        if hardware_mode && !self.dxr_failed && self.dxr.is_none() {
+            self.begin_dxr_initialization();
+            if !self.poll_dxr_initialization(device) {
+                self.traced_last_frame = output_was_ready && !resized && depth_ext == self.render_extent;
+                return;
+            }
         }
         let (rw, rh) = self.render_extent;
         encoder.copy_texture_to_texture(
@@ -4858,7 +4939,11 @@ impl RaywatcherGpu {
         } else {
             0.0
         };
-        packed.restir[1] = 4.0;
+        // Plan::grid_scale budgets pixels * plan.samples. Allowing the shader
+        // to adapt up to four samples here silently multiplied that budget by
+        // as much as 4x, causing GPU spikes. Keep the shader ceiling inside the
+        // exact sample count used by the planner (for both Software and DXR).
+        packed.restir[1] = plan.samples.clamp(1, 8) as f32;
         packed.restir[2] = 4.0;
         packed.restir[3] = (self.frames & 1) as f32;
         if has_object_mv {
@@ -4889,14 +4974,6 @@ impl RaywatcherGpu {
             && !self.dlss_rr_failed;
 
         let mut traced_hw = false;
-        if hardware_mode && !self.dxr_failed && self.dxr.is_none() {
-            self.begin_dxr_initialization();
-            // DXR construction/rebuild is asynchronous. Keep dispatching the
-            // already-available Software tracer while it runs; returning here
-            // would skip the entire RT composite for a frame and flash every
-            // replaced raster effect back on.
-            let _ = self.poll_dxr_initialization(device);
-        }
 
         // Track the backend actually used for this frame, not the requested
         // mode. During a scene/AS rebuild DXR is temporarily unavailable, so
@@ -6422,7 +6499,15 @@ mod dxr_backend_selection_tests {
     use super::hardware_trace_ready;
 
     #[test]
-    fn hardware_scene_rebuild_keeps_software_path_available_until_dxr_is_ready() {
+    fn adaptive_ray_ceiling_is_the_sample_count_included_in_the_plan() {
+        for samples in 1..=8 {
+            let ceiling = samples.clamp(1, 8) as f32;
+            assert_eq!(ceiling, samples as f32);
+        }
+    }
+
+    #[test]
+    fn hardware_scene_rebuild_does_not_report_hardware_ready_until_dxr_is_ready() {
         assert!(!hardware_trace_ready(true, false, false, true));
         assert!(!hardware_trace_ready(true, false, false, false));
         assert!(hardware_trace_ready(true, false, true, false));
