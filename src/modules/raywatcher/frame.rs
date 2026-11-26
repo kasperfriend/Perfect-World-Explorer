@@ -892,9 +892,16 @@ mod tests {
         record.fog_range = (0.0, 0.0);
         assert_eq!(record.environment(), Vec3::ZERO);
         record.fog_colour = Vec3::new(0.6, 0.7, 0.9);
-        assert_eq!(record.environment(), Vec3::ZERO, "disabled fog must not tint sky misses");
+        assert_eq!(
+            record.environment(),
+            Vec3::ZERO,
+            "disabled fog must not tint sky misses"
+        );
         record.fog_range = (0.0, 400.0);
-        assert!(record.environment().z > 0.5, "enabled fog supplies the horizon radiance");
+        assert!(
+            record.environment().z > 0.5,
+            "enabled fog supplies the horizon radiance"
+        );
     }
 
     #[test]
