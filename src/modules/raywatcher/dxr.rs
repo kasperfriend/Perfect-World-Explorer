@@ -1232,7 +1232,9 @@ mod imp {
                 }
                 let blas_inputs = BuildAsInputs {
                     ty: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
-                    flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                    // This scene is created/rebuilt on demand. Prefer finishing
+                    // startup quickly; traversal still uses hardware DXR.
+                    flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
                     num_descs: geoms.len() as UINT,
                     descs_layout: D3D12_ELEMENTS_LAYOUT_ARRAY,
                     u: BuildInputsUnion {
@@ -1285,7 +1287,7 @@ mod imp {
 
                 let tlas_inputs = BuildAsInputs {
                     ty: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-                    flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                    flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
                     num_descs: 1,
                     descs_layout: D3D12_ELEMENTS_LAYOUT_ARRAY,
                     u: BuildInputsUnion {

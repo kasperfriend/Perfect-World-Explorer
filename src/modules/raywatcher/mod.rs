@@ -98,6 +98,8 @@ pub struct Raywatcher {
     pending_reset: bool,
     /// Why hardware rays are unavailable, for the tab.
     hardware_note: Option<String>,
+    /// True while the one-time DXR capability probe is running off-thread.
+    hardware_probing: bool,
     /// True while the background worker thread is rebuilding the BVH.
     scene_building: bool,
     /// True while Raywatcher's GPU pipelines or DXR acceleration structures initialize off-thread.
@@ -121,6 +123,7 @@ impl Default for Raywatcher {
             frame: 0,
             pending_reset: true,
             hardware_note: None,
+            hardware_probing: false,
             scene_building: false,
             hardware_initializing: false,
             sdk_fallback_note: None,
@@ -203,6 +206,10 @@ impl Raywatcher {
     /// here) is what makes the whole decision surface testable without a GPU.
     pub fn set_hardware_note(&mut self, note: Option<String>) {
         self.hardware_note = note;
+    }
+
+    pub fn set_hardware_probing(&mut self, probing: bool) {
+        self.hardware_probing = probing;
     }
 
     pub fn configure(&mut self, ray_queries: bool, sdk_present: (bool, bool)) {
@@ -370,7 +377,8 @@ impl Raywatcher {
         ui.horizontal(|ui| {
             ui.label("Mode");
             for mode in RayTracingMode::ALL {
-                let enabled = mode != RayTracingMode::Hardware || self.hardware_rays;
+                let enabled = mode != RayTracingMode::Hardware
+                    || (self.hardware_rays && !self.hardware_probing);
                 let response = ui.add_enabled(
                     enabled,
                     egui::SelectableLabel::new(settings.mode == mode, mode.label()),
@@ -378,7 +386,9 @@ impl Raywatcher {
                 if response.clicked() {
                     settings.mode = mode;
                 }
-                if mode == RayTracingMode::Hardware && !self.hardware_rays {
+                if mode == RayTracingMode::Hardware && self.hardware_probing {
+                    response.on_hover_text("Checking DXR 1.1 hardware support in the background");
+                } else if mode == RayTracingMode::Hardware && !self.hardware_rays {
                     response.on_hover_text(
                         self.hardware_note
                             .as_deref()
@@ -575,6 +585,12 @@ impl Raywatcher {
         sdk_line.on_hover_text(format!("Resolved SDK folder: {}", self.sdk_dir.display()));
         if let Some(note) = &self.sdk_fallback_note {
             ui.label(egui::RichText::new(note).small().weak());
+        }
+        if self.hardware_probing {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Checking DXR 1.1 hardware support in the background…",
+            );
         }
         if self.hardware_initializing {
             ui.colored_label(

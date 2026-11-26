@@ -797,10 +797,10 @@ uint adaptive_ray_samples(uint2 pixel, float dist, float3 normal, float roughnes
     }
     float complexity = max(normal_edge * 2.0, max(depth_edge * 5.0, colour_edge * 2.0));
     complexity = max(complexity, (1.0 - smoothstep(0.0, 320.0, dist)) * 0.20);
+    // Native water uses a deterministic planar mirror ray. Extra random
+    // samples would trace the identical direction repeatedly.
+    if (roughness <= 0.12) return base;
     complexity = max(complexity, saturate((0.36 - roughness) / 0.36) * 0.20);
-    if (roughness <= 0.12) {
-        complexity = max(complexity, 0.42);
-    }
     bool gi_enabled = ((uint(round(params.effects.y)) & 16u) != 0u)
         && params.frame.z >= 1.0 && params.tuning.w > 0.0;
     if (gi_enabled) {
@@ -1215,13 +1215,17 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             // Native game water is a flat glossy dielectric: no animated wave
             // normals. Use the raster normal for both water and non-water surfaces.
             float3 refl_base_n = shade_normal;
-            float3 h = ggx_sample(refl_base_n, eff_roughness, rand01(state), rand01(state));
+            // GGX remains for glossy scenery; native water is a perfect
+            // planar dielectric mirror and must not use stochastic microfacets.
+            float3 h = is_water
+                ? refl_base_n
+                : ggx_sample(refl_base_n, eff_roughness, rand01(state), rand01(state));
             float3 reflect_dir = reflect(view_dir, h);
             if (dot(reflect_dir, refl_base_n) <= 0.0) {
                 reflect_dir = reflect(view_dir, refl_base_n);
             }
             // Feature #6: Conductor Fresnel for gold/steel armor/weapons/roofs; matte stays matte.
-            float f0 = is_water ? 0.18 : (metalness > 0.1 ? 0.55 : 0.04);
+            float f0 = is_water ? 0.0204 : (metalness > 0.1 ? 0.55 : 0.04);
             float m = 1.0 - saturate(dot(-view_dir, h));
             float m2 = m * m;
             float fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);

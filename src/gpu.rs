@@ -1818,6 +1818,8 @@ struct Renderer {
     /// it. `Plan::OFF` on a frame the module is not tracing.
     raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan,
     raywatcher_hw_probe: Option<(bool, Option<String>)>,
+    /// The one-time DXR capability check runs off the renderer thread.
+    raywatcher_hw_probe_init: Option<std::sync::mpsc::Receiver<(bool, Option<String>)>>,
     /// The raster effects this frame's ray pass replaces. Read by `render` so a
     /// replaced effect is not drawn, and by the tab so it can say which.
     raywatcher_overrides: crate::modules::raywatcher::frame::RasterOverrides,
@@ -2598,6 +2600,7 @@ impl Renderer {
             last_sky_frame: None,
             raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan::OFF,
             raywatcher_hw_probe: None,
+            raywatcher_hw_probe_init: None,
             raywatcher_overrides: crate::modules::raywatcher::frame::RasterOverrides::NONE,
             module_format: format.remove_srgb_suffix(),
             models,
@@ -3812,12 +3815,53 @@ impl Renderer {
             );
             (dlss.available, fsr.available)
         };
-        // Probe DXR Tier 1.1 (`RayQuery`) directly on the underlying DX12
-        // device once per session so RTX 20/30/40/50, RDNA2+, and Intel Arc
-        // GPUs run Hardware mode on their RT cores.
+        // Probe DXR Tier 1.1 once per session, but never call the native
+        // driver/COM capability path on the render thread. A slow driver check
+        // must not freeze the window when Raywatcher first becomes available.
+        if self.raywatcher_hw_probe.is_none() && self.raywatcher_hw_probe_init.is_none() {
+            let worker_device = std::sync::Arc::clone(&self.device);
+            let (tx, rx) = std::sync::mpsc::channel();
+            match std::thread::Builder::new()
+                .name("pwe-raywatcher-dxr-probe".to_string())
+                .spawn(move || {
+                    let result = crate::modules::raywatcher::dxr::probe_hardware_rt(&worker_device);
+                    let _ = tx.send(result);
+                })
+            {
+                Ok(_) => self.raywatcher_hw_probe_init = Some(rx),
+                Err(err) => {
+                    self.raywatcher_hw_probe = Some((
+                        false,
+                        Some(format!("Could not start DXR capability probe ({err})")),
+                    ));
+                }
+            }
+        }
+        if self.raywatcher_hw_probe.is_none() {
+            match self.raywatcher_hw_probe_init.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(result)) => {
+                    self.raywatcher_hw_probe_init = None;
+                    self.raywatcher_hw_probe = Some(result);
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                    self.modules.raywatcher_mut().set_hardware_probing(true);
+                    self.raywatcher_frame_plan = crate::modules::raywatcher::plan::Plan::OFF;
+                    return RasterOverrides::NONE;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) | None => {
+                    self.raywatcher_hw_probe_init = None;
+                    self.raywatcher_hw_probe = Some((
+                        false,
+                        Some("DXR capability probe worker exited without a result".to_string()),
+                    ));
+                }
+            }
+        }
+        self.modules.raywatcher_mut().set_hardware_probing(false);
         let (ray_queries, hw_note) = self
             .raywatcher_hw_probe
-            .get_or_insert_with(|| crate::modules::raywatcher::dxr::probe_hardware_rt(&self.device))
+            .as_ref()
+            .expect("DXR probe result is cached before planning")
             .clone();
         {
             let module = self.modules.raywatcher_mut();
@@ -4057,8 +4101,6 @@ impl Renderer {
 
             let mut real_meshes = Vec::new();
             let mut page_tris = Vec::new();
-            let mut real_mesh_pages = 0usize;
-            let proxy_fallback_models = 0usize;
             let proxies = Vec::new();
             let pages_slice = if self.world_done {
                 &self.world_pages[..]
@@ -4091,55 +4133,25 @@ impl Renderer {
                 let page = &pages_slice[idx];
                 let tris = page.rt_triangles();
                 if !tris.is_empty() {
-                    real_mesh_pages += 1;
                     page_tris.push(page.rt_triangles_arc());
                 }
             }
             // Do not emit coarse axis-aligned bounding boxes (`InstanceProxy`):
             // solid boxes create rectangular shadow blocks and boxy water
             // reflections. Real meshes already cover the full detail bubble.
-            // Phase 4: Harvest the runtime SpeedTree LOD geometry the raster draws,
-            // with the same camera-facing leaf transform and height/scale LOD bands.
-            // Under the RT triangle budget, only real coarser SpeedTree LODs are used;
-            // no synthetic crossed-card proxy is injected.
-            let tree_lod_scale =
-                self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees);
-            let tree_tri_budget = 420_000usize;
-            let mut tree_tris = Vec::with_capacity(65_536);
-            let (real_tree_instances, real_tree_tris, tree_budget_skips) =
-                self.far_trees.harvest_rt_triangles(
-                    camera.pos,
-                    camera.direction(),
-                    detail_radius.min(640.0),
-                    tree_lod_scale,
-                    tree_tri_budget,
-                    &mut tree_tris,
-                );
-            real_meshes.reserve(tree_tris.len());
-            for t in tree_tris {
-                real_meshes.push(MeshTriangle {
-                    a: t.a,
-                    b: t.b,
-                    c: t.c,
-                    normal: t.normal,
-                    albedo: t.albedo,
-                    roughness: t.roughness,
-                    opacity: t.opacity,
-                    alpha_mask: t.alpha_mask,
-                });
-            }
-            if std::env::var_os("PWE_RT_DEBUG").is_some() {
-                eprintln!(
-                    "[Raywatcher] harvest: {} real-mesh pages ({} total tris), {} proxy fallbacks, trees(real_inst={}, real_tris={}, budget_skips={}) (detail_radius={:.0})",
-                    real_mesh_pages,
-                    real_meshes.len(),
-                    proxy_fallback_models,
-                    real_tree_instances,
-                    real_tree_tris,
-                    tree_budget_skips,
-                    detail_radius,
-                );
-            }
+            // Share immutable SpeedTree RT geometry with the existing background
+            // scene worker. Expanding nearby placements and camera-facing LODs can
+            // involve hundreds of thousands of triangles; do not do that on the
+            // render/UI thread when Hardware is enabled.
+            let tree_species = self.far_trees.rt_species_snapshot();
+            let tree_harvest = crate::modules::raywatcher::harvest::TreeHarvestConfig {
+                eye: camera.pos,
+                view_direction: camera.direction(),
+                max_distance: detail_radius.min(640.0),
+                lod_scale: self.detail.tree_lod_scale
+                    * lod_scale(self.detail.scenery_quality, Class::Trees),
+                triangle_budget: 420_000,
+            };
             // Diagnostics log is written immediately on toggle-on and every 4s above.
 
             // Reflective water surfaces across the visible frustum.
@@ -4174,6 +4186,8 @@ impl Renderer {
                 real_meshes,
                 proxies,
                 water,
+                tree_species,
+                tree_harvest,
                 skip_cpu_bvh,
             );
         }

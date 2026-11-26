@@ -78,6 +78,18 @@ impl Default for HarvestConfig {
     }
 }
 
+/// Inputs for expanding the resident SpeedTree LOD cache into real RT
+/// triangles. The cache is an Arc snapshot, so this work runs on the scene
+/// worker instead of blocking the renderer when Hardware mode is selected.
+#[derive(Clone, Copy, Debug)]
+pub struct TreeHarvestConfig {
+    pub eye: Vec3,
+    pub view_direction: Vec3,
+    pub max_distance: f32,
+    pub lod_scale: f32,
+    pub triangle_budget: usize,
+}
+
 /// Camera view frustum (six inward-pointing half-space planes) extracted from a
 /// reversed-Z `view_projection` matrix (`z_ndc` in `[0, 1]`).
 #[derive(Clone, Copy, Debug)]
@@ -479,6 +491,8 @@ impl Harvester {
         mut real_meshes: Vec<MeshTriangle>,
         instances: Vec<InstanceProxy>,
         water: Vec<WaterSurface>,
+        tree_species: std::sync::Arc<[crate::far_trees_gpu::RtTreeSpecies]>,
+        tree_harvest: TreeHarvestConfig,
         skip_cpu_bvh: bool,
     ) {
         if self.pending_bg.is_some() {
@@ -520,6 +534,41 @@ impl Harvester {
                 let mut triangles = Vec::with_capacity(512_000);
                 let mut materials = Vec::with_capacity(2048);
                 let mut terrain_lod_tris = [0usize; 4];
+
+                // SpeedTree placement/LOD expansion used to run synchronously
+                // in Renderer::raywatcher_record and could hold the UI for tens
+                // of seconds in dense regions. Keep the resident LOD data shared
+                // and expand it here, with the same cancellation token as the
+                // rest of the scene build.
+                let tree_started = std::time::Instant::now();
+                let mut tree_tris = Vec::with_capacity(tree_harvest.triangle_budget.min(65_536));
+                let (real_tree_instances, real_tree_tris, tree_budget_skips) =
+                    crate::far_trees_gpu::harvest_rt_tree_species(
+                        tree_species.as_ref(),
+                        tree_harvest.eye,
+                        tree_harvest.view_direction,
+                        tree_harvest.max_distance,
+                        tree_harvest.lod_scale,
+                        tree_harvest.triangle_budget,
+                        &mut tree_tris,
+                    );
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                real_meshes.reserve(tree_tris.len());
+                for t in tree_tris {
+                    real_meshes.push(MeshTriangle {
+                        a: t.a,
+                        b: t.b,
+                        c: t.c,
+                        normal: t.normal,
+                        albedo: t.albedo,
+                        roughness: t.roughness,
+                        opacity: t.opacity,
+                        alpha_mask: t.alpha_mask,
+                    });
+                }
+                let tree_harvest_ms = tree_started.elapsed().as_secs_f64() * 1000.0;
                 if let Some(ground_fn) = ground {
                     let Some(lod) = push_terrain_frustum_cancellable(
                         &mut triangles,
@@ -663,7 +712,7 @@ impl Harvester {
                         }
                     }
                     eprintln!(
-                        "[Raywatcher] bg_build: kinds(water={k_water}, terrain_lod={k_terrain}, real_mesh={k_mesh}, tree_proxy={k_proxy}) water_quads={water_quads} lod_terrain_tris=[near:{}, mid:{}, far:{}, vfar:{}] real_mesh_tris={real_mesh_tris} proxy_tris={proxy_tris} total_tris={total_tris} bvh_build_ms={bvh_ms:.2} total_ms={total_ms:.2}",
+                        "[Raywatcher] bg_build: kinds(water={k_water}, terrain_lod={k_terrain}, real_mesh={k_mesh}, tree_proxy={k_proxy}) water_quads={water_quads} lod_terrain_tris=[near:{}, mid:{}, far:{}, vfar:{}] real_mesh_tris={real_mesh_tris} trees(instances={real_tree_instances}, tris={real_tree_tris}, budget_skips={tree_budget_skips}, harvest_ms={tree_harvest_ms:.1}) proxy_tris={proxy_tris} total_tris={total_tris} bvh_build_ms={bvh_ms:.2} total_ms={total_ms:.2}",
                         terrain_lod_tris[0],
                         terrain_lod_tris[1],
                         terrain_lod_tris[2],

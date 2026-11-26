@@ -387,7 +387,7 @@ pub struct FarTrees {
     instances: wgpu::Buffer,
     batches: Vec<Batch>,
     groups: Vec<Group>,
-    rt_species: Vec<RtTreeSpecies>,
+    rt_species: std::sync::Arc<[RtTreeSpecies]>,
     /// Slots in the instance buffer: three level slices per placement.
     capacity: usize,
     last_resident_update: Option<([f32; 3], f32, Option<[f32; 4]>)>,
@@ -1423,7 +1423,7 @@ impl FarTrees {
             instances,
             batches,
             groups,
-            rt_species,
+            rt_species: rt_species.into(),
             capacity,
             last_resident_update: None,
             lod_pipeline,
@@ -1452,6 +1452,13 @@ impl FarTrees {
     /// level cannot fit the triangle budget; skips an instance if none can fit.
     ///
     /// Returns `(real_tree_instances, real_tree_tris, budget_skips)`.
+    /// Cheap immutable snapshot for the Raywatcher scene worker. The backing
+    /// species/LOD geometry is shared; no tree mesh data is copied on the
+    /// render thread when RT scene construction starts.
+    pub fn rt_species_snapshot(&self) -> std::sync::Arc<[RtTreeSpecies]> {
+        std::sync::Arc::clone(&self.rt_species)
+    }
+
     pub fn harvest_rt_triangles(
         &self,
         eye: glam::Vec3,
@@ -1464,7 +1471,7 @@ impl FarTrees {
         // Opt #30: Pre-allocate RT tree triangle staging Vec to eliminate multi-MB reallocs during harvest.
         out.reserve(tri_budget.min(65_536));
         harvest_rt_tree_species(
-            &self.rt_species,
+            self.rt_species.as_ref(),
             eye,
             view_direction,
             max_dist,
@@ -1480,7 +1487,7 @@ impl FarTrees {
         use std::fmt::Write;
         let max_d2 = max_dist * max_dist;
         let mut rows: Vec<(f32, usize, [f32; 3], &RtTreeSpecies)> = Vec::new();
-        for sp in &self.rt_species {
+        for sp in self.rt_species.iter() {
             let mut near_cnt = 0usize;
             let mut nearest_d2 = f32::INFINITY;
             let mut nearest_pos = [0.0f32; 3];

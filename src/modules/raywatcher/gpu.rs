@@ -1255,10 +1255,13 @@ fn adaptive_ray_samples(pixel: vec2<i32>, dist: f32, normal: vec3<f32>, roughnes
     }
     var complexity = max(normal_edge * 2.0, max(depth_edge * 5.0, colour_edge * 2.0));
     complexity = max(complexity, (1.0 - smoothstep(0.0, 320.0, dist)) * 0.20);
-    complexity = max(complexity, clamp((0.36 - roughness) / 0.36, 0.0, 1.0) * 0.20);
+    // Native water is a flat dielectric plane. Its RT reflection is an
+    // exact mirror ray, so additional random samples would retrace the same
+    // direction and only add duplicate work/noise.
     if (roughness <= 0.12) {
-        complexity = max(complexity, 0.42);
+        return base;
     }
+    complexity = max(complexity, clamp((0.36 - roughness) / 0.36, 0.0, 1.0) * 0.20);
     let gi_enabled = (u32(round(params.effects.y)) & 16u) != 0u
         && params.frame.z >= 1.0
         && params.tuning.w > 0.0;
@@ -1607,12 +1610,19 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             // Native game water is a flat glossy dielectric: no animated wave
             // normals. Use the raster normal for both water and non-water surfaces.
             let refl_base_n = normal;
-            let h = ggx_sample(refl_base_n, roughness, next_f32(&state), next_f32(&state));
+            // Keep non-water glossy trims on GGX, but use the exact
+            // planar normal for native water so the reflected scene is stable.
+            let h = select(
+                ggx_sample(refl_base_n, roughness, next_f32(&state), next_f32(&state)),
+                refl_base_n,
+                is_water,
+            );
             var reflect_dir = reflect(view_dir, h);
             if (dot(reflect_dir, refl_base_n) <= 0.0) {
                 reflect_dir = reflect(view_dir, refl_base_n);
             }
-            let f0 = select(0.04, 0.18, is_water);
+            // Air/water dielectric normal-incidence reflectance (IOR 1.333).
+            let f0 = select(0.04, 0.0204, is_water);
             let m = 1.0 - clamp(dot(-view_dir, h), 0.0, 1.0);
             let m2 = m * m;
             let fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
@@ -5988,14 +5998,27 @@ mod shader_optimization_regression_tests {
     }
 
     #[test]
-    fn water_reflections_receive_a_higher_but_bounded_ray_budget_on_both_backends() {
+    fn flat_water_avoids_duplicate_stochastic_reflection_samples_on_both_backends() {
         let dxr = include_str!("dxr_trace.hlsl");
-        assert!(RAY_SHADER.contains("if (roughness <= 0.12)"));
-        assert!(dxr.contains("if (roughness <= 0.12)"));
-        assert!(RAY_SHADER.contains("complexity = max(complexity, 0.42)"));
-        assert!(dxr.contains("complexity = max(complexity, 0.42)"));
+        assert!(RAY_SHADER.contains("if (roughness <= 0.12) {\n        return base;"));
+        assert!(dxr.contains("if (roughness <= 0.12) return base;"));
         assert!(RAY_SHADER.contains("clamp(base + extra, base, maximum)"));
         assert!(dxr.contains("clamp(base + extra, base, max_samples)"));
+    }
+
+    #[test]
+    fn native_water_uses_a_stable_planar_mirror_ray_and_physical_dielectric_fresnel() {
+        let dxr = include_str!("dxr_trace.hlsl");
+        assert!(RAY_SHADER.contains("if (roughness <= 0.12) {"));
+        assert!(RAY_SHADER.contains("return base;"));
+        assert!(RAY_SHADER.contains("refl_base_n,\n                is_water,"));
+        assert!(RAY_SHADER.contains("select(0.04, 0.0204, is_water)"));
+        assert!(!RAY_SHADER.contains("complexity = max(complexity, 0.42)"));
+        assert!(dxr.contains("if (roughness <= 0.12) return base;"));
+        assert!(dxr.contains("float3 h = is_water"));
+        assert!(dxr.contains("? refl_base_n"));
+        assert!(dxr.contains("is_water ? 0.0204"));
+        assert!(!dxr.contains("complexity = max(complexity, 0.42)"));
     }
 
     #[test]
