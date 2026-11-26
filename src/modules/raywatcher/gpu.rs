@@ -5852,8 +5852,8 @@ mod shader_optimization_regression_tests {
         assert!(RAY_SHADER.contains("array<RadianceCacheCell>"));
         assert!(RAY_SHADER.contains("fn rc_slot("));
         assert!(!RAY_SHADER.contains("array<atomic<u32>>"));
-        assert!(RAY_SHADER.contains("atomicAdd(&cell.r, q.x)"));
-        assert!(RAY_SHADER.contains("atomicAdd(&cell.count, 1u)"));
+        assert!(RAY_SHADER.contains("atomicAdd(&radiance_cache[slot].r, q.x)"));
+        assert!(RAY_SHADER.contains("atomicAdd(&radiance_cache[slot].count, 1u)"));
         assert!(dxr.contains("RWStructuredBuffer<uint4> radiance_cache"));
         assert!(dxr.contains("InterlockedAdd(radiance_cache[slot].x"));
         assert!(!RAY_SHADER.contains("atomicCompareExchange"));
