@@ -895,6 +895,7 @@ mod tests {
             archive_entries: Vec::new(),
             archive_error: None,
             selected_scene_object: None,
+            selected_scene_transform: None,
             selected_placement: None,
             multi_selection: HashSet::new(),
             quick_bar: Vec::new(),
