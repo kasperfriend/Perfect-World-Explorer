@@ -159,6 +159,10 @@ pub struct World {
     alpha: Vec<model_queue::AlphaCandidate>,
     reported: Vec<String>,
     frustum: Option<[[f32; 4]; 6]>,
+    /// Plane normal lengths are invariant for a frame's frustum. Cache them
+    /// when the camera matrix changes instead of taking six square roots for
+    /// every world-model instance on every frame.
+    frustum_plane_lengths: Option<[f32; 6]>,
     scratch_candidates: Vec<model_queue::AlphaCandidate>,
     scratch_failures: Vec<(usize, String)>,
 }
@@ -256,6 +260,7 @@ impl World {
             alpha: Vec::new(),
             reported: Vec::new(),
             frustum: None,
+            frustum_plane_lengths: None,
             scratch_candidates: Vec::new(),
             scratch_failures: Vec::new(),
         })
@@ -279,6 +284,7 @@ impl World {
     }
 
     pub fn set_frustum(&mut self, frustum: Option<[[f32; 4]; 6]>) {
+        self.frustum_plane_lengths = frustum.map(frustum_plane_lengths);
         self.frustum = frustum;
     }
     /// Attach the real GFX archive so installed producers can load their roots.
@@ -1278,6 +1284,7 @@ impl World {
         }
         let bounds = self.resident_bounds;
         let frustum = self.frustum;
+        let frustum_plane_lengths = self.frustum_plane_lengths.unwrap_or([0.; 6]);
         let keep_unbounded = self.keep_unbounded;
         let Self {
             assets,
@@ -1305,7 +1312,12 @@ impl World {
                 continue;
             }
             if let Some(planes) = frustum {
-                if !sphere_in_frustum(&planes, instance.placement.position, 128.0) {
+                if !sphere_in_frustum(
+                    &planes,
+                    &frustum_plane_lengths,
+                    instance.placement.position,
+                    128.0,
+                ) {
                     slot.visible = false;
                     continue;
                 }
@@ -1564,9 +1576,18 @@ impl World {
     }
 }
 
-fn sphere_in_frustum(planes: &[[f32; 4]; 6], center: [f32; 3], radius: f32) -> bool {
-    for &[a, b, c, d] in planes {
-        let len = (a * a + b * b + c * c).sqrt();
+#[inline]
+fn frustum_plane_lengths(planes: [[f32; 4]; 6]) -> [f32; 6] {
+    planes.map(|[a, b, c, _]| (a * a + b * b + c * c).sqrt())
+}
+
+fn sphere_in_frustum(
+    planes: &[[f32; 4]; 6],
+    plane_lengths: &[f32; 6],
+    center: [f32; 3],
+    radius: f32,
+) -> bool {
+    for (&[a, b, c, d], &len) in planes.iter().zip(plane_lengths) {
         if len > 0.0 && a * center[0] + b * center[1] + c * center[2] + d < -radius * len {
             return false;
         }
@@ -1680,6 +1701,27 @@ fn event_milliseconds(event: &crate::ecmodel::EcmEvent, key: &str) -> Result<f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn world_model_frustum_plane_lengths_are_cached_without_changing_sphere_tests() {
+        let planes = [
+            [2., 0., 0., 20.],
+            [-3., 0., 0., 30.],
+            [0., 4., 0., 40.],
+            [0., -5., 0., 50.],
+            [0., 0., 6., 60.],
+            [0., 0., 0., 1.],
+        ];
+        let lengths = frustum_plane_lengths(planes);
+        assert_eq!(lengths, [2., 3., 4., 5., 6., 0.]);
+        assert!(sphere_in_frustum(&planes, &lengths, [0., 0., 0.], 128.));
+        assert!(!sphere_in_frustum(&planes, &lengths, [-100., 0., 0.], 1.));
+        // A zero-normal plane retains the old rule: it never rejects a sphere.
+        let mut zero_only = [[0.; 4]; 6];
+        zero_only[0][3] = -1000.;
+        let zero_lengths = frustum_plane_lengths(zero_only);
+        assert!(sphere_in_frustum(&zero_only, &zero_lengths, [0.; 3], 0.));
+    }
 
     /// `FadeGFX` is `SetAlphaTransition(alpha, 3000)`: a full ramp takes three
     /// seconds at any frame rate, and the step never overshoots.
