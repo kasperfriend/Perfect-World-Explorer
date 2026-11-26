@@ -902,7 +902,8 @@ mod imp {
                     StateAfter: d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 };
                 (*list).ResourceBarrier(1, &barrier);
-                self.ring.retire(slot_idx, &self.raw_queue, "DXR-Radiance-Cache-Init")?;
+                self.ring
+                    .retire(slot_idx, &self.raw_queue, "DXR-Radiance-Cache-Init")?;
                 let fence = self.ring.current_fence();
                 self.retired_buffers.push((fence, vec![staging]));
             }
