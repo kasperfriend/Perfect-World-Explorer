@@ -1081,6 +1081,12 @@ mod tests {
     }
 
     #[test]
+    fn cancellable_build_stops_before_allocating_a_bvh() {
+        let cancel = AtomicBool::new(true);
+        assert!(SceneGeometry::build_cancellable(scattered(32), vec![], &cancel).is_none());
+    }
+
+    #[test]
     fn the_tree_agrees_with_brute_force_on_a_thousand_rays() {
         let tris = scattered(400);
         let scene = SceneGeometry::build(tris.clone(), vec![]);
