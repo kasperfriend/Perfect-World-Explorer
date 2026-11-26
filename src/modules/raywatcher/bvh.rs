@@ -18,6 +18,7 @@
 //!   verifies here is the tree the shader walks.
 
 use glam::Vec3;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// One triangle in world space, with the material the ray pass shades with.
 ///
@@ -377,6 +378,29 @@ impl SceneGeometry {
     /// terrain's cells are already spatially coherent — and it keeps the build
     /// fast enough to rerun when the resident set changes without a hitch.
     pub fn build(triangles: Vec<RayTriangle>, materials: Vec<RayMaterial>) -> Self {
+        Self::build_internal(triangles, materials, None).unwrap_or_default()
+    }
+
+    /// Build a BVH while allowing its background owner to cancel expensive work.
+    /// Cancellation is checked during bounds generation, SAH partitioning and
+    /// recursive node construction so disabling Raywatcher doesn't leave a
+    /// detached worker consuming CPU for the remainder of a large map build.
+    pub fn build_cancellable(
+        triangles: Vec<RayTriangle>,
+        materials: Vec<RayMaterial>,
+        cancel: &AtomicBool,
+    ) -> Option<Self> {
+        Self::build_internal(triangles, materials, Some(cancel))
+    }
+
+    fn build_internal(
+        triangles: Vec<RayTriangle>,
+        materials: Vec<RayMaterial>,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<Self> {
+        if is_cancelled(cancel) {
+            return None;
+        }
         let mut geometry = Self {
             triangles,
             materials,
@@ -387,12 +411,15 @@ impl SceneGeometry {
             widest_leaf: 0,
         };
         if geometry.triangles.is_empty() {
-            return geometry;
+            return Some(geometry);
         }
         let n = geometry.triangles.len();
         let mut tri_bounds = Vec::with_capacity(n);
         let mut centroids = Vec::with_capacity(n);
-        for tri in &geometry.triangles {
+        for (i, tri) in geometry.triangles.iter().enumerate() {
+            if i & 0x3ff == 0 && is_cancelled(cancel) {
+                return None;
+            }
             let a = Vec3::new(tri.a[0], tri.a[1], tri.a[2]);
             let b = Vec3::new(tri.b[0], tri.b[1], tri.b[2]);
             let c = Vec3::new(tri.c[0], tri.c[1], tri.c[2]);
@@ -407,7 +434,7 @@ impl SceneGeometry {
         // Opt #26: Parallel multi-threaded BVH build via std::thread::scope for scenes > 4096 tris.
         if n > 4096 {
             let root_bounds = geometry.bounds;
-            let mid = partition_sah(&tri_bounds, &centroids, &mut index, root_bounds);
+            let mid = partition_sah(&tri_bounds, &centroids, &mut index, root_bounds, cancel)?;
             let (left_idx, right_idx) = index.split_at_mut(mid);
             let (left_state, right_state) = std::thread::scope(|scope| {
                 let tb = &tri_bounds;
@@ -416,6 +443,7 @@ impl SceneGeometry {
                     let mut st = BuildState {
                         tri_bounds: tb,
                         centroids: ct,
+                        cancel,
                         nodes: Vec::with_capacity(
                             right_idx.len().saturating_mul(2).clamp(1, 1 << 21),
                         ),
@@ -423,21 +451,24 @@ impl SceneGeometry {
                         depth: 0,
                         widest: 0,
                     };
-                    st.build_node(right_idx, 1);
-                    st
+                    st.build_node(right_idx, 1).map(|_| st)
                 });
                 let mut left_st = BuildState {
                     tri_bounds: tb,
                     centroids: ct,
+                    cancel,
                     nodes: Vec::with_capacity(left_idx.len().saturating_mul(2).clamp(1, 1 << 21)),
                     order: Vec::with_capacity(left_idx.len()),
                     depth: 0,
                     widest: 0,
                 };
-                left_st.build_node(left_idx, 1);
+                let left_ok = left_st.build_node(left_idx, 1).is_some();
                 let right_st = handle.join().expect("BVH worker thread panicked");
-                (left_st, right_st)
-            });
+                if !left_ok {
+                    return None;
+                }
+                Some((left_st, right_st?))
+            })?;
             let left_nodes = left_state.nodes.len() as u32;
             let left_order = left_state.order.len() as u32;
             let right_root = 1 + left_nodes;
@@ -457,13 +488,19 @@ impl SceneGeometry {
                     right_root as f32,
                 ],
             });
-            for mut node in left_state.nodes {
+            for (i, mut node) in left_state.nodes.into_iter().enumerate() {
+                if i & 0x3ff == 0 && is_cancelled(cancel) {
+                    return None;
+                }
                 if node.min[3] < 0.0 {
                     node.max[3] += 1.0;
                 }
                 nodes.push(node);
             }
-            for mut node in right_state.nodes {
+            for (i, mut node) in right_state.nodes.into_iter().enumerate() {
+                if i & 0x3ff == 0 && is_cancelled(cancel) {
+                    return None;
+                }
                 if node.min[3] < 0.0 {
                     node.max[3] += right_root as f32;
                 } else {
@@ -478,22 +515,23 @@ impl SceneGeometry {
             geometry.order = order;
             geometry.depth = left_state.depth.max(right_state.depth);
             geometry.widest_leaf = left_state.widest.max(right_state.widest);
-            return geometry;
+            return Some(geometry);
         }
         let mut state = BuildState {
             tri_bounds: &tri_bounds,
             centroids: &centroids,
+            cancel,
             nodes: Vec::with_capacity(n.saturating_mul(2).clamp(1, 1 << 22)),
             order: Vec::with_capacity(n),
             depth: 0,
             widest: 0,
         };
-        state.build_node(&mut index, 0);
+        state.build_node(&mut index, 0)?;
         geometry.nodes = state.nodes;
         geometry.order = state.order;
         geometry.depth = state.depth;
         geometry.widest_leaf = state.widest;
-        geometry
+        Some(geometry)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -705,6 +743,7 @@ impl SceneGeometry {
 struct BuildState<'a> {
     tri_bounds: &'a [(Vec3, Vec3)],
     centroids: &'a [Vec3],
+    cancel: Option<&'a AtomicBool>,
     nodes: Vec<BvhNode>,
     order: Vec<u32>,
     depth: u32,
@@ -717,12 +756,18 @@ impl<'a> BuildState<'a> {
     /// `partition` is `&mut [u32]` of triangle indices this subtree owns; the
     /// node is appended first and then its children are appended in order, so
     /// "left child = node + 1" holds.
-    fn build_node(&mut self, partition: &mut [u32], depth: u32) -> u32 {
+    fn build_node(&mut self, partition: &mut [u32], depth: u32) -> Option<u32> {
+        if is_cancelled(self.cancel) {
+            return None;
+        }
         let node_index = self.nodes.len() as u32;
         let mut bmin = Vec3::splat(f32::INFINITY);
         let mut bmax = Vec3::splat(f32::NEG_INFINITY);
-        for &i in partition.iter() {
-            let (lo, hi) = self.tri_bounds[i as usize];
+        for (i, &tri_index) in partition.iter().enumerate() {
+            if i & 0x3ff == 0 && is_cancelled(self.cancel) {
+                return None;
+            }
+            let (lo, hi) = self.tri_bounds[tri_index as usize];
             bmin = bmin.min(lo);
             bmax = bmax.max(hi);
         }
@@ -755,11 +800,11 @@ impl<'a> BuildState<'a> {
                 ],
                 max: [bounds.max.x, bounds.max.y, bounds.max.z, first as f32],
             };
-            return node_index;
+            return Some(node_index);
         }
         // Opt #27: Fast 8-bin Surface Area Heuristic (SAH) split for partitions > 64 tris.
         let mid = if partition.len() > 64 {
-            partition_sah(self.tri_bounds, self.centroids, partition, bounds)
+            partition_sah(self.tri_bounds, self.centroids, partition, bounds, self.cancel)?
         } else {
             let mut axis = 0usize;
             let mut best = f32::NEG_INFINITY;
@@ -778,9 +823,12 @@ impl<'a> BuildState<'a> {
             });
             m
         };
+        if is_cancelled(self.cancel) {
+            return None;
+        }
         let (left, right) = partition.split_at_mut(mid);
-        self.build_node(left, depth + 1);
-        let right_child = self.build_node(right, depth + 1);
+        self.build_node(left, depth + 1)?;
+        let right_child = self.build_node(right, depth + 1)?;
         self.nodes[node_index as usize] = BvhNode {
             min: [
                 bounds.min.x,
@@ -790,8 +838,12 @@ impl<'a> BuildState<'a> {
             ],
             max: [bounds.max.x, bounds.max.y, bounds.max.z, right_child as f32],
         };
-        node_index
+        Some(node_index)
     }
+}
+
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
 /// Opt #28: 16-bin Surface Area Heuristic (SAH) partitioner for finer split placement.
@@ -800,7 +852,11 @@ fn partition_sah(
     centroids: &[Vec3],
     partition: &mut [u32],
     bounds: Bounds,
-) -> usize {
+    cancel: Option<&AtomicBool>,
+) -> Option<usize> {
+    if is_cancelled(cancel) {
+        return None;
+    }
     const BINS: usize = 16;
     let ext = bounds.max - bounds.min;
     let mut best_axis = 0usize;
@@ -808,6 +864,9 @@ fn partition_sah(
     let mut best_cost = f32::INFINITY;
 
     for axis in 0..3 {
+        if is_cancelled(cancel) {
+            return None;
+        }
         let len = ext[axis];
         if len <= 1e-5 {
             continue;
@@ -818,10 +877,13 @@ fn partition_sah(
         let mut bin_max = [Vec3::splat(f32::NEG_INFINITY); BINS];
         let mut bin_cnt = [0u32; BINS];
 
-        for &i in partition.iter() {
-            let c = centroids[i as usize][axis];
+        for (i, &tri_index) in partition.iter().enumerate() {
+            if i & 0x3ff == 0 && is_cancelled(cancel) {
+                return None;
+            }
+            let c = centroids[tri_index as usize][axis];
             let b = (((c - min_a) * inv_len) as usize).min(BINS - 1);
-            let (lo, hi) = tri_bounds[i as usize];
+            let (lo, hi) = tri_bounds[tri_index as usize];
             bin_min[b] = bin_min[b].min(lo);
             bin_max[b] = bin_max[b].max(hi);
             bin_cnt[b] += 1;
@@ -872,6 +934,9 @@ fn partition_sah(
         let mut l = 0usize;
         let mut r = partition.len();
         while l < r {
+            if l & 0x3ff == 0 && is_cancelled(cancel) {
+                return None;
+            }
             if centroids[partition[l] as usize][best_axis] < split_pos {
                 l += 1;
             } else {
@@ -880,10 +945,13 @@ fn partition_sah(
             }
         }
         if l > 0 && l < partition.len() {
-            return l;
+            return Some(l);
         }
     }
 
+    if is_cancelled(cancel) {
+        return None;
+    }
     let mut axis = 0usize;
     let mut best = f32::NEG_INFINITY;
     for a in 0..3 {
@@ -898,7 +966,11 @@ fn partition_sah(
         let rc = centroids[r as usize][axis];
         lc.partial_cmp(&rc).unwrap_or(std::cmp::Ordering::Equal)
     });
-    mid
+    if is_cancelled(cancel) {
+        None
+    } else {
+        Some(mid)
+    }
 }
 
 /// Möller–Trumbore, returning the distance and the barycentrics.
