@@ -670,9 +670,8 @@ impl Draw {
                 pos
             } else {
                 let mut verts = if let Some(verts) = self.scratch_pool.pop() {
-                    self.scratch_pool_vertices = self
-                        .scratch_pool_vertices
-                        .saturating_sub(verts.capacity());
+                    self.scratch_pool_vertices =
+                        self.scratch_pool_vertices.saturating_sub(verts.capacity());
                     verts
                 } else {
                     Vec::new()
@@ -773,7 +772,8 @@ impl Draw {
                             Err(error) => {
                                 self.failed_textures.insert(
                                     key.texture,
-                                    self.frame_index.saturating_add(TEXTURE_RETRY_INTERVAL_FRAMES),
+                                    self.frame_index
+                                        .saturating_add(TEXTURE_RETRY_INTERVAL_FRAMES),
                                 );
                                 self.note_failure(&tex_name, &error);
                             }
@@ -787,7 +787,8 @@ impl Draw {
                     Err(error) => {
                         self.failed_textures.insert(
                             key.texture,
-                            self.frame_index.saturating_add(TEXTURE_RETRY_INTERVAL_FRAMES),
+                            self.frame_index
+                                .saturating_add(TEXTURE_RETRY_INTERVAL_FRAMES),
                         );
                         self.note_failure(&tex_name, &error);
                     }
@@ -887,8 +888,7 @@ impl Draw {
             }
             let capacity = verts.capacity();
             if self.scratch_pool.len() < BUCKET_CACHE_LIMIT
-                && self.scratch_pool_vertices.saturating_add(capacity)
-                    <= MAX_SCRATCH_POOL_VERTICES
+                && self.scratch_pool_vertices.saturating_add(capacity) <= MAX_SCRATCH_POOL_VERTICES
             {
                 self.scratch_pool_vertices += capacity;
                 self.scratch_pool.push(verts);
@@ -2248,7 +2248,11 @@ mod tests {
             &mut present,
         )
         .unwrap();
-        assert_eq!(present_attempts.get(), 0, "failed paths are not retried each frame");
+        assert_eq!(
+            present_attempts.get(),
+            0,
+            "failed paths are not retried each frame"
+        );
         assert!(draw.buckets.values().next().unwrap().bound_fallback);
 
         // When the retry window arrives, the archive answers and replaces the
