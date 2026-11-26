@@ -11,6 +11,16 @@ use crate::{
     world_models::Assets,
 };
 use std::{collections::HashMap, fs::File, path::Path};
+
+/// A non-destructive placement supplied by Architect. The same native ECM loader,
+/// animation system, material handling and GPU queues are used as for map models.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorPlacement {
+    pub path: String,
+    pub position: [f32; 3],
+    pub rotation: [f32; 3],
+    pub scale: f32,
+}
 #[path = "terrain_cutoff.rs"]
 mod cutoff_residency;
 
@@ -161,6 +171,9 @@ pub struct World {
     frustum: Option<[[f32; 4]; 6]>,
     scratch_candidates: Vec<model_queue::AlphaCandidate>,
     scratch_failures: Vec<(usize, String)>,
+    native_instance_count: usize,
+    editor_placements: Vec<EditorPlacement>,
+    editor_asset_cache: HashMap<String, usize>,
 }
 
 impl World {
@@ -258,8 +271,113 @@ impl World {
             frustum: None,
             scratch_candidates: Vec::new(),
             scratch_failures: Vec::new(),
+            native_instance_count: assets.instances.len(),
+            editor_placements: Vec::new(),
+            editor_asset_cache: HashMap::new(),
         })
     }
+    /// Replace Architect's transient project layer without disturbing native map
+    /// instances. Asset geometry is cached by normalized ECM path; edits only
+    /// rebuild the lightweight placement/pose slots.
+    pub fn sync_editor_placements(&mut self, placements: &[EditorPlacement]) {
+        if self.editor_placements == placements {
+            return;
+        }
+
+        self.assets.instances.truncate(self.native_instance_count);
+        self.slots.truncate(self.native_instance_count);
+        self.alpha.retain(|candidate| candidate.slot < self.native_instance_count);
+        self.editor_placements.clear();
+
+        let mut random = crate::model_playback::SceneRandom::new(1);
+        for (index, placement) in placements.iter().enumerate() {
+            let path = crate::ecmodel::normalize(&placement.path);
+            if !path.ends_with(".ecm")
+                || !placement.position.iter().all(|value| value.is_finite())
+                || !placement.rotation.iter().all(|value| value.is_finite())
+                || !placement.scale.is_finite()
+                || !(0.001..=1000.).contains(&placement.scale)
+            {
+                self.reported.push(format!(
+                    "Architect placement {index} has an unsupported asset or invalid transform: {}",
+                    placement.path
+                ));
+                continue;
+            }
+
+            let asset = if let Some(&asset) = self.editor_asset_cache.get(&path) {
+                asset
+            } else {
+                match crate::model_asset::ModelAsset::load_with(&path, |dependency| {
+                    (self.read)(dependency)
+                }) {
+                    Ok(asset) => {
+                        let asset_index = self.assets.assets.len();
+                        self.assets.assets.push(asset);
+                        self.editor_asset_cache.insert(path.clone(), asset_index);
+                        asset_index
+                    }
+                    Err(error) => {
+                        self.reported.push(format!(
+                            "Architect asset {} could not be loaded: {error}",
+                            path
+                        ));
+                        continue;
+                    }
+                }
+            };
+
+            let rotation = glam::Quat::from_euler(
+                glam::EulerRot::XYZ,
+                placement.rotation[0],
+                placement.rotation[1],
+                placement.rotation[2],
+            );
+            let direction = rotation * glam::Vec3::Z;
+            let up = rotation * glam::Vec3::Y;
+            let scene_placement = crate::scene::SceneModel {
+                export_id: u32::try_from(index).unwrap_or(u32::MAX),
+                position: placement.position,
+                direction: direction.to_array(),
+                up: up.to_array(),
+                path: path.clone(),
+                action: String::new(),
+            };
+            let action = self.assets.assets[asset]
+                .descriptor
+                .scene_action(&scene_placement.action);
+            let mut playback = crate::model_playback::Playback::new(
+                &self.assets.assets[asset],
+                action,
+            );
+            if let Ok(clock) = &mut playback {
+                if let Err(error) = clock.tick(random.initial_tick()) {
+                    self.reported.push(format!(
+                        "Architect animation initialization failed for {path}: {error}"
+                    ));
+                }
+            }
+            self.assets.instances.push(crate::world_models::Instance {
+                placement: scene_placement.clone(),
+                asset,
+                action,
+                playback,
+            });
+            let transform = crate::world_models::transform(&scene_placement)
+                .map(|matrix| matrix * glam::Mat4::from_scale(glam::Vec3::splat(placement.scale)));
+            self.slots.push(Slot {
+                draw: None,
+                failed: false,
+                transform,
+                posed: None,
+                geometry_dirty: true,
+                vertex_fog: None,
+                visible: true,
+            });
+        }
+        self.editor_placements = placements.to_vec();
+    }
+
     /// A world with no model assets of its own.
     ///
     /// The animated effect half of this object does not need `models.pck` or a
