@@ -104,3 +104,11 @@ hook-attached GFX keeps the same frame-consistent parent pose.
   same parent; animated parents continue to resolve their hook from the current
   pose. The owner attachment setter is also idempotent, avoiding repeated writes
   when a cached matrix is unchanged.
+
+
+- Retained world-model constant updates now derive each mesh's material/frame
+  payload once, cache those payloads in a per-Draw scratch vector, then upload
+  them in a second pass. Previously every visible mesh performed all material
+  lookup and constant derivation twice per frame (once for validation and again
+  for writing); this keeps the all-or-nothing validation-before-upload contract
+  while removing duplicate work and steady-state allocations.

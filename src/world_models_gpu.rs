@@ -1836,7 +1836,7 @@ fn draw_one(
         f.point_position = point.position;
         f.attenuation = point.stored_attenuation;
     }
-    if let Some(draw) = &slot.draw {
+    if let Some(draw) = slot.draw.as_mut() {
         if slot.geometry_dirty || slot.vertex_fog != Some(f.vertex_fog) {
             draw.update(queue, asset, &posed.meshes, f)?;
             slot.geometry_dirty = false;

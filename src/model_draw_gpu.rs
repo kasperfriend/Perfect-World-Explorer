@@ -205,6 +205,10 @@ pub struct Draw {
     /// [`Self::update_posed`] convert vertices without re-running it.
     pose_of: Vec<usize>,
     alpha_meshes: Vec<usize>,
+    /// Reused per-mesh uniform payloads. Camera turns update every visible
+    /// receiver's constants, but the payload scratch must not allocate or
+    /// recompute material constants twice on each frame.
+    constant_scratch: Vec<raster::Params>,
     // Keep authored textures alive and share repeated per-skin texture slots.
     textures: Vec<std::sync::Arc<wgpu::Texture>>,
 }
@@ -480,6 +484,7 @@ impl Draw {
             meshes,
             pose_of,
             alpha_meshes,
+            constant_scratch: Vec::new(),
             textures,
         })
     }
@@ -619,7 +624,7 @@ impl Draw {
     /// World-owned immutable topology: pass changes only require constants,
     /// not another prepare/copy/upload of the exact same posed vertices.
     pub fn update_constants(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         asset: &ModelAsset,
         frame: Frame,
@@ -628,6 +633,7 @@ impl Draw {
             return Err("model pass blending changed; rebuild its pipeline".into());
         }
         let original = asset.descriptor.render_settings().original_color;
+        self.constant_scratch.clear();
         for mesh in self.meshes.iter().flatten() {
             let skin = asset.skins.get(mesh.key.0).ok_or("missing retained skin")?;
             let source = skin
@@ -644,29 +650,17 @@ impl Draw {
             } else {
                 asset.mesh_color(mesh.key.0, mesh.key.1, original)
             };
-            let _ = frame.params(
+            // Validate and retain the exact uniform payload before any writes,
+            // so a bad final mesh cannot leave a partially updated model.
+            self.constant_scratch.push(frame.params(
                 material,
                 color,
                 mesh.diffuse_alpha_only,
                 mesh.face_shader.as_ref(),
-            )?;
+            )?);
         }
-        for mesh in self.meshes.iter().flatten() {
-            let skin = &asset.skins[mesh.key.0];
-            let source = &skin.data.meshes[mesh.key.1];
-            let material = &skin.data.materials[source.material as usize];
-            let color = if mesh.face_shader.is_some() {
-                u32::MAX
-            } else {
-                asset.mesh_color(mesh.key.0, mesh.key.1, original)
-            };
-            let params = frame.params(
-                material,
-                color,
-                mesh.diffuse_alpha_only,
-                mesh.face_shader.as_ref(),
-            )?;
-            mesh.binding.update(queue, &params)?;
+        for (mesh, params) in self.meshes.iter().flatten().zip(&self.constant_scratch) {
+            mesh.binding.update(queue, params)?;
         }
         Ok(())
     }
