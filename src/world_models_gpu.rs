@@ -103,11 +103,7 @@ fn build_model_spatial_cells(
 
 /// Conservative broad phase for the existing per-model 128-unit sphere test.
 /// Every kept slot still runs that exact sphere test before it is drawn.
-fn model_cell_intersects_frustum(
-    planes: &[[f32; 4]; 6],
-    min: [f32; 3],
-    max: [f32; 3],
-) -> bool {
+fn model_cell_intersects_frustum(planes: &[[f32; 4]; 6], min: [f32; 3], max: [f32; 3]) -> bool {
     if min.iter().chain(max.iter()).any(|value| !value.is_finite())
         || (0..3).any(|axis| min[axis] > max[axis])
     {
@@ -119,12 +115,7 @@ fn model_cell_intersects_frustum(
             if plane[1] >= 0.0 { max[1] } else { min[1] },
             if plane[2] >= 0.0 { max[2] } else { min[2] },
         ];
-        if plane[0] * positive[0]
-            + plane[1] * positive[1]
-            + plane[2] * positive[2]
-            + plane[3]
-            < 0.0
-        {
+        if plane[0] * positive[0] + plane[1] * positive[1] + plane[2] * positive[2] + plane[3] < 0.0 {
             return false;
         }
     }
@@ -139,17 +130,11 @@ fn append_visible_model_slots(
 ) {
     for cell in cells {
         if let Some([x0, x1, z0, z1]) = bounds {
-            if cell.max[0] < x0
-                || cell.min[0] >= x1
-                || cell.max[2] < z0
-                || cell.min[2] >= z1
-            {
+            if cell.max[0] < x0 || cell.min[0] >= x1 || cell.max[2] < z0 || cell.min[2] >= z1 {
                 continue;
             }
         }
-        if frustum.is_some_and(|planes| {
-            !model_cell_intersects_frustum(planes, cell.min, cell.max)
-        }) {
+        if frustum.is_some_and(|planes| !model_cell_intersects_frustum(planes, cell.min, cell.max)) {
             continue;
         }
         out.extend_from_slice(&cell.slots);
