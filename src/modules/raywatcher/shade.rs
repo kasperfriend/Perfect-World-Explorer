@@ -229,7 +229,9 @@ pub fn trace(
     // The original client uses table fog over view-space Z, not Euclidean
     // eye-to-hit distance. Projecting the hit gives clip.w = positive view Z;
     // this matches the raster shaders even for wide/off-axis rays.
-    let view_z = (params.view_projection * point_of(scene, &hit).extend(1.0)).w.max(0.0);
+    let view_z = (params.view_projection * point_of(scene, &hit).extend(1.0))
+        .w
+        .max(0.0);
     colour = apply_fog(colour, params, view_z);
     let visibility = sample_occlusion(scene, params, config, &hit, sampler, seed);
     let reflection = reflection_lane(scene, params, config, &hit, direction, seed);
@@ -989,7 +991,11 @@ mod tests {
         let near = apply_fog(Vec3::splat(0.1), &params, 0.);
         assert!((near - Vec3::splat(0.1)).length() < 1e-6);
         let far = apply_fog(Vec3::splat(0.1), &params, 1000.);
-        let fog_linear = Vec3::new(srgb_to_linear(0.6), srgb_to_linear(0.7), srgb_to_linear(0.9));
+        let fog_linear = Vec3::new(
+            srgb_to_linear(0.6),
+            srgb_to_linear(0.7),
+            srgb_to_linear(0.9),
+        );
         assert!((far - fog_linear).length() < 1e-5);
         let mid = apply_fog(Vec3::splat(0.1), &params, 60.);
         assert!(mid.x > 0.1 && mid.x < fog_linear.x);
@@ -1007,10 +1013,7 @@ mod tests {
         let mut params = params((8, 8));
         // A simple perspective-like projection whose clip.w is forward view Z.
         params.view_projection = glam::Mat4::from_cols_array(&[
-            1., 0., 0., 0.,
-            0., 1., 0., 0.,
-            0., 0., 1., 1.,
-            0., 0., 0., 0.,
+            1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 1., 0., 0., 0., 0.,
         ]);
         let point = Vec3::new(30., 0., 40.);
         let view_z = (params.view_projection * point.extend(1.)).w;
@@ -1028,9 +1031,9 @@ mod tests {
         );
 
         let shader = super::super::gpu::RAY_SHADER;
-        assert!(shader.contains(
-            "let fog_view_z = max((params.vp * vec4<f32>(point, 1.0)).w, 0.0);"
-        ));
+        assert!(
+            shader.contains("let fog_view_z = max((params.vp * vec4<f32>(point, 1.0)).w, 0.0);")
+        );
         assert!(shader.contains("linear_to_srgb(relit), params.fog_colour.xyz"));
     }
 
