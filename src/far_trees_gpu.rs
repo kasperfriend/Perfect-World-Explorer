@@ -55,6 +55,84 @@ pub(crate) struct GroupInfo {
     /// Placements per level, i.e. the capacity of each level's slice.
     pub(crate) capacity: u32,
 }
+
+const TREE_SPATIAL_CELL_SIZE: f32 = 256.0;
+
+struct TreeSpatialCell {
+    min: [f32; 3],
+    max: [f32; 3],
+    placement_indices: Vec<u32>,
+}
+
+fn build_tree_spatial_cells(
+    placements: &[Placement],
+    groups: &[GroupInfo],
+) -> Vec<TreeSpatialCell> {
+    let mut cells = std::collections::BTreeMap::<(i32, i32), TreeSpatialCell>::new();
+    for (index, placement) in placements.iter().enumerate() {
+        let Some(group) = groups.get(placement.group as usize) else {
+            continue;
+        };
+        if group.capacity == 0 {
+            continue;
+        }
+        let position = [
+            placement.pos_height[0],
+            placement.pos_height[1],
+            placement.pos_height[2],
+        ];
+        if !position.iter().all(|value| value.is_finite()) {
+            continue;
+        }
+        let radius = group.height.max(5.0) * 2.0;
+        let min = [position[0] - radius, position[1] - radius, position[2] - radius];
+        let max = [position[0] + radius, position[1] + radius, position[2] + radius];
+        let key = (
+            (position[0] / TREE_SPATIAL_CELL_SIZE).floor() as i32,
+            (position[2] / TREE_SPATIAL_CELL_SIZE).floor() as i32,
+        );
+        let cell = cells.entry(key).or_insert_with(|| TreeSpatialCell {
+            min: [f32::INFINITY; 3],
+            max: [f32::NEG_INFINITY; 3],
+            placement_indices: Vec::new(),
+        });
+        for axis in 0..3 {
+            cell.min[axis] = cell.min[axis].min(min[axis]);
+            cell.max[axis] = cell.max[axis].max(max[axis]);
+        }
+        cell.placement_indices.push(index as u32);
+    }
+    cells.into_values().collect()
+}
+
+/// Append only cells whose conservative tree bounds can intersect this view.
+/// The per-tree shader tests still run on every selected placement.
+fn append_visible_tree_indices(
+    cells: &[TreeSpatialCell],
+    frustum: &[[f32; 4]; 6],
+    clip_plane: Option<(f32, f32)>,
+    bounds: Option<[f32; 4]>,
+    out: &mut Vec<u32>,
+) {
+    for cell in cells {
+        if let Some([x0, x1, z0, z1]) = bounds {
+            if cell.max[0] < x0
+                || cell.min[0] >= x1
+                || cell.max[2] < z0
+                || cell.min[2] >= z1
+            {
+                continue;
+            }
+        }
+        if !crate::world_objects::aabb_survives_clip(clip_plane, cell.min, cell.max)
+            || !crate::world_objects::aabb_in_frustum(frustum, cell.min, cell.max)
+        {
+            continue;
+        }
+        out.extend_from_slice(&cell.placement_indices);
+    }
+}
+
 /// Per-frame inputs of the LOD compute pass.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -67,7 +145,7 @@ pub(crate) struct LodParams {
     pub(crate) frustum: [[f32; 4]; 6],
     /// Optional water clip plane: height, sign, enabled, unused.
     pub(crate) clip: [f32; 4],
-    /// `placements, groups, bounds_active, 0`.
+    /// `active placements, groups, bounds_active, 0`.
     pub(crate) counts: [u32; 4],
     /// The exact view-projection used by the depth-producing pass.
     pub(crate) view_projection: [[f32; 4]; 4],
@@ -106,6 +184,7 @@ struct Instance {data0:vec4<f32>,data1:vec4<f32>};
 @group(0) @binding(3) var<storage,read_write> instances:array<Instance>;
 @group(0) @binding(4) var<storage,read_write> args:array<Args>;
 @group(0) @binding(5) var hiz:texture_2d<f32>;
+@group(0) @binding(6) var<storage,read> active_indices:array<u32>;
 fn is_finite(v:f32)->bool {return v>=-3.0e38 && v<=3.0e38;}
 // SpeedTreeRT 0x100282b0's estimate: f32 squared distance, then the float-bit
 // square root. Matches `tree_lod::client_distance`.
@@ -209,8 +288,9 @@ fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>) {
 }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id:vec3<u32>) {
- let index=id.x;
- if index>=p.counts.x {return;}
+ let active_slot=id.x;
+ if active_slot>=p.counts.x {return;}
+ let index=active_indices[active_slot];
  let placement=placements[index];
  let position=placement.pos_height.xyz;
  if !is_finite(position.x) || !is_finite(position.y) || !is_finite(position.z) {return;}
@@ -303,6 +383,11 @@ pub struct FarTrees {
     groups: Vec<Group>,
     /// Slots in the instance buffer: three level slices per placement.
     capacity: usize,
+    /// Coarse CPU spatial index; only indices from cells intersecting this view
+    /// are uploaded before the per-tree GPU LOD/occlusion pass.
+    spatial_cells: Vec<TreeSpatialCell>,
+    active_placement_indices: RefCell<Vec<u32>>,
+    active_index_buffer: wgpu::Buffer,
     last_resident_update: RefCell<
         Option<(
             [f32; 3],
@@ -1078,11 +1163,18 @@ impl FarTrees {
                 capacity: 0,
             });
         }
+        let spatial_cells = build_tree_spatial_cells(&placement_data, &group_data);
         let placement_count = placement_data.len() as u32;
         let placement_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tree placements"),
             contents: bytemuck::cast_slice(&placement_data),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let active_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("visible tree placement indices"),
+            size: (placement_data.len().max(1) * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let lod_group_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tree lod groups"),
@@ -1193,6 +1285,16 @@ impl FarTrees {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let lod_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1252,6 +1354,10 @@ impl FarTrees {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(&hiz_dummy_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: active_index_buffer.as_entire_binding(),
+                },
             ],
         });
         eprintln!(
@@ -1277,6 +1383,9 @@ impl FarTrees {
             batches,
             groups,
             capacity,
+            spatial_cells,
+            active_placement_indices: RefCell::new(Vec::new()),
+            active_index_buffer,
             last_resident_update: RefCell::new(None),
             lod_pipeline,
             lod_bind,
@@ -1328,6 +1437,10 @@ impl FarTrees {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.active_index_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1405,6 +1518,30 @@ impl FarTrees {
                 }
             }
         }
+        // A cheap spatial-cell test reduces the compute dispatch from the full
+        // map's tree count to the subset whose conservative cell bounds overlap
+        // this view. The shader still performs exact per-tree frustum, clip,
+        // distance/LOD and optional Hi-Z tests.
+        let mut active_indices = self.active_placement_indices.borrow_mut();
+        active_indices.clear();
+        append_visible_tree_indices(
+            &self.spatial_cells,
+            &frustum,
+            clip_plane,
+            bounds,
+            &mut active_indices,
+        );
+        let active_count = active_indices.len();
+        if active_count == 0 {
+            queue.write_buffer(&self.lod_args, 0, &self.lod_args_reset);
+            *self.last_resident_update.borrow_mut() = Some(key);
+            return;
+        }
+        queue.write_buffer(
+            &self.active_index_buffer,
+            0,
+            bytemuck::cast_slice(active_indices.as_slice()),
+        );
         let (hiz_width, hiz_height, hiz_levels) = hiz_extent.unwrap_or((0, 0, 0));
         let params = LodParams {
             camera: [camera[0], camera[1], camera[2], scale],
@@ -1412,7 +1549,7 @@ impl FarTrees {
             frustum,
             clip: clip_plane.map_or([0.; 4], |(height, sign)| [height, sign, 1., 0.]),
             counts: [
-                self.placements,
+                active_count as u32,
                 self.groups.len() as u32,
                 u32::from(bounds.is_some()),
                 0,
@@ -1436,7 +1573,7 @@ impl FarTrees {
         });
         pass.set_pipeline(&self.lod_pipeline);
         pass.set_bind_group(0, &self.lod_bind, &[]);
-        pass.dispatch_workgroups(self.placements.div_ceil(64), 1, 1);
+        pass.dispatch_workgroups((active_count as u32).div_ceil(64), 1, 1);
         drop(pass);
         *self.last_resident_update.borrow_mut() = Some(key);
     }
@@ -1634,6 +1771,35 @@ fn sphere_visible(position: [f32; 3], radius: f32, planes: &[[f32; 4]; 6]) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_spatial_cells_keep_intersections_and_reject_distant_regions() {
+        let groups = [GroupInfo {
+            height: 5.0,
+            args_base: 0,
+            first_instance: 0,
+            capacity: 3,
+        }];
+        let placements = [
+            Placement { pos_height: [95.0, 0.0, 0.0, 0.0], group: 0, pad: [0; 3] },
+            Placement { pos_height: [120.0, 0.0, 0.0, 0.0], group: 0, pad: [0; 3] },
+            Placement { pos_height: [1024.0, 0.0, 0.0, 0.0], group: 0, pad: [0; 3] },
+        ];
+        let cells = build_tree_spatial_cells(&placements, &groups);
+        let cube = [
+            [1.0, 0.0, 0.0, 100.0],
+            [-1.0, 0.0, 0.0, 100.0],
+            [0.0, 1.0, 0.0, 100.0],
+            [0.0, -1.0, 0.0, 100.0],
+            [0.0, 0.0, 1.0, 100.0],
+            [0.0, 0.0, -1.0, 100.0],
+        ];
+        let mut visible = Vec::new();
+        append_visible_tree_indices(&cells, &cube, None, None, &mut visible);
+        // The first two trees share a cell. The second tree's sphere reaches
+        // the view, so retaining that entire cell is intentionally conservative.
+        assert_eq!(visible, vec![0, 1]);
+    }
 
     #[test]
     fn tree_frustum_spheres_reject_outside_and_keep_intersecting_canopies() {
