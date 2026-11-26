@@ -1958,41 +1958,32 @@ impl GpuPage {
             // for a list whose page boundaries already force one draw per run.
             if scratch.indirect_runs.iter().any(|run| run.record_count > 1) {
                 let slot = usize::from(sdr_only);
-                let required_bytes = (scratch.indirect_args.len() as u64)
-                    .saturating_mul(PAGE_DRAW_ARGS_SIZE);
+                let required_bytes =
+                    (scratch.indirect_args.len() as u64).saturating_mul(PAGE_DRAW_ARGS_SIZE);
                 let current_bytes = scratch.indirect_buffers[slot]
                     .as_ref()
                     .map_or(0, wgpu::Buffer::size);
                 let max_buffer_size = device.limits().max_buffer_size;
-                let capacity = required_bytes.max(
-                    current_bytes
-                        .saturating_mul(2)
-                        .min(max_buffer_size),
-                );
+                let capacity =
+                    required_bytes.max(current_bytes.saturating_mul(2).min(max_buffer_size));
                 if required_bytes > 0 && capacity <= max_buffer_size {
                     if capacity != current_bytes {
-                        scratch.indirect_buffers[slot] = Some(device.create_buffer(
-                            &wgpu::BufferDescriptor {
+                        scratch.indirect_buffers[slot] =
+                            Some(device.create_buffer(&wgpu::BufferDescriptor {
                                 label: Some(if sdr_only {
                                     "whole-world SDR indirect commands"
                                 } else {
                                     "whole-world opaque indirect commands"
                                 }),
                                 size: capacity,
-                                usage: wgpu::BufferUsages::INDIRECT
-                                    | wgpu::BufferUsages::COPY_DST,
+                                usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
                                 mapped_at_creation: false,
-                            },
-                        ));
+                            }));
                     }
                     let buffer = scratch.indirect_buffers[slot]
                         .as_ref()
                         .expect("whole-world indirect buffer was just allocated");
-                    queue.write_buffer(
-                        buffer,
-                        0,
-                        bytemuck::cast_slice(&scratch.indirect_args),
-                    );
+                    queue.write_buffer(buffer, 0, bytemuck::cast_slice(&scratch.indirect_args));
                     use_multi_draw = true;
                 }
             }
@@ -2016,7 +2007,11 @@ impl GpuPage {
                     if !same_atlas {
                         pass.set_bind_group(
                             0,
-                            if reflected { &page.reflected } else { &page.normal },
+                            if reflected {
+                                &page.reflected
+                            } else {
+                                &page.normal
+                            },
                             &[],
                         );
                     }
@@ -2044,7 +2039,11 @@ impl GpuPage {
                     if !same_atlas {
                         pass.set_bind_group(
                             0,
-                            if reflected { &page.reflected } else { &page.normal },
+                            if reflected {
+                                &page.reflected
+                            } else {
+                                &page.normal
+                            },
                             &[],
                         );
                     }
@@ -2635,12 +2634,36 @@ mod page_tests {
     #[test]
     fn indirect_page_runs_preserve_command_order_and_record_contents() {
         let cmds = [
-            DrawCmd { page: 0, start: 0, end: 12 },
-            DrawCmd { page: 0, start: 12, end: 30 },
-            DrawCmd { page: 1, start: 4, end: 10 },
-            DrawCmd { page: 0, start: 30, end: 42 },
-            DrawCmd { page: 1, start: 10, end: 22 },
-            DrawCmd { page: 1, start: 22, end: 40 },
+            DrawCmd {
+                page: 0,
+                start: 0,
+                end: 12,
+            },
+            DrawCmd {
+                page: 0,
+                start: 12,
+                end: 30,
+            },
+            DrawCmd {
+                page: 1,
+                start: 4,
+                end: 10,
+            },
+            DrawCmd {
+                page: 0,
+                start: 30,
+                end: 42,
+            },
+            DrawCmd {
+                page: 1,
+                start: 10,
+                end: 22,
+            },
+            DrawCmd {
+                page: 1,
+                start: 22,
+                end: 40,
+            },
         ];
         let mut args = Vec::new();
         let mut runs = Vec::<WorldIndirectRun>::new();
@@ -2666,10 +2689,30 @@ mod page_tests {
         assert_eq!(
             runs,
             vec![
-                WorldIndirectRun { page: 0, first_record: 0, record_count: 2, first_cmd: 0 },
-                WorldIndirectRun { page: 1, first_record: 2, record_count: 1, first_cmd: 2 },
-                WorldIndirectRun { page: 0, first_record: 3, record_count: 1, first_cmd: 3 },
-                WorldIndirectRun { page: 1, first_record: 4, record_count: 2, first_cmd: 4 },
+                WorldIndirectRun {
+                    page: 0,
+                    first_record: 0,
+                    record_count: 2,
+                    first_cmd: 0
+                },
+                WorldIndirectRun {
+                    page: 1,
+                    first_record: 2,
+                    record_count: 1,
+                    first_cmd: 2
+                },
+                WorldIndirectRun {
+                    page: 0,
+                    first_record: 3,
+                    record_count: 1,
+                    first_cmd: 3
+                },
+                WorldIndirectRun {
+                    page: 1,
+                    first_record: 4,
+                    record_count: 2,
+                    first_cmd: 4
+                },
             ]
         );
         let expanded: Vec<(usize, u32, u32)> = runs
@@ -2682,11 +2725,13 @@ mod page_tests {
             .collect();
         assert_eq!(
             expanded,
-            cmds.iter().map(|cmd| (cmd.page, cmd.start, cmd.end)).collect::<Vec<_>>()
+            cmds.iter()
+                .map(|cmd| (cmd.page, cmd.start, cmd.end))
+                .collect::<Vec<_>>()
         );
-        assert!(args.iter().all(|arg| arg.instance_count == 1
-            && arg.base_vertex == 0
-            && arg.first_instance == 0));
+        assert!(args
+            .iter()
+            .all(|arg| arg.instance_count == 1 && arg.base_vertex == 0 && arg.first_instance == 0));
     }
 
     #[test]

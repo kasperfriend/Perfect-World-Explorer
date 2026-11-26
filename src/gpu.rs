@@ -3519,7 +3519,9 @@ impl Renderer {
                 false,
                 &self.device,
                 &self.queue,
-                self.device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT),
+                self.device
+                    .features()
+                    .contains(wgpu::Features::MULTI_DRAW_INDIRECT),
                 &mut opaque_world_scratch,
             );
         }
@@ -3559,7 +3561,9 @@ impl Renderer {
                     true,
                     &self.device,
                     &self.queue,
-                    self.device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT),
+                    self.device
+                        .features()
+                        .contains(wgpu::Features::MULTI_DRAW_INDIRECT),
                     &mut sdr_world_scratch,
                 );
             }
