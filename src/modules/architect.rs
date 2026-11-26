@@ -537,9 +537,11 @@ impl Architect {
         let Some(asset) = self.selected_asset.clone() else {
             return;
         };
+        let portable_asset = self.portable_asset_path(&asset);
+        let position = self.placement_position(camera);
         self.project.objects.push(PlacedObject {
-            asset: self.portable_asset_path(&asset),
-            position: self.placement_position(camera),
+            asset: portable_asset,
+            position,
             rotation: [0.; 3],
             scale: 1.,
         });
@@ -1048,11 +1050,16 @@ impl Architect {
                 ui.horizontal(|ui| { ui.heading("Terrain sculpt"); Self::dock_picker(ui, &mut self.bottom_dock); });
                 ui.add(egui::Slider::new(&mut self.flatten_height, -500.0..=500.0).text("Flatten target"));
                 if ui.button("Record brush operation at camera").clicked() {
+                    let position = self.placement_position(camera);
                     self.project.strokes.push(TerrainStroke {
                         mode: self.brush,
-                        position: self.placement_position(camera),
+                        position,
                         radius: self.brush_radius,
-                        strength: if self.brush == BrushMode::Flatten { self.flatten_height } else { self.brush_strength },
+                        strength: if self.brush == BrushMode::Flatten {
+                            self.flatten_height
+                        } else {
+                            self.brush_strength
+                        },
                     });
                     self.status = "Brush operation recorded in the project. Terrain mesh mutation is not wired yet.".into();
                 }
