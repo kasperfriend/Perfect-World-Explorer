@@ -804,7 +804,13 @@ impl<'a> BuildState<'a> {
         }
         // Opt #27: Fast 8-bin Surface Area Heuristic (SAH) split for partitions > 64 tris.
         let mid = if partition.len() > 64 {
-            partition_sah(self.tri_bounds, self.centroids, partition, bounds, self.cancel)?
+            partition_sah(
+                self.tri_bounds,
+                self.centroids,
+                partition,
+                bounds,
+                self.cancel,
+            )?
         } else {
             let mut axis = 0usize;
             let mut best = f32::NEG_INFINITY;
