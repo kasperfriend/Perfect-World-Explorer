@@ -60,7 +60,9 @@ impl RasterOverrides {
         plan: &crate::modules::raywatcher::plan::Plan,
         rt_output_ready: bool,
     ) -> Self {
-        if rt_output_ready {
+        if rt_output_ready
+            && plan.debug_view != crate::modules::raywatcher::plan::DebugView::RasterOnly
+        {
             Self::for_plan(plan)
         } else {
             Self::NONE
