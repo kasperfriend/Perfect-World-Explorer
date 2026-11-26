@@ -480,8 +480,8 @@ impl Scan {
         // The catalogue records the actual client side of each pair where
         // public release inventories distinguish it from the server data.
         // Regional builds sometimes reuse both header numbers across releases.
-        // In those cases the returned candidate list is intentionally not a
-        // selected marketing version; content fingerprints could narrow it.
+        // In those cases a best-effort default is shown with an explicit
+        // "Version is guessed:" label; content fingerprints could refine it.
         // Unknown pairs remain unknown until another client is measured.
         data_version_profile(elements.version(), tasks_version)
     }
@@ -2188,7 +2188,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_legacy_marker_uses_data_profiles_without_guessing_collisions() {
+    fn shared_legacy_marker_labels_ambiguous_profiles_as_guesses() {
         let cases = [
             (10, 55, "1.3.1 (data-version profile)"),
             (
@@ -2199,7 +2199,7 @@ mod tests {
             (
                 27,
                 75,
-                "unknown game version (ambiguous data pair; candidates: 1.4.1 / 1.4.2)",
+                "Version is guessed: 1.4.2",
             ),
             (
                 29,
@@ -2209,7 +2209,7 @@ mod tests {
             (
                 70,
                 105,
-                "unknown game version (ambiguous data pair; candidates: 1.4.4 / 1.4.5 / 1.4.6)",
+                "Version is guessed: 1.4.4",
             ),
             (85, 176, "unknown game version (unmapped client marker 1 0)"),
         ];
@@ -2951,7 +2951,7 @@ mod tests {
         }
         assert_eq!(
             Ambiguous("1.3.6").game_version(),
-            "unknown game version (ambiguous data pair; candidates: 1.3.4 / 1.3.6 / 1.3.8)"
+            "Version is guessed: 1.3.6"
         );
     }
 
@@ -2999,7 +2999,7 @@ fn data_version_profile(elements: u32, tasks: u32) -> Option<DataVersionProfile>
         // A modified Brazilian 1.4.1 client and the W2I 1.4.2 client share
         // this data pair. The executable or its release marker can disambiguate.
         (27, 75) => Some(Ambiguous("1.4.2")),
-        (29, 78) => Some(Ambiguous("1.4.1 / 1.4.2")),
+        (29, 78) => Some(Ambiguous("1.4.2")),
         (60, 93) => Some(Exact("1.4.4")),
         (63, 101) | (69, 103) => Some(Exact("1.4.5")),
         (70, 105) => Some(Ambiguous("1.4.4")),
