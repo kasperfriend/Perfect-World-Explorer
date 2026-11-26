@@ -3135,22 +3135,28 @@ impl Pipelines {
                 },
             ],
         });
-        let screen_raster_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("raywatcher full-resolution screen raster"),
-            entries: &[texture_entry(0, wgpu::TextureSampleType::Float { filterable: true })],
-        });
-        let screen_raster_copy_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("raywatcher full-resolution raster copy"),
-            entries: &[
-                texture_entry(0, wgpu::TextureSampleType::Float { filterable: true }),
-                storage_texture_entry(1, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
-            ],
-        });
-        let screen_raster_copy_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("raywatcher full-resolution raster copy"),
-            bind_group_layouts: &[&screen_raster_copy_layout],
-            push_constant_ranges: &[],
-        });
+        let screen_raster_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("raywatcher full-resolution screen raster"),
+                entries: &[texture_entry(
+                    0,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                )],
+            });
+        let screen_raster_copy_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("raywatcher full-resolution raster copy"),
+                entries: &[
+                    texture_entry(0, wgpu::TextureSampleType::Float { filterable: true }),
+                    storage_texture_entry(1, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
+                ],
+            });
+        let screen_raster_copy_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("raywatcher full-resolution raster copy"),
+                bind_group_layouts: &[&screen_raster_copy_layout],
+                push_constant_ranges: &[],
+            });
         let screen_raster_copy = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("raywatcher full-resolution raster copy"),
             layout: Some(&screen_raster_copy_pipeline_layout),
@@ -3790,8 +3796,13 @@ impl RaywatcherGpu {
             plane(device, "raywatcher temporal moments", w, h, GUIDE_FORMAT);
         let (motion_tex, motion) = plane(device, "raywatcher motion", w, h, COLOUR_FORMAT);
         let (depth_tex, depth) = depth_plane(device, w, h);
-        let (screen_raster_tex, screen_raster_view) =
-            plane(device, "raywatcher full-resolution raster", w, h, COLOUR_FORMAT);
+        let (screen_raster_tex, screen_raster_view) = plane(
+            device,
+            "raywatcher full-resolution raster",
+            w,
+            h,
+            COLOUR_FORMAT,
+        );
         let screen_raster_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("raywatcher full-resolution screen raster"),
             layout: &pipelines.screen_raster_layout,
@@ -4405,8 +4416,13 @@ impl RaywatcherGpu {
             plane(device, "raywatcher temporal moments", w, h, GUIDE_FORMAT);
         let (motion_tex, motion) = plane(device, "raywatcher motion", w, h, COLOUR_FORMAT);
         let (depth_tex, depth) = depth_plane(device, w, h);
-        let (screen_raster_tex, screen_raster_view) =
-            plane(device, "raywatcher full-resolution raster", w, h, COLOUR_FORMAT);
+        let (screen_raster_tex, screen_raster_view) = plane(
+            device,
+            "raywatcher full-resolution raster",
+            w,
+            h,
+            COLOUR_FORMAT,
+        );
         let screen_raster_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("raywatcher full-resolution screen raster"),
             layout: &pipelines.screen_raster_layout,
@@ -4532,7 +4548,12 @@ impl RaywatcherGpu {
             return;
         }
         let started = std::time::Instant::now();
-        match super::dxr::DxrTracer::new(&self.device, &self.scene_geom, self.grid_extent, self.render_extent) {
+        match super::dxr::DxrTracer::new(
+            &self.device,
+            &self.scene_geom,
+            self.grid_extent,
+            self.render_extent,
+        ) {
             Ok(tracer) => {
                 self.dxr = Some(tracer);
                 eprintln!(
@@ -5666,8 +5687,8 @@ impl RaywatcherGpu {
             let Some((_, _, _, raster_view, _)) = self.raster_copy.as_ref() else {
                 return;
             };
-            self.screen_raster_copy_bind_group = Some(device.create_bind_group(
-                &wgpu::BindGroupDescriptor {
+            self.screen_raster_copy_bind_group =
+                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("raywatcher full-resolution raster copy"),
                     layout: &self.pipelines.screen_raster_copy_layout,
                     entries: &[
@@ -5680,8 +5701,7 @@ impl RaywatcherGpu {
                             resource: wgpu::BindingResource::TextureView(&self.screen_raster_view),
                         },
                     ],
-                },
-            ));
+                }));
         }
         let mut copy_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("raywatcher full-resolution raster conversion"),
