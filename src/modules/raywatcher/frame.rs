@@ -704,7 +704,10 @@ mod tests {
         assert!(on_ov.suppress_baked_shadows);
         assert!(!on_ov.directional_light);
         assert!(!on_ov.ambient);
-        assert!(on_ov.reflection_pass, "RT reflections own the native water mirror");
+        assert!(
+            on_ov.reflection_pass,
+            "RT reflections own the native water mirror"
+        );
 
         s.effects.shadows = false;
         let no_sh_plan = Plan::decide(&s, (1920, 1080), true, |_| false);
