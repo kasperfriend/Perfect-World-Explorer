@@ -3606,9 +3606,15 @@ fn depth_plane(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::T
     (texture, view)
 }
 
+/// Adaptive samples may never exceed the count included in Plan::grid_scale.
+fn adaptive_sample_ceiling(samples: u32) -> f32 {
+    samples.clamp(1, 8) as f32
+}
+
 /// Whether this frame can actually dispatch through DXR. A Hardware mode
 /// request alone is insufficient while the acceleration structure is being
-/// rebuilt on a worker; the Software tracer remains active during that window.
+/// rebuilt on a worker; the last RT output is held (or raster remains visible)
+/// until the matching hardware scene is ready.
 fn hardware_trace_ready(
     hardware_mode: bool,
     dxr_failed: bool,
@@ -4729,12 +4735,6 @@ impl RaywatcherGpu {
         self.dxr_init.is_some()
     }
 
-    /// Render output extent. The host must keep raster terms enabled if the
-    /// previous RT image belongs to a different viewport size.
-    pub fn render_extent(&self) -> (u32, u32) {
-        self.render_extent
-    }
-
     /// Whether the previous frame produced a complete RT output. During DXR
     /// preparation the host may keep displaying that stable image, but must
     /// not claim a newly resized or never-produced target is ready.
@@ -4943,7 +4943,7 @@ impl RaywatcherGpu {
         // to adapt up to four samples here silently multiplied that budget by
         // as much as 4x, causing GPU spikes. Keep the shader ceiling inside the
         // exact sample count used by the planner (for both Software and DXR).
-        packed.restir[1] = plan.samples.clamp(1, 8) as f32;
+        packed.restir[1] = adaptive_sample_ceiling(plan.samples);
         packed.restir[2] = 4.0;
         packed.restir[3] = (self.frames & 1) as f32;
         if has_object_mv {
@@ -4976,8 +4976,8 @@ impl RaywatcherGpu {
         let mut traced_hw = false;
 
         // Track the backend actually used for this frame, not the requested
-        // mode. During a scene/AS rebuild DXR is temporarily unavailable, so
-        // Software remains live until the replacement tracer is ready.
+        // mode. Hardware frames are paused while its scene/AS worker runs, so
+        // the backend transition resets temporal history only after it is ready.
         let requested_hardware = hardware_trace_ready(
             hardware_mode,
             self.dxr_failed,
@@ -6496,13 +6496,15 @@ mod shader_optimization_regression_tests {
 
 #[cfg(test)]
 mod dxr_backend_selection_tests {
-    use super::hardware_trace_ready;
+    use super::{adaptive_sample_ceiling, hardware_trace_ready};
 
     #[test]
     fn adaptive_ray_ceiling_is_the_sample_count_included_in_the_plan() {
-        for samples in 1..=8 {
-            let ceiling = samples.clamp(1, 8) as f32;
-            assert_eq!(ceiling, samples as f32);
+        for samples in 0..=10 {
+            assert_eq!(
+                adaptive_sample_ceiling(samples),
+                samples.clamp(1, 8) as f32
+            );
         }
     }
 
