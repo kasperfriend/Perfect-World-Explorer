@@ -4607,12 +4607,10 @@ impl RaywatcherGpu {
         self.dxr_init.is_some()
     }
 
-    /// The raster mirror can be suppressed once either RT backend has
-    /// produced the previous frame. A pending DXR rebuild does not make the
-    /// active Software fallback unready.
     /// Whether the previous frame produced a complete RT output. The host
-    /// queries this before the raster pass, so it is also the safety gate for
-    /// removing any raster term that the following RT pass will replace.
+    /// queries this before the raster pass, so no raster term is removed until
+    /// its RT replacement is available. A pending DXR rebuild does not make
+    /// the active Software fallback unready.
     pub fn can_replace_raster_effects(&self) -> bool {
         self.traced_last_frame
     }
