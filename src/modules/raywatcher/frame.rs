@@ -77,12 +77,16 @@ impl RasterOverrides {
         }
         if !plan.replace_raster {
             return Self {
-                reflection_pass: false,
+                reflection_pass: plan.effects.reflections
+                    && plan.debug_view == crate::modules::raywatcher::plan::DebugView::None,
                 suppress_baked_shadows: plan.effects.shadows,
                 ..Self::NONE
             };
         }
-        Self::for_effects(plan.effects, true)
+        let mut overrides = Self::for_effects(plan.effects, true);
+        overrides.reflection_pass &=
+            plan.debug_view == crate::modules::raywatcher::plan::DebugView::None;
+        overrides
     }
 
     /// The overrides implied when explicit raster replacement is enabled.
@@ -93,7 +97,7 @@ impl RasterOverrides {
         Self {
             directional_light: effects.lighting || effects.shadows,
             ambient: effects.lighting || effects.ambient_occlusion || effects.global_illumination,
-            reflection_pass: false,
+            reflection_pass: effects.reflections,
             occlusion: effects.ambient_occlusion,
             suppress_baked_shadows: effects.shadows,
         }
@@ -739,9 +743,9 @@ mod tests {
         // term *is* the raster shadowed lighting.
         assert!(only(|e| e.shadows = true).directional_light);
         assert!(only(|e| e.lighting = true).directional_light);
-        // RT reflections never suppress the native game water reflection pass.
+        // RT reflections own the native mirror submission instead of stacking with it.
         let r = only(|e| e.reflections = true);
-        assert!(!r.reflection_pass);
+        assert!(r.reflection_pass);
         assert!(!r.directional_light && !r.occlusion);
         // ...and ambient occlusion removes the fog occlusion term.
         let o = only(|e| e.ambient_occlusion = true);

@@ -16,7 +16,7 @@ pub struct WaterUniform {
     /// x: original-style rasterized edge alpha is available in refraction.
     pub edge_mode: [f32; 4],
     /// x: water-surface fog start; y: fog end; z: 1 when fog applies;
-    /// w: unused. Appended after `edge_mode`, so earlier offsets are unchanged.
+    /// w: Raywatcher owns the reflection (disable only the native mirror term).
     pub fog: [f32; 4],
     /// The water-surface fog colour bound right before the water draw.
     pub fog_color: [f32; 4],
@@ -129,7 +129,9 @@ fn surface_fog(c:vec3<f32>, reciprocal_w:f32)->vec3<f32>{
  let bump=n.xz*edge*edge;
  let mirrored=textureSample(reflection,screen_sampler,clamp(screen+bump*0.25,vec2<f32>(0.001),vec2<f32>(0.999))).rgb;
  let fallback=textureSample(scene_color,screen_sampler,screen).rgb*vec3<f32>(0.75,0.85,0.95);
- let reflect_color=select(fallback,mirrored,w.size.w>0.5);
+ let raster_reflect_color=select(fallback,mirrored,w.size.w>0.5);
+ // Keep the existing surface and refraction, but avoid combining two mirror sources.
+ let reflect_color=select(raster_reflect_color,vec3<f32>(0.0),w.fog.w>0.5);
  // Reject displaced samples in front of the water plane. Without this,
  // shore objects smear across the water even when they should occlude it.
  let refr_uv=clamp(screen-bump*0.15,vec2<f32>(0.001),vec2<f32>(0.999));

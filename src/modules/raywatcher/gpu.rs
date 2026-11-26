@@ -1439,17 +1439,6 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let is_water = roughness <= 0.12;
     let is_glossy_trim = !is_water && roughness <= 0.36;
 
-    // Water is owned entirely by the original game renderer: no RT lighting,
-    // reflection, denoising signal or reconstruction is allowed to alter it.
-    if (is_water) {
-        textureStore(out_colour, ip, vec4<f32>(select(raster_rgb, vec3<f32>(0.0), layered), 1.0));
-        textureStore(out_guide, ip, vec4<f32>(1.0, dist / max(params.lens.y, 1e-4), 1.0, roughness));
-        textureStore(out_reflection, ip, vec4<f32>(0.0, 0.0, 0.0, 1.0));
-        textureStore(out_normals, ip, vec4<f32>(normal, roughness));
-        textureStore(out_albedo, ip, vec4<f32>(raster_rgb, 0.0));
-        restir_clear(reservoir_index);
-        return;
-    }
     let effects = u32(round(params.effects.y));
     let bits_shadows = (effects & 1u) != 0u;
     let bits_lighting = (effects & 2u) != 0u;
@@ -1459,6 +1448,19 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let bits_contact_shadows = (effects & 256u) != 0u;
     let bits_moonlit_night = (effects & 512u) != 0u;
     let bits_weather = (effects & 2048u) != 0u;
+    let trace_water_reflection = bits_reflections
+        && params.eye.y > point.y + 0.05
+        && u32(round(params.counts.w)) == 0u;
+    // Preserve native water for refraction-only, underwater and debug views.
+    if (is_water && !trace_water_reflection) {
+        textureStore(out_colour, ip, vec4<f32>(select(raster_rgb, vec3<f32>(0.0), layered), 1.0));
+        textureStore(out_guide, ip, vec4<f32>(1.0, dist / max(params.lens.y, 1e-4), 1.0, roughness));
+        textureStore(out_reflection, ip, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        textureStore(out_normals, ip, vec4<f32>(normal, roughness));
+        textureStore(out_albedo, ip, vec4<f32>(raster_rgb, 0.0));
+        restir_clear(reservoir_index);
+        return;
+    }
 
     let steepness = 1.0 - clamp(normal.y, 0.0, 1.0);
     let slope_bias = steepness * (0.75 + dist * 0.0065);
@@ -1518,7 +1520,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         // Feature #7 (Contact-Hardening Soft Shadows / PCSS) + Feature #4 (Foliage Transmission)
         var shadow = 1.0;
         var trans_tint = vec3<f32>(0.0);
-        if (bits_shadows && n_dot_l > 0.02 && fog_t < 0.96) {
+        if (bits_shadows && !is_water && n_dot_l > 0.02 && fog_t < 0.96) {
             let sun_taps = select(1u, 2u, spread_tan > 0.0 && dist < 140.0);
             var h0 = closest_hit(ray_origin, params.sun_dir.xyz, shadow_t_min, params.lens.y);
             let terrain_self_skip = select(2.5 + steepness * 14.0 + dist * 0.025, 0.0, is_water);
@@ -2311,6 +2313,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let spec_f0 = select(select(0.02, 0.06, is_glossy_trim), 0.18, is_water);
+    if (is_water && debug_mode_early == 0u) {
+        out_rgb = vec3<f32>(0.0);
+        out_lf = 1.0;
+    }
     textureStore(out_colour, ip, vec4<f32>(out_rgb, out_lf));
     textureStore(out_guide, ip, vec4<f32>(avg_open, dist / params.lens.y, avg_shadow, roughness));
     textureStore(out_reflection, ip, vec4<f32>(store_refl, avg_refl_dist / params.lens.y));
@@ -2477,7 +2483,8 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
                 let p = clamp(gp + vec2<i32>(dx, dy), vec2<i32>(0), gmax);
                 let raw = textureLoad(src_colour, p, 0);
-                let c = select(raw.rgb, raw.rgb + textureLoad(src_reflection, p, 0).rgb, is_glossy);
+                let tap_is_glossy = textureLoad(src_normals, p, 0).w <= 0.12;
+                let c = select(raw.rgb, raw.rgb + textureLoad(src_reflection, p, 0).rgb, tap_is_glossy);
                 sum = sum + c;
                 sum_sq = sum_sq + c * c;
                 sum_lf = sum_lf + raw.a;
@@ -2512,7 +2519,8 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
                 let p = clamp(gp + vec2<i32>(dx, dy), vec2<i32>(0), gmax);
                 let raw = textureLoad(src_colour, p, 0);
-                let c = select(raw.rgb, raw.rgb + textureLoad(src_reflection, p, 0).rgb, is_glossy);
+                let tap_is_glossy = textureLoad(src_normals, p, 0).w <= 0.12;
+                let c = select(raw.rgb, raw.rgb + textureLoad(src_reflection, p, 0).rgb, tap_is_glossy);
                 let l = luminance(c);
                 l_sum = l_sum + l;
                 l2_sum = l2_sum + l * l;
@@ -2780,13 +2788,20 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
     let n_len = length(norm_raw.xyz);
     let n_center = select(vec3<f32>(0.0, 1.0, 0.0), norm_raw.xyz / n_len, n_len > 1e-4);
     let center_roughness = norm_raw.w;
-    // Preserve original game water pixels exactly, including after DLSS RR.
-    if (center_roughness <= 0.12) {
+    let is_water = center_roughness <= 0.12;
+    // Keep the native water byte-for-byte unless an RT reflection was actually
+    // traced. In active mode its raster base/refraction stays and RT adds only mirror radiance.
+    if (is_water && comp_params.z <= 0.5) {
         return raster;
     }
-    // In this mode the ray image is already composited (DLSS RR or explicit
-    // replace-raster mode); copy it unchanged for every non-water pixel.
+    // In this mode the ray image is already composited. DLSS RR in layered mode
+    // includes the raster base; explicit replace-raster mode does not.
     if (comp_params.y > 0.5) {
+        if (is_water) {
+            let rt = textureLoad(src_rt, px, 0);
+            let water_rgb = select(raster.rgb + rt.rgb, rt.rgb, comp_params.w > 0.5);
+            return vec4<f32>(max(water_rgb, vec3<f32>(0.0)), raster.a);
+        }
         return textureLoad(src_rt, px, 0);
     }
 
@@ -5470,6 +5485,7 @@ impl RaywatcherGpu {
         destination: &wgpu::Texture,
         layered: bool,
         dlss_rr_ran: bool,
+        rt_water_reflections: bool,
     ) {
         if self.raster_copy.is_none() {
             self.blit_to(device, encoder, destination);
@@ -5485,8 +5501,8 @@ impl RaywatcherGpu {
             bytemuck::bytes_of(&[
                 self.last_scene_albedo_gain,
                 if already_composited { 1.0 } else { 0.0 },
-                0.0,
-                0.0,
+                if rt_water_reflections { 1.0 } else { 0.0 },
+                if dlss_rr_ran && layered { 1.0 } else { 0.0 },
             ]),
         );
         let target_format = destination.format();

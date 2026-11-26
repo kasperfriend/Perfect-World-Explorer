@@ -4943,6 +4943,7 @@ impl Renderer {
                 destination,
                 layered,
                 dlss_rr_ran,
+                rt_water_reflections,
             );
         }
         self.modules.raywatcher_mut().next_frame();
@@ -5055,6 +5056,10 @@ impl Renderer {
         );
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&normal));
+        let rt_water_reflections = camera.water_reflections
+            && self.raywatcher_overrides.reflection_pass;
+        let mut water_fog = frame.active_fog_range;
+        water_fog[3] = if rt_water_reflections { 1.0 } else { 0.0 };
         self.water.update(
             &self.queue,
             &crate::water_gpu::WaterUniform {
@@ -5076,7 +5081,7 @@ impl Renderer {
                 edge_mode: [if camera.water_reflections { 1. } else { 0. }, 0., 0., 0.],
                 // Water-surface fog: the client binds the region's own triple
                 // (white 100..400 above water, blue 10..60 below).
-                fog: frame.active_fog_range,
+                fog: water_fog,
                 fog_color: frame.active_fog_color,
             },
         );
@@ -5368,7 +5373,11 @@ impl Renderer {
         // below. Nothing here is duplicated work to remove — a mirror is a mirror
         // — but the count is what decides how much world the frame rasterises, so
         // it goes into the `TimingFrame` line rather than staying invisible.
-        self.scene_passes = 1 + 2 * visible.iter().filter(|b| !b.simple).count() as u32;
+        let rt_water_reflections = camera.water_reflections
+            && self.raywatcher_overrides.reflection_pass;
+        self.scene_passes = 1
+            + (if rt_water_reflections { 1 } else { 2 })
+                * visible.iter().filter(|b| !b.simple).count() as u32;
         let mut simple_encoder: Option<wgpu::CommandEncoder> = None;
         for (batch_idx, batch) in visible.iter().enumerate() {
             if batch.simple {
@@ -5596,6 +5605,22 @@ impl Renderer {
                     batch.end,
                 );
                 self.queue.submit(Some(re.finish()));
+                continue;
+            }
+            if rt_water_reflections {
+                // Above-water refraction is already rendered. Keep the exact
+                // existing water geometry/shader and skip only the old mirrored scene.
+                let mut water_encoder = self.device.create_command_encoder(&Default::default());
+                self.water.draw_water(
+                    &mut water_encoder,
+                    scene_target,
+                    &scene_depth,
+                    &self.vertex,
+                    &self.index,
+                    batch.start,
+                    batch.end,
+                );
+                self.queue.submit(Some(water_encoder.finish()));
                 continue;
             }
             let flip = Mat4::from_translation(Vec3::new(0., 2. * plane, 0.))

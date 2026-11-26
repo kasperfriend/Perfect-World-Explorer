@@ -977,8 +977,22 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     bool is_glossy_trim = !is_water && roughness <= 0.36;
 
     bool layered = params.effects.w > 0.5;
-    // Keep native PW water (including its original planar reflection pass) completely out of DXR.
-    if (is_water) {
+    uint effects = uint(round(params.effects.y));
+    bool bits_shadows = (effects & 1u) != 0u;
+    bool bits_lighting = (effects & 2u) != 0u;
+    bool bits_reflections = (effects & 4u) != 0u;
+    bool bits_ao = (effects & 8u) != 0u;
+    bool bits_gi = (effects & 16u) != 0u;
+    bool bits_contact_shadows = (effects & 256u) != 0u;
+    bool bits_moonlit_night = (effects & 512u) != 0u;
+    bool bits_weather = (effects & 2048u) != 0u;
+    bool bits_twilight_sky = (effects & 4096u) != 0u;
+    bool trace_water_reflection = bits_reflections
+        && params.eye.y > world_pos.y + 0.05
+        && uint(round(params.counts.w)) == 0u;
+    // Native water remains entirely untouched unless an above-water RT
+    // reflection is available. Underwater and debug views keep legacy behaviour.
+    if (is_water && !trace_water_reflection) {
         out_colour[id.xy] = float4(layered ? float3(0.0, 0.0, 0.0) : raster_rgb, 1.0);
         if (params.point_light_meta.w > 0.5) {
             out_guide[id.xy] = float4(1.0, dist / max(params.lens.y, 1e-4), 1.0, roughness);
@@ -991,16 +1005,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         restir_clear(reservoir_index);
         return;
     }
-    uint effects = uint(round(params.effects.y));
-    bool bits_shadows = (effects & 1u) != 0u;
-    bool bits_lighting = (effects & 2u) != 0u;
-    bool bits_reflections = (effects & 4u) != 0u;
-    bool bits_ao = (effects & 8u) != 0u;
-    bool bits_gi = (effects & 16u) != 0u;
-    bool bits_contact_shadows = (effects & 256u) != 0u;
-    bool bits_moonlit_night = (effects & 512u) != 0u;
-    bool bits_weather = (effects & 2048u) != 0u;
-    bool bits_twilight_sky = (effects & 4096u) != 0u;
 
     // Feature #6: True metallic PBR material separation for armor, weapons & gold roofs
     // (Opt: skip metallic classification completely on water pixels).
@@ -1114,7 +1118,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // proportionally so shadows stay razor-sharp at bases/trunks and soften further away.
         float shadow = 1.0;
         float3 trans_tint = float3(0.0, 0.0, 0.0);
-        if (bits_shadows && n_dot_l > 0.02 && fog_t < 0.96) {
+        if (bits_shadows && !is_water && n_dot_l > 0.02 && fog_t < 0.96) {
             // Opt #6: Clamp primary shadow ray t_max to 480u to prune far BVH nodes.
             float shadow_max_t = min(params.lens.y, 480.0);
             bool fast_shadow = dist > 520.0;
@@ -2049,6 +2053,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         store_refl = float3(0.0, 0.0, 0.0);
     }
 
+    if (is_water && debug_mode_early == 0u) {
+        out_rgb = float3(0.0, 0.0, 0.0);
+        out_lf = 1.0;
+    }
     out_colour[id.xy] = float4(out_rgb, out_lf);
     if (params.point_light_meta.w > 0.5) {
         out_guide[id.xy] = float4(avg_open, dist / params.lens.y, avg_shadow, roughness);
