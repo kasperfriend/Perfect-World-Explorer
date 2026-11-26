@@ -688,6 +688,29 @@ mod tests {
     }
 
     #[test]
+    fn coarser_mip_sampling_keeps_clear_depth_holes_conservative() {
+        let mut depth = vec![0.9; 8 * 8];
+        depth[3 * 8 + 3] = 0.0;
+        let (levels, dimensions) = pyramid(depth, 8, 8);
+        assert!(!rectangle_occluded(
+            &levels,
+            &dimensions,
+            [0, 0, 7, 7],
+            0.5,
+            0.001
+        ));
+
+        let (levels, dimensions) = pyramid(vec![0.9; 8 * 8], 8, 8);
+        assert!(rectangle_occluded(
+            &levels,
+            &dimensions,
+            [0, 0, 7, 7],
+            0.5,
+            0.001
+        ));
+    }
+
+    #[test]
     fn projection_keeps_near_plane_intersections_visible() {
         let projection = Mat4::perspective_rh(70f32.to_radians(), 1.0, 1000.0, 1.0);
         let vp = projection * Mat4::look_to_rh(Vec3::ZERO, -Vec3::Z, Vec3::Y);
