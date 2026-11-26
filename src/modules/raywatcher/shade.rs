@@ -981,7 +981,7 @@ mod tests {
         let near = apply_fog(Vec3::splat(0.1), &params, 0.);
         assert_eq!(near, Vec3::splat(0.1));
         let far = apply_fog(Vec3::splat(0.1), &params, 1000.);
-        let fog_linear = Vec3::new(0.6, 0.7, 0.9).map(srgb_to_linear);
+        let fog_linear = Vec3::new(srgb_to_linear(0.6), srgb_to_linear(0.7), srgb_to_linear(0.9));
         assert!((far - fog_linear).length() < 1e-5);
         let mid = apply_fog(Vec3::splat(0.1), &params, 60.);
         assert!(mid.x > 0.1 && mid.x < fog_linear.x);
