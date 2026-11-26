@@ -82,6 +82,12 @@ impl Modules {
         }
     }
 
+    /// Placements authored by Architect that can be submitted to the native
+    /// ECM renderer. Empty while the module is disabled.
+    pub fn architect_placements(&self) -> Vec<crate::world_models_gpu::EditorPlacement> {
+        self.architect.renderer_placements()
+    }
+
     pub fn architect_active(&self) -> bool {
         self.architect.active()
     }
