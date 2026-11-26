@@ -3807,7 +3807,7 @@ impl Renderer {
         reset_history: bool,
     ) -> crate::modules::raywatcher::frame::RasterOverrides {
         use crate::modules::raywatcher::frame::RasterOverrides;
-        let availability = {
+        let (availability, sdk_probe_pending) = {
             // The providers are probed from the DLLs that are present, not by
             // creating a context: a context is created on the first traced
             // frame, and the tab has to be right before then.
@@ -3815,12 +3815,10 @@ impl Renderer {
                 self.modules.raywatcher().sdk_dir(),
                 cfg!(windows),
             );
-            if dlss.note == "Checking SDK files in background..." {
-                self.modules.raywatcher_mut().set_hardware_probing(true);
-                self.raywatcher_frame_plan = crate::modules::raywatcher::plan::Plan::OFF;
-                return RasterOverrides::NONE;
-            }
-            (dlss.available, fsr.available)
+            (
+                (dlss.available, fsr.available),
+                dlss.note == "Checking SDK files in background...",
+            )
         };
         // Probe DXR Tier 1.1 once per session, but never call the native
         // driver/COM capability path on the render thread. A slow driver check
@@ -3866,6 +3864,11 @@ impl Renderer {
                     ));
                 }
             }
+        }
+        if sdk_probe_pending {
+            self.modules.raywatcher_mut().set_hardware_probing(true);
+            self.raywatcher_frame_plan = crate::modules::raywatcher::plan::Plan::OFF;
+            return RasterOverrides::NONE;
         }
         self.modules.raywatcher_mut().set_hardware_probing(false);
         let (ray_queries, hw_note) = self
