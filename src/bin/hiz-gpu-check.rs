@@ -186,7 +186,8 @@ fn main() {
             );
             if y == height as usize - 1 {
                 assert_eq!(
-                    mip[width as usize - 1], 0.0,
+                    mip[width as usize - 1],
+                    0.0,
                     "clear hole must propagate through mip {index}"
                 );
             }

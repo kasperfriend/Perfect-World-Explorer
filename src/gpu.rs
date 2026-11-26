@@ -2595,7 +2595,10 @@ impl Renderer {
             let (weather, cloud) = weather_cloud_task.join().unwrap();
             let (water, simple_water, shore) = water_task.join().unwrap();
             let mut far_trees = trees_task.join().unwrap();
-            far_trees.set_hiz_view(&device, hiz.as_ref().map_or(&hiz_fallback_view, |p| p.view()));
+            far_trees.set_hiz_view(
+                &device,
+                hiz.as_ref().map_or(&hiz_fallback_view, |p| p.view()),
+            );
             let (pipeline, scenery_pipeline, sdr_blend_pipeline) =
                 world_pipelines_task.join().unwrap();
             let post = post_task.join().unwrap();
