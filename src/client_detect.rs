@@ -1772,7 +1772,7 @@ mod tests {
         );
         assert_eq!(
             exe(None).version_row(),
-            "unknown game version (no config/element/version.sw in folder or configs.pck)",
+            "unknown game version (no config/element/version.sw or usable PE version resource)",
             "without a marker, the resource version must never appear as the game version"
         );
         assert!(
