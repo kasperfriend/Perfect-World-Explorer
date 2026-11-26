@@ -3444,35 +3444,12 @@ impl Renderer {
         let [opaque_scratch_cell, sdr_scratch_cell] = &self.world_draw_scratch;
         let mut opaque_world_scratch = opaque_scratch_cell.borrow_mut();
         let mut sdr_world_scratch = sdr_scratch_cell.borrow_mut();
-        if self.world_done {
-            let multi_draw = self
-                .device
-                .features()
-                .contains(wgpu::Features::MULTI_DRAW_INDIRECT);
-            let list = &self.world_draw_cmds[world_slot];
-            crate::world_objects::GpuPage::encode_world_culling(
-                &self.device,
-                e,
-                &self.queue,
-                list,
-                cull,
-                world_slot,
-                false,
-                multi_draw,
-                &mut opaque_world_scratch,
-            );
-            crate::world_objects::GpuPage::encode_world_culling(
-                &self.device,
-                e,
-                &self.queue,
-                list,
-                cull,
-                world_slot,
-                true,
-                multi_draw,
-                &mut sdr_world_scratch,
-            );
-        }
+        // The experimental GPU kernel writes zero-instance indirect records but
+        // still submits every original page run. That saves neither the CPU
+        // command walk nor the driver's per-run submission cost on camera turns.
+        // Keep its shader/regression test, but use the CPU page/chunk/placement
+        // culler here until the GPU path produces a genuinely compact command list.
+
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("opaque scenery occluders after terrain"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4657,7 +4634,7 @@ impl Renderer {
                     &uw_refr_cull,
                     refraction_scissor,
                     matrix,
-                    true,
+                    false, // Water views are already surface-scissored; skip full Hi-Z.
                 );
                 let model_view = self.water.refraction_raw();
                 self.draw_addons(
@@ -4723,7 +4700,7 @@ impl Renderer {
                     &above_refr_cull,
                     refraction_scissor,
                     matrix,
-                    true,
+                    false, // Keep frustum/clip/LOD culling without per-tree Hi-Z sampling.
                 );
                 if let Some(cloud) = &self.cloud {
                     cloud.draw(
@@ -4871,7 +4848,7 @@ impl Renderer {
                 // the same rectangle applies through the mirrored matrix.
                 reflection_scissor,
                 matrix * flip,
-                true,
+                false, // The water mirror is scissored; frustum/clip culling is enough.
             );
             if let Some(cloud) = &self.cloud {
                 cloud.draw(

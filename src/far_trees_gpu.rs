@@ -177,7 +177,9 @@ fn sphere_occluded(position:vec3<f32>,radius:f32)->bool {
   let scale=1u<<mip;
   let lo=rect_min/vec2<u32>(scale);
   let hi=rect_max/vec2<u32>(scale);
-  if (hi.x-lo.x)<4u && (hi.y-lo.y)<4u {break;}
+  // At most 2x2 conservative Hi-Z cells. The coarser minimum pyramid can
+  // only turn an occlusion into a visible candidate; it cannot hide a hole.
+  if (hi.x-lo.x)<2u && (hi.y-lo.y)<2u {break;}
   if mip+1u>=p.hiz_info.z {break;}
   mip=mip+1u;
  }

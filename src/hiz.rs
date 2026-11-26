@@ -516,7 +516,7 @@ pub fn rectangle_occluded(
         let y0 = rect[1] >> shift;
         let x1 = rect[2] >> shift;
         let y1 = rect[3] >> shift;
-        if x1 - x0 < 4 && y1 - y0 < 4 {
+        if x1 - x0 < 2 && y1 - y0 < 2 {
             selected = index;
             break;
         }
