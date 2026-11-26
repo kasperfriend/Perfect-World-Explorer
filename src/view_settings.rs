@@ -373,7 +373,7 @@ impl Default for ViewSettings {
 
 impl ViewSettings {
     fn decode(text: &str) -> Self {
-        Self::decode_with_fog_default(text, false)
+        Self::decode_with_fog_default(text, true)
     }
     fn decode_with_fog_default(text: &str, fog_enabled: bool) -> Self {
         let legacy_v1 = text
