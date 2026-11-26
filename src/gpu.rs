@@ -3269,6 +3269,7 @@ impl Renderer {
                 self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
                 self.resident_bounds(),
                 cull.frustum,
+                cull.clip_plane,
             );
         }
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
