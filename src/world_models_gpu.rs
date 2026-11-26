@@ -346,7 +346,8 @@ impl World {
                     static_pose_pending,
                     geometry_dirty: true,
                     vertex_fog: None,
-                    visible: true,
+                    // Only the current view's spatial query may mark a slot visible.
+                    visible: false,
                 }
             })
             .collect();
@@ -1615,7 +1616,16 @@ impl World {
             }
         }
         for candidate in &self.alpha {
-            if let Some(Some(draw)) = self.slots.get(candidate.slot).map(|s| &s.draw) {
+            let Some(slot) = self.slots.get(candidate.slot) else {
+                continue;
+            };
+            // Alpha order is built by the main view and reused by reflection /
+            // refraction. Respect the visibility produced by each secondary view
+            // instead of resubmitting every main-view alpha mesh into the water.
+            if !slot.visible {
+                continue;
+            }
+            if let Some(draw) = &slot.draw {
                 draw.draw_alpha_mesh(pass, candidate.mesh);
             }
         }
