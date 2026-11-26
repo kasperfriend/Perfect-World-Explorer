@@ -388,7 +388,7 @@ impl World {
             self.slots.push(Slot {
                 draw: None,
                 failed: false,
-                transform,
+                transform: Ok(transform),
                 posed: None,
                 geometry_dirty: true,
                 vertex_fog: None,
