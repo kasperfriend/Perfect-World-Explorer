@@ -57,6 +57,16 @@ struct ModelSpatialCell {
     slots: Vec<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActivationKey {
+    view_x: u32,
+    view_z: u32,
+    radius: u32,
+    night: u32,
+    resident_bounds: Option<[u32; 4]>,
+    producer_count: usize,
+}
+
 fn build_model_spatial_cells(
     positions: impl IntoIterator<Item = (usize, [f32; 3])>,
 ) -> Vec<ModelSpatialCell> {
@@ -264,6 +274,13 @@ pub struct World {
     /// Retail `SCNRES_EFFECT` distance in world units; 0 disables the fade and
     /// leaves every root at its authored alpha (the explorer default).
     effect_distance: f32,
+    /// Last inputs used for the CPU activation scan. Rotation alone does not
+    /// change activation; position, radius, night, residency or root membership does.
+    activation_key: Option<ActivationKey>,
+    /// Last eye/distance key and per-root target used by the attenuation ramp.
+    attenuation_key: Option<(u32, u32, u32, usize)>,
+    attenuation_targets: Vec<f32>,
+    attenuation_settled: bool,
     /// Why the last activation pass left producers out, so a zone that draws
     /// nothing can say which gate closed on it: beyond the activation radius,
     /// outside the resident terrain window, or outside its day/night window.
@@ -396,6 +413,10 @@ impl World {
             catalog_spawns: 0,
             view: None,
             effect_distance: 0.,
+            activation_key: None,
+            attenuation_key: None,
+            attenuation_targets: Vec::new(),
+            attenuation_settled: false,
             census: [0; 3],
             resident_bounds: None,
             alpha: Vec::new(),
@@ -859,33 +880,44 @@ impl World {
             return;
         }
         let (x, z, radius) = self.view.unwrap_or((0., 0., -1.));
-        let radius_sq = radius * radius;
-        let resident_bounds = self.resident_bounds;
-        let mut census = [0usize; 3];
-        let Self {
-            producers, owners, ..
-        } = self;
-        for producer in producers.iter() {
-            let dx = producer.position[0] - x;
-            let dz = producer.position[2] - z;
-            let near = dx * dx + dz * dz <= radius_sq;
-            let resident = cutoff_residency::contains(resident_bounds, producer.position);
-            let visible = match producer.valid_time {
-                Some(mode) => crate::scene::effect_visible(mode, night),
-                None => true,
-            };
-            if !near {
-                census[0] += 1;
+        let key = ActivationKey {
+            view_x: x.to_bits(),
+            view_z: z.to_bits(),
+            radius: radius.to_bits(),
+            night: night.to_bits(),
+            resident_bounds: self.resident_bounds.map(|bounds| bounds.map(f32::to_bits)),
+            producer_count: self.producers.len(),
+        };
+        if self.activation_key != Some(key) {
+            let radius_sq = radius * radius;
+            let resident_bounds = self.resident_bounds;
+            let mut census = [0usize; 3];
+            let Self {
+                producers, owners, ..
+            } = self;
+            for producer in producers.iter() {
+                let dx = producer.position[0] - x;
+                let dz = producer.position[2] - z;
+                let near = dx * dx + dz * dz <= radius_sq;
+                let resident = cutoff_residency::contains(resident_bounds, producer.position);
+                let visible = match producer.valid_time {
+                    Some(mode) => crate::scene::effect_visible(mode, night),
+                    None => true,
+                };
+                if !near {
+                    census[0] += 1;
+                }
+                if !resident {
+                    census[1] += 1;
+                }
+                if !visible {
+                    census[2] += 1;
+                }
+                owners.set_active(producer.identity, near && resident && visible);
             }
-            if !resident {
-                census[1] += 1;
-            }
-            if !visible {
-                census[2] += 1;
-            }
-            owners.set_active(producer.identity, near && resident && visible);
+            self.census = census;
+            self.activation_key = Some(key);
         }
-        self.census = census;
         self.apply_attenuation(delta_ms, eye);
     }
     /// Ramp every attenuating root's alpha toward "visible inside the retail
@@ -913,22 +945,51 @@ impl World {
     fn apply_attenuation(&mut self, delta_ms: u32, eye: [f32; 3]) {
         let effect_distance = self.effect_distance;
         let off = effect_distance <= 0.;
-        let Self {
-            producers, owners, ..
-        } = self;
-        for producer in producers.iter_mut().filter(|p| p.attenuation) {
-            if off {
-                if producer.fade != 1. {
-                    producer.fade = 1.;
-                    owners.set_attenuation(producer.identity, 1.);
+        let key = (
+            effect_distance.to_bits(),
+            eye[0].to_bits(),
+            eye[2].to_bits(),
+            self.producers.len(),
+        );
+        if self.attenuation_key != Some(key)
+            || self.attenuation_targets.len() != self.producers.len()
+        {
+            self.attenuation_targets.clear();
+            self.attenuation_targets.extend(self.producers.iter().map(|producer| {
+                if producer.attenuation && !off {
+                    attenuation_target(effect_distance, producer.position, eye)
+                } else {
+                    1.
                 }
+            }));
+            self.attenuation_key = Some(key);
+            self.attenuation_settled = false;
+        }
+        // Once every fade reaches its current target, a stationary camera and
+        // unchanged distance setting need no producer walk or owner writes.
+        if self.attenuation_settled {
+            return;
+        }
+        let mut moving = false;
+        let targets = &self.attenuation_targets;
+        let (producers, owners) = (&mut self.producers, &mut self.owners);
+        for (producer, &target) in producers.iter_mut().zip(targets) {
+            if !producer.attenuation || producer.fade == target {
                 continue;
             }
-            let target = attenuation_target(effect_distance, producer.position, eye);
-            let next = attenuation_step(producer.fade, target, delta_ms);
-            producer.fade = next;
-            owners.set_attenuation(producer.identity, next);
+            let old = producer.fade;
+            let next = if off {
+                1.
+            } else {
+                attenuation_step(old, target, delta_ms)
+            };
+            if next != old {
+                producer.fade = next;
+                owners.set_attenuation(producer.identity, next);
+            }
+            moving |= next != target;
         }
+        self.attenuation_settled = !moving;
     }
     pub fn update(
         &mut self,
