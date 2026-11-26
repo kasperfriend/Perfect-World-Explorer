@@ -1217,9 +1217,10 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float3 refl_base_n = shade_normal;
             // GGX remains for glossy scenery; native water is a perfect
             // planar dielectric mirror and must not use stochastic microfacets.
-            float3 h = is_water
-                ? refl_base_n
-                : ggx_sample(refl_base_n, eff_roughness, rand01(state), rand01(state));
+            float3 h = refl_base_n;
+            if (!is_water) {
+                h = ggx_sample(refl_base_n, eff_roughness, rand01(state), rand01(state));
+            }
             float3 reflect_dir = reflect(view_dir, h);
             if (dot(reflect_dir, refl_base_n) <= 0.0) {
                 reflect_dir = reflect(view_dir, refl_base_n);

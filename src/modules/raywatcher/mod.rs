@@ -956,7 +956,7 @@ mod tests {
             disabled.overrides.directional_light
         );
         assert_eq!(enabled.overrides.ambient, disabled.overrides.ambient);
-        assert!(!enabled.overrides.reflection_pass);
+        assert!(enabled.overrides.reflection_pass);
         assert!(!disabled.overrides.reflection_pass);
         assert_eq!(enabled.overrides.occlusion, disabled.overrides.occlusion);
         assert!(
@@ -978,7 +978,7 @@ mod tests {
         assert!(layered.active);
         assert!(!layered.overrides.directional_light);
         assert!(!layered.overrides.ambient);
-        assert!(!layered.overrides.reflection_pass);
+        assert!(layered.overrides.reflection_pass);
         assert!(!layered.overrides.occlusion);
         assert!(layered.overrides.suppress_baked_shadows);
         assert_eq!(layered.plan.render, (1920, 1080));
@@ -994,7 +994,7 @@ mod tests {
         assert!(replaced.active);
         assert!(replaced.overrides.directional_light);
         assert!(replaced.overrides.ambient);
-        assert!(!replaced.overrides.reflection_pass);
+        assert!(replaced.overrides.reflection_pass);
     }
 
     #[test]

@@ -543,7 +543,7 @@ impl Harvester {
                 let tree_started = std::time::Instant::now();
                 let mut tree_tris = Vec::with_capacity(tree_harvest.triangle_budget.min(65_536));
                 let (real_tree_instances, real_tree_tris, tree_budget_skips) =
-                    crate::far_trees_gpu::harvest_rt_tree_species(
+                    crate::far_trees_gpu::harvest_rt_tree_species_cancellable(
                         tree_species.as_ref(),
                         tree_harvest.eye,
                         tree_harvest.view_direction,
@@ -551,6 +551,7 @@ impl Harvester {
                         tree_harvest.lod_scale,
                         tree_harvest.triangle_budget,
                         &mut tree_tris,
+                        Some(worker_cancel.as_ref()),
                     );
                 if worker_cancel.load(Ordering::Relaxed) {
                     return;

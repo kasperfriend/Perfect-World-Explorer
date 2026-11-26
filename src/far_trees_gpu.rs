@@ -1445,13 +1445,6 @@ impl FarTrees {
     /// instance counts the indirect draws read. Nothing is uploaded per frame,
     /// and the pass is skipped entirely when the camera, scale and cutoff are
     /// unchanged, exactly like the old staging rebuild.
-    /// Phase 4: Harvest the runtime-generated SpeedTree LOD geometry (branches,
-    /// fronds, leaves with per-material alpha) for trees near `eye`, selecting
-    /// the LOD matching the view distance (`height * 5 * scale` / `height * 16 * scale`).
-    /// Tries progressively coarser real SpeedTree LODs when the selected detail
-    /// level cannot fit the triangle budget; skips an instance if none can fit.
-    ///
-    /// Returns `(real_tree_instances, real_tree_tris, budget_skips)`.
     /// Cheap immutable snapshot for the Raywatcher scene worker. The backing
     /// species/LOD geometry is shared; no tree mesh data is copied on the
     /// render thread when RT scene construction starts.
@@ -1459,6 +1452,12 @@ impl FarTrees {
         std::sync::Arc::clone(&self.rt_species)
     }
 
+    /// Harvest runtime-generated SpeedTree LOD geometry (branches, fronds,
+    /// and leaves with per-material alpha) near `eye`, selecting the raster-
+    /// matching LOD. Tries progressively coarser real LODs under budget pressure
+    /// and skips an instance if no real LOD can fit.
+    ///
+    /// Returns `(real_tree_instances, real_tree_tris, budget_skips)`.
     pub fn harvest_rt_triangles(
         &self,
         eye: glam::Vec3,
@@ -1936,6 +1935,27 @@ pub fn harvest_rt_tree_species(
     tri_budget: usize,
     out: &mut Vec<RtTreeTriangle>,
 ) -> (usize, usize, usize) {
+    harvest_rt_tree_species_cancellable(
+        species_list, eye, view_direction, max_dist, lod_scale, tri_budget, out, None,
+    )
+}
+
+/// Cancellable form used by the asynchronous Raywatcher scene worker. The
+/// ordinary helper remains convenient for diagnostics and unit tests.
+pub fn harvest_rt_tree_species_cancellable(
+    species_list: &[RtTreeSpecies],
+    eye: glam::Vec3,
+    view_direction: glam::Vec3,
+    max_dist: f32,
+    lod_scale: f32,
+    tri_budget: usize,
+    out: &mut Vec<RtTreeTriangle>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> (usize, usize, usize) {
+    let start_len = out.len();
+    let cancelled = |cancel: Option<&std::sync::atomic::AtomicBool>| {
+        cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    };
     let max_d2 = max_dist * max_dist;
     let scale = lod_scale.clamp(0.25, 4.0);
     // Boost #20: Fast XZ bounding reject before 3D distance + squared LOD thresholds (zero sqrt).
@@ -1944,7 +1964,11 @@ pub fn harvest_rt_tree_species(
         if sp.lods.is_empty() {
             continue;
         }
-        for &pos in &sp.positions {
+        for (position_index, &pos) in sp.positions.iter().enumerate() {
+            if position_index & 0x3ff == 0 && cancelled(cancel) {
+                out.truncate(start_len);
+                return (0, 0, 0);
+            }
             let dx = pos[0] - eye.x;
             if dx.abs() > max_dist {
                 continue;
@@ -1965,9 +1989,11 @@ pub fn harvest_rt_tree_species(
     let mut real_instances = 0usize;
     let mut real_tris = 0usize;
     let mut budget_skips = 0usize;
-    let start_len = out.len();
-
-    for (d2, si, pos) in candidates {
+    for (candidate_index, (d2, si, pos)) in candidates.into_iter().enumerate() {
+        if candidate_index & 0x3f == 0 && cancelled(cancel) {
+            out.truncate(start_len);
+            return (0, 0, 0);
+        }
         let sp = &species_list[si];
         let distance = approximate_client_distance(d2);
         let lod_count = sp.lods.len().min(3);
@@ -1995,7 +2021,11 @@ pub fn harvest_rt_tree_species(
         };
         let offset = glam::Vec3::from_array(pos);
         out.reserve(src_tris.len());
-        for t in src_tris {
+        for (triangle_index, t) in src_tris.iter().enumerate() {
+            if triangle_index & 0x3ff == 0 && cancelled(cancel) {
+                out.truncate(start_len);
+                return (0, 0, 0);
+            }
             let mut moved = *t;
             if moved.leaf_rho >= 0.0 {
                 let pivot = moved.leaf_center;
@@ -2026,6 +2056,34 @@ pub fn harvest_rt_tree_species(
 #[cfg(test)]
 mod raywatcher_tree_tests {
     use super::*;
+
+    #[test]
+    fn tree_harvest_stops_promptly_when_the_background_scene_is_cancelled() {
+        let species = RtTreeSpecies {
+            species_id: 1,
+            height: 10.0,
+            composite_size: (1, 1),
+            composite_alpha_min: 0,
+            composite_alpha_max: 255,
+            positions: vec![[0.0, 0.0, 0.0]],
+            lods: vec![Vec::new()],
+            lod_diags: vec![RtTreeLodDiag::default()],
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let mut out = Vec::new();
+        let result = harvest_rt_tree_species_cancellable(
+            &[species],
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
+            100.0,
+            1.0,
+            100,
+            &mut out,
+            Some(&cancel),
+        );
+        assert_eq!(result, (0, 0, 0));
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn trees_with_lod_geometry_are_harvested_as_real_alpha_triangles_not_boxes() {

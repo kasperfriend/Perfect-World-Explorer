@@ -1612,11 +1612,10 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             let refl_base_n = normal;
             // Keep non-water glossy trims on GGX, but use the exact
             // planar normal for native water so the reflected scene is stable.
-            let h = select(
-                ggx_sample(refl_base_n, roughness, next_f32(&state), next_f32(&state)),
-                refl_base_n,
-                is_water,
-            );
+            var h = refl_base_n;
+            if (!is_water) {
+                h = ggx_sample(refl_base_n, roughness, next_f32(&state), next_f32(&state));
+            }
             var reflect_dir = reflect(view_dir, h);
             if (dot(reflect_dir, refl_base_n) <= 0.0) {
                 reflect_dir = reflect(view_dir, refl_base_n);
@@ -6011,7 +6010,8 @@ mod shader_optimization_regression_tests {
         let dxr = include_str!("dxr_trace.hlsl");
         assert!(RAY_SHADER.contains("if (roughness <= 0.12) {"));
         assert!(RAY_SHADER.contains("return base;"));
-        assert!(RAY_SHADER.contains("refl_base_n,\n                is_water,"));
+        assert!(RAY_SHADER.contains("var h = refl_base_n;"));
+        assert!(RAY_SHADER.contains("if (!is_water)"));
         assert!(RAY_SHADER.contains("select(0.04, 0.0204, is_water)"));
         assert!(!RAY_SHADER.contains("complexity = max(complexity, 0.42)"));
         assert!(dxr.contains("if (roughness <= 0.12) return base;"));

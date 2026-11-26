@@ -30,7 +30,7 @@ pub struct RasterOverrides {
     /// Stop the sky's ambient contribution to the raster scene (the ray pass
     /// reconstructs it from its own hemisphere samples).
     pub ambient: bool,
-    /// Skip the native screen-space water/terrain reflection pass (never set by RT).
+    /// Skip native water mirror submissions once RT reflections are ready; the renderer gates readiness.
     pub reflection_pass: bool,
     /// Skip the screen-space ambient-occlusion-style darkening (the fog
     /// occlusion term the raster path applies to the sky and terrain).
@@ -68,9 +68,10 @@ impl RasterOverrides {
     /// Raster overrides for a planned frame.
     ///
     /// By default (`plan.replace_raster == false`) Raywatcher layers ray-traced
-    /// shadows, reflections, AO and GI over the untouched raster world, so this
-    /// returns [`Self::NONE`]. Raster terms are only removed when the user
-    /// explicitly opts into `replace_raster`.
+    /// effects over the raster world. Water is the deliberate exception: when
+    /// reflections are enabled, the native mirror is marked for replacement;
+    /// the renderer keeps it active until the RT reflection is ready. Other
+    /// raster terms are only removed when the user opts into `replace_raster`.
     pub fn for_plan(plan: &crate::modules::raywatcher::plan::Plan) -> Self {
         if !plan.trace {
             return Self::NONE;
@@ -703,7 +704,7 @@ mod tests {
         assert!(on_ov.suppress_baked_shadows);
         assert!(!on_ov.directional_light);
         assert!(!on_ov.ambient);
-        assert!(!on_ov.reflection_pass);
+        assert!(on_ov.reflection_pass, "RT reflections own the native water mirror");
 
         s.effects.shadows = false;
         let no_sh_plan = Plan::decide(&s, (1920, 1080), true, |_| false);
