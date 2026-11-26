@@ -1319,6 +1319,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float3 cur_b = b_axis;
             float cur_bias = bias;
             float path_dist = dist;
+            float3 cur_hit_world = world_pos;
             float3 throughput = float3(1.0, 1.0, 1.0);
             float3 gi_sample = float3(0.0, 0.0, 0.0);
             float3 gi_first_direction = float3(0.0, 1.0, 0.0);
@@ -1331,6 +1332,15 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             gi_total_rays += 1.0;
 
             for (uint bounce = 0u; bounce < max_bounces; bounce = bounce + 1u) {
+                // Confidence-gated radiance-cache tail: at the last secondary
+                // bounce, a converged entry replaces the ray entirely.
+                if (bounce > 0u && bounce + 1u == max_bounces) {
+                    float4 cached = rc_query(cur_hit_world, cur_normal, path_dist);
+                    if (cached.w >= 2.0) {
+                        gi_sample += throughput * min(cached.rgb, float3(2.4, 2.4, 2.4));
+                        break;
+                    }
+                }
                 float u1 = rand01(state);
                 float phi = rot_angle + 1.0471975 + float(s) * 2.39996323
                     + float(bounce) * 1.9132 + rand01(state) * 0.65;
@@ -1452,6 +1462,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                     cur_origin = bhit_world + bhit.normal * b_bias;
                     cur_normal = bhit.normal;
                     cur_bias = b_bias;
+                    cur_hit_world = bhit_world;
                     float3 b_up = abs(cur_normal.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
                     cur_t = normalize(cross(b_up, cur_normal));
                     cur_b = cross(cur_normal, cur_t);
