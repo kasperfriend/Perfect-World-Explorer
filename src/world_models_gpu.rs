@@ -222,6 +222,10 @@ pub struct World {
     animated_pose_slots: Vec<usize>,
     /// Indices of slots visible in the most recently prepared view.
     visible_slots: Vec<usize>,
+    /// Last main-view alpha order key. Rotation changes the frustum but not
+    /// transparent-mesh sort distance; reuse while the eye and visible set match.
+    alpha_order_eye: Option<[f32; 3]>,
+    alpha_order_slots: Vec<usize>,
     /// Reused candidate storage for the spatial-cell query.
     scratch_model_candidates: Vec<usize>,
     read: Box<dyn FnMut(&str) -> Result<Vec<u8>, String>>,
@@ -372,6 +376,8 @@ impl World {
             pending_static_pose_slots,
             animated_pose_slots,
             visible_slots: Vec::new(),
+            alpha_order_eye: None,
+            alpha_order_slots: Vec::new(),
             scratch_model_candidates: Vec::new(),
             read: Box::new(read),
             textures: HashMap::new(),
@@ -1538,6 +1544,14 @@ impl World {
     /// priority weights of the original insertion routine were not recovered, so
     /// they stay zero and the comparison falls through to distance.
     fn rebuild_alpha_order(&mut self, eye: [f32; 3]) {
+        // Alpha distance is measured from the eye position and the visible
+        // model set, not from camera yaw/pitch. A rotation-only frame with an
+        // unchanged set therefore has exactly the same ordered candidates.
+        if self.alpha_order_eye == Some(eye)
+            && self.alpha_order_slots.as_slice() == self.visible_slots.as_slice()
+        {
+            return;
+        }
         self.scratch_candidates.clear();
         self.scratch_failures.clear();
         for &slot in &self.visible_slots {
@@ -1601,6 +1615,8 @@ impl World {
             }
             self.alpha.retain(|candidate| candidate.slot != *slot);
         }
+        self.alpha_order_eye = Some(eye);
+        self.alpha_order_slots.clone_from(&self.visible_slots);
     }
     /// Include dependency failures in the UI; never count a skipped asset ready.
     /// Entries owned by the world cache, excluding live draw references.

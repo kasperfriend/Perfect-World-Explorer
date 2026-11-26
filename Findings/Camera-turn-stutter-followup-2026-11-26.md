@@ -112,3 +112,11 @@ hook-attached GFX keeps the same frame-consistent parent pose.
   lookup and constant derivation twice per frame (once for validation and again
   for writing); this keeps the all-or-nothing validation-before-upload contract
   while removing duplicate work and steady-state allocations.
+
+
+- Alpha mesh ordering is now reused across rotation-only camera frames when the
+  eye position and main-view visible model-slot list are identical. Its sort
+  distance depends on the eye's position, not yaw/pitch; a changed eye or a
+  changed visible set still rebuilds the exact same order from transformed
+  initial bounds. This removes an unnecessary full alpha-candidate walk and
+  sort while turning in place without changing transparency output.
