@@ -100,7 +100,7 @@ fn probes_from_presence(sdk_dir: &Path, (dlss, fsr): (bool, bool)) -> (Probe, Pr
 }
 
 /// Synchronous implementation used by the background worker and deterministic tests.
-fn probe_offline_now(sdk_dir: &Path, platform_supported: bool) -> (Probe, Probe) {
+pub(super) fn probe_offline_now(sdk_dir: &Path, platform_supported: bool) -> (Probe, Probe) {
     if !platform_supported {
         let note = "Windows + DX12 only".to_string();
         return (Probe::unavailable(note.clone()), Probe::unavailable(note));
