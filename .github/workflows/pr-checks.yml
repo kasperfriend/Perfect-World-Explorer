@@ -548,6 +548,7 @@ jobs:
         with:
           artifact-ids: ${{ steps.viewer_package.outputs.artifact-id }}
           path: ${{ runner.temp }}/uploaded-viewer
+          merge-multiple: true
       - name: Audit the uploaded artifact layout
         shell: pwsh
         run: |
