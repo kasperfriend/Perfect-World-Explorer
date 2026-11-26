@@ -198,11 +198,17 @@ mod tests {
         std::fs::write(element.join("tasks.data"), tasks).unwrap();
 
         let (cells, facts) = measure_client("mixed-layout", &root);
-        let elements = cells.iter().find(|cell| cell.category == "elements data").unwrap();
+        let elements = cells
+            .iter()
+            .find(|cell| cell.category == "elements data")
+            .unwrap();
         assert_eq!(elements.status, "ok");
         assert!(elements.detail.contains("v27"), "{}", elements.detail);
 
-        let tasks = cells.iter().find(|cell| cell.category == "tasks data").unwrap();
+        let tasks = cells
+            .iter()
+            .find(|cell| cell.category == "tasks data")
+            .unwrap();
         assert_eq!(tasks.status, "ok");
         assert!(tasks.detail.contains("v75"), "{}", tasks.detail);
         assert!(
@@ -211,8 +217,12 @@ mod tests {
             tasks.detail
         );
 
-        assert!(facts.iter().any(|(key, value)| *key == "elementsVersion" && value == "27"));
-        assert!(facts.iter().any(|(key, value)| *key == "tasksVersion" && value == "75"));
+        assert!(facts
+            .iter()
+            .any(|(key, value)| *key == "elementsVersion" && value == "27"));
+        assert!(facts
+            .iter()
+            .any(|(key, value)| *key == "tasksVersion" && value == "75"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -282,7 +292,9 @@ fn main() {
 
 /// Read a dword at a known offset without turning a short input into zero.
 fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
-    bytes.get(offset..offset + 4).map(|raw| u32::from_le_bytes(raw.try_into().unwrap()))
+    bytes
+        .get(offset..offset + 4)
+        .map(|raw| u32::from_le_bytes(raw.try_into().unwrap()))
 }
 
 /// Measure one client and return its cells and facts.
@@ -333,9 +345,7 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
                 }
                 (Some(magic), Some(version)) => cells.push(Cell::refused(
                     "tasks data",
-                    format!(
-                        "unexpected header magic {magic:#010x} (version word {version})"
-                    ),
+                    format!("unexpected header magic {magic:#010x} (version word {version})"),
                 )),
                 _ => cells.push(Cell::refused("tasks data", "shorter than 8-byte header")),
             }
