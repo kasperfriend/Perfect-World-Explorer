@@ -59,6 +59,13 @@ struct TerrainStroke {
     strength: f32,
 }
 
+#[derive(Clone, Debug)]
+struct ExplorerEntry {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Project {
     name: String,
@@ -123,8 +130,6 @@ impl Architect {
             project_root,
             project: Project::default(),
             project_files: Vec::new(),
-            directory_cache: HashMap::new(),
-            archive_cache: HashMap::new(),
             directory_cache: HashMap::new(),
             archive_cache: HashMap::new(),
             project_name: "Untitled World".into(),
@@ -1239,6 +1244,8 @@ mod tests {
             project_root: path.parent().unwrap().to_path_buf(),
             project: project.clone(),
             project_files: Vec::new(),
+            directory_cache: HashMap::new(),
+            archive_cache: HashMap::new(),
             project_name: project.name.clone(),
             selected_project: None,
             selected_map: project.source_map.clone(),
