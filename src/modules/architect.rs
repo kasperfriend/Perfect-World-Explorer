@@ -110,7 +110,7 @@ impl Architect {
             project_files: Vec::new(),
             project_name: "Untitled World".into(),
             selected_project: None,
-            selected_map: "world".into(),
+            selected_map: String::new(),
             cursor: CursorMode::Select,
             snap: SnapMode::Smart,
             brush: BrushMode::Raise,
@@ -150,7 +150,7 @@ impl Architect {
         let Ok(entries) = fs::read_dir(&self.project_root) else { return };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pwa")) {
+            if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pwa")) {
                 self.project_files.push(path);
             }
         }
@@ -217,6 +217,7 @@ impl Architect {
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         let temp = path.with_extension("pwa.tmp");
         fs::write(&temp, out).map_err(|e| format!("{}: {e}", temp.display()))?;
+        if path.exists() { fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?; }
         fs::rename(&temp, path).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(())
     }
@@ -433,7 +434,7 @@ impl Architect {
         camera: Vec3,
     ) -> Option<String> {
         if !self.enabled { return None; }
-        self.selected_map = current_map.id.clone();
+        if self.selected_map.is_empty() { self.selected_map = current_map.id.clone(); }
         self.toolbar(ctx);
         let screen = ctx.input(|input| input.screen_rect());
         let mut map_request = None;
