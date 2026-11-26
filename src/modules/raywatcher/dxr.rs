@@ -19,11 +19,7 @@ const DXR_PSO_CACHE_VERSION: u32 = 1;
 const DXR_PSO_CACHE_HEADER_BYTES: usize = 28;
 const DXR_PSO_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-fn dxr_pso_cache_key(
-    shader_bytecode: &[u8],
-    root_signature: &[u8],
-    adapter_luid: [u8; 8],
-) -> u64 {
+fn dxr_pso_cache_key(shader_bytecode: &[u8], root_signature: &[u8], adapter_luid: [u8; 8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in b"pwe-dxr-pso-cache-v1"
         .iter()
@@ -197,7 +193,8 @@ mod imp {
     fn load_pso_cache(key: u64) -> Option<Vec<u8>> {
         let path = pso_cache_path(key);
         let metadata = std::fs::metadata(&path).ok()?;
-        if metadata.len() > (super::DXR_PSO_CACHE_HEADER_BYTES + super::DXR_PSO_CACHE_MAX_BYTES) as u64
+        if metadata.len()
+            > (super::DXR_PSO_CACHE_HEADER_BYTES + super::DXR_PSO_CACHE_MAX_BYTES) as u64
             || metadata.len() < super::DXR_PSO_CACHE_HEADER_BYTES as u64
         {
             let _ = std::fs::remove_file(path);
@@ -226,13 +223,13 @@ mod imp {
             return;
         };
         if let Err(err) = std::fs::create_dir_all(parent) {
-            eprintln!("[Raywatcher] Could not create DXR PSO cache folder ({}): {err}", parent.display());
+            eprintln!(
+                "[Raywatcher] Could not create DXR PSO cache folder ({}): {err}",
+                parent.display()
+            );
             return;
         }
-        let temp = path.with_file_name(format!(
-            "dxr-pso-v1-{key:016x}.{}.tmp",
-            std::process::id()
-        ));
+        let temp = path.with_file_name(format!("dxr-pso-v1-{key:016x}.{}.tmp", std::process::id()));
         let write_result = (|| -> std::io::Result<()> {
             let mut file = std::fs::File::create(&temp)?;
             file.write_all(&encoded)?;
@@ -249,7 +246,10 @@ mod imp {
         })();
         if let Err(err) = write_result {
             let _ = std::fs::remove_file(&temp);
-            eprintln!("[Raywatcher] Could not write DXR PSO cache ({}): {err}", path.display());
+            eprintln!(
+                "[Raywatcher] Could not write DXR PSO cache ({}): {err}",
+                path.display()
+            );
         }
     }
 
@@ -1133,11 +1133,8 @@ mod imp {
                 (*blob).GetBufferPointer() as *const u8,
                 (*blob).GetBufferSize(),
             );
-            let cache_key = super::dxr_pso_cache_key(
-                DXR_TRACE_DXIL,
-                root_signature_bytes,
-                adapter_luid_bytes,
-            );
+            let cache_key =
+                super::dxr_pso_cache_key(DXR_TRACE_DXIL, root_signature_bytes, adapter_luid_bytes);
             let mut root_sig: *mut d12::ID3D12RootSignature = null_mut();
             let hr = (*dev_ptr).CreateRootSignature(
                 0,
@@ -1183,7 +1180,9 @@ mod imp {
                     com_release(pso as *mut c_void);
                     pso = null_mut();
                 }
-                eprintln!("[Raywatcher] DXR PSO cache rejected by driver; recompiling without cache");
+                eprintln!(
+                    "[Raywatcher] DXR PSO cache rejected by driver; recompiling without cache"
+                );
                 remove_pso_cache(cache_key);
                 pso_desc.CachedPSO = d12::D3D12_CACHED_PIPELINE_STATE {
                     pCachedBlob: null(),
@@ -2342,15 +2341,16 @@ mod imp {
 
 #[cfg(test)]
 mod dxr_pso_cache_tests {
-    use super::{
-        decode_dxr_pso_cache, dxr_pso_cache_key, encode_dxr_pso_cache,
-    };
+    use super::{decode_dxr_pso_cache, dxr_pso_cache_key, encode_dxr_pso_cache};
 
     #[test]
     fn cached_pso_round_trips_and_is_bound_to_its_key() {
         let key = dxr_pso_cache_key(b"shader", b"root-signature", [1, 2, 3, 4, 5, 6, 7, 8]);
         let encoded = encode_dxr_pso_cache(key, b"driver-pso").unwrap();
-        assert_eq!(decode_dxr_pso_cache(key, &encoded), Some(&b"driver-pso"[..]));
+        assert_eq!(
+            decode_dxr_pso_cache(key, &encoded),
+            Some(&b"driver-pso"[..])
+        );
         assert_eq!(decode_dxr_pso_cache(key.wrapping_add(1), &encoded), None);
     }
 
