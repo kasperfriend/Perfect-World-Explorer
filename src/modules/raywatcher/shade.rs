@@ -226,10 +226,11 @@ pub fn trace(
     let seed =
         pixel.1.wrapping_mul(params.grid.0.max(1)) ^ pixel.0 ^ params.frame.wrapping_mul(977);
     let mut colour = shade_hit(scene, params, config, sampler, &hit, direction, seed);
-    // The primary ray's own fog: a hit at distance `d` is seen through
-    // `exp(-d * density)` of air, exactly as the raster path's per-material fog
-    // does it.
-    colour = apply_fog(colour, params, hit.t);
+    // The original client uses table fog over view-space Z, not Euclidean
+    // eye-to-hit distance. Projecting the hit gives clip.w = positive view Z;
+    // this matches the raster shaders even for wide/off-axis rays.
+    let view_z = (params.view_projection * point_of(scene, &hit).extend(1.0)).w.max(0.0);
+    colour = apply_fog(colour, params, view_z);
     let visibility = sample_occlusion(scene, params, config, &hit, sampler, seed);
     let reflection = reflection_lane(scene, params, config, &hit, direction, seed);
     PixelSample {
@@ -444,7 +445,7 @@ fn reflection_lane(
     }
 }
 
-/// Beer-Lambert extinction from the eye to `distance`.
+/// Apply the client's linear table fog at positive view-space Z.
 pub fn apply_fog(colour: Vec3, params: &FrameParams, distance: f32) -> Vec3 {
     let (start, end) = params.lighting.fog_range;
     if end <= start || !start.is_finite() || !end.is_finite() {
