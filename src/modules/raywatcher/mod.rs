@@ -966,7 +966,7 @@ mod tests {
             "Phase 5 single shadow source suppresses baked lightmaps when RT shadows are active"
         );
         assert_eq!(enabled.plan.render, (1920, 1080));
-        assert_eq!(enabled.plan.grid, (1920, 1080));
+        assert_eq!(enabled.plan.grid, (960, 540));
     }
 
     #[test]
@@ -984,9 +984,9 @@ mod tests {
         assert!(!layered.overrides.occlusion);
         assert!(layered.overrides.suppress_baked_shadows);
         assert_eq!(layered.plan.render, (1920, 1080));
-        assert_eq!(layered.plan.grid, (960, 540));
+        assert_eq!(layered.plan.grid, (480, 270));
         assert!(layered.summary.contains("Software"));
-        assert!(layered.summary.contains("960x540"));
+        assert!(layered.summary.contains("480x270"));
 
         // Opting into `replace_raster` removes the raster sun/ambient/reflection terms.
         let mut s = m.settings().clone();
