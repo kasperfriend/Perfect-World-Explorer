@@ -99,7 +99,8 @@ impl Modules {
         ornaments: &[crate::scene::Ornament],
         camera: Vec3,
     ) -> Option<String> {
-        self.architect.ui(ctx, catalog, current_map, scene, ornaments, camera)
+        self.architect
+            .ui(ctx, catalog, current_map, scene, ornaments, camera)
     }
 
     pub fn prepare_librarian_preview(
@@ -288,7 +289,14 @@ impl Modules {
             "populator" => self.populator_module_ui(ui, spawn),
             "architect" => {
                 let active = self.architect.active();
-                if ui.button(if active { "Disable Architect" } else { "Enable Architect" }).clicked() {
+                if ui
+                    .button(if active {
+                        "Disable Architect"
+                    } else {
+                        "Enable Architect"
+                    })
+                    .clicked()
+                {
                     self.architect.set_active(!active);
                 }
                 ui.label("Full-screen world authoring workspace with separate, non-destructive projects.");
