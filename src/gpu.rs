@@ -3967,11 +3967,16 @@ impl Renderer {
         } else {
             self.local_pages.len() as u64
         };
-        // Keep the CPU BVH available even in Hardware mode. When a camera
-        // traversal replaces the scene, DXR's BLAS/TLAS rebuild runs in the
-        // background and the renderer temporarily traces this same scene with
-        // the Software compute path to avoid dropping a frame of all RT effects.
-        let skip_cpu_bvh = false;
+        // DXR owns acceleration for Hardware scenes. Building a second CPU
+        // BVH for the old per-frame Software fallback duplicated an expensive
+        // scene build and competed with BLAS/TLAS preparation. Hardware frames
+        // now hold the last RT image (or raster) during rebuilds. If DXR fails,
+        // switch back to a CPU-BVH scene so Software can take over safely.
+        let hardware_failed = self
+            .raywatcher_gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.hardware_failed());
+        let skip_cpu_bvh = hardware_mode && !hardware_failed;
         let content_hash = (active_pages_len << 16)
             ^ (self.water_batches.len() as u64)
             ^ (u64::from(skip_cpu_bvh) << 61)
