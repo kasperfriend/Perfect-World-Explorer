@@ -1483,6 +1483,136 @@ impl GpuPage {
             page_has_sdr: page.page_has_sdr,
         }
     }
+    /// Upload a whole-world page through a caller-owned staging belt and command
+    /// encoder. The caller batches many pages into one submission per frame,
+    /// avoiding two short-lived mapped upload buffers and a separate implicit
+    /// upload submission for every page. Texture uploads remain byte-exact.
+    pub fn upload_world_ref_staged(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        normal: &wgpu::Buffer,
+        reflected: &wgpu::Buffer,
+        existing: &[Self],
+        belt: &mut wgpu::util::StagingBelt,
+        encoder: &mut wgpu::CommandEncoder,
+        page: &Page,
+    ) -> Self {
+        let (normal_bg, reflected_bg) = if let Some(source) = page.shared_atlas {
+            let source = existing
+                .get(source)
+                .expect("shared atlas must precede its geometry");
+            (Arc::clone(&source.normal), Arc::clone(&source.reflected))
+        } else {
+            let image = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("whole-world object atlas"),
+                size: wgpu::Extent3d {
+                    width: SIDE as u32,
+                    height: page.used_height as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 8,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let mut width = SIDE;
+            let mut height = page.used_height;
+            for mip in 0..8u32 {
+                let level = if mip == 0 {
+                    &page.atlas
+                } else {
+                    &page.mips[(mip - 1) as usize]
+                };
+                queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &image,
+                        mip_level: mip,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    level,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some((width * 4) as u32),
+                        rows_per_image: Some(height as u32),
+                    },
+                    wgpu::Extent3d {
+                        width: width as u32,
+                        height: height as u32,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                width /= 2;
+                height /= 2;
+            }
+            let view = image.create_view(&Default::default());
+            let make = |buf: &wgpu::Buffer| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("whole-world object material"),
+                    layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                })
+            };
+            (Arc::new(make(normal)), Arc::new(make(reflected)))
+        };
+
+        let vertex_bytes = bytemuck::cast_slice(&page.vertices);
+        let index_bytes = bytemuck::cast_slice(&page.indices);
+        let vertex = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("whole-world object vertices"),
+            size: vertex_bytes.len().max(4) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let index = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("whole-world object indices"),
+            size: index_bytes.len().max(4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if !vertex_bytes.is_empty() {
+            let size = std::num::NonZeroU64::new(vertex_bytes.len() as u64)
+                .expect("non-empty vertex upload");
+            belt.write_buffer(encoder, &vertex, 0, size, device)
+                .copy_from_slice(vertex_bytes);
+        }
+        if !index_bytes.is_empty() {
+            let size = std::num::NonZeroU64::new(index_bytes.len() as u64)
+                .expect("non-empty index upload");
+            belt.write_buffer(encoder, &index, 0, size, device)
+                .copy_from_slice(index_bytes);
+        }
+        Self {
+            vertex,
+            index,
+            count: page.indices.len() as u32,
+            normal: normal_bg,
+            reflected: reflected_bg,
+            placements: Vec::new(),
+            bounds: Vec::new(),
+            page_min: page.page_min,
+            page_max: page.page_max,
+            page_has_sdr: page.page_has_sdr,
+        }
+    }
+
     fn geometry(
         device: &wgpu::Device,
         page: Page,
