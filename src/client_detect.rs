@@ -1243,14 +1243,16 @@ pub(crate) fn version_string(blob: &[u8], key: &str) -> Option<String> {
     None
 }
 
+/// Resolve a loose data file in either location used by retail clients.
+/// The data subdirectory wins when both copies exist, matching the scanner's
+/// elements.data precedence.
+pub(crate) fn data_file_path(element: &Path, name: &str) -> Option<PathBuf> {
+    find_file(element, &format!("data/{name}")).or_else(|| find_file(element, name))
+}
+
 /// `elements.data` header. Reads only the first bytes.
 fn scan_elements(element: &Path) -> Option<DataFileInfo> {
-    let path = [
-        element.join("data/elements.data"),
-        element.join("elements.data"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())?;
+    let path = data_file_path(element, "elements.data")?;
     let mut info = DataFileInfo {
         name: "elements.data".into(),
         path: Some(path.clone()),
@@ -1293,37 +1295,40 @@ fn scan_elements(element: &Path) -> Option<DataFileInfo> {
 /// Each entry says which field it is, because they are not the same field:
 /// `tasks.data` holds a magic then a version, `gshop*.data` holds a timestamp.
 fn scan_data_files(element: &Path) -> Vec<DataFileInfo> {
-    let data = element.join("data");
-    let dir = if data.is_dir() {
-        data
-    } else {
-        element.to_path_buf()
-    };
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return out;
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(OsStr::to_str)
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("data"))
-        })
-        .collect();
-    paths.sort();
-    for path in paths {
-        let name = path
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or("?")
-            .to_ascii_lowercase();
-        if name == "elements.data" {
+    // Retail layouts vary: some keep tasks.data and the auxiliary tables beside
+    // elementclient.exe even when elements.data is under data/. Scan both
+    // locations, preferring data/ for duplicate names rather than treating the
+    // existence of that directory as proof that the root contains no data.
+    let mut paths_by_name = std::collections::BTreeMap::<String, PathBuf>::new();
+    for dir in [element.join("data"), element.to_path_buf()] {
+        let Ok(entries) = fs::read_dir(&dir) else {
             continue;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .and_then(OsStr::to_str)
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("data"))
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            let name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("?")
+                .to_ascii_lowercase();
+            if name != "elements.data" {
+                paths_by_name.entry(name).or_insert(path);
+            }
         }
+    }
+    let mut out = Vec::new();
+    for (name, path) in paths_by_name {
         let mut info = DataFileInfo {
             name: name.clone(),
             path: Some(path.clone()),
@@ -2124,6 +2129,40 @@ mod tests {
         tasks.extend_from_slice(&tasks_version.to_le_bytes());
         fs::write(element.join("data/tasks.data"), tasks).unwrap();
         root
+    }
+
+    #[test]
+    fn loose_data_files_are_found_in_both_supported_locations() {
+        let root = std::env::temp_dir().join(format!(
+            "pw-data-locations-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("data")).unwrap();
+
+        // elements.data is under data/, while tasks.data and an auxiliary file
+        // remain beside elementclient.exe. The existence of data/ must not
+        // hide files in the element root.
+        let mut elements = 0x3000_001bu32.to_le_bytes().to_vec();
+        elements.extend_from_slice(&0x4b39_c931u32.to_le_bytes());
+        fs::write(root.join("data/elements.data"), elements).unwrap();
+        let mut tasks = 0x9385_8361u32.to_le_bytes().to_vec();
+        tasks.extend_from_slice(&75u32.to_le_bytes());
+        fs::write(root.join("tasks.data"), tasks).unwrap();
+        let mut npc = 4096u32.to_le_bytes().to_vec();
+        npc.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        npc.extend_from_slice(&9u16.to_le_bytes());
+        npc.extend_from_slice(&42u16.to_le_bytes());
+        fs::write(root.join("task_npc.data"), npc).unwrap();
+
+        let elements = scan_elements(&root).expect("elements.data");
+        assert_eq!(elements.version.as_deref(), Some("v27"));
+        let data = scan_data_files(&root);
+        let tasks = data.iter().find(|info| info.name == "tasks.data").unwrap();
+        assert_eq!(tasks.version.as_deref(), Some("v75"));
+        let npc = data.iter().find(|info| info.name == "task_npc.data").unwrap();
+        assert!(npc.detail.as_deref().unwrap().contains("42 records"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
