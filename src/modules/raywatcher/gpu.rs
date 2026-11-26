@@ -3499,6 +3499,7 @@ pub struct RaywatcherGpu {
     scene_geom: Arc<super::bvh::SceneGeometry>,
     dxr: Option<super::dxr::DxrTracer>,
     dxr_failed: bool,
+    dxr_init: Option<std::sync::mpsc::Receiver<Result<super::dxr::DxrTracer, String>>>,
     dlss_rr: Option<super::reconstruct::DlssRayReconstructor>,
     dlss_rr_failed: bool,
     dlss_rr_error: Option<String>,
@@ -3585,6 +3586,11 @@ pub struct RaywatcherGpu {
     /// Actual backend used for the previous traced frame; switching backends invalidates GI history.
     last_traced_hardware: Option<bool>,
 }
+
+// SAFETY: the initialized value is sent once from its construction worker to
+// the render thread before DLSS reconstruction contexts are created. It then
+// remains exclusively owned and is never sent back to another thread.
+unsafe impl Send for RaywatcherGpu {}
 
 impl RaywatcherGpu {
     pub fn new(
@@ -3781,6 +3787,7 @@ impl RaywatcherGpu {
             scene_geom,
             dxr: None,
             dxr_failed: false,
+            dxr_init: None,
             dlss_rr: None,
             dlss_rr_failed: false,
             dlss_rr_error: None,
@@ -4377,6 +4384,72 @@ impl RaywatcherGpu {
         true
     }
 
+    /// Initialize DXR on the startup worker before moving this GPU state to the render thread.
+    pub fn initialize_hardware(&mut self, device: &wgpu::Device) {
+        if self.dxr.is_some() || self.dxr_failed { return; }
+        let started = std::time::Instant::now();
+        match super::dxr::DxrTracer::new(device, &self.scene_geom, self.grid_extent) {
+            Ok(tracer) => {
+                self.dxr = Some(tracer);
+                eprintln!("[Raywatcher] Hardware backend prepared in {:.1}s on initialization worker", started.elapsed().as_secs_f32());
+            }
+            Err(err) => {
+                eprintln!("[Raywatcher] DXR 1.1 init failed ({err}); falling back to Software");
+                self.dxr_failed = true;
+            }
+        }
+    }
+
+    fn begin_dxr_initialization(&mut self, device: &wgpu::Device) {
+        if self.dxr.is_some() || self.dxr_failed || self.dxr_init.is_some() { return; }
+        let worker_device = device.clone();
+        let scene = self.scene_geom.clone();
+        let grid_extent = self.grid_extent;
+        let triangle_count = scene.triangles.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawn = std::thread::Builder::new().name("pwe-raywatcher-dxr-init".to_string()).spawn(move || {
+            let started = std::time::Instant::now();
+            let result = super::dxr::DxrTracer::new(&worker_device, &scene, grid_extent);
+            eprintln!("[Raywatcher] Background DXR build finished in {:.1}s ({} triangles, success={})", started.elapsed().as_secs_f32(), triangle_count, result.is_ok());
+            let _ = tx.send(result);
+        });
+        match spawn {
+            Ok(_) => self.dxr_init = Some(rx),
+            Err(err) => { self.dxr_failed = true; eprintln!("[Raywatcher] Could not start DXR initialization worker ({err}); using Software"); }
+        }
+    }
+
+    fn poll_dxr_initialization(&mut self, device: &wgpu::Device) -> bool {
+        let Some(rx) = self.dxr_init.as_ref() else { return true; };
+        match rx.try_recv() {
+            Ok(Ok(mut tracer)) => {
+                self.dxr_init = None;
+                if let Err(err) = tracer.resize(device, self.grid_extent) {
+                    self.dxr_failed = true;
+                    eprintln!("[Raywatcher] DXR target resize after background init failed ({err}); using Software");
+                } else { self.dxr = Some(tracer); }
+                true
+            }
+            Ok(Err(err)) => {
+                self.dxr_init = None; self.dxr_failed = true;
+                eprintln!("[Raywatcher] DXR 1.1 init failed ({err}); falling back to Software"); true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.dxr_init = None; self.dxr_failed = true;
+                eprintln!("[Raywatcher] DXR initialization worker exited without a result; falling back to Software"); true
+            }
+        }
+    }
+
+    pub fn hardware_initializing(&self) -> bool { self.dxr_init.is_some() }
+
+    pub fn can_replace_water_reflections(&self, hardware_requested: bool) -> bool {
+        self.traced_last_frame
+            && (!hardware_requested || self.dxr.is_some() || self.dxr_failed)
+            && self.dxr_init.is_none()
+    }
+
     /// Replace the scene. Called when the resident terrain set, tree set or
     /// water areas change.
     pub fn set_scene(&mut self, device: &wgpu::Device, scene: Arc<super::bvh::SceneGeometry>) {
@@ -4429,10 +4502,8 @@ impl RaywatcherGpu {
         walker_pos: Option<(glam::Vec3, bool)>,
         walker_rt_verts: &[[f32; 3]],
     ) {
-        if !plan.trace {
-            self.traced_last_frame = false;
-            return;
-        }
+        self.traced_last_frame = false;
+        if !plan.trace { return; }
         // Compare against the backend that can actually be used this frame.
         // Once DXR initialization has failed, a hardware-mode setting must not
         // keep invalidating the software path's history on every frame.
@@ -4598,18 +4669,14 @@ impl RaywatcherGpu {
             && !self.dlss_rr_failed;
 
         let mut traced_hw = false;
-        if hardware_mode && !self.dxr_failed {
-            if self.dxr.is_none() {
-                match super::dxr::DxrTracer::new(device, &self.scene_geom, self.grid_extent) {
-                    Ok(tracer) => self.dxr = Some(tracer),
-                    Err(err) => {
-                        eprintln!(
-                            "[Raywatcher] DXR 1.1 init failed ({err}); falling back to Software"
-                        );
-                        self.dxr_failed = true;
-                    }
-                }
+        if hardware_mode && !self.dxr_failed && self.dxr.is_none() {
+            self.begin_dxr_initialization(device);
+            if !self.poll_dxr_initialization(device) {
+                // Keep native raster visible until the DXR scene and targets are ready.
+                return;
             }
+        }
+        if hardware_mode && !self.dxr_failed {
             if let Some(dxr) = self.dxr.as_mut() {
                 let _ = dxr.update_dynamic_character(walker_rt_verts);
                 // Copy the freshly built G-buffer planes into the shared DX12

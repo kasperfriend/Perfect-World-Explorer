@@ -1796,6 +1796,8 @@ struct Renderer {
     /// for a traced frame and dropped when it stops asking. `None` on any frame
     /// the module is off, so a disabled module owns no GPU memory at all.
     raywatcher_gpu: Option<crate::modules::raywatcher::gpu::RaywatcherGpu>,
+    /// First-use GPU state is created on a worker; raster remains visible until ready.
+    raywatcher_gpu_init: Option<std::sync::mpsc::Receiver<Result<crate::modules::raywatcher::gpu::RaywatcherGpu, String>>>,
     /// The geometry the current `raywatcher_gpu` was built from, so a world
     /// change can drop the tree instead of tracing stale geometry.
     raywatcher_scene: Option<std::sync::Arc<crate::modules::raywatcher::bvh::SceneGeometry>>,
@@ -2586,6 +2588,7 @@ impl Renderer {
         Ok(Self {
             modules: crate::modules::Modules::default(),
             raywatcher_gpu: None,
+            raywatcher_gpu_init: None,
             raywatcher_scene: None,
             raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester::new(),
             raywatcher_worst_frame_ms: 0.0,
@@ -3836,11 +3839,24 @@ impl Renderer {
             // for a module the user turned off. The harvester also signals any
             // detached CPU worker to cancel before dropping its receiver.
             self.raywatcher_gpu = None;
+            self.raywatcher_gpu_init = None;
             self.raywatcher_scene = None;
+            self.modules.raywatcher_mut().set_hardware_initializing(false);
             self.raywatcher_harvest.invalidate();
             return RasterOverrides::NONE;
         }
-        RasterOverrides::for_plan(&plan)
+        let mut overrides = RasterOverrides::for_plan(&plan);
+        if overrides.reflection_pass {
+            let hardware_requested = self.modules.raywatcher().effective_mode()
+                == crate::modules::raywatcher::plan::RayTracingMode::Hardware;
+            let ready = self.raywatcher_gpu.as_ref().is_some_and(|gpu| {
+                gpu.can_replace_water_reflections(hardware_requested)
+            });
+            overrides.reflection_pass &= ready
+                && self.raywatcher_gpu_init.is_none()
+                && !self.raywatcher_harvest.is_building_in_background();
+        }
+        overrides
     }
 
     /// Trace and filter this frame's rays, then write the result into the world
@@ -3870,6 +3886,8 @@ impl Renderer {
         }
         let reset_history = reset_history || self.modules.raywatcher_mut().take_history_reset();
         let settings = self.modules.raywatcher().settings().clone();
+        let hardware_mode = self.modules.raywatcher().effective_mode()
+            == crate::modules::raywatcher::plan::RayTracingMode::Hardware;
         // --- The scene. Frustum-wide chunked LOD terrain + real near meshes +
         //     per-chunk building/tree proxies + reflective water planes out to
         //     `camera.far`, rebuilt only when the camera chunk, view sector, or
@@ -4173,24 +4191,73 @@ impl Renderer {
             .is_some_and(|old| std::sync::Arc::ptr_eq(old, &scene));
         let depth_extent = (self.depth.width().max(1), self.depth.height().max(1));
         if !same_world {
-            match self.raywatcher_gpu.as_mut() {
-                Some(gpu) => {
-                    gpu.set_scene(&self.device, scene.clone());
-                    gpu.resize(&self.device, depth_extent, plan.grid);
+            self.raywatcher_gpu_init = None;
+            if let Some(gpu) = self.raywatcher_gpu.as_mut() {
+                gpu.set_scene(&self.device, scene.clone());
+                gpu.resize(&self.device, depth_extent, plan.grid);
+                self.raywatcher_scene = Some(scene.clone());
+            } else {
+                let worker_device = self.device.clone();
+                let worker_scene = scene.clone();
+                let worker_extent = depth_extent;
+                let worker_grid = plan.grid;
+                let worker_hardware = hardware_mode;
+                let triangle_count = worker_scene.triangles.len();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let spawn = std::thread::Builder::new().name("pwe-raywatcher-gpu-init".to_string()).spawn(move || {
+                    let started = std::time::Instant::now();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut gpu = crate::modules::raywatcher::gpu::RaywatcherGpu::new(
+                            &worker_device, worker_scene, worker_extent, worker_grid,
+                        );
+                        if worker_hardware { gpu.initialize_hardware(&worker_device); }
+                        gpu
+                    })).map_err(|_| "Raywatcher GPU initialization panicked".to_string());
+                    eprintln!("[Raywatcher] First-use GPU setup took {:.1}s ({} triangles, hardware_requested={}, success={})", started.elapsed().as_secs_f32(), triangle_count, worker_hardware, result.is_ok());
+                    let _ = tx.send(result);
+                });
+                match spawn {
+                    Ok(_) => {
+                        self.raywatcher_gpu_init = Some(rx);
+                        self.raywatcher_scene = Some(scene.clone());
+                        self.modules.raywatcher_mut().set_hardware_initializing(worker_hardware);
+                    }
+                    Err(err) => {
+                        self.raywatcher_scene = None;
+                        self.modules.raywatcher_mut().set_hardware_initializing(false);
+                        eprintln!("[Raywatcher] Could not start GPU initialization worker ({err})");
+                    }
                 }
-                None => {
-                    self.raywatcher_gpu =
-                        Some(crate::modules::raywatcher::gpu::RaywatcherGpu::new(
-                            &self.device,
-                            scene.clone(),
-                            depth_extent,
-                            plan.grid,
-                        ));
+                return;
+            }
+        } else if self.raywatcher_gpu.is_none() {
+            match self.raywatcher_gpu_init.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(Ok(mut gpu))) => {
+                    self.raywatcher_gpu_init = None;
+                    gpu.resize(&self.device, depth_extent, plan.grid);
+                    self.raywatcher_gpu = Some(gpu);
+                    self.modules.raywatcher_mut().set_hardware_initializing(false);
+                }
+                Some(Ok(Err(err))) => {
+                    self.raywatcher_gpu_init = None;
+                    self.raywatcher_scene = None;
+                    self.modules.raywatcher_mut().set_hardware_initializing(false);
+                    eprintln!("[Raywatcher] Background GPU initialization failed: {err}");
+                    return;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                    self.modules.raywatcher_mut().set_hardware_initializing(hardware_mode);
+                    return;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) | None => {
+                    self.raywatcher_gpu_init = None;
+                    self.raywatcher_scene = None;
+                    self.modules.raywatcher_mut().set_hardware_initializing(false);
+                    eprintln!("[Raywatcher] Background GPU initialization worker disconnected");
+                    return;
                 }
             }
-            self.raywatcher_scene = Some(scene);
         } else if let Some(gpu) = self.raywatcher_gpu.as_mut() {
-            // A resize is a new extent, not a new world.
             gpu.resize(&self.device, depth_extent, plan.grid);
         }
         // Refresh the 512x512 top-down real textured terrain albedo map whenever
@@ -4337,8 +4404,6 @@ impl Renderer {
             iterations: plan.denoise_iterations,
             ..Default::default()
         };
-        let hardware_mode = self.modules.raywatcher().effective_mode()
-            == crate::modules::raywatcher::plan::RayTracingMode::Hardware;
         if plan.debug_view == crate::modules::raywatcher::plan::DebugView::RasterOnly {
             // Phase 0 baseline check: leave the raster world target completely
             // untouched so the user can compare against RT off.
@@ -4817,6 +4882,8 @@ impl Renderer {
             walker_pos,
             &self.raywatcher_dyn_rt_verts,
         );
+        self.modules.raywatcher_mut().set_hardware_initializing(gpu.hardware_initializing());
+        if !gpu.traced_last_frame { return; }
         let mut dlss_rr_ran = false;
         if plan.reconstruction
             == crate::modules::raywatcher::plan::RayReconstruction::DlssRayReconstruction

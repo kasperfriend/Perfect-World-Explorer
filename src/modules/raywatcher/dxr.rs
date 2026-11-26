@@ -727,6 +727,11 @@ mod imp {
         has_dyn_instance: bool,
     }
 
+    // SAFETY: DxrTracer is constructed on a worker and moved exactly once to
+    // the render thread before use. D3D12 device/queue/resource interfaces are
+    // free-threaded; the COM pointers remain uniquely owned by this value.
+    unsafe impl Send for DxrTracer {}
+
     // Descriptor heap slots:
     // 0: t0 TLAS SRV
     // 1: t1 tris StructuredBuffer SRV
@@ -762,6 +767,7 @@ mod imp {
             scene: &Arc<SceneGeometry>,
             grid_extent: (u32, u32),
         ) -> Result<Self, String> {
+            let startup_started = std::time::Instant::now();
             let (ok, reason) = probe_hardware_rt(device);
             if !ok {
                 return Err(reason.unwrap_or_else(|| "DXR 1.1 unavailable".into()));
@@ -773,8 +779,10 @@ mod imp {
                     .map_err(|hr| format!("ID3D12Device5 QueryInterface failed (0x{hr:08x})"))?
             });
             let mut ring = NativeCommandRing::new(&raw_device, "DXR")?;
+            let pipeline_started = std::time::Instant::now();
             let (root_sig, pso, desc_heap, desc_stride) =
                 unsafe { Self::create_pipeline(dev_ptr)? };
+            let pipeline_ms = pipeline_started.elapsed().as_millis();
             let root_sig_guard = ComGuard(root_sig as *mut c_void);
             let pso_guard = ComGuard(pso as *mut c_void);
             let desc_heap_guard = ComGuard(desc_heap as *mut c_void);
@@ -793,6 +801,7 @@ mod imp {
             let cbvs = [mk_cbv()?, mk_cbv()?, mk_cbv()?];
             let mut reusable_scratch: Option<(u64, RawBuffer)> = None;
             let mut reusable_instance_desc: Option<RawBuffer> = None;
+            let scene_build_started = std::time::Instant::now();
             let (dxr_scene, staging, build_fence) = Self::build_scene(
                 dev_ptr,
                 device5_guard.0,
@@ -802,6 +811,8 @@ mod imp {
                 &mut reusable_scratch,
                 &mut reusable_instance_desc,
             )?;
+            let scene_build_ms = scene_build_started.elapsed().as_millis();
+            let resources_started = std::time::Instant::now();
             let radiance_cache = unsafe {
                 RawBuffer::create(
                     dev_ptr,
@@ -864,6 +875,14 @@ mod imp {
             tracer.write_scene_descriptors();
             tracer.write_target_descriptors();
             tracer.initialize_radiance_cache()?;
+            eprintln!(
+                "[Raywatcher] DXR init profile: pipeline={}ms, scene+AS={}ms ({} triangles), targets/cache={}ms, total={}ms",
+                pipeline_ms,
+                scene_build_ms,
+                scene.triangles.len(),
+                resources_started.elapsed().as_millis(),
+                startup_started.elapsed().as_millis(),
+            );
             Ok(tracer)
         }
 

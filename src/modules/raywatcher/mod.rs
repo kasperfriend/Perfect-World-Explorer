@@ -100,6 +100,8 @@ pub struct Raywatcher {
     hardware_note: Option<String>,
     /// True while the background worker thread is rebuilding the BVH.
     scene_building: bool,
+    /// True while Raywatcher's GPU pipelines or DXR acceleration structures initialize off-thread.
+    hardware_initializing: bool,
     /// Optional note when `PW_UPSCALER_SDK_DIR` lacked `nvngx_dlssd.dll` and fell back to `<exe>/sdk`.
     sdk_fallback_note: Option<String>,
     /// Last runtime NGX DLSS Ray Reconstruction error reported by the GPU runner.
@@ -120,6 +122,7 @@ impl Default for Raywatcher {
             pending_reset: true,
             hardware_note: None,
             scene_building: false,
+            hardware_initializing: false,
             sdk_fallback_note: None,
             dlss_rr_error: None,
             last: Status::inactive(None),
@@ -176,6 +179,10 @@ impl Raywatcher {
     /// Update whether the background ray-scene worker is currently rebuilding.
     pub fn set_scene_building(&mut self, building: bool) {
         self.scene_building = building;
+    }
+
+    pub fn set_hardware_initializing(&mut self, initializing: bool) {
+        self.hardware_initializing = initializing;
     }
 
     /// Record or clear the runtime DLSS Ray Reconstruction failure diagnostic
@@ -568,6 +575,12 @@ impl Raywatcher {
         sdk_line.on_hover_text(format!("Resolved SDK folder: {}", self.sdk_dir.display()));
         if let Some(note) = &self.sdk_fallback_note {
             ui.label(egui::RichText::new(note).small().weak());
+        }
+        if self.hardware_initializing {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Preparing Raywatcher GPU pipelines and hardware acceleration structures in the background…",
+            );
         }
         if let Some(note) = &self.hardware_note {
             ui.colored_label(egui::Color32::YELLOW, note);
