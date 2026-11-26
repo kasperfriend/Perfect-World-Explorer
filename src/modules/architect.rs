@@ -308,6 +308,9 @@ impl Architect {
                 self.project_name = project.name.clone();
                 self.selected_map = if project.source_map.is_empty() { "world".into() } else { project.source_map.clone() };
                 self.project = project;
+                self.selected_placement = None;
+                self.selected_scene_object = None;
+                self.multi_selection.clear();
                 self.status = format!("Loaded {} ({} placements, {} brush operations).", self.project.name, self.project.objects.len(), self.project.strokes.len());
             }
             Err(error) => self.status = format!("Could not load project: {error}"),
@@ -400,10 +403,17 @@ impl Architect {
         position
     }
 
+    fn portable_asset_path(&self, asset: &str) -> String {
+        Path::new(asset)
+            .strip_prefix(&self.client_root)
+            .map(|relative| relative.to_string_lossy().replace('\\\\', "/"))
+            .unwrap_or_else(|_| asset.to_string())
+    }
+
     fn add_selected_asset_at_camera(&mut self, camera: Vec3) {
         let Some(asset) = self.selected_asset.clone() else { return };
         self.project.objects.push(PlacedObject {
-            asset,
+            asset: self.portable_asset_path(&asset),
             position: self.placement_position(camera),
             rotation: [0.; 3],
             scale: 1.,
@@ -656,11 +666,14 @@ impl Architect {
                 ui.separator();
                 ui.heading("Custom placements");
                 let mut delete_placement = None;
+                let placement_rows = self.project.objects.iter().enumerate().map(|(index, object)| {
+                    let label = format!("{} · ({:.1}, {:.1}, {:.1})", Path::new(&object.asset).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| object.asset.clone()), object.position[0], object.position[1], object.position[2]);
+                    (index, label)
+                }).collect::<Vec<_>>();
                 egui::ScrollArea::vertical().max_height(100.).show(ui, |ui| {
-                    for (index, object) in self.project.objects.iter().enumerate() {
-                        let label = format!("{} · ({:.1}, {:.1}, {:.1})", Path::new(&object.asset).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| object.asset.clone()), object.position[0], object.position[1], object.position[2]);
-                        if ui.selectable_label(self.selected_placement == Some(index), label).clicked() {
-                            self.selected_placement = Some(index);
+                    for (index, label) in &placement_rows {
+                        if ui.selectable_label(self.selected_placement == Some(*index), label).clicked() {
+                            self.selected_placement = Some(*index);
                         }
                     }
                 });
