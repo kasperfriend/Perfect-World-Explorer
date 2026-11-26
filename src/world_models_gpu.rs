@@ -34,6 +34,10 @@ struct Producer {
     attenuation: bool,
     /// Current distance fade, 0..1, ramped toward the target at 1/3000 per ms.
     fade: f32,
+    /// Last activation decision applied to the owner. Camera motion changes
+    /// distance calculations every frame, but most producers remain on the
+    /// same side of the activation boundary; skip their hash/index updates.
+    active: Option<bool>,
 }
 
 /// `FadeGFX`'s transition length: `SetAlphaTransition(max_alpha * fAlpha, 3000)`
@@ -639,6 +643,7 @@ impl World {
                     hook: None,
                     attenuation: effect.attenuation,
                     fade: if effect.attenuation { 0. } else { 1. },
+                    active: None,
                 });
                 installed += 1;
             }
@@ -757,6 +762,7 @@ impl World {
                         local,
                         static_parent: None,
                     }),
+                    active: None,
                 });
                 installed += 1;
             }
@@ -901,7 +907,7 @@ impl World {
             let Self {
                 producers, owners, ..
             } = self;
-            for producer in producers.iter() {
+            for producer in producers.iter_mut() {
                 let dx = producer.position[0] - x;
                 let dz = producer.position[2] - z;
                 let near = dx * dx + dz * dz <= radius_sq;
@@ -919,7 +925,11 @@ impl World {
                 if !visible {
                     census[2] += 1;
                 }
-                owners.set_active(producer.identity, near && resident && visible);
+                let active = near && resident && visible;
+                if producer.active != Some(active) {
+                    owners.set_active(producer.identity, active);
+                    producer.active = Some(active);
+                }
             }
             self.census = census;
             self.activation_key = Some(key);
