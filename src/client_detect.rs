@@ -2238,7 +2238,11 @@ mod tests {
         // is missing; executable identity is preferred, not a hard dependency.
         fs::remove_file(root.join("element/elementclient.exe")).unwrap();
         let without_executable = scan(&root);
-        assert!(without_executable.loadable(), "{}", without_executable.report());
+        assert!(
+            without_executable.loadable(),
+            "{}",
+            without_executable.report()
+        );
         assert_eq!(
             without_executable.game_version(),
             "1.4.4 (data-version profile)"
@@ -2945,7 +2949,6 @@ mod tests {
     }
 }
 
-
 /// The result of matching both client data headers against the public corpus.
 /// An ambiguous signature is surfaced as candidates, never as a single game
 /// version. This is separate from parser support and client compatibility.
@@ -2959,9 +2962,9 @@ impl DataVersionProfile {
     fn game_version(self) -> String {
         match self {
             Self::Exact(version) => format!("{version} (data-version profile)"),
-            Self::Ambiguous(candidates) => format!(
-                "unknown game version (ambiguous data pair; candidates: {candidates})"
-            ),
+            Self::Ambiguous(candidates) => {
+                format!("unknown game version (ambiguous data pair; candidates: {candidates})")
+            }
         }
     }
 }
