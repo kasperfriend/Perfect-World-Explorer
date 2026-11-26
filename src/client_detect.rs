@@ -576,7 +576,7 @@ impl Scan {
                         .unwrap_or("config/element/version.sw");
                     out.push_str(&format!("  client marker   {release} ({source})\n"));
                 }
-                out.push_str(&format!("  identity  {}\n", exe.label()));
+                out.push_str(&format!("  identity  {}\n", self.executable_label()));
                 if let Some(versions) = exe.known_data_versions() {
                     out.push_str(&format!("  inspected with  {versions}\n"));
                 }
