@@ -1785,6 +1785,9 @@ struct Renderer {
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
     world_draw_cmds: [crate::world_objects::WorldDrawList; crate::world_objects::WORLD_VIEWS],
     world_draw_scratch: std::cell::RefCell<crate::world_objects::WorldDrawScratch>,
+    /// Reused upload staging pages; all whole-world geometry copies are
+    /// encoded together and submitted once per frame.
+    world_upload_belt: wgpu::util::StagingBelt,
     world_done: bool,
     /// The scenery half of the drawn mesh was left out because the whole-world
     /// preload owns it. Unlike `world_done` this describes the *mesh*, so the
@@ -2645,6 +2648,7 @@ impl Renderer {
             world_draw_scratch: std::cell::RefCell::new(
                 crate::world_objects::WorldDrawScratch::default(),
             ),
+            world_upload_belt: wgpu::util::StagingBelt::new(16 * 1024 * 1024),
             world_done: false,
             local_scenery_skipped: m.local_scenery_skipped,
             layout,
@@ -6836,6 +6840,11 @@ pub fn run(
                     // frame pacing for faster scenery readiness.
                     let upload_deadline = std::time::Instant::now()
                         + std::time::Duration::from_millis(world_upload_budget_ms);
+                    let mut upload_encoder = renderer.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("whole-world batched geometry uploads"),
+                        },
+                    );
                     let mut uploaded_this_frame = 0usize;
                     while uploaded_this_frame < 64
                         && (uploaded_this_frame == 0 || std::time::Instant::now() < upload_deadline)
@@ -6844,7 +6853,7 @@ pub fn run(
                             Ok(crate::world_objects::Message::Page(page)) => {
                                 let processed = page.processed;
                                 let upload_started = std::time::Instant::now();
-                                let uploaded = crate::world_objects::GpuPage::upload_world_ref(
+                                let uploaded = crate::world_objects::GpuPage::upload_world_ref_staged(
                                     &renderer.device,
                                     &renderer.queue,
                                     &renderer.layout,
@@ -6852,6 +6861,8 @@ pub fn run(
                                     &renderer.uniform,
                                     &renderer.reflected_uniform,
                                     &renderer.world_pages,
+                                    &mut renderer.world_upload_belt,
+                                    &mut upload_encoder,
                                     &page,
                                 );
                                 let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
@@ -6931,7 +6942,12 @@ pub fn run(
                         }
                     }
                     if uploaded_this_frame > 0 {
-                        renderer.queue.submit(std::iter::empty());
+                        // All vertex/index copies from this frame share the
+                        // staging belt and one command submission. Texture
+                        // writes queued above are ordered before this submit.
+                        renderer.world_upload_belt.finish();
+                        renderer.queue.submit(Some(upload_encoder.finish()));
+                        renderer.world_upload_belt.recall();
                         renderer.device.poll(wgpu::Maintain::Poll);
                     }
                 }
