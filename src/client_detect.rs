@@ -2204,7 +2204,7 @@ mod tests {
             (
                 29,
                 78,
-                "unknown game version (ambiguous data pair; candidates: 1.4.1 / 1.4.2)",
+                "Version is guessed: 1.4.2",
             ),
             (
                 70,
