@@ -49,7 +49,7 @@ impl Default for Modules {
         Self {
             walker: Walker::default(),
             librarian: librarian::Librarian::new(PathBuf::new()),
-            architect: architect::Architect::new(PathBuf::new()),
+            architect: architect::Architect::new(PathBuf::new(), None),
             populator: Populator::default(),
             packages: Registry::discover(package::default_root()),
             selected: 0,
@@ -70,10 +70,11 @@ impl Modules {
         // The add-ons each own their state; the host only clones the two
         // handles they need (client root and the loaded world space).
         let populator = Populator::new(element.clone(), map.clone(), map_dir);
+        let architect = architect::Architect::new(element.clone(), Some(map.clone()));
         Self {
             walker: Walker::with_host(element.clone(), map, water, scene, ornaments),
             librarian: librarian::Librarian::new(element.clone()),
-            architect: architect::Architect::new(element),
+            architect,
             populator,
             packages: Registry::discover(package::default_root()),
             selected: 0,
