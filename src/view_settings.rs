@@ -808,7 +808,7 @@ mod tests {
         assert!(!ViewSettings::decode_with_fog_default("", false).atmospheric_fog);
         assert!(ViewSettings::decode_with_fog_default("atmospheric_fog=false", true).atmospheric_fog);
         assert!(ViewSettings::decode_with_fog_default(
-            "# Perfect World Explorer settings, version 1\\natmospheric_fog=false",
+            "# Perfect World Explorer settings, version 1\natmospheric_fog=false",
             true
         )
         .atmospheric_fog);
