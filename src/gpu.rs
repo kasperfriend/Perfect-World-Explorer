@@ -3908,18 +3908,14 @@ impl Renderer {
         // pixels are produced afterwards. Keep every original raster term until
         // a complete RT frame from the previous iteration exists. That closes
         // the one-frame hole during first-use initialization and scene/AS swaps.
-        let rt_output_ready = self
-            .raywatcher_gpu
-            .as_ref()
-            .is_some_and(|gpu| gpu.can_replace_raster_effects());
-        let mut overrides = RasterOverrides::for_plan_when_ready(&plan, rt_output_ready);
-        if overrides.reflection_pass {
-            // Keep the native mirror while the scene harvester has invalidated
-            // its reflected-object coverage; other RT lighting terms can still
-            // use the completed RT frame.
-            overrides.reflection_pass &= !self.raywatcher_harvest.is_building_in_background();
-        }
-        overrides
+        let rt_output_ready = self.raywatcher_gpu.as_ref().is_some_and(|gpu| {
+            gpu.render_extent() == render_extent && gpu.can_replace_raster_effects()
+        });
+        // The previous completed RT image remains valid while a new scene/AS
+        // is prepared. Do not toggle the native mirror based on CPU harvester
+        // activity: that made reflections alternate every time a background
+        // build started/finished, despite an unchanged RT output.
+        RasterOverrides::for_plan_when_ready(&plan, rt_output_ready)
     }
 
     /// Trace and filter this frame's rays, then write the result into the world
