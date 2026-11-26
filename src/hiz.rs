@@ -41,11 +41,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     } else {
         // Ceil-halving keeps odd right/bottom edges in the hierarchy.
-        for (var oy = 0u; oy < 2u; oy += 1u) {
-            for (var ox = 0u; ox < 2u; ox += 1u) {
+        var x_count = 2u;
+        var y_count = 2u;
+        if id.x == p.dst_width - 1u && (p.src_width & 1u) == 1u {
+            x_count = 3u;
+        }
+        if id.y == p.dst_height - 1u && (p.src_height & 1u) == 1u {
+            y_count = 3u;
+        }
+        for (var oy = 0u; oy < 3u; oy += 1u) {
+            for (var ox = 0u; ox < 3u; ox += 1u) {
                 let sx = id.x * 2u + ox;
                 let sy = id.y * 2u + oy;
-                if sx < p.src_width && sy < p.src_height {
+                if ox < x_count && oy < y_count && sx < p.src_width && sy < p.src_height {
                     let value = textureLoad(
                         source_values,
                         vec2<i32>(i32(sx), i32(sy)),
@@ -97,7 +105,7 @@ pub struct Pyramid {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     level_views: Vec<wgpu::TextureView>,
-    dummy_texture: wgpu::Texture,
+    _dummy_texture: wgpu::Texture,
     dummy_view: wgpu::TextureView,
     pipeline: wgpu::ComputePipeline,
     bind_layout: wgpu::BindGroupLayout,
@@ -138,10 +146,12 @@ impl Pyramid {
             if w == 1 && h == 1 {
                 break;
             }
-            w = w.div_ceil(2);
-            h = h.div_ceil(2);
+            // Native texture mip extents floor-halve. The reduction kernel
+            // folds any odd trailing row/column into the last destination texel.
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
         }
-        let memory_size = next_offset
+        next_offset
             .checked_mul(4)
             .ok_or("Hi-Z texture memory size overflow")?;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -295,7 +305,7 @@ impl Pyramid {
             texture,
             view,
             level_views,
-            dummy_texture,
+            _dummy_texture: dummy_texture,
             dummy_view,
             pipeline,
             bind_layout,
@@ -389,14 +399,24 @@ impl Pyramid {
 /// CPU reference for one ceil-halved minimum-reduction level.
 pub fn reduce_min_level(source: &[f32], width: u32, height: u32) -> (Vec<f32>, u32, u32) {
     assert_eq!(source.len(), width as usize * height as usize);
-    let dst_width = width.div_ceil(2);
-    let dst_height = height.div_ceil(2);
+    let dst_width = (width / 2).max(1);
+    let dst_height = (height / 2).max(1);
     let mut destination = vec![1.0f32; dst_width as usize * dst_height as usize];
     for y in 0..dst_height {
         for x in 0..dst_width {
             let mut minimum = 1.0f32;
-            for oy in 0..2 {
-                for ox in 0..2 {
+            let x_count = if x + 1 == dst_width && width % 2 == 1 {
+                3
+            } else {
+                2
+            };
+            let y_count = if y + 1 == dst_height && height % 2 == 1 {
+                3
+            } else {
+                2
+            };
+            for oy in 0..y_count {
+                for ox in 0..x_count {
                     let sx = x * 2 + ox;
                     let sy = y * 2 + oy;
                     if sx < width && sy < height {
@@ -553,11 +573,8 @@ mod tests {
     fn reduction_covers_odd_right_and_bottom_edges() {
         let source: Vec<f32> = (1..=15).map(|v| v as f32 / 16.0).collect();
         let (level, width, height) = reduce_min_level(&source, 5, 3);
-        assert_eq!((width, height), (3, 2));
-        assert_eq!(
-            level,
-            vec![source[0], source[2], source[4], source[10], source[12], source[14]]
-        );
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(level, vec![source[0], source[2]]);
     }
 
     #[test]
@@ -565,9 +582,9 @@ mod tests {
         let mut source = vec![0.8; 5 * 3];
         source[2 * 5 + 4] = 0.0;
         let (levels, dimensions) = pyramid(source, 5, 3);
-        assert_eq!(dimensions, vec![(5, 3), (3, 2), (2, 1), (1, 1)]);
-        assert_eq!(levels[1][5], 0.0);
-        assert_eq!(levels[3], vec![0.0]);
+        assert_eq!(dimensions, vec![(5, 3), (2, 1), (1, 1)]);
+        assert_eq!(levels[1][1], 0.0);
+        assert_eq!(levels[2], vec![0.0]);
     }
 
     #[test]
@@ -661,7 +678,7 @@ mod tests {
     fn odd_dimensions_build_a_finite_hierarchy() {
         let source: Vec<f32> = (0..35).map(|v| v as f32 / 35.0).collect();
         let (levels, dimensions) = pyramid(source, 7, 5);
-        assert_eq!(dimensions, vec![(7, 5), (4, 3), (2, 2), (1, 1)]);
+        assert_eq!(dimensions, vec![(7, 5), (3, 2), (1, 1)]);
         assert_eq!(levels.last().unwrap(), &[0.0]);
     }
 }
