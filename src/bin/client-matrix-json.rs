@@ -178,6 +178,45 @@ fn world_file(element: &Path) -> Option<PathBuf> {
     all.into_iter().next()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matrix_reads_nested_elements_and_root_tasks_version_not_magic() {
+        let root = std::env::temp_dir().join(format!("pw-matrix-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let element = root.join("element");
+        std::fs::create_dir_all(element.join("data")).unwrap();
+
+        // Different locations are both used by retail client distributions.
+        let mut elements = 0x3000_001bu32.to_le_bytes().to_vec();
+        elements.extend_from_slice(&0x4b39_c931u32.to_le_bytes());
+        std::fs::write(element.join("data/elements.data"), elements).unwrap();
+        let mut tasks = 0x9385_8361u32.to_le_bytes().to_vec();
+        tasks.extend_from_slice(&75u32.to_le_bytes());
+        std::fs::write(element.join("tasks.data"), tasks).unwrap();
+
+        let (cells, facts) = measure_client("mixed-layout", &root);
+        let elements = cells.iter().find(|cell| cell.category == "elements data").unwrap();
+        assert_eq!(elements.status, "ok");
+        assert!(elements.detail.contains("v27"), "{}", elements.detail);
+
+        let tasks = cells.iter().find(|cell| cell.category == "tasks data").unwrap();
+        assert_eq!(tasks.status, "ok");
+        assert!(tasks.detail.contains("v75"), "{}", tasks.detail);
+        assert!(
+            !tasks.detail.contains("2474998625"),
+            "the magic must not be printed as the version: {}",
+            tasks.detail
+        );
+
+        assert!(facts.iter().any(|(key, value)| *key == "elementsVersion" && value == "27"));
+        assert!(facts.iter().any(|(key, value)| *key == "tasksVersion" && value == "75"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut it = args.into_iter();
@@ -241,6 +280,11 @@ fn main() {
     }
 }
 
+/// Read a dword at a known offset without turning a short input into zero.
+fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes.get(offset..offset + 4).map(|raw| u32::from_le_bytes(raw.try_into().unwrap()))
+}
+
 /// Measure one client and return its cells and facts.
 fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, String)>) {
     let _ = name;
@@ -250,8 +294,8 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
         let mut facts: Vec<(&'static str, String)> = Vec::new();
 
         // --- the client's declared data version
-        let elements_data = element.join("elements.data");
-        if elements_data.is_file() {
+        let elements_data = client_detect::data_file_path(&element, "elements.data");
+        if let Some(elements_data) = elements_data {
             let bytes = std::fs::read(&elements_data).unwrap_or_default();
             match client_detect::ElementsHeader::parse(&bytes) {
                 Some(h) => {
@@ -276,15 +320,24 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
         } else {
             cells.push(Cell::absent("elements data"));
         }
-        let tasks_data = element.join("tasks.data");
-        if tasks_data.is_file() {
+        let tasks_data = client_detect::data_file_path(&element, "tasks.data");
+        if let Some(tasks_data) = tasks_data {
             let bytes = std::fs::read(&tasks_data).unwrap_or_default();
-            let v = bytes
-                .get(0..4)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
-            match v {
-                Some(w) => cells.push(Cell::ok("tasks data", format!("version word {w}"))),
-                None => cells.push(Cell::refused("tasks data", "shorter than 4 bytes")),
+            match (u32_at(&bytes, 0), u32_at(&bytes, 4)) {
+                (Some(magic), Some(version)) if magic == 0x9385_8361 => {
+                    facts.push(("tasksVersion", format!("{version}")));
+                    cells.push(Cell::ok(
+                        "tasks data",
+                        format!("v{version}; header magic {magic:#010x}"),
+                    ));
+                }
+                (Some(magic), Some(version)) => cells.push(Cell::refused(
+                    "tasks data",
+                    format!(
+                        "unexpected header magic {magic:#010x} (version word {version})"
+                    ),
+                )),
+                _ => cells.push(Cell::refused("tasks data", "shorter than 8-byte header")),
             }
         } else {
             cells.push(Cell::absent("tasks data"));
