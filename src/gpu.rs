@@ -3262,7 +3262,7 @@ impl Renderer {
         }
     }
     fn draw_opaque(
-        &mut self,
+        &self,
         e: &mut wgpu::CommandEncoder,
         label: &str,
         view: &wgpu::TextureView,
