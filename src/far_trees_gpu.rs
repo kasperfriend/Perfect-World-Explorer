@@ -1608,8 +1608,9 @@ impl FarTrees {
             clip: clip_plane.map_or([0.; 4], |(height, sign)| [height, sign, 1., 0.]),
             counts: [
                 active_count as u32,
-                self.active_index_offset
-                    .map_or(0, |offset| (offset / std::mem::size_of::<u32>() as u64) as u32),
+                self.active_index_offset.map_or(0, |offset| {
+                    (offset / std::mem::size_of::<u32>() as u64) as u32
+                }),
                 u32::from(bounds.is_some()),
                 0,
             ],
