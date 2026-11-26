@@ -367,7 +367,7 @@ pub fn classify_surface_roughness(
     world_pos: glam::Vec3,
     water: &[super::harvest::WaterSurface],
 ) -> f32 {
-    if water.is_empty() || normal.y <= 0.985 {
+    if water.is_empty() || normal.y.abs() <= 0.985 {
         return 0.92;
     }
     for w in water.iter().take(16) {
@@ -532,7 +532,9 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
     // active water plane footprint and height, without a second depth pass.
     var roughness = 0.92;
     let water_count = min(u32(prep.water_count.x), 16u);
-    if (n.y > 0.985) {
+    // Surface normals are oriented toward the camera above, so the underside
+    // of a horizontal water plane has a negative Y normal. Classify both faces.
+    if (abs(n.y) > 0.985) {
         for (var wi = 0u; wi < water_count; wi = wi + 1u) {
             let bounds = prep.water_planes[wi];
             let height = prep.water_heights[wi / 4u][wi % 4u];
@@ -541,7 +543,13 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
                 && abs(p.y - height) < 0.15)
             {
                 roughness = 0.06;
-                n = vec3<f32>(0.0, 1.0, 0.0);
+                // Keep the tagged water normal facing the camera on either side
+                // of the plane; reflection/Fresnel code relies on that convention.
+                n = select(
+                    vec3<f32>(0.0, -1.0, 0.0),
+                    vec3<f32>(0.0, 1.0, 0.0),
+                    view_dir.y < 0.0,
+                );
                 break;
             }
         }
@@ -1237,6 +1245,12 @@ fn adaptive_ray_samples(pixel: vec2<i32>, dist: f32, normal: vec3<f32>, roughnes
     var complexity = max(normal_edge * 2.0, max(depth_edge * 5.0, colour_edge * 2.0));
     complexity = max(complexity, (1.0 - smoothstep(0.0, 320.0, dist)) * 0.20);
     complexity = max(complexity, clamp((0.36 - roughness) / 0.36, 0.0, 1.0) * 0.20);
+    let gi_enabled = (u32(round(params.effects.y)) & 16u) != 0u
+        && params.frame.z >= 1.0
+        && params.tuning.w > 0.0;
+    if (gi_enabled) {
+        complexity = max(complexity, (1.0 - smoothstep(40.0, 220.0, dist)) * 0.50);
+    }
     let extra = u32(ceil(clamp(complexity, 0.0, 1.0) * f32(maximum - base)));
     return clamp(base + extra, base, maximum);
 }
@@ -5560,10 +5574,28 @@ mod phase_r1_tests {
             height: 10.0,
         }];
         let flat_normal = glam::Vec3::Y;
+        let underside_normal = glam::Vec3::NEG_Y;
         let slope_normal = glam::Vec3::new(0.2, 0.97, 0.0);
         assert_eq!(
             classify_surface_roughness(flat_normal, glam::Vec3::new(0.0, 10.0, 0.0), &water),
             0.06
+        );
+        assert_eq!(
+            classify_surface_roughness(
+                underside_normal,
+                glam::Vec3::new(0.0, 10.0, 0.0),
+                &water
+            ),
+            0.06,
+            "the underside of native water must stay tagged when viewed underwater"
+        );
+        assert!(
+            GBUF_PREP_SHADER.contains("if (abs(n.y) > 0.985)"),
+            "the GPU classifier must accept both sides of a horizontal water plane"
+        );
+        assert!(
+            GBUF_PREP_SHADER.contains("view_dir.y < 0.0"),
+            "the water normal must face the camera from above and below"
         );
         assert_eq!(
             classify_surface_roughness(flat_normal, glam::Vec3::new(101.0, 10.0, 0.0), &water),
@@ -5793,6 +5825,17 @@ mod phase_r1_tests {
 #[cfg(test)]
 mod shader_optimization_regression_tests {
     use super::RAY_SHADER;
+
+    #[test]
+    fn gi_adaptive_sampling_increases_near_field_rays_on_both_backends() {
+        let dxr = include_str!("dxr_trace.hlsl");
+        assert!(RAY_SHADER.contains(
+            "(1.0 - smoothstep(40.0, 220.0, dist)) * 0.50"
+        ));
+        assert!(dxr.contains(
+            "(1.0 - smoothstep(40.0, 220.0, dist)) * 0.50"
+        ));
+    }
 
     #[test]
     fn collision_prone_radiance_cache_is_disabled_in_both_backends() {
