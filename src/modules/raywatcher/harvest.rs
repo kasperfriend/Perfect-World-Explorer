@@ -1535,8 +1535,10 @@ fn push_terrain_frustum(
     config: HarvestConfig,
     ground: &dyn Fn(f32, f32) -> f32,
 ) -> [usize; 4] {
-    push_terrain_frustum_cancellable(triangles, materials, eye, frustum, far, base_cell, config, ground, None)
-        .unwrap_or([0; 4])
+    push_terrain_frustum_cancellable(
+        triangles, materials, eye, frustum, far, base_cell, config, ground, None,
+    )
+    .unwrap_or([0; 4])
 }
 
 #[allow(clippy::too_many_arguments)]
