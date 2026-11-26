@@ -3510,6 +3510,9 @@ impl Renderer {
                 reflected,
                 cull,
                 false,
+                &self.device,
+                &self.queue,
+                self.device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT),
                 &mut scratch,
             );
         }
@@ -3548,6 +3551,9 @@ impl Renderer {
                     reflected,
                     cull,
                     true,
+                    &self.device,
+                    &self.queue,
+                    self.device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT),
                     &mut scratch,
                 );
             }

@@ -2,6 +2,7 @@
 //! globally across geometry chunks, rather than duplicated at every page turn.
 use crate::{
     gpu::Vertex,
+    indirect_args::DrawIndexedArgs,
     objects::Objects,
     scene::Ornament,
     scenery_visibility::{allows_with_context, Pass, RenderContext, Visibility},
@@ -267,12 +268,26 @@ impl CullParams {
     }
 }
 
+/// One consecutive page run in the stable whole-world command order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorldIndirectRun {
+    page: usize,
+    first_record: u32,
+    record_count: u32,
+    first_cmd: usize,
+}
+
 /// Reusable per-frame scratch buffers owned by `Renderer` so whole-world
-/// culling and draw-call coalescing perform zero heap allocations per frame.
+/// culling, indirect packing and draw-call coalescing perform zero heap
+/// allocations after their first use. Normal and SDR commands need distinct
+/// buffers because both lists can be consumed by one encoded render pass.
 #[derive(Default)]
 pub struct WorldDrawScratch {
     pub cmds: Vec<DrawCmd>,
     pub page_visible: Vec<bool>,
+    indirect_args: Vec<DrawIndexedArgs>,
+    indirect_runs: Vec<WorldIndirectRun>,
+    indirect_buffers: [Option<wgpu::Buffer>; 2],
 }
 
 /// Returns false when an AABB lies completely on the clipped side of a water
@@ -1781,6 +1796,9 @@ impl GpuPage {
         reflected: bool,
         cull: &CullParams,
         sdr_only: bool,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        multi_draw: bool,
         scratch: &mut WorldDrawScratch,
     ) {
         if pages.is_empty() || list.chunks.is_empty() {
@@ -1892,22 +1910,138 @@ impl GpuPage {
             }
         }
 
-        // 3. Submit coalesced draws, binding each page's vertex/index buffers
-        // once per page run and skipping redundant bind-group switches when
-        // consecutive pages share the same atlas texture.
-        let mut bound_page: Option<usize> = None;
-        for cmd in &scratch.cmds {
-            if bound_page != Some(cmd.page) {
-                let p = &pages[cmd.page];
-                let same_atlas = bound_page.is_some_and(|prev| pages[prev].shares_atlas_with(p));
-                if !same_atlas {
-                    pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
+        // 3. Group adjacent commands that already share a page. Their order
+        // remains unchanged (including interleaved pages), but a run with two
+        // or more commands can now be issued by one native multi-draw call.
+        // Keep the original direct path when the optional device feature or
+        // an appropriately sized indirect buffer is unavailable.
+        let mut use_multi_draw = false;
+        if multi_draw && scratch.cmds.len() > 1 {
+            scratch.indirect_args.clear();
+            scratch.indirect_runs.clear();
+            for (cmd_index, cmd) in scratch.cmds.iter().enumerate() {
+                let record_index = scratch.indirect_args.len() as u32;
+                scratch.indirect_args.push(DrawIndexedArgs {
+                    index_count: cmd.end - cmd.start,
+                    instance_count: 1,
+                    first_index: cmd.start,
+                    base_vertex: 0,
+                    first_instance: 0,
+                });
+                match scratch.indirect_runs.last_mut() {
+                    Some(run) if run.page == cmd.page => {
+                        run.record_count += 1;
+                    }
+                    _ => scratch.indirect_runs.push(WorldIndirectRun {
+                        page: cmd.page,
+                        first_record: record_index,
+                        record_count: 1,
+                        first_cmd: cmd_index,
+                    }),
                 }
-                pass.set_vertex_buffer(0, p.vertex.slice(..));
-                pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
-                bound_page = Some(cmd.page);
             }
-            pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
+
+            let slot = usize::from(sdr_only);
+            let required_bytes = (scratch.indirect_args.len() as u64)
+                .saturating_mul(crate::indirect_args::DRAW_ARGS);
+            let current_bytes = scratch.indirect_buffers[slot]
+                .as_ref()
+                .map_or(0, wgpu::Buffer::size);
+            let capacity = if current_bytes >= required_bytes {
+                current_bytes
+            } else {
+                required_bytes
+                    .max(current_bytes.saturating_mul(2))
+                    .checked_next_power_of_two()
+                    .unwrap_or(u64::MAX)
+            };
+            if required_bytes > 0
+                && capacity <= device.limits().max_buffer_size
+                && capacity != u64::MAX
+            {
+                if capacity != current_bytes {
+                    scratch.indirect_buffers[slot] = Some(device.create_buffer(
+                        &wgpu::BufferDescriptor {
+                            label: Some(if sdr_only {
+                                "whole-world SDR indirect commands"
+                            } else {
+                                "whole-world opaque indirect commands"
+                            }),
+                            size: capacity.max(crate::indirect_args::DRAW_ARGS),
+                            usage: wgpu::BufferUsages::INDIRECT
+                                | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        },
+                    ));
+                }
+                let buffer = scratch.indirect_buffers[slot]
+                    .as_ref()
+                    .expect("whole-world indirect buffer was just allocated");
+                queue.write_buffer(
+                    buffer,
+                    0,
+                    bytemuck::cast_slice(&scratch.indirect_args),
+                );
+                use_multi_draw = true;
+            }
+        }
+
+        // 4. Submit in the same stable page/command order. The vertex and index
+        // bindings still change only at page boundaries. A one-command run is
+        // cheaper as a direct draw; larger runs use one multi-draw submission.
+        let indirect_buffer = if use_multi_draw {
+            scratch.indirect_buffers[usize::from(sdr_only)].as_ref()
+        } else {
+            None
+        };
+        let mut bound_page: Option<usize> = None;
+        if let Some(indirect_buffer) = indirect_buffer {
+            for run in &scratch.indirect_runs {
+                if bound_page != Some(run.page) {
+                    let page = &pages[run.page];
+                    let same_atlas =
+                        bound_page.is_some_and(|prev| pages[prev].shares_atlas_with(page));
+                    if !same_atlas {
+                        pass.set_bind_group(
+                            0,
+                            if reflected { &page.reflected } else { &page.normal },
+                            &[],
+                        );
+                    }
+                    pass.set_vertex_buffer(0, page.vertex.slice(..));
+                    pass.set_index_buffer(page.index.slice(..), wgpu::IndexFormat::Uint32);
+                    bound_page = Some(run.page);
+                }
+                if run.record_count > 1 {
+                    pass.multi_draw_indexed_indirect(
+                        indirect_buffer,
+                        u64::from(run.first_record) * crate::indirect_args::DRAW_ARGS,
+                        run.record_count,
+                    );
+                } else {
+                    let cmd = &scratch.cmds[run.first_cmd];
+                    pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
+                }
+            }
+        } else {
+            for cmd in &scratch.cmds {
+                if bound_page != Some(cmd.page) {
+                    let page = &pages[cmd.page];
+                    let same_atlas =
+                        bound_page.is_some_and(|prev| pages[prev].shares_atlas_with(page));
+                    if !same_atlas {
+                        pass.set_bind_group(
+                            0,
+                            if reflected { &page.reflected } else { &page.normal },
+                            &[],
+                        );
+                    }
+                    pass.set_vertex_buffer(0, page.vertex.slice(..));
+                    pass.set_index_buffer(page.index.slice(..), wgpu::IndexFormat::Uint32);
+                    bound_page = Some(cmd.page);
+                }
+                pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
+            }
         }
     }
 
@@ -2484,6 +2618,63 @@ mod page_tests {
         assert!(all_chunks_inside_frustum(&[inside], &cube));
         assert!(!all_chunks_inside_frustum(&[inside, outside], &cube));
         assert!(!all_chunks_inside_frustum(&[], &cube));
+    }
+
+    #[test]
+    fn indirect_page_runs_preserve_command_order_and_record_contents() {
+        let cmds = [
+            DrawCmd { page: 0, start: 0, end: 12 },
+            DrawCmd { page: 0, start: 12, end: 30 },
+            DrawCmd { page: 1, start: 4, end: 10 },
+            DrawCmd { page: 0, start: 30, end: 42 },
+            DrawCmd { page: 1, start: 10, end: 22 },
+            DrawCmd { page: 1, start: 22, end: 40 },
+        ];
+        let mut args = Vec::new();
+        let mut runs = Vec::<WorldIndirectRun>::new();
+        for (cmd_index, cmd) in cmds.iter().enumerate() {
+            let record_index = args.len() as u32;
+            args.push(DrawIndexedArgs {
+                index_count: cmd.end - cmd.start,
+                instance_count: 1,
+                first_index: cmd.start,
+                base_vertex: 0,
+                first_instance: 0,
+            });
+            match runs.last_mut() {
+                Some(run) if run.page == cmd.page => run.record_count += 1,
+                _ => runs.push(WorldIndirectRun {
+                    page: cmd.page,
+                    first_record: record_index,
+                    record_count: 1,
+                    first_cmd: cmd_index,
+                }),
+            }
+        }
+        assert_eq!(
+            runs,
+            vec![
+                WorldIndirectRun { page: 0, first_record: 0, record_count: 2, first_cmd: 0 },
+                WorldIndirectRun { page: 1, first_record: 2, record_count: 1, first_cmd: 2 },
+                WorldIndirectRun { page: 0, first_record: 3, record_count: 1, first_cmd: 3 },
+                WorldIndirectRun { page: 1, first_record: 4, record_count: 2, first_cmd: 4 },
+            ]
+        );
+        let expanded: Vec<(usize, u32, u32)> = runs
+            .iter()
+            .flat_map(|run| {
+                args[run.first_record as usize..(run.first_record + run.record_count) as usize]
+                    .iter()
+                    .map(move |arg| (run.page, arg.first_index, arg.first_index + arg.index_count))
+            })
+            .collect();
+        assert_eq!(
+            expanded,
+            cmds.iter().map(|cmd| (cmd.page, cmd.start, cmd.end)).collect::<Vec<_>>()
+        );
+        assert!(args.iter().all(|arg| arg.instance_count == 1
+            && arg.base_vertex == 0
+            && arg.first_instance == 0));
     }
 
     #[test]
