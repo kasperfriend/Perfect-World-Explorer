@@ -974,6 +974,11 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float3 raster_rgb = raster_rgba.rgb;
     float3 view_dir = normalize(world_pos - params.eye.xyz);
     bool is_water = roughness <= 0.12;
+    // Orient the flat water plane toward the camera on both sides of the
+    // interface so the ray origin and dielectric Fresnel use the right side.
+    if (is_water && dot(normal, view_dir) > 0.0) {
+        normal = -normal;
+    }
     bool is_glossy_trim = !is_water && roughness <= 0.36;
 
     bool layered = params.effects.w > 0.5;
@@ -1023,7 +1028,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     }
     float eff_roughness = (metalness > 0.1) ? min(roughness, 0.24) : roughness;
 
-    float steepness = 1.0 - saturate(normal.y);
+    float steepness = is_water ? 0.0 : (1.0 - saturate(normal.y));
     float slope_bias = steepness * (0.75 + dist * 0.0065);
     float bias = max(params.effects.z, max(0.18, dist * 0.0035)) + slope_bias;
     float3 ray_origin = world_pos + normal * bias + float3(0.0, 1.0, 0.0) * (steepness * 0.55) - view_dir * (bias * 0.35);

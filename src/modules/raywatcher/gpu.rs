@@ -1431,12 +1431,16 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let point = pos_d.xyz;
     let norm_r = textureLoad(src_gbuf_norm, ip, 0);
     let raw_n = norm_r.xyz;
-    let normal = select(vec3<f32>(0.0, 1.0, 0.0), normalize(raw_n), length(raw_n) > 1e-4);
+    let base_normal = select(vec3<f32>(0.0, 1.0, 0.0), normalize(raw_n), length(raw_n) > 1e-4);
     let roughness = clamp(norm_r.w, 0.04, 1.0);
     let raster_rgba = textureLoad(src_gbuf_raster, ip, 0);
     let raster_rgb = raster_rgba.rgb;
     let view_dir = normalize(point - params.eye.xyz);
     let is_water = roughness <= 0.12;
+    // Orient the flat water plane toward the camera; below the surface the
+    // legacy G-buffer normal can still point +Y, placing the RT ray origin
+    // above the interface and giving Schlick Fresnel the wrong incident angle.
+    let normal = select(base_normal, -base_normal, is_water && dot(base_normal, view_dir) > 0.0);
     let is_glossy_trim = !is_water && roughness <= 0.36;
 
     let effects = u32(round(params.effects.y));
@@ -1461,7 +1465,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    let steepness = 1.0 - clamp(normal.y, 0.0, 1.0);
+    let steepness = select(1.0 - clamp(normal.y, 0.0, 1.0), 0.0, is_water);
     let slope_bias = steepness * (0.75 + dist * 0.0065);
     let bias = max(params.effects.z, max(0.18, dist * 0.0035)) + slope_bias;
     let ray_origin = point + normal * bias + vec3<f32>(0.0, 1.0, 0.0) * (steepness * 0.55) - view_dir * (bias * 0.35);
@@ -5996,24 +6000,27 @@ mod shader_optimization_regression_tests {
     #[test]
     fn flat_water_avoids_duplicate_stochastic_reflection_samples_on_both_backends() {
         let dxr = include_str!("dxr_trace.hlsl");
-        assert!(RAY_SHADER.contains("if (roughness <= 0.12) {\n        return base;"));
-        assert!(dxr.contains("if (roughness <= 0.12) return base;"));
-        assert!(RAY_SHADER.contains("clamp(base + extra, base, maximum)"));
-        assert!(dxr.contains("clamp(base + extra, base, max_samples)"));
+        assert!(RAY_SHADER.contains("maximum <= base || is_water"));
+        assert!(dxr.contains("max_samples <= base || is_water"));
+        assert!(RAY_SHADER.contains("adaptive_ray_samples(ip, dist, normal, roughness, is_water, base_samples)"));
+        assert!(dxr.contains("adaptive_ray_samples(id.xy, dist, normal, roughness, is_water, base_samples)"));
+        assert!(RAY_SHADER.contains("(!is_water || s == 0u)"));
+        assert!(dxr.contains("(!is_water || s == 0u)"));
     }
 
     #[test]
     fn native_water_uses_a_stable_planar_mirror_ray_and_physical_dielectric_fresnel() {
         let dxr = include_str!("dxr_trace.hlsl");
-        assert!(RAY_SHADER.contains("if (roughness <= 0.12) {"));
-        assert!(RAY_SHADER.contains("return base;"));
+        assert!(RAY_SHADER.contains("maximum <= base || is_water"));
         assert!(RAY_SHADER.contains("var h = refl_base_n;"));
         assert!(RAY_SHADER.contains("if (!is_water)"));
+        assert!(RAY_SHADER.contains("is_water && dot(base_normal, view_dir) > 0.0"));
         assert!(RAY_SHADER.contains("select(0.04, 0.0204, is_water)"));
         assert!(!RAY_SHADER.contains("complexity = max(complexity, 0.42)"));
         assert!(dxr.contains("if (roughness <= 0.12) return base;"));
         assert!(dxr.contains("float3 h = refl_base_n;"));
         assert!(dxr.contains("if (!is_water)"));
+        assert!(dxr.contains("if (is_water && dot(normal, view_dir) > 0.0)"));
         assert!(dxr.contains("is_water ? 0.0204"));
         assert!(!dxr.contains("complexity = max(complexity, 0.42)"));
     }
