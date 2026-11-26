@@ -367,6 +367,23 @@ fn planes(matrix: Mat4) -> [[f32; 4]; 6] {
     ]
 }
 
+fn planes_rect(matrix: Mat4, rect: [f32; 4]) -> [[f32; 4]; 6] {
+    let m = matrix.to_cols_array();
+    let r0 = [m[0], m[4], m[8], m[12]];
+    let r1 = [m[1], m[5], m[9], m[13]];
+    let r2 = [m[2], m[6], m[10], m[14]];
+    let r3 = [m[3], m[7], m[11], m[15]];
+    let [left, right, bottom, top] = rect;
+    [
+        std::array::from_fn(|i| r0[i] - left * r3[i]),
+        std::array::from_fn(|i| right * r3[i] - r0[i]),
+        std::array::from_fn(|i| r1[i] - bottom * r3[i]),
+        std::array::from_fn(|i| top * r3[i] - r1[i]),
+        r2,
+        std::array::from_fn(|i| r3[i] - r2[i]),
+    ]
+}
+
 fn intersects(planes: &[[f32; 4]; 6], bounds: [f32; 6]) -> bool {
     for &[a, b, c, d] in planes {
         let px = if a >= 0.0 { bounds[3] } else { bounds[0] };
@@ -406,10 +423,7 @@ pub fn visible_runs_rect_into(
     rect: [f32; 4],
     runs: &mut Vec<(u32, u32)>,
 ) {
-    let planes = crate::world_objects::frustum_planes_from_matrix_rect(
-        matrix.to_cols_array(),
-        rect,
-    );
+    let planes = planes_rect(matrix, rect);
     visible_runs_with_planes_into(spans, &planes, runs);
 }
 
