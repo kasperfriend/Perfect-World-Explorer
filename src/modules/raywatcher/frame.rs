@@ -52,6 +52,21 @@ impl RasterOverrides {
         suppress_baked_shadows: false,
     };
 
+    /// Apply plan overrides only after a complete RT frame is available.
+    /// The host makes this decision before the raster pass, whereas RT output
+    /// is produced afterwards. Without this guard a transient scene/AS rebuild
+    /// can remove raster terms before their replacement image exists.
+    pub fn for_plan_when_ready(
+        plan: &crate::modules::raywatcher::plan::Plan,
+        rt_output_ready: bool,
+    ) -> Self {
+        if rt_output_ready {
+            Self::for_plan(plan)
+        } else {
+            Self::NONE
+        }
+    }
+
     /// The overrides a plan implies. The viewer draws three light terms
     /// inline: the mesh shaders' sun term, the sky's ambient term, and the fog
     /// occlusion term. Each ray switch removes the term it replaces:
@@ -72,21 +87,6 @@ impl RasterOverrides {
     /// reflections are enabled, the native mirror is marked for replacement;
     /// the renderer keeps it active until the RT reflection is ready. Other
     /// raster terms are only removed when the user opts into `replace_raster`.
-    /// Apply plan overrides only after a complete RT frame is available.
-    /// The host makes this decision before the raster pass, whereas RT output
-    /// is produced afterwards. Without this guard a transient scene/AS rebuild
-    /// can remove raster terms before their replacement image exists.
-    pub fn for_plan_when_ready(
-        plan: &crate::modules::raywatcher::plan::Plan,
-        rt_output_ready: bool,
-    ) -> Self {
-        if rt_output_ready {
-            Self::for_plan(plan)
-        } else {
-            Self::NONE
-        }
-    }
-
     pub fn for_plan(plan: &crate::modules::raywatcher::plan::Plan) -> Self {
         if !plan.trace {
             return Self::NONE;
