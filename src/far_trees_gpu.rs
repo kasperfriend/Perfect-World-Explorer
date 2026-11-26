@@ -237,7 +237,15 @@ pub struct FarTrees {
     groups: Vec<Group>,
     /// Slots in the instance buffer: three level slices per placement.
     capacity: usize,
-    last_resident_update: RefCell<Option<([f32; 3], f32, Option<[f32; 4]>, [[f32; 4]; 6], Option<(f32, f32)>)>>,
+    last_resident_update: RefCell<
+        Option<(
+            [f32; 3],
+            f32,
+            Option<[f32; 4]>,
+            [[f32; 4]; 6],
+            Option<(f32, f32)>,
+        )>,
+    >,
     /// The LOD selection pass: a camera move dispatches this instead of walking
     /// every placement on the CPU and re-uploading the instance buffer.
     lod_pipeline: wgpu::ComputePipeline,
@@ -1433,9 +1441,9 @@ fn normalize_frustum(mut planes: [[f32; 4]; 6]) -> [[f32; 4]; 6] {
 
 /// CPU reference for the conservative sphere/frustum test mirrored in WGSL.
 fn sphere_visible(position: [f32; 3], radius: f32, planes: &[[f32; 4]; 6]) -> bool {
-    planes.iter().all(|p| {
-        p[0] * position[0] + p[1] * position[1] + p[2] * position[2] + p[3] >= -radius
-    })
+    planes
+        .iter()
+        .all(|p| p[0] * position[0] + p[1] * position[1] + p[2] * position[2] + p[3] >= -radius)
 }
 
 #[cfg(test)]
