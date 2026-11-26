@@ -1001,6 +1001,8 @@ struct Sampled {
 struct ElementRuntime {
     /// Index into `Root::elements`.
     index: usize,
+    /// Direct slot in this Player's model array, computed once at load time.
+    model_slot: Option<usize>,
     /// The keypoint the controller state was seeded from; -1 reseeds.
     seeded: isize,
     /// Which play of the element's clock `state` belongs to. A controller
@@ -1589,7 +1591,15 @@ impl Player {
         let mut warnings: Vec<String> = Vec::new();
         let mut elements = Vec::with_capacity(root.elements.len());
         let mut textures = Vec::new();
+        let mut next_model_slot = 0usize;
         for (index, element) in root.elements.iter().enumerate() {
+            let model_slot = if matches!(&element.spec, Spec::Model(_)) {
+                let slot = next_model_slot;
+                next_model_slot += 1;
+                Some(slot)
+            } else {
+                None
+            };
             if !element.common.texture.is_empty() {
                 let path = texture_path(&element.common.texture)?;
                 if !textures.contains(&path) {
@@ -1670,6 +1680,7 @@ impl Player {
             }
             elements.push(ElementRuntime {
                 index,
+                model_slot,
                 seeded: -1,
                 play: 0.,
                 state,
@@ -2082,16 +2093,9 @@ impl Player {
             // The instance owns this element's action clock, so the frame is
             // posed per tick instead of once at load. Only scan earlier elements
             // for the model slot when this element actually is a Spec::Model.
-            let model_instance = match self.root.elements[index].spec {
-                Spec::Model(_) => {
-                    let model_slot = self.root.elements[..index]
-                        .iter()
-                        .filter(|element| matches!(element.spec, Spec::Model(_)))
-                        .count();
-                    self.models.get_mut(model_slot)
-                }
-                _ => None,
-            };
+            let model_instance = self.elements[slot]
+                .model_slot
+                .and_then(|model_slot| self.models.get_mut(model_slot));
             let runtime = &mut self.elements[slot];
             let done = advance_element(
                 element,

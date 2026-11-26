@@ -344,8 +344,36 @@ pub struct Status {
     pub player_failures: usize,
 }
 
+#[derive(Clone, Copy)]
+struct EffectStepJob {
+    owner_index: usize,
+    transform: Mat4,
+    authored_scale: f32,
+    alpha: f32,
+    ground: Option<crate::gfx_player::GroundHit>,
+}
+
+const MIN_PARALLEL_EFFECT_ROOTS: usize = 64;
+const EFFECT_ROOTS_PER_WORKER: usize = 32;
+const MAX_EFFECT_WORKERS: usize = 4;
+
+fn effect_worker_count(active_roots: usize, available_workers: usize) -> usize {
+    if active_roots < MIN_PARALLEL_EFFECT_ROOTS {
+        return 1;
+    }
+    available_workers
+        .max(1)
+        .min(MAX_EFFECT_WORKERS)
+        .min(active_roots / EFFECT_ROOTS_PER_WORKER)
+        .max(1)
+}
+
 pub struct Manager {
     owners: Vec<Owner>,
+    /// Reused sparse job list: only owners with an active player occupy a slot.
+    effect_jobs: Vec<EffectStepJob>,
+    /// Cached once at construction; the frame loop never queries the OS.
+    effect_worker_limit: usize,
     /// Manager light-priority limit (native `[[0x9b3eec]+0x28]+0x134`). An
     /// element whose authored `Priority` exceeds this value is skipped by the
     /// publication gate at `0x70ba3c..0x70ba44` while still advancing. The
@@ -544,6 +572,12 @@ impl Manager {
     pub fn new() -> Self {
         Self {
             owners: Vec::new(),
+            effect_jobs: Vec::new(),
+            effect_worker_limit: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(MAX_EFFECT_WORKERS)
+                .max(1),
             priority_limit: i32::MAX,
             failures: Vec::new(),
             unsupported: Vec::new(),
@@ -831,16 +865,11 @@ impl Manager {
         self.load_one();
         const ACTIVE_PLAYER_BUDGET: usize = 4;
         for _ in 0..ACTIVE_PLAYER_BUDGET {
-            if !self.owners.iter().any(|o| {
-                matches!(o.state, State::Live { .. })
-                    && o.player.is_none()
-                    && !o.player_failed
-                    && o.request.active
-                    && o.elapsed >= o.request.start_ms
-            }) {
+            // The builder performs its own candidate search. A separate .any()
+            // here walked the full owner array once more before every build.
+            if !self.build_one_player() {
                 break;
             }
-            self.build_one_player();
         }
     }
 
@@ -954,18 +983,12 @@ impl Manager {
             }
             _ => None,
         };
-        struct StepJob {
-            transform: Mat4,
-            authored_scale: f32,
-            alpha: f32,
-            ground: Option<crate::gfx_player::GroundHit>,
-        }
         let mut failures = Vec::new();
-        let mut jobs: Vec<Option<StepJob>> = Vec::with_capacity(self.owners.len());
-        let mut active_count = 0usize;
-        for owner in &mut self.owners {
+        // Retain capacity from the previous frame, but store only active players.
+        let mut jobs = std::mem::take(&mut self.effect_jobs);
+        jobs.clear();
+        for (owner_index, owner) in self.owners.iter_mut().enumerate() {
             if !matches!(owner.state, State::Live { .. }) {
-                jobs.push(None);
                 continue;
             }
             if !owner.request.active || owner.elapsed < owner.request.start_ms {
@@ -989,11 +1012,9 @@ impl Manager {
                     owner.elapsed,
                     owner.request.start_ms
                 );
-                jobs.push(None);
                 continue;
             }
             if owner.player.is_none() {
-                jobs.push(None);
                 continue;
             }
             let alpha = owner.request.outer.map_or(1., |outer| outer[3]) * owner.attenuation;
@@ -1002,7 +1023,6 @@ impl Manager {
                 Err(error) => {
                     failures.push((owner.request.origin.clone(), error));
                     owner.player = None;
-                    jobs.push(None);
                     continue;
                 }
             };
@@ -1064,47 +1084,37 @@ impl Manager {
             } else {
                 None
             };
-            active_count += 1;
-            jobs.push(Some(StepJob {
+            jobs.push(EffectStepJob {
+                owner_index,
                 transform,
                 authored_scale,
                 alpha,
                 ground,
-            }));
+            });
         }
 
         // Step active effect players in parallel across CPU cores when many
         // effects are live simultaneously (cities, torch clusters, waterfalls).
-        let workers = if active_count >= 12 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(active_count / 4)
-                .min(16)
-        } else {
-            1
-        };
+        let workers = effect_worker_count(jobs.len(), self.effect_worker_limit);
         let mut step_errors: Vec<(usize, String)> = Vec::new();
         if workers > 1 {
             let chunk_len = self.owners.len().div_ceil(workers);
             let dt = delta_ms as f32;
             std::thread::scope(|s| {
                 let mut handles = Vec::with_capacity(workers);
-                for (chunk_idx, (owner_chunk, job_chunk)) in self
-                    .owners
-                    .chunks_mut(chunk_len)
-                    .zip(jobs.chunks(chunk_len))
-                    .enumerate()
-                {
+                for (chunk_idx, owner_chunk) in self.owners.chunks_mut(chunk_len).enumerate() {
                     let base = chunk_idx * chunk_len;
+                    let limit = base + owner_chunk.len();
+                    let start = jobs.partition_point(|job| job.owner_index < base);
+                    let end = jobs.partition_point(|job| job.owner_index < limit);
+                    let job_chunk = &jobs[start..end];
+                    if job_chunk.is_empty() {
+                        continue;
+                    }
                     handles.push(s.spawn(move || {
                         let mut errs = Vec::new();
-                        for (i, (owner, job_opt)) in
-                            owner_chunk.iter_mut().zip(job_chunk.iter()).enumerate()
-                        {
-                            let Some(job) = job_opt else {
-                                continue;
-                            };
+                        for job in job_chunk {
+                            let owner = &mut owner_chunk[job.owner_index - base];
                             let Some(player) = owner.player.as_mut() else {
                                 continue;
                             };
@@ -1118,7 +1128,7 @@ impl Manager {
                                 terrain,
                             ) {
                                 owner.player = None;
-                                errs.push((base + i, error));
+                                errs.push((job.owner_index, error));
                             }
                         }
                         errs
@@ -1130,10 +1140,8 @@ impl Manager {
             });
         } else {
             let dt = delta_ms as f32;
-            for (i, (owner, job_opt)) in self.owners.iter_mut().zip(jobs.iter()).enumerate() {
-                let Some(job) = job_opt else {
-                    continue;
-                };
+            for job in &jobs {
+                let owner = &mut self.owners[job.owner_index];
                 let Some(player) = owner.player.as_mut() else {
                     continue;
                 };
@@ -1147,17 +1155,15 @@ impl Manager {
                     terrain,
                 ) {
                     owner.player = None;
-                    step_errors.push((i, error));
+                    step_errors.push((job.owner_index, error));
                 }
             }
         }
         for (idx, error) in step_errors {
             failures.push((self.owners[idx].request.origin.clone(), error));
         }
-        for (owner, job_opt) in self.owners.iter().zip(jobs.iter()) {
-            let Some(job) = job_opt else {
-                continue;
-            };
+        for job in &jobs {
+            let owner = &self.owners[job.owner_index];
             let Some(player) = owner.player.as_ref() else {
                 continue;
             };
@@ -1186,13 +1192,14 @@ impl Manager {
                     .push(format!("effect census not written: {error}"));
             }
         }
+        self.effect_jobs = jobs;
     }
 
     /// Build the animated root for one visible owner, at most one per call, and
     /// record the failure once if it will not build.
-    fn build_one_player(&mut self) {
+    fn build_one_player(&mut self) -> bool {
         if !self.effects {
-            return;
+            return false;
         }
         let Some(index) = self.owners.iter().position(|owner| {
             matches!(owner.state, State::Live { .. })
@@ -1201,7 +1208,7 @@ impl Manager {
                 && owner.request.active
                 && owner.elapsed >= owner.request.start_ms
         }) else {
-            return;
+            return false;
         };
         let path = self.owners[index].request.path.clone();
         let origin = self.owners[index].request.origin.clone();
@@ -1278,6 +1285,7 @@ impl Manager {
                 }
             }
         }
+        true
     }
 
     /// Parse a root and build its player, resolving nested `GfxPath` children
@@ -1544,6 +1552,17 @@ mod tests {
             active,
             origin: format!("test owner {identity}"),
         }
+    }
+
+    #[test]
+    fn sparse_effect_sets_do_not_spawn_transient_worker_threads() {
+        assert_eq!(effect_worker_count(0, 8), 1);
+        assert_eq!(effect_worker_count(12, 8), 1);
+        assert_eq!(effect_worker_count(63, 8), 1);
+        assert_eq!(effect_worker_count(64, 8), 2);
+        assert_eq!(effect_worker_count(128, 8), 4);
+        assert_eq!(effect_worker_count(1024, 16), 4);
+        assert_eq!(effect_worker_count(256, 0), 1);
     }
 
     fn grid() -> StaticGrid {

@@ -120,3 +120,25 @@ hook-attached GFX keeps the same frame-consistent parent pose.
   changed visible set still rebuilds the exact same order from transformed
   initial bounds. This removes an unnecessary full alpha-candidate walk and
   sort while turning in place without changing transparency output.
+
+
+## Effect-update hot path
+
+- Effect jobs now contain only owners that actually have an active player. The
+  previous per-frame table allocated and filled one `Option` entry for every
+  owner in the loaded world, then scanned that full table again to step players
+  and gather quads. The compact job vector retains capacity between frames and
+  the step/output loops visit active jobs only.
+- Transient effect worker creation is now reserved for 64 or more active roots,
+  with at most four workers and a cached processor limit. Sparse views no longer
+  launch multiple scoped OS threads for a handful of animated roots. Dense
+  effect clusters still parallelize, while their chunks index the sparse job
+  list rather than walking placeholders for every owner.
+- The player warm-up loop no longer performs a separate full-owner `.any()`
+  search before each builder search.
+- Every effect element's model slot is assigned during root construction.
+  Animation no longer recounts all preceding model elements to rediscover the
+  same slot every frame.
+- These changes preserve effect clock advancement, root order, quad order, and
+  model lookup order. They have compile/unit-test coverage but still need a
+  target-machine frame-time capture; no specific FPS gain is claimed.
