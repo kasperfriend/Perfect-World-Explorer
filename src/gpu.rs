@@ -7907,7 +7907,7 @@ pub fn run(
                             // into its own encoder and submits it, which keeps
                             // the queue order wgpu already guarantees: world,
                             // rays, upscale, frame generation, present.
-                            {
+                            if renderer.raywatcher_frame_plan.trace {
                                 let mut ray_encoder = renderer.device.create_command_encoder(
                                     &wgpu::CommandEncoderDescriptor {
                                         label: Some("raywatcher"),
