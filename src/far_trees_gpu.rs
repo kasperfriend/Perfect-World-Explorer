@@ -156,10 +156,10 @@ fn sphere_occluded(position:vec3<f32>,radius:f32)->bool {
   let sy=select(-1.0,1.0,(corner&2u)!=0u);
   let sz=select(-1.0,1.0,(corner&4u)!=0u);
   let clip=p.view_projection*vec4<f32>(position+vec3<f32>(sx,sy,sz)*radius,1.0);
-  if !all(isFinite(clip)) || clip.w<=1.0 {return false;}
+  if !is_finite(clip.x) || !is_finite(clip.y) || !is_finite(clip.z) || !is_finite(clip.w) || clip.w<=1.0 {return false;}
   let ndc=clip.xyz/clip.w;
   // A box intersecting either depth plane is uncertain and must be drawn.
-  if !all(isFinite(ndc)) || ndc.z<0.0 || ndc.z>=1.0 {return false;}
+  if !is_finite(ndc.x) || !is_finite(ndc.y) || !is_finite(ndc.z) || ndc.z<0.0 || ndc.z>=1.0 {return false;}
   let pixel=vec2<f32>((ndc.x*0.5+0.5)*extent.x,(0.5-ndc.y*0.5)*extent.y);
   min_pixel=min(min_pixel,pixel);
   max_pixel=max(max_pixel,pixel);
@@ -171,7 +171,7 @@ fn sphere_occluded(position:vec3<f32>,radius:f32)->bool {
  let rect_min=vec2<u32>(clamp(floor(min_pixel-vec2<f32>(2.0)),vec2<f32>(0.0),screen_max));
  let rect_max=vec2<u32>(clamp(ceil(max_pixel+vec2<f32>(2.0)),vec2<f32>(0.0),screen_max));
  let threshold=nearest_depth+p.hiz_bias.x;
- if !isFinite(threshold) || threshold>=1.0 {return false;}
+ if !is_finite(threshold) || threshold>=1.0 {return false;}
  var mip=0u;
  loop {
   let scale=1u<<mip;
@@ -189,7 +189,7 @@ fn sphere_occluded(position:vec3<f32>,radius:f32)->bool {
  for(var y=lo.y;y<=hi.y;y=y+1u) {
   for(var x=lo.x;x<=hi.x;x=x+1u) {
    let depth=hiz[info.z+y*info.x+x];
-   if !isFinite(depth) || depth<0.0 || depth>1.0 || depth<=threshold {return false;}
+   if !is_finite(depth) || depth<0.0 || depth>1.0 || depth<=threshold {return false;}
   }
  }
  return true;

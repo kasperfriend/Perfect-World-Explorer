@@ -18,13 +18,17 @@ struct Params {
 @group(1) @binding(0) var<storage, read_write> values: array<f32>;
 @group(2) @binding(0) var<uniform> p: Params;
 
+fn finite(v: f32) -> bool {
+    return v >= -3.0e38 && v <= 3.0e38;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= p.dst_width || id.y >= p.dst_height { return; }
     var result = 1.0;
     if p.mode == 0u {
         result = textureLoad(source_depth, vec2<i32>(id.xy), 0);
-        if !isFinite(result) { result = 0.0; }
+        if !finite(result) { result = 0.0; }
     } else {
         // Ceil-halving keeps odd right/bottom edges in the hierarchy.
         for (var oy = 0u; oy < 2u; oy += 1u) {
@@ -34,7 +38,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 if sx < p.src_width && sy < p.src_height {
                     let value = values[p.src_offset + sy * p.src_width + sx];
                     // Invalid depth is treated exactly like a clear pixel.
-                    if !isFinite(value) || value < 0.0 || value > 1.0 {
+                    if !finite(value) || value < 0.0 || value > 1.0 {
                         result = 0.0;
                     } else {
                         result = min(result, value);
