@@ -1289,6 +1289,7 @@ mod tests {
             selected_scene_transform: None,
             selected_placement: None,
             multi_selection: HashSet::new(),
+            multi_scene_items: HashMap::new(),
             quick_bar: Vec::new(),
             left_dock: Dock::Left,
             right_dock: Dock::Right,
