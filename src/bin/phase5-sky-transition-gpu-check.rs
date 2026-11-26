@@ -154,9 +154,8 @@ fn render(
         mapped_at_creation: false,
     });
     queue.write_buffer(&buf, 0, bytemuck::cast_slice(params));
-    // Depth dummy for the flare occlusion path — the check's own layout now
-    // carries it (see main) so the bind must too; the content is irrelevant
-    // for the crossfade probe.
+    // The binding layout still carries its legacy depth slots; use inert 1x1
+    // resources because the production sky shader no longer samples them.
     let depth_dummy = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("phase5 sky depth dummy (render)"),
         size: wgpu::Extent3d {
@@ -313,30 +312,6 @@ fn main() {
         address_mode_w: wgpu::AddressMode::Repeat,
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
-        ..Default::default()
-    });
-    // Dummy depth for the flare occlusion path (shader samples it at 6 taps).
-    let depth_dummy = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("phase5 sky depth dummy"),
-        size: wgpu::Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let depth_view = depth_dummy.create_view(&Default::default());
-    let depth_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("phase5 sky depth sampler"),
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        mag_filter: wgpu::FilterMode::Nearest,
-        min_filter: wgpu::FilterMode::Nearest,
         ..Default::default()
     });
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -532,7 +507,11 @@ fn main() {
     let sun_disc = image::RgbaImage::from_fn(W, H, |x, y| {
         image::Rgba([
             0,
-            if (24..40).contains(&x) && (24..40).contains(&y) { 255 } else { 0 },
+            if (24..40).contains(&x) && (24..40).contains(&y) {
+                255
+            } else {
+                0
+            },
             0,
             255,
         ])
@@ -549,7 +528,11 @@ fn main() {
     // old sunshine, moon halo, or flare layers becomes an unmistakable red pixel.
     let removed_celestial_effect = image::RgbaImage::from_fn(W, H, |x, y| {
         image::Rgba([
-            if (18..46).contains(&x) && (18..46).contains(&y) { 255 } else { 0 },
+            if (18..46).contains(&x) && (18..46).contains(&y) {
+                255
+            } else {
+                0
+            },
             0,
             0,
             255,
@@ -567,7 +550,11 @@ fn main() {
             wgpu::ImageCopyTexture {
                 texture: &sky,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             image.as_raw(),
@@ -583,9 +570,8 @@ fn main() {
             },
         );
     }
-    let channel_peak = |pixels: &[u8], channel: usize| {
-        pixels.chunks_exact(4).map(|p| p[channel]).max().unwrap()
-    };
+    let channel_peak =
+        |pixels: &[u8], channel: usize| pixels.chunks_exact(4).map(|p| p[channel]).max().unwrap();
     let core_center = |pixels: &[u8], channel: usize| {
         let peak = channel_peak(pixels, channel) as f32;
         assert!(peak > 0., "missing celestial channel {channel}");
@@ -628,31 +614,57 @@ fn main() {
             sun_params[39] = 0.45;
             sun_params[40..44].fill(0.);
             let sun_pixels = render(
-                &device, &queue, &pipeline, &layout, &sky_view,
-                &sampler, &roof_sampler, &t, &sun_params,
+                &device,
+                &queue,
+                &pipeline,
+                &layout,
+                &sky_view,
+                &sampler,
+                &roof_sampler,
+                &t,
+                &sun_params,
             );
-            assert!(channel_peak(&sun_pixels, 1) > 0,
-                "missing sun disc: mirrored={mirrored}, pitch={pitch}");
+            assert!(
+                channel_peak(&sun_pixels, 1) > 0,
+                "missing sun disc: mirrored={mirrored}, pitch={pitch}"
+            );
             let sun_center = core_center(&sun_pixels, 1);
-            assert_eq!(channel_peak(&sun_pixels, 0), 0,
-                "removed sun/moon glow or flare layers still contribute red: mirrored={mirrored}, pitch={pitch}");
+            assert_eq!(
+                channel_peak(&sun_pixels, 0),
+                0,
+                "removed sun/moon glow or flare layers still contribute red: mirrored={mirrored}, pitch={pitch}"
+            );
 
             // Moon disc: switch off the sun and activate only the moon lane.
             let mut moon_params = sun_params;
             moon_params[20..24].fill(0.);
             moon_params[24..28].copy_from_slice(&[1., el, az, 0.]);
             let moon_pixels = render(
-                &device, &queue, &pipeline, &layout, &sky_view,
-                &sampler, &roof_sampler, &t, &moon_params,
+                &device,
+                &queue,
+                &pipeline,
+                &layout,
+                &sky_view,
+                &sampler,
+                &roof_sampler,
+                &t,
+                &moon_params,
             );
-            assert!(channel_peak(&moon_pixels, 2) > 0,
-                "missing moon disc: mirrored={mirrored}, pitch={pitch}");
-            let moon_center = core_center(&moon_pixels, 2);
-            assert_eq!(channel_peak(&moon_pixels, 0), 0,
-                "removed sun/moon glow or flare layers still contribute red: mirrored={mirrored}, pitch={pitch}");
             assert!(
-                sun_center[0].is_finite() && sun_center[1].is_finite()
-                    && moon_center[0].is_finite() && moon_center[1].is_finite(),
+                channel_peak(&moon_pixels, 2) > 0,
+                "missing moon disc: mirrored={mirrored}, pitch={pitch}"
+            );
+            let moon_center = core_center(&moon_pixels, 2);
+            assert_eq!(
+                channel_peak(&moon_pixels, 0),
+                0,
+                "removed sun/moon glow or flare layers still contribute red: mirrored={mirrored}, pitch={pitch}"
+            );
+            assert!(
+                sun_center[0].is_finite()
+                    && sun_center[1].is_finite()
+                    && moon_center[0].is_finite()
+                    && moon_center[1].is_finite(),
                 "celestial disc centroid is not finite"
             );
         }
