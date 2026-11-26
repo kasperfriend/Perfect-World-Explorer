@@ -4653,7 +4653,9 @@ impl RaywatcherGpu {
             Err(err) => {
                 self.dxr_init_scene = None;
                 self.dxr_failed = true;
-                eprintln!("[Raywatcher] Could not start DXR scene rebuild worker ({err}); using Software");
+                eprintln!(
+                    "[Raywatcher] Could not start DXR scene rebuild worker ({err}); using Software"
+                );
             }
         }
     }
@@ -4781,10 +4783,7 @@ impl RaywatcherGpu {
     pub fn can_replace_raster_effects(&self) -> bool {
         self.traced_last_frame
             && (!self.dxr_failed
-                || software_fallback_ready(
-                    self.scene.counts.triangles,
-                    self.scene.counts.nodes,
-                ))
+                || software_fallback_ready(self.scene.counts.triangles, self.scene.counts.nodes))
     }
 
     pub fn can_replace_water_reflections(&self) -> bool {
@@ -4869,7 +4868,8 @@ impl RaywatcherGpu {
         if hardware_mode && !self.dxr_failed && self.dxr.is_none() {
             self.begin_dxr_initialization();
             if !self.poll_dxr_initialization(device) {
-                self.traced_last_frame = output_was_ready && !resized && depth_ext == self.render_extent;
+                self.traced_last_frame =
+                    output_was_ready && !resized && depth_ext == self.render_extent;
                 return;
             }
         }
@@ -4877,10 +4877,7 @@ impl RaywatcherGpu {
         // CPU BVH. Do not dispatch Software against dummy buffers; native raster
         // effects remain active until the CPU scene is ready.
         if self.dxr_failed
-            && !software_fallback_ready(
-                self.scene.counts.triangles,
-                self.scene.counts.nodes,
-            )
+            && !software_fallback_ready(self.scene.counts.triangles, self.scene.counts.nodes)
         {
             return;
         }
@@ -6560,9 +6557,7 @@ mod shader_optimization_regression_tests {
 
 #[cfg(test)]
 mod dxr_backend_selection_tests {
-    use super::{
-        adaptive_sample_ceiling, hardware_trace_ready, software_fallback_ready,
-    };
+    use super::{adaptive_sample_ceiling, hardware_trace_ready, software_fallback_ready};
 
     #[test]
     fn adaptive_ray_ceiling_preserves_original_visual_quality() {
