@@ -3613,6 +3613,13 @@ fn adaptive_sample_ceiling(_samples: u32) -> f32 {
     4.0
 }
 
+/// Software tracing needs a CPU BVH for every non-empty scene. Hardware-only
+/// triangle snapshots deliberately omit those nodes to avoid a second
+/// acceleration structure; keep native raster active until CPU fallback exists.
+fn software_fallback_ready(triangle_count: u32, node_count: u32) -> bool {
+    triangle_count == 0 || node_count > 0
+}
+
 /// Whether this frame can actually dispatch through DXR. A Hardware mode
 /// request alone is insufficient while the acceleration structure is being
 /// rebuilt on a worker; the last RT output is held (or raster remains visible)
@@ -4774,8 +4781,10 @@ impl RaywatcherGpu {
     pub fn can_replace_raster_effects(&self) -> bool {
         self.traced_last_frame
             && (!self.dxr_failed
-                || self.scene_geom.triangles.is_empty()
-                || !self.scene_geom.nodes.is_empty())
+                || software_fallback_ready(
+                    self.scene.counts.triangles,
+                    self.scene.counts.nodes,
+                ))
     }
 
     pub fn can_replace_water_reflections(&self) -> bool {
@@ -4863,6 +4872,17 @@ impl RaywatcherGpu {
                 self.traced_last_frame = output_was_ready && !resized && depth_ext == self.render_extent;
                 return;
             }
+        }
+        // A DXR failure may leave the current snapshot with triangles but no
+        // CPU BVH. Do not dispatch Software against dummy buffers; native raster
+        // effects remain active until the CPU scene is ready.
+        if self.dxr_failed
+            && !software_fallback_ready(
+                self.scene.counts.triangles,
+                self.scene.counts.nodes,
+            )
+        {
+            return;
         }
         let (rw, rh) = self.render_extent;
         encoder.copy_texture_to_texture(
@@ -5078,6 +5098,15 @@ impl RaywatcherGpu {
                         );
                         self.dxr = None;
                         self.dxr_failed = true;
+                        if !software_fallback_ready(
+                            self.scene.counts.triangles,
+                            self.scene.counts.nodes,
+                        ) {
+                            // Do not produce one invalid, unshadowed frame from
+                            // the triangles-only hardware snapshot.
+                            self.last_traced_hardware = None;
+                            return;
+                        }
                     }
                 }
             }
@@ -6538,6 +6567,13 @@ mod dxr_backend_selection_tests {
         for samples in [0, 1, 2, 4, 8, 16] {
             assert_eq!(adaptive_sample_ceiling(samples), 4.0);
         }
+    }
+
+    #[test]
+    fn software_fallback_requires_a_cpu_bvh_for_non_empty_scenes() {
+        assert!(software_fallback_ready(0, 0));
+        assert!(software_fallback_ready(32, 1));
+        assert!(!software_fallback_ready(32, 0));
     }
 
     #[test]
