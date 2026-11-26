@@ -832,7 +832,7 @@ mod imp {
                 )?
             };
 
-            let tracer = Self {
+            let mut tracer = Self {
                 raw_device,
                 device5: device5_guard.take(),
                 raw_queue,
