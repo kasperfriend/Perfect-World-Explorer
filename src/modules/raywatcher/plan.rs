@@ -528,12 +528,13 @@ impl Plan {
         debug_view: DebugView::None,
     };
 
-    /// Software ray budget. At 1080p this keeps the BVH trace to 480x270;
-    /// temporal reconstruction still returns a full-resolution image.
-    pub const SOFTWARE_GRID_BUDGET: u64 = 640 * 360;
-    /// Hardware ray budget. At 1080p this keeps the trace to 960x540, rather
-    /// than dispatching a costly full-resolution ray for every output pixel.
-    pub const HARDWARE_GRID_BUDGET: u64 = 1280 * 720;
+    /// Software ray budget. At 1080p this keeps the BVH trace to 960x540;
+    /// the temporal filter reconstructs the remaining spatial detail.
+    pub const SOFTWARE_GRID_BUDGET: u64 = 960 * 540;
+    /// Hardware ray budget. At 1080p this permits a full-resolution trace.
+    /// The shader's adaptive sample ceiling is separately clamped to the
+    /// sample count included in this budget.
+    pub const HARDWARE_GRID_BUDGET: u64 = 1920 * 1080;
 
     /// Decide one frame.
     ///
@@ -749,16 +750,16 @@ mod tests {
     }
 
     #[test]
-    fn software_defaults_to_quarter_resolution_and_hardware_to_half_resolution() {
+    fn software_defaults_to_half_resolution_and_hardware_to_full_resolution() {
         let mut s = settings();
         s.mode = RayTracingMode::Software;
         let plan = Plan::decide(&s, (1920, 1080), false, |_| true);
-        assert_eq!(plan.ray_scale, 4, "Software traces 480x270 at 1080p");
-        assert_eq!(plan.grid, (480, 270));
+        assert_eq!(plan.ray_scale, 2, "Software traces 960x540 at 1080p");
+        assert_eq!(plan.grid, (960, 540));
         s.mode = RayTracingMode::Hardware;
         let plan = Plan::decide(&s, (1920, 1080), true, |_| true);
-        assert_eq!(plan.ray_scale, 2, "Hardware traces 960x540 at 1080p");
-        assert_eq!(plan.grid, (960, 540));
+        assert_eq!(plan.ray_scale, 1, "Hardware traces full 1080p");
+        assert_eq!(plan.grid, (1920, 1080));
     }
 
     #[test]
@@ -769,13 +770,13 @@ mod tests {
         let plan = Plan::decide(&s, (1920, 1080), false, |_| true);
         // The budget counts samples *and* pixels, so four samples trade
         // another factor of four in grid area for the same frame budget.
-        assert_eq!(plan.ray_scale, 8);
-        assert_eq!(plan.grid, (240, 135));
-        // The same extent at one sample uses the quarter-rate software grid.
-        s.samples = 1;
-        let plan = Plan::decide(&s, (1920, 1080), false, |_| true);
         assert_eq!(plan.ray_scale, 4);
         assert_eq!(plan.grid, (480, 270));
+        // The same extent at one sample uses the half-rate software grid.
+        s.samples = 1;
+        let plan = Plan::decide(&s, (1920, 1080), false, |_| true);
+        assert_eq!(plan.ray_scale, 2);
+        assert_eq!(plan.grid, (960, 540));
         // The scale only moves in one direction per axis: more samples never buy
         // a finer grid, a bigger budget never buys a coarser one.
         for budget in [64_000u64, 120_000, 300_000, 518_400, 2_073_600] {
