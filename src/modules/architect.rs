@@ -70,6 +70,8 @@ struct Project {
 pub struct Architect {
     enabled: bool,
     element: PathBuf,
+    client_root: PathBuf,
+    map: Option<crate::navigation::MapSpace>,
     project_root: PathBuf,
     project: Project,
     project_files: Vec<PathBuf>,
@@ -84,11 +86,15 @@ pub struct Architect {
     flatten_height: f32,
     selected_asset: Option<String>,
     selected_scene_object: Option<usize>,
+    selected_placement: Option<usize>,
     multi_selection: HashSet<usize>,
     quick_bar: Vec<String>,
     left_dock: Dock,
     right_dock: Dock,
     bottom_dock: Dock,
+    applied_left_dock: Dock,
+    applied_right_dock: Dock,
+    applied_bottom_dock: Dock,
     confirm_erase: bool,
     status: String,
     tree_filter: String,
@@ -97,15 +103,18 @@ pub struct Architect {
 }
 
 impl Architect {
-    pub fn new(element: PathBuf) -> Self {
+    pub fn new(element: PathBuf, map: Option<crate::navigation::MapSpace>) -> Self {
         let base = std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let project_root = base.join("Architect").join("Worlds");
+        let client_root = element.parent().unwrap_or(&element).to_path_buf();
         let mut editor = Self {
             enabled: false,
             element,
+            client_root,
+            map,
             project_root,
             project: Project::default(),
             project_files: Vec::new(),
@@ -120,11 +129,15 @@ impl Architect {
             flatten_height: 0.,
             selected_asset: None,
             selected_scene_object: None,
+            selected_placement: None,
             multi_selection: HashSet::new(),
             quick_bar: Vec::new(),
             left_dock: Dock::Left,
             right_dock: Dock::Right,
             bottom_dock: Dock::Bottom,
+            applied_left_dock: Dock::Left,
+            applied_right_dock: Dock::Right,
+            applied_bottom_dock: Dock::Bottom,
             confirm_erase: false,
             status: "Ready. Changes are saved as a separate Architect project.".into(),
             tree_filter: String::new(),
@@ -376,6 +389,28 @@ impl Architect {
         }
     }
 
+    fn placement_position(&self, camera: Vec3) -> [f32; 3] {
+        let mut position = camera.to_array();
+        if matches!(self.snap, SnapMode::Terrain | SnapMode::Smart) {
+            if let Some(map) = &self.map {
+                position[1] = map.ground(position[0], position[2]) + 0.5;
+            }
+        }
+        position
+    }
+
+    fn add_selected_asset_at_camera(&mut self, camera: Vec3) {
+        let Some(asset) = self.selected_asset.clone() else { return };
+        self.project.objects.push(PlacedObject {
+            asset,
+            position: self.placement_position(camera),
+            rotation: [0.; 3],
+            scale: 1.,
+        });
+        self.selected_placement = Some(self.project.objects.len() - 1);
+        self.status = "Custom placement staged in the project. It is not yet drawn by the world renderer.".into();
+    }
+
     fn pin(&mut self, path: String) {
         if !self.quick_bar.iter().any(|item| item == &path) && self.quick_bar.len() < 24 {
             self.quick_bar.push(path);
@@ -508,20 +543,14 @@ impl Architect {
                 ui.label(egui::RichText::new("Loose files and folders under the client element directory. PCK archives are listed as files; their internal entries are not expanded here.").small().weak());
                 ui.text_edit_singleline(&mut self.tree_filter);
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                    self.show_tree(ui, &self.element.clone(), 0);
+                    self.show_tree(ui, &self.client_root.clone(), 0);
                 });
                 if let Some(asset) = self.selected_asset.clone() {
                     ui.separator();
                     ui.label(egui::RichText::new(&asset).small().strong());
                     if ui.button("Add to quick bar").clicked() { self.pin(asset.clone()); }
                     if ui.button("Record placement at camera").clicked() {
-                        self.project.objects.push(PlacedObject {
-                            asset: asset.clone(),
-                            position: camera.to_array(),
-                            rotation: [0., 0., 0.],
-                            scale: 1.,
-                        });
-                        self.status = "Placement recorded in the project. Native scene rendering/export is not wired yet.".into();
+                        self.add_selected_asset_at_camera(camera);
                     }
                 }
             });
@@ -663,6 +692,8 @@ mod tests {
         let editor = Architect {
             enabled: false,
             element: PathBuf::new(),
+            client_root: PathBuf::new(),
+            map: None,
             project_root: path.parent().unwrap().to_path_buf(),
             project: project.clone(),
             project_files: Vec::new(),
@@ -677,11 +708,15 @@ mod tests {
             flatten_height: 0.,
             selected_asset: None,
             selected_scene_object: None,
+            selected_placement: None,
             multi_selection: HashSet::new(),
             quick_bar: Vec::new(),
             left_dock: Dock::Left,
             right_dock: Dock::Right,
             bottom_dock: Dock::Bottom,
+            applied_left_dock: Dock::Left,
+            applied_right_dock: Dock::Right,
+            applied_bottom_dock: Dock::Bottom,
             confirm_erase: false,
             status: String::new(),
             tree_filter: String::new(),
