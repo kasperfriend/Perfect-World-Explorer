@@ -647,12 +647,7 @@ mod tests {
             },
         ];
         let mut runs = Vec::new();
-        visible_runs_rect_into(
-            &spans,
-            Mat4::IDENTITY,
-            [-0.5, 0.5, -0.25, 0.75],
-            &mut runs,
-        );
+        visible_runs_rect_into(&spans, Mat4::IDENTITY, [-0.5, 0.5, -0.25, 0.75], &mut runs);
         assert_eq!(runs, vec![(0, 6)]);
     }
 
