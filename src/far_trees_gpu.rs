@@ -4,6 +4,7 @@ use crate::{gpu::Vertex, trees::Trees};
 mod cutoff_residency;
 use crate::indirect_args::{base_instance, multi_draw, record, DrawIndexedArgs, DRAW_ARGS};
 use bytemuck::{Pod, Zeroable};
+use std::cell::RefCell;
 use wgpu::util::DeviceExt;
 /// One instance record: `[position.xyz, 0]`, then `[fraction, mode, 0, 0]`.
 ///
@@ -236,7 +237,7 @@ pub struct FarTrees {
     groups: Vec<Group>,
     /// Slots in the instance buffer: three level slices per placement.
     capacity: usize,
-    last_resident_update: Option<([f32; 3], f32, Option<[f32; 4]>, [[f32; 4]; 6], Option<(f32, f32)>)>,
+    last_resident_update: RefCell<Option<([f32; 3], f32, Option<[f32; 4]>, [[f32; 4]; 6], Option<(f32, f32)>)>>,
     /// The LOD selection pass: a camera move dispatches this instead of walking
     /// every placement on the CPU and re-uploading the instance buffer.
     lod_pipeline: wgpu::ComputePipeline,
@@ -1168,7 +1169,7 @@ impl FarTrees {
             batches,
             groups,
             capacity,
-            last_resident_update: None,
+            last_resident_update: RefCell::new(None),
             lod_pipeline,
             lod_bind,
             lod_params,
@@ -1189,7 +1190,7 @@ impl FarTrees {
     /// and the pass is skipped entirely when the camera, scale and cutoff are
     /// unchanged, exactly like the old staging rebuild.
     pub fn update_resident_lods(
-        &mut self,
+        &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         camera: [f32; 3],
@@ -1203,7 +1204,9 @@ impl FarTrees {
         }
         let frustum = normalize_frustum(frustum);
         let key = (camera, scale, bounds, frustum, clip_plane);
-        if let Some((prev_cam, prev_scale, prev_bounds, prev_frustum, prev_clip)) = self.last_resident_update {
+        if let Some((prev_cam, prev_scale, prev_bounds, prev_frustum, prev_clip)) =
+            *self.last_resident_update.borrow()
+        {
             let dx = camera[0] - prev_cam[0];
             let dy = camera[1] - prev_cam[1];
             let dz = camera[2] - prev_cam[2];
@@ -1242,7 +1245,7 @@ impl FarTrees {
             pass.dispatch_workgroups(self.placements.div_ceil(64), 1, 1);
         }
         queue.submit(Some(e.finish()));
-        self.last_resident_update = Some(key);
+        *self.last_resident_update.borrow_mut() = Some(key);
     }
     /// CPU LOD packing, kept for the checks that place one tree at a distance.
     ///
