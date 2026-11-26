@@ -96,3 +96,11 @@ slots are visited by the per-frame clock/pose update. Static slots are queued
 again if a residency-window change evicts and later re-admits them. Pose
 advancement and hook resolution still happen before the main view, so
 hook-attached GFX keeps the same frame-consistent parent pose.
+
+
+- Hook-attached GFX roots whose parent world model has no active action now cache
+  the first validated bind-pose hook matrix. Residency is still checked every
+  frame, so cutoff eviction still detaches the root and re-entry restores the
+  same parent; animated parents continue to resolve their hook from the current
+  pose. The owner attachment setter is also idempotent, avoiding repeated writes
+  when a cached matrix is unchanged.

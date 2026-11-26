@@ -167,6 +167,10 @@ struct HookBinding {
     record: model_attachment::Attachment,
     /// Authored hook-local matrix, resolved once at install time.
     local: glam::Mat4,
+    /// A parent without an active action never changes pose. Cache the first
+    /// resolved hook matrix so world effects attached to static scenery do not
+    /// traverse its skeleton on every camera turn/frame.
+    static_parent: Option<[f32; 16]>,
 }
 
 /// This frame's pose and deformed meshes for one slot. Secondary views reuse
@@ -718,6 +722,7 @@ impl World {
                         instance: index,
                         record,
                         local,
+                        static_parent: None,
                     }),
                 });
                 installed += 1;
@@ -1335,8 +1340,8 @@ impl World {
     /// light attached to a stale or invented transform.
     fn resolve_attachments(&mut self) {
         let mut resolved: Vec<(u64, Result<Option<[f32; 16]>, String>)> = Vec::new();
-        for producer in &self.producers {
-            let Some(binding) = &producer.hook else {
+        for producer in &mut self.producers {
+            let Some(binding) = producer.hook.as_mut() else {
                 continue;
             };
             let id = producer.identity;
@@ -1353,6 +1358,21 @@ impl World {
                 if !cutoff_residency::contains(self.resident_bounds, parent.placement.position) {
                     return Ok(None);
                 }
+
+                // Static placements use the bind pose forever. Once one of
+                // their hook matrices has been validated, reuse it after future
+                // camera/window changes instead of walking the skeleton each
+                // frame. Still check residency above so an evicted parent
+                // detaches just as before.
+                let static_parent = parent.action.is_none();
+                if static_parent {
+                    if let Some(matrix) = binding.static_parent {
+                        let hook = glam::Mat4::from_cols_array(&matrix);
+                        let _ = model_attachment::world(hook, binding.local)?;
+                        return Ok(Some(matrix));
+                    }
+                }
+
                 let posed = match &slot.posed {
                     Some(Ok(posed)) => posed,
                     Some(Err(e)) => return Err(format!("producer {id}: parent pose failed: {e}")),
@@ -1369,7 +1389,11 @@ impl World {
                 // `local`, and `Request::world_transform` computes
                 // `parent * self.transform`.
                 let _ = model_attachment::world(hook, binding.local)?;
-                Ok(Some(hook.to_cols_array()))
+                let matrix = hook.to_cols_array();
+                if static_parent {
+                    binding.static_parent = Some(matrix);
+                }
+                Ok(Some(matrix))
             })();
             resolved.push((producer.identity, outcome));
         }

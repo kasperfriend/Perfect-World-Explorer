@@ -733,7 +733,9 @@ impl Manager {
         let Some(index) = self.position_of(identity) else {
             return false;
         };
-        self.owners[index].request.attachment = parent;
+        if self.owners[index].request.attachment != parent {
+            self.owners[index].request.attachment = parent;
+        }
         true
     }
 
