@@ -497,12 +497,15 @@ jobs:
           path: artifact/
           if-no-files-found: error
           retention-days: 14
+      # This artifact was uploaded in this same workflow run. Leave github-token
+      # unset so download-artifact uses the run-scoped artifact service; setting
+      # it switches to the cross-run REST path, which can return 404 before the
+      # current workflow run has finalized.
       - name: Download the uploaded portable artifact
         uses: actions/download-artifact@v4
         with:
           name: Perfect-World-Explorer-Windows-x64
           path: ${{ runner.temp }}/uploaded-viewer
-          github-token: ${{ github.token }}
       - name: Audit the uploaded artifact layout
         shell: pwsh
         run: |
