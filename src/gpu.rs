@@ -4943,7 +4943,9 @@ impl Renderer {
                 destination,
                 layered,
                 dlss_rr_ran,
-                rt_water_reflections,
+                camera.water_reflections
+                    && camera.underwater_depth <= 0.0
+                    && self.raywatcher_overrides.reflection_pass,
             );
         }
         self.modules.raywatcher_mut().next_frame();
@@ -5057,6 +5059,7 @@ impl Renderer {
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&normal));
         let rt_water_reflections = camera.water_reflections
+            && camera.underwater_depth <= 0.0
             && self.raywatcher_overrides.reflection_pass;
         let mut water_fog = frame.active_fog_range;
         water_fog[3] = if rt_water_reflections { 1.0 } else { 0.0 };
@@ -5373,8 +5376,6 @@ impl Renderer {
         // below. Nothing here is duplicated work to remove — a mirror is a mirror
         // — but the count is what decides how much world the frame rasterises, so
         // it goes into the `TimingFrame` line rather than staying invisible.
-        let rt_water_reflections = camera.water_reflections
-            && self.raywatcher_overrides.reflection_pass;
         self.scene_passes = 1
             + (if rt_water_reflections { 1 } else { 2 })
                 * visible.iter().filter(|b| !b.simple).count() as u32;

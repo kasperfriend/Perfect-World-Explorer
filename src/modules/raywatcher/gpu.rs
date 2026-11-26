@@ -4461,22 +4461,39 @@ impl RaywatcherGpu {
 
     pub fn can_replace_water_reflections(&self, hardware_requested: bool) -> bool {
         self.traced_last_frame
-            && (!hardware_requested || self.dxr.is_some() || self.dxr_failed)
-            && self.dxr_init.is_none()
+            && (!hardware_requested
+                || (self.dxr.is_some() || self.dxr_failed) && self.dxr_init.is_none())
     }
 
     /// Replace the scene. Called when the resident terrain set, tree set or
     /// water areas change.
     pub fn set_scene(&mut self, device: &wgpu::Device, scene: Arc<super::bvh::SceneGeometry>) {
+        // Drop the previous receiver before replacing its scene. A completed
+        // stale build is dropped on its worker if its receiver has disappeared.
+        self.dxr_init = None;
+        let old_dxr = self.dxr.take();
         self.scene_geom = scene.clone();
-        self.scene = SceneBuffers::upload(device, scene);
+        self.scene = SceneBuffers::upload(device, scene.clone());
         self.prev_view_projection = None;
         self.frames = 0;
-        if let Some(dxr) = self.dxr.as_mut() {
-            if let Err(err) = dxr.set_scene(&self.scene_geom) {
-                eprintln!("[Raywatcher] DXR acceleration structure rebuild failed ({err}); falling back to Software");
-                self.dxr = None;
-                self.dxr_failed = true;
+        self.traced_last_frame = false;
+        if let Some(mut dxr) = old_dxr {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker_scene = scene;
+            let spawn = std::thread::Builder::new()
+                .name("pwe-raywatcher-dxr-scene".to_string())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let result = dxr.set_scene(&worker_scene).map(|()| dxr);
+                    eprintln!("[Raywatcher] Background DXR scene/AS rebuild took {:.1}s (success={})", started.elapsed().as_secs_f32(), result.is_ok());
+                    let _ = tx.send(result);
+                });
+            match spawn {
+                Ok(_) => self.dxr_init = Some(rx),
+                Err(err) => {
+                    self.dxr_failed = true;
+                    eprintln!("[Raywatcher] Could not start DXR scene rebuild worker ({err}); using Software");
+                }
             }
         }
         self.trace_bind_group = Self::trace_bindings(
@@ -5980,11 +5997,25 @@ mod shader_optimization_regression_tests {
     }
 
     #[test]
-    fn composite_restores_native_water_after_precomposited_ray_reconstruction() {
-        assert!(COMPOSITE_SHADER.contains("if (center_roughness <= 0.12)"));
+    fn composite_keeps_native_water_until_rt_reflections_are_ready() {
+        assert!(COMPOSITE_SHADER.contains("if (is_water && comp_params.z <= 0.5)"));
         assert!(COMPOSITE_SHADER.contains("if (comp_params.y > 0.5)"));
+        assert!(COMPOSITE_SHADER.contains("raster.rgb + rt.rgb"));
         assert!(COMPOSITE_SHADER.contains("return raster;"));
         assert!(COMPOSITE_SHADER.contains("return textureLoad(src_rt, px, 0);"));
+    }
+
+    #[test]
+    fn water_reflections_are_rt_only_above_water_and_replace_the_native_mirror() {
+        let dxr = include_str!("dxr_trace.hlsl");
+        let water = include_str!("../../water_gpu.rs");
+        assert!(RAY_SHADER.contains("params.eye.y > point.y + 0.05"));
+        assert!(dxr.contains("params.eye.y > world_pos.y + 0.05"));
+        assert!(RAY_SHADER.contains("if (is_water && debug_mode_early == 0u)"));
+        assert!(dxr.contains("if (is_water && debug_mode_early == 0u)"));
+        assert!(water.contains("w.fog.w>0.5"));
+        assert!(COMPOSITE_SHADER.contains("comp_params.z <= 0.5"));
+        assert!(COMPOSITE_SHADER.contains("raster.rgb + rt.rgb"));
     }
 
     #[test]

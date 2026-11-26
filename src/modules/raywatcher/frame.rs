@@ -712,6 +712,19 @@ mod tests {
     }
 
     #[test]
+    fn layered_rt_reflections_replace_the_native_water_mirror_only_when_enabled() {
+        use super::super::plan::{Plan, RayTracingMode, Settings};
+        let mut settings = Settings::default();
+        settings.mode = RayTracingMode::Hardware;
+        settings.effects.reflections = true;
+        let plan = Plan::decide(&settings, (1920, 1080), true, |_| false);
+        assert!(RasterOverrides::for_plan(&plan).reflection_pass);
+        settings.effects.reflections = false;
+        let plan = Plan::decide(&settings, (1920, 1080), true, |_| false);
+        assert!(!RasterOverrides::for_plan(&plan).reflection_pass);
+    }
+
+    #[test]
     fn a_disabled_plan_touches_no_raster_effect() {
         use crate::modules::raywatcher::plan::Effects;
         assert_eq!(
