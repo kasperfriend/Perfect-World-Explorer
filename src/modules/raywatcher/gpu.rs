@@ -6560,7 +6560,9 @@ mod shader_optimization_regression_tests {
 
 #[cfg(test)]
 mod dxr_backend_selection_tests {
-    use super::{adaptive_sample_ceiling, hardware_trace_ready};
+    use super::{
+        adaptive_sample_ceiling, hardware_trace_ready, software_fallback_ready,
+    };
 
     #[test]
     fn adaptive_ray_ceiling_preserves_original_visual_quality() {
