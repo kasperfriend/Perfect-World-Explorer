@@ -387,7 +387,9 @@ impl Raywatcher {
                     settings.mode = mode;
                 }
                 if mode == RayTracingMode::Hardware && self.hardware_probing {
-                    response.on_hover_text("Checking hardware and reconstruction SDK support in the background");
+                    response.on_hover_text(
+                        "Checking hardware and reconstruction SDK support in the background",
+                    );
                 } else if mode == RayTracingMode::Hardware && !self.hardware_rays {
                     response.on_hover_text(
                         self.hardware_note
