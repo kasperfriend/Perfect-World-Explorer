@@ -3014,14 +3014,6 @@ impl Renderer {
             self.sky
                 .update(&self.queue, direction, w, h, frame, reflected_sets, true);
         }
-        let resident_bounds = self.resident_bounds();
-        self.far_trees.update_resident_lods(
-            &self.device,
-            &self.queue,
-            camera.pos.to_array(),
-            self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
-            resident_bounds,
-        );
         // Use the actual uploaded window. The native window shifts at map
         // edges; recomputing a clamped camera square discarded the wrong area.
         let win = self.lod.window;
@@ -3247,7 +3239,7 @@ impl Renderer {
         }
     }
     fn draw_opaque(
-        &self,
+        &mut self,
         e: &mut wgpu::CommandEncoder,
         label: &str,
         view: &wgpu::TextureView,
@@ -3264,6 +3256,21 @@ impl Renderer {
         // `water_view_scissor`'s rectangle. `None` draws the whole attachment.
         scissor: Option<[u32; 4]>,
     ) {
+        // Far-tree instances used to be submitted for every placement inside
+        // the resident map bounds, even when the camera faced the opposite
+        // direction. Select LOD and compact the visible instances on the GPU
+        // for this exact view (main, reflection, or refraction). Updating here
+        // also prevents a reflection from reusing the main view's tree set.
+        if !ui_test() && !skip_trees_test() {
+            self.far_trees.update_resident_lods(
+                &self.device,
+                &self.queue,
+                cull.eye,
+                self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
+                self.resident_bounds(),
+                cull.frustum,
+            );
+        }
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
