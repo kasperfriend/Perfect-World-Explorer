@@ -2749,9 +2749,10 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
         ddim - vec2<i32>(1),
     );
     let z_center = textureLoad(src_depth, dpx, 0);
-    // Sky pixels pass through 100% untouched.
+    // Sky is already passed through by the reconstruction prep stage. Keep
+    // that exact result when this compositor is only restoring native water.
     if (z_center <= 0.0) {
-        return raster;
+        return select(raster, textureLoad(src_rt, px, 0), comp_params.y > 0.5);
     }
 
     let n_center_coord = clamp(
@@ -2763,9 +2764,14 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
     let n_len = length(norm_raw.xyz);
     let n_center = select(vec3<f32>(0.0, 1.0, 0.0), norm_raw.xyz / n_len, n_len > 1e-4);
     let center_roughness = norm_raw.w;
-    // Preserve original game water pixels exactly and avoid the RT upsample for them.
+    // Preserve original game water pixels exactly, including after DLSS RR.
     if (center_roughness <= 0.12) {
         return raster;
+    }
+    // In this mode the ray image is already composited (DLSS RR or explicit
+    // replace-raster mode); copy it unchanged for every non-water pixel.
+    if (comp_params.y > 0.5) {
+        return textureLoad(src_rt, px, 0);
     }
 
     // Boost #13: When src_rt is already full-resolution (1:1 with raster), skip the
@@ -5372,15 +5378,30 @@ impl RaywatcherGpu {
     pub fn composite_to(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         destination: &wgpu::Texture,
         layered: bool,
         dlss_rr_ran: bool,
     ) {
-        if !layered || dlss_rr_ran || self.raster_copy.is_none() {
+        if self.raster_copy.is_none() {
             self.blit_to(device, encoder, destination);
             return;
         }
+        // For DLSS RR and replace-raster mode, the RT output is already a full
+        // image. Still run the native-water bypass so animated PW water remains
+        // byte-for-byte raster output rather than being temporally reconstructed.
+        let already_composited = !layered || dlss_rr_ran;
+        queue.write_buffer(
+            &self.composite_uniforms,
+            0,
+            bytemuck::bytes_of(&[
+                self.last_scene_albedo_gain,
+                if already_composited { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ]),
+        );
         let target_format = destination.format();
         if self
             .composite_pipeline
@@ -5822,7 +5843,7 @@ mod phase_r1_tests {
 
 #[cfg(test)]
 mod shader_optimization_regression_tests {
-    use super::RAY_SHADER;
+    use super::{COMPOSITE_SHADER, RAY_SHADER};
 
     #[test]
     fn gi_adaptive_sampling_increases_near_field_rays_on_both_backends() {
@@ -5853,6 +5874,14 @@ mod shader_optimization_regression_tests {
 
         assert!(RAY_SHADER.contains("accum_gi = gi_estimate * (f32(samples) * selected_cosine);"));
         assert!(dxr.contains("normalisation * float(samples) * selected_cosine"));
+    }
+
+    #[test]
+    fn composite_restores_native_water_after_precomposited_ray_reconstruction() {
+        assert!(COMPOSITE_SHADER.contains("if (center_roughness <= 0.12)"));
+        assert!(COMPOSITE_SHADER.contains("if (comp_params.y > 0.5)"));
+        assert!(COMPOSITE_SHADER.contains("return raster;"));
+        assert!(COMPOSITE_SHADER.contains("return textureLoad(src_rt, px, 0);"));
     }
 
     #[test]

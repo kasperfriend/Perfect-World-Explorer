@@ -4869,7 +4869,14 @@ impl Renderer {
         // world target (or blit directly when DLSS RR already composited or
         // when `replace_raster` was explicitly opted into).
         if let Some(gpu) = self.raywatcher_gpu.as_mut() {
-            gpu.composite_to(&self.device, encoder, destination, layered, dlss_rr_ran);
+            gpu.composite_to(
+                &self.device,
+                &self.queue,
+                encoder,
+                destination,
+                layered,
+                dlss_rr_ran,
+            );
         }
         self.modules.raywatcher_mut().next_frame();
     }
