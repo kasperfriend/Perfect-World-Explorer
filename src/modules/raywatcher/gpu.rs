@@ -6051,6 +6051,7 @@ mod shader_optimization_regression_tests {
 
     #[test]
     fn composite_keeps_native_water_until_rt_reflections_are_ready() {
+        let dxr = include_str!("dxr_trace.hlsl");
         assert!(COMPOSITE_SHADER.contains("if (is_water && comp_params.z <= 0.5)"));
         assert!(COMPOSITE_SHADER.contains("if (comp_params.y > 0.5)"));
         assert!(COMPOSITE_SHADER.contains("(tap_norm_raw.w <= 0.12) != is_water"));
