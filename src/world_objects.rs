@@ -165,6 +165,30 @@ pub fn frustum_planes_from_matrix(m: [f32; 16]) -> [[f32; 4]; 6] {
     ]
 }
 
+/// Build a tighter view frustum for a pixel-space scissor rectangle.
+/// Water reflection/refraction textures are sampled only beneath the water
+/// surface (plus the shader's distortion margin); drawing world geometry
+/// outside this rectangle still runs vertex work and CPU submission even
+/// though rasterization is scissored away.
+pub fn frustum_planes_from_matrix_rect(
+    m: [f32; 16],
+    rect: [f32; 4], // left, right, bottom, top in NDC
+) -> [[f32; 4]; 6] {
+    let r0 = [m[0], m[4], m[8], m[12]];
+    let r1 = [m[1], m[5], m[9], m[13]];
+    let r2 = [m[2], m[6], m[10], m[14]];
+    let r3 = [m[3], m[7], m[11], m[15]];
+    let [left, right, bottom, top] = rect;
+    [
+        std::array::from_fn(|i| r0[i] - left * r3[i]),
+        std::array::from_fn(|i| right * r3[i] - r0[i]),
+        std::array::from_fn(|i| r1[i] - bottom * r3[i]),
+        std::array::from_fn(|i| top * r3[i] - r1[i]),
+        r2,
+        std::array::from_fn(|i| r3[i] - r2[i]),
+    ]
+}
+
 #[inline]
 fn all_chunks_inside_frustum(chunks: &[WorldDrawChunk], planes: &[[f32; 4]; 6]) -> bool {
     !chunks.is_empty()
@@ -2340,6 +2364,17 @@ mod page_tests {
         cmds.iter()
             .flat_map(|c| (c.start..c.end).map(move |i| (c.page, i)))
             .collect()
+    }
+
+    #[test]
+    fn scissor_frustum_rejects_geometry_outside_the_water_sample_rectangle() {
+        let planes = frustum_planes_from_matrix_rect(
+            glam::Mat4::IDENTITY.to_cols_array(),
+            [-0.5, 0.5, -0.25, 0.75],
+        );
+        assert!(aabb_in_frustum(&planes, [-0.1, -0.1, 0.1], [0.1, 0.1, 0.9]));
+        assert!(!aabb_in_frustum(&planes, [0.6, -0.1, 0.1], [0.8, 0.1, 0.9]));
+        assert!(!aabb_in_frustum(&planes, [-0.1, 0.8, 0.1], [0.1, 0.9, 0.9]));
     }
 
     #[test]
