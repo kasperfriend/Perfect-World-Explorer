@@ -890,13 +890,9 @@ void restir_reuse_one(
     if (cosine <= 0.01) return;
     if (!is_sky) {
         float tolerance = max(0.35, sample_distance * 0.02);
-        float min_t = max(0.05, bias * 0.25);
-        // The reservoir sample position is an existing surface hit. Only a
-        // blocker strictly before its tolerance interval can invalidate reuse;
-        // an any-hit query avoids resolving the nearest triangle at/behind it.
-        if (sample_distance > min_t + tolerance &&
-            occluded_opacity(ray_origin, direction, min_t, sample_distance - tolerance,
-                opaque_offset, tri_count)) return;
+        Hit visible = closest_hit(ray_origin, direction, max(0.05, bias * 0.25),
+            sample_distance + tolerance, opaque_offset, tri_count);
+        if (visible.index == 0xffffffffu || abs(visible.t - sample_distance) > tolerance) return;
     }
     float target = max(luma(source.radiance_m.xyz) * cosine, 1e-5);
     float target_over_pdf = target / max(cosine, 1e-5);
