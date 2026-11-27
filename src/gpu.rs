@@ -3494,11 +3494,37 @@ impl Renderer {
         let [opaque_scratch_cell, sdr_scratch_cell] = &self.world_draw_scratch;
         let mut opaque_world_scratch = opaque_scratch_cell.borrow_mut();
         let mut sdr_world_scratch = sdr_scratch_cell.borrow_mut();
-        // The experimental GPU kernel writes zero-instance indirect records but
-        // still submits every original page run. That saves neither the CPU
-        // command walk nor the driver's per-run submission cost on camera turns.
-        // Keep its shader/regression test, but use the CPU page/chunk/placement
-        // culler here until the GPU path produces a genuinely compact command list.
+        let multi_draw_count = self
+            .device
+            .features()
+            .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
+        if self.world_done && multi_draw_count {
+            let commands = &self.world_draw_cmds[world_slot];
+            crate::world_objects::GpuPage::encode_world_culling(
+                &self.device,
+                e,
+                &self.queue,
+                commands,
+                cull,
+                world_slot,
+                false,
+                multi_draw_count,
+                &mut opaque_world_scratch,
+            );
+            if has_sdr {
+                crate::world_objects::GpuPage::encode_world_culling(
+                    &self.device,
+                    e,
+                    &self.queue,
+                    commands,
+                    cull,
+                    world_slot,
+                    true,
+                    multi_draw_count,
+                    &mut sdr_world_scratch,
+                );
+            }
+        }
 
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("opaque scenery occluders after terrain"),
@@ -5800,6 +5826,7 @@ async fn adapter(
                 required_features: a.features()
                     & (wgpu::Features::TEXTURE_COMPRESSION_BC
                         | wgpu::Features::MULTI_DRAW_INDIRECT
+                        | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
                         | wgpu::Features::INDIRECT_FIRST_INSTANCE),
                 required_limits: wgpu::Limits::downlevel_defaults().using_resolution(a.limits()),
             },
