@@ -2818,9 +2818,10 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         // bypassing the neighbourhood clamp lets stale reflected edges smear
         // across the moving surface. Use a wider clamp for water while keeping
         // the tighter variance clamp for diffuse lighting.
+        let water_clamp_radius = max(stddev * 2.0, vec3<f32>(0.08));
         let history = select(
             clamp(prev.colour, mean - stddev, mean + stddev),
-            clamp(prev.colour, mean - stddev * 2.0, mean + stddev * 2.0),
+            clamp(prev.colour, mean - water_clamp_radius, mean + water_clamp_radius),
             is_glossy,
         );
         let current_clamped = min(current, mean * 1.75 + vec3<f32>(0.12));
