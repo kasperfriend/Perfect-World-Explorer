@@ -2905,10 +2905,9 @@ impl Architect {
                 if begin_marquee || begin_lasso {
                     // Selection gestures own the viewport drag; do not fall
                     // through to source-scene picking or object transforms.
-                } else if self.selected_placement.is_some() {
-                    self.selected_scene_object = None;
-                    self.selected_scene_transform = None;
                 } else if source_is_frontmost {
+                    self.selected_placement = None;
+                    self.selected_placements.clear();
                     if let Some((index, _, _, asset, position)) = source_pick {
                         self.selected_scene_object = Some(index);
                         self.selected_scene_transform = Some(position);
@@ -2925,6 +2924,9 @@ impl Architect {
                             self.multi_scene_items.clear();
                         }
                     }
+                } else if self.selected_placement.is_some() {
+                    self.selected_scene_object = None;
+                    self.selected_scene_transform = None;
                 } else {
                     self.selected_scene_object = None;
                     self.selected_scene_transform = None;
@@ -3071,7 +3073,7 @@ impl Architect {
             let pivot = self
                 .selected_placement
                 .and_then(|index| self.project.objects.get(index))
-                .map(|object| Vec3::from_array(object.position))
+                .map(|_| Vec3::from_array(self.object_drag_start_position))
                 .unwrap_or(Vec3::ZERO);
             match self.transform_mode {
                 TransformMode::Move => {
@@ -3269,6 +3271,65 @@ impl Architect {
                             painter.rect_filled(egui::Rect::from_center_size(end, egui::vec2(9., 9.)), 1., color);
                         }
                     },
+                }
+            }
+        }
+        // Draw a clear white 3D wire boundary for every selected project
+        // placement. The current scene API exposes placement origins rather
+        // than per-instance mesh bounds, so use conservative class-aware extents.
+        let mut outline_items = self
+            .selected_placements
+            .iter()
+            .filter_map(|index| self.project.objects.get(*index))
+            .filter(|object| object.visible)
+            .map(|object| (object.asset.clone(), object.position, object.scale))
+            .collect::<Vec<_>>();
+        if outline_items.is_empty() {
+            if let (Some(asset), Some(position)) = (
+                self.selected_asset.as_ref().filter(|_| self.selected_scene_object.is_some()),
+                self.selected_scene_transform,
+            ) {
+                outline_items.push((asset.clone(), position, 1.0));
+            }
+        }
+        let outline_painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("architect_selected_object_bounds"),
+        ));
+        for (asset, position, scale) in outline_items {
+            let lower = asset.to_ascii_lowercase();
+            let half = if lower.contains("tree") || lower.contains("forest") {
+                Vec3::new(3.5, 9.0, 3.5)
+            } else if lower.ends_with(".bmd") || lower.contains("building") {
+                Vec3::new(5.0, 5.0, 5.0)
+            } else if lower.ends_with(".gfx") || lower.contains("effect") {
+                Vec3::new(2.5, 3.5, 2.5)
+            } else {
+                Vec3::new(2.0, 2.5, 2.0)
+            } * scale.max(0.01);
+            let center = Vec3::from_array(position);
+            let mut corners = [egui::Pos2::ZERO; 8];
+            let mut valid = [false; 8];
+            for bits in 0..8 {
+                let point = center + Vec3::new(
+                    if bits & 1 == 0 { -half.x } else { half.x },
+                    if bits & 2 == 0 { -half.y } else { half.y },
+                    if bits & 4 == 0 { -half.z } else { half.z },
+                );
+                if let Some(projected) = project_point(point) {
+                    corners[bits] = projected;
+                    valid[bits] = true;
+                }
+            }
+            for bits in 0..8 {
+                for axis in [1usize, 2, 4] {
+                    let other = bits ^ axis;
+                    if bits < other && valid[bits] && valid[other] {
+                        outline_painter.line_segment(
+                            [corners[bits], corners[other]],
+                            egui::Stroke::new(1.8, egui::Color32::WHITE),
+                        );
+                    }
                 }
             }
         }
