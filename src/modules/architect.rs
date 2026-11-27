@@ -2624,7 +2624,7 @@ impl Architect {
                                     |(_, best_score, best_depth, _, _)| {
                                         score < *best_score - 0.025
                                             || ((score - *best_score).abs() <= 0.025
-                                                && clip.z < *best_depth)
+                                                && clip.z > *best_depth)
                                     },
                                 )
                             {
