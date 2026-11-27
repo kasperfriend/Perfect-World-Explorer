@@ -1746,7 +1746,7 @@ fn stage_page_atlas_mips(
     }
 
     let mut packed = vec![0u8; total_bytes];
-    for (mip, width, height, row_bytes, padded_row_bytes, offset) in &levels {
+    for (mip, _width, height, row_bytes, padded_row_bytes, offset) in &levels {
         let source = if *mip == 0 {
             &page.atlas
         } else {
@@ -1758,7 +1758,6 @@ fn stage_page_atlas_mips(
             packed[dst..dst + *row_bytes]
                 .copy_from_slice(&source[src..src + *row_bytes]);
         }
-        let _ = width;
     }
 
     let upload_size = std::num::NonZeroU64::new(total_bytes as u64)
@@ -2038,7 +2037,6 @@ impl GpuPage {
     /// upload submission for every page. Texture uploads remain byte-exact.
     pub fn upload_world_ref_staged(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
         normal: &wgpu::Buffer,
