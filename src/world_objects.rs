@@ -3654,10 +3654,17 @@ mod page_tests {
             compatible_surface: None,
         }))
         .expect("no software Vulkan adapter");
+        if !adapter
+            .features()
+            .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT)
+        {
+            println!("::notice::GPU world culling skipped: software adapter lacks indirect-count support");
+            return;
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("world culling regression device"),
-                required_features: wgpu::Features::empty(),
+                required_features: wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
                 required_limits: wgpu::Limits::downlevel_defaults(),
             },
             None,
@@ -3700,6 +3707,38 @@ mod page_tests {
         ];
         let mut cull = CullParams::frustum_only(frustum);
         let mut scratch = WorldDrawScratch::default();
+        let read_counts = |device: &wgpu::Device,
+                           queue: &wgpu::Queue,
+                           scratch: &WorldDrawScratch,
+                           count: usize| {
+            let view = scratch.gpu_culler.as_ref().unwrap().views[0]
+                .as_ref()
+                .unwrap();
+            let size = (count as u64) * std::mem::size_of::<u32>() as u64;
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("world culling count readback"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("world culling count readback encoder"),
+            });
+            encoder.copy_buffer_to_buffer(&view.counts, 0, &readback, 0, size);
+            queue.submit(Some(encoder.finish()));
+            let slice = readback.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            let mapped = slice.get_mapped_range();
+            let counts = bytemuck::cast_slice::<u8, u32>(&mapped).to_vec();
+            drop(mapped);
+            readback.unmap();
+            counts
+        };
         let read_records = |device: &wgpu::Device,
                             queue: &wgpu::Queue,
                             scratch: &WorldDrawScratch,
@@ -3749,8 +3788,14 @@ mod page_tests {
         ));
         queue.submit(Some(encoder.finish()));
         let first = read_records(&device, &queue, &scratch, 64);
+        let first_counts = read_counts(&device, &queue, &scratch, 1);
+        assert_eq!(first_counts, vec![32]);
         assert!(first[..32].iter().all(|arg| arg.instance_count == 1));
         assert!(first[32..].iter().all(|arg| arg.instance_count == 0));
+        assert!(first[..32]
+            .iter()
+            .enumerate()
+            .all(|(index, arg)| arg.first_index == index as u32 * 3));
 
         // Reusing the same static command/bounds buffers with a changed view
         // must rewrite every count; old occluded bits cannot survive a turn.
@@ -3781,9 +3826,11 @@ mod page_tests {
         ));
         queue.submit(Some(encoder.finish()));
         let second = read_records(&device, &queue, &scratch, 64);
+        let second_counts = read_counts(&device, &queue, &scratch, 1);
+        assert_eq!(second_counts, vec![64]);
         assert!(second.iter().all(|arg| arg.instance_count == 1));
         println!(
-            "::notice::GPU world culling passed: frustum compaction and current-view invalidation"
+            "::notice::GPU world culling passed: stable compaction, indirect draw counts, and current-view invalidation"
         );
     }
 
