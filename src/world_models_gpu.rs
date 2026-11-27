@@ -1458,7 +1458,12 @@ fn normalize_frustum_planes(mut planes: [[f32; 4]; 6]) -> [[f32; 4]; 6] {
         let len_squared = a * a + b * b + c * c;
         if len_squared.is_finite() && len_squared > 1.0e-12 {
             let inverse_len = len_squared.sqrt().recip();
-            *plane = [a * inverse_len, b * inverse_len, c * inverse_len, d * inverse_len];
+            *plane = [
+                a * inverse_len,
+                b * inverse_len,
+                c * inverse_len,
+                d * inverse_len,
+            ];
         } else {
             // A degenerate/non-finite plane must not reject scene geometry.
             *plane = [0.0; 4];
@@ -1588,15 +1593,22 @@ mod tests {
     #[test]
     fn normalized_frustum_planes_preserve_sphere_visibility() {
         let planes = [
-            [2.0, 0.0, 0.0, 10.0], [-3.0, 0.0, 0.0, 30.0],
-            [0.0, 4.0, 0.0, 20.0], [0.0, -5.0, 0.0, 50.0],
-            [0.0, 0.0, 6.0, 60.0], [0.0, 0.0, -7.0, 70.0],
+            [2.0, 0.0, 0.0, 10.0],
+            [-3.0, 0.0, 0.0, 30.0],
+            [0.0, 4.0, 0.0, 20.0],
+            [0.0, -5.0, 0.0, 50.0],
+            [0.0, 0.0, 6.0, 60.0],
+            [0.0, 0.0, -7.0, 70.0],
         ];
         let normalized = normalize_frustum_planes(planes);
         assert!(sphere_in_frustum(&normalized, [0.0; 3], 9.9));
         assert!(!sphere_in_frustum(&normalized, [-20.0, 0.0, 0.0], 1.0));
         assert_eq!(normalize_frustum_planes([[0.0; 4]; 6]), [[0.0; 4]; 6]);
-        assert!(sphere_in_frustum(&normalize_frustum_planes([[0.0; 4]; 6]), [1.0e9; 3], 0.0));
+        assert!(sphere_in_frustum(
+            &normalize_frustum_planes([[0.0; 4]; 6]),
+            [1.0e9; 3],
+            0.0
+        ));
     }
 
     /// `FadeGFX` is `SetAlphaTransition(alpha, 3000)`: a full ramp takes three
