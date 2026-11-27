@@ -359,9 +359,7 @@ impl FarTrees {
                 .filter(|p| p.tree_type as usize == id)
                 .map(|p| p.position)
                 .collect();
-            if positions.is_empty() {
-                continue;
-            }
+            let transforms = vec![[0.0, 1.0]; positions.len()];
             let height = tree.lods[0]
                 .branch
                 .vertices
@@ -448,7 +446,10 @@ impl FarTrees {
                 instances.extend(
                     positions
                         .iter()
-                        .map(|&position| Instance::new(position, [0., 0.])),
+                        .zip(&transforms)
+                        .map(|(&position, transform)| {
+                            Instance::new(position, [0., 0.], transform[0], transform[1])
+                        }),
                 );
                 let end_inst = instances.len() as u32;
                 let start_idx = indices.len() as u32;
@@ -530,7 +531,10 @@ impl FarTrees {
                 });
             }
             groups.push(Group {
+                tree_type: id,
+                native_count: positions.len(),
                 positions,
+                transforms,
                 height,
                 first_batch,
             });
@@ -859,21 +863,26 @@ impl FarTrees {
         // dispatches `LOD_COMPUTE` over the placement table.
         let mut placement_data = Vec::new();
         for (index, group) in groups.iter().enumerate() {
-            for &position in &group.positions {
+            for (&position, transform) in group.positions.iter().zip(&group.transforms) {
                 placement_data.push(Placement {
                     pos_height: [position[0], position[1], position[2], 0.],
                     group: index as u32,
-                    pad: [0; 3],
+                    yaw: transform[0],
+                    scale: transform[1],
+                    pad: 0,
                 });
             }
         }
+        let placement_count = placement_data.len() as u32;
         // `args_base` is a batch index (`first_batch + level`), not a group index.
         let mut group_data = group_table(&groups, &batches);
         if placement_data.is_empty() {
             placement_data.push(Placement {
                 pos_height: [0.; 4],
                 group: 0,
-                pad: [0; 3],
+                yaw: 0.0,
+                scale: 1.0,
+                pad: 0,
             });
         }
         if group_data.is_empty() {
@@ -884,7 +893,6 @@ impl FarTrees {
                 capacity: 0,
             });
         }
-        let placement_count = placement_data.len() as u32;
         let placement_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tree placements"),
             contents: bytemuck::cast_slice(&placement_data),
@@ -1054,11 +1062,13 @@ impl FarTrees {
             capacity,
             last_resident_update: None,
             lod_pipeline,
+            lod_layout,
             lod_bind,
             lod_params,
             placements: placement_count,
             lod_args,
             lod_args_reset,
+            editor_placements: Vec::new(),
             multi_draw: one_call,
         }
     }
