@@ -325,6 +325,24 @@ fn raster_lod_index(distance: f32, height: f32, scale: f32, lod_count: usize) ->
     }
 }
 
+/// Select the first real, non-sparse LOD that fits the available triangle
+/// budget. With an unlimited budget this is the baseline LOD used to decide
+/// whether candidate ordering can affect the harvest.
+fn select_harvest_lod(
+    species: &RtTreeSpecies,
+    start_lod: usize,
+    lod_count: usize,
+    remaining: usize,
+) -> Option<usize> {
+    (start_lod..lod_count).find(|&candidate| {
+        let triangles = &species.lods[candidate];
+        let sparse_outer_lod = candidate > 0
+            && triangles.len() < 12
+            && !species.lods[candidate - 1].is_empty();
+        !triangles.is_empty() && !sparse_outer_lod && triangles.len() <= remaining
+    })
+}
+
 #[inline]
 fn approximate_client_distance(d2: f32) -> f32 {
     f32::from_bits((d2.to_bits() >> 1).wrapping_add(0x1fc0_0000))
@@ -2083,7 +2101,12 @@ pub fn harvest_rt_tree_species_cancellable(
                 {
                     lod_idx -= 1;
                 }
-                desired_triangles = desired_triangles.saturating_add(sp.lods[lod_idx].len());
+                if let Some(preferred_lod) =
+                    select_harvest_lod(sp, lod_idx, lod_count, usize::MAX)
+                {
+                    desired_triangles =
+                        desired_triangles.saturating_add(sp.lods[preferred_lod].len());
+                }
                 candidates.push((d2, si, pos, lod_idx));
             }
         }
@@ -2120,20 +2143,13 @@ pub fn harvest_rt_tree_species_cancellable(
         let remaining = tri_budget.saturating_sub(out.len() - start_len);
         // Under pressure, try only progressively coarser *real* SpeedTree LODs.
         // If none fits, omit the instance rather than injecting synthetic card geometry.
-        let mut chosen = None;
-        for candidate in lod_idx..lod_count {
-            let tris = &sp.lods[candidate];
-            let sparse_outer_lod =
-                candidate > 0 && tris.len() < 12 && !sp.lods[candidate - 1].is_empty();
-            if !tris.is_empty() && !sparse_outer_lod && tris.len() <= remaining {
-                chosen = Some((candidate, tris));
-                break;
-            }
-        }
-        let Some((chosen_lod_idx, src_tris)) = chosen else {
+        let Some(chosen_lod_idx) =
+            select_harvest_lod(sp, lod_idx, lod_count, remaining)
+        else {
             budget_skips += 1;
             continue;
         };
+        let src_tris = &sp.lods[chosen_lod_idx];
         let offset = glam::Vec3::from_array(pos);
         let has_billboards = *billboard_lods[si][chosen_lod_idx]
             .get_or_insert_with(|| src_tris.iter().any(|triangle| triangle.leaf_rho >= 0.0));
