@@ -846,7 +846,10 @@ mod imp {
         pso: *mut d12::ID3D12PipelineState,
         desc_heap: *mut d12::ID3D12DescriptorHeap,
         desc_stride: u32,
-        cbvs: [RawBuffer; 3],
+        /// One parameter upload buffer per native command-ring slot. The ring
+        /// is six slots deep; deriving this vector from `slot_count()` keeps
+        /// acquire() indices and CBV storage in lockstep.
+        cbvs: Vec<RawBuffer>,
         scene: DxrScene,
         /// Deferred retirement lists freed once `ring.completed_fence() >= fence`.
         retired_scenes: Vec<(u64, DxrScene)>,
@@ -939,7 +942,10 @@ mod imp {
                 buf.map_persistent()?;
                 Ok::<RawBuffer, String>(buf)
             };
-            let cbvs = [mk_cbv()?, mk_cbv()?, mk_cbv()?];
+            let mut cbvs = Vec::with_capacity(ring.slot_count());
+            for _ in 0..ring.slot_count() {
+                cbvs.push(mk_cbv()?);
+            }
             let mut reusable_scratch: Option<(u64, RawBuffer)> = None;
             let mut reusable_instance_desc: Option<RawBuffer> = None;
             let scene_build_started = std::time::Instant::now();
