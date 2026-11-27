@@ -1238,7 +1238,7 @@ impl Architect {
             self.project.source_map = self.current_map_id.clone();
         }
         let Some(asset) = self.selected_asset.clone() else {
-            self.status = "Choose an ECM asset before placing it.".into();
+            self.status = "Choose a placeable game model from the client assets before placing it.".into();
             return;
         };
         if Self::renderer_asset_path(&asset).is_none() {
@@ -1260,7 +1260,7 @@ impl Architect {
             scale: 1.,
         });
         self.selected_placement = Some(self.project.objects.len() - 1);
-        self.status = "ECM placement added to the live Architect viewport.".into();
+        self.status = "Game model placed in the live Architect viewport.".into();
     }
 
     fn duplicate_selected_scene_item(&mut self) {
@@ -1282,7 +1282,7 @@ impl Architect {
         }
         for (_, asset, position) in items {
             if Self::renderer_asset_path(&asset).is_none() {
-                self.status = "One or more selected items are not ECM models from models.pck; those items cannot be duplicated into the live model layer.".into();
+                self.status = "One or more selected items are not supported game models (ECM or static SMD); those items cannot be copied into the editable layer.".into();
                 continue;
             }
             let portable_asset = self.portable_asset_path(&asset);
@@ -2227,6 +2227,17 @@ impl Architect {
                 }
                 ui.separator();
                 ui.heading("Custom placements");
+                ui.horizontal(|ui| {
+                    if ui.button("Copy (Ctrl+C)").clicked() {
+                        self.copy_selected_objects();
+                    }
+                    if ui.button("Paste (Ctrl+V)").clicked() {
+                        self.paste_objects();
+                    }
+                    if ui.button("Delete (Del)").clicked() {
+                        self.delete_selected_objects();
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.label(format!("{} selected", self.selected_placements.len()));
                     if ui.button("Select all").clicked() {
@@ -3375,6 +3386,48 @@ mod tests {
         assert_eq!(editor.project.objects[0].position, [4., 5., 6.]);
         assert_eq!(editor.selected_placement, None);
         assert!(editor.selected_placements.is_empty());
+    }
+
+    #[test]
+    fn object_clipboard_preserves_game_asset_and_transform_on_paste() {
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element/element.data"),
+            None,
+            "a01".into(),
+        );
+        editor.enabled = true;
+        editor.project.source_map = "a01".into();
+        editor.project.objects.push(PlacedObject {
+            asset: "element/models.pck::Models/Buildings/gate.ecm".into(),
+            name: "Gate".into(),
+            group: "Buildings".into(),
+            visible: true,
+            locked: true,
+            position: [10.0, 20.0, 30.0],
+            rotation: [0.1, 0.2, 0.3],
+            scale: 1.75,
+        });
+        editor.selected_placement = Some(0);
+
+        editor.copy_selected_objects();
+        assert_eq!(editor.clipboard_objects.len(), 1);
+        editor.paste_objects();
+
+        assert_eq!(editor.project.objects.len(), 2);
+        let pasted = &editor.project.objects[1];
+        assert_eq!(pasted.asset, "element/models.pck::Models/Buildings/gate.ecm");
+        assert_eq!(pasted.name, "Gate");
+        assert_eq!(pasted.group, "Buildings");
+        assert!(pasted.visible);
+        assert!(!pasted.locked);
+        assert_eq!(pasted.position, [12.0, 20.0, 32.0]);
+        assert_eq!(pasted.rotation, [0.1, 0.2, 0.3]);
+        assert_eq!(pasted.scale, 1.75);
+        assert_eq!(editor.selected_placements, HashSet::from([1]));
+
+        editor.undo_objects();
+        assert_eq!(editor.project.objects.len(), 1);
+        assert_eq!(editor.project.objects[0].position, [10.0, 20.0, 30.0]);
     }
 
     #[test]
