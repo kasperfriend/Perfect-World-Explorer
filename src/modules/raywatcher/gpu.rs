@@ -2183,56 +2183,88 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         var exact_ws = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
         var exact_cols = array<vec3<f32>, 4>(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
 
-        let pl_loop_end = select(0u, pl_count, any_pl_near);
-        for (var li = 0u; li < pl_loop_end; li = li + 1u) {
-            let pl_pr = params.point_lights_pos_rad[li];
-            let to_l = pl_pr.xyz - point;
-            if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
+        // Traverse only light-BVH leaves whose conservative influence bounds
+        // contain this receiver. This preserves every exact sphere test and
+        // ReSTIR candidate while avoiding a full 128-light scan per pixel.
+        var light_stack: array<u32, 16>;
+        var light_sp = 0u;
+        if (any_pl_near && params.point_light_bvh_meta.x > 0.5) {
+            light_stack[light_sp] = 0u;
+            light_sp = light_sp + 1u;
+        }
+        loop {
+            if (light_sp == 0u) {
+                break;
+            }
+            light_sp = light_sp - 1u;
+            let node_index = light_stack[light_sp];
+            let node_min = params.point_light_bvh_min[node_index];
+            let node_max = params.point_light_bvh_max[node_index];
+            if (any(point < node_min.xyz) || any(point > node_max.xyz)) {
                 continue;
             }
-            let pl_d2 = dot(to_l, to_l);
-            if (pl_d2 <= 1e-6 || pl_d2 >= pl_pr.w * pl_pr.w) {
-                continue;
-            }
-            let pl_dist = sqrt(pl_d2);
-            let l_dir = to_l / pl_dist;
-            let raw_cos = dot(pl_normal, l_dir);
-            if (raw_cos <= -0.28) {
-                continue;
-            }
-            let pl_ndl = clamp((raw_cos + 0.32) / 1.32, 0.0, 1.0);
-            if (pl_ndl <= 0.001) {
-                continue;
-            }
-            let atten = point_light_falloff(pl_dist, pl_pr.w);
-            if (atten <= 1e-5) {
-                continue;
-            }
-            let pl_ci = params.point_lights_col_int[li];
-            let w = pl_ci.w * atten * pl_ndl;
-            let p_hat = max(luminance(pl_ci.rgb), 0.05) * w;
-            if (p_hat <= 1e-6) {
-                continue;
-            }
-            if (cand_count < 4u) {
-                exact_idxs[cand_count] = li;
-                exact_ws[cand_count] = w;
-                exact_cols[cand_count] = pl_ci.rgb;
-            }
-            cand_count = cand_count + 1u;
-            res0_wsum = res0_wsum + p_hat;
-            if (next_f32(&state) * res0_wsum <= p_hat) {
-                res0_idx = li;
-                res0_phat = p_hat;
-                res0_col = pl_ci.rgb;
-                res0_w = w;
-            }
-            res1_wsum = res1_wsum + p_hat;
-            if (next_f32(&state) * res1_wsum <= p_hat) {
-                res1_idx = li;
-                res1_phat = p_hat;
-                res1_col = pl_ci.rgb;
-                res1_w = w;
+            if (node_min.w >= 0.0) {
+                let leaf_count = u32(node_min.w);
+                let leaf_first = u32(node_max.w);
+                for (var offset = 0u; offset < leaf_count; offset = offset + 1u) {
+                    let li = point_light_order_at(leaf_first + offset);
+                    let pl_pr = params.point_lights_pos_rad[li];
+                    let to_l = pl_pr.xyz - point;
+                    if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
+                        continue;
+                    }
+                    let pl_d2 = dot(to_l, to_l);
+                    if (pl_d2 <= 1e-6 || pl_d2 >= pl_pr.w * pl_pr.w) {
+                        continue;
+                    }
+                    let pl_dist = sqrt(pl_d2);
+                    let l_dir = to_l / pl_dist;
+                    let raw_cos = dot(pl_normal, l_dir);
+                    if (raw_cos <= -0.28) {
+                        continue;
+                    }
+                    let pl_ndl = clamp((raw_cos + 0.32) / 1.32, 0.0, 1.0);
+                    if (pl_ndl <= 0.001) {
+                        continue;
+                    }
+                    let atten = point_light_falloff(pl_dist, pl_pr.w);
+                    if (atten <= 1e-5) {
+                        continue;
+                    }
+                    let pl_ci = params.point_lights_col_int[li];
+                    let w = pl_ci.w * atten * pl_ndl;
+                    let p_hat = max(luminance(pl_ci.rgb), 0.05) * w;
+                    if (p_hat <= 1e-6) {
+                        continue;
+                    }
+                    if (cand_count < 4u) {
+                        exact_idxs[cand_count] = li;
+                        exact_ws[cand_count] = w;
+                        exact_cols[cand_count] = pl_ci.rgb;
+                    }
+                    cand_count = cand_count + 1u;
+                    res0_wsum = res0_wsum + p_hat;
+                    if (next_f32(&state) * res0_wsum <= p_hat) {
+                        res0_idx = li;
+                        res0_phat = p_hat;
+                        res0_col = pl_ci.rgb;
+                        res0_w = w;
+                    }
+                    res1_wsum = res1_wsum + p_hat;
+                    if (next_f32(&state) * res1_wsum <= p_hat) {
+                        res1_idx = li;
+                        res1_phat = p_hat;
+                        res1_col = pl_ci.rgb;
+                        res1_w = w;
+                    }
+                }
+            } else {
+                let left = node_index + 1u;
+                let right = u32(node_max.w);
+                light_stack[light_sp] = right;
+                light_sp = light_sp + 1u;
+                light_stack[light_sp] = left;
+                light_sp = light_sp + 1u;
             }
         }
 
