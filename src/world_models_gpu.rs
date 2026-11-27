@@ -226,11 +226,32 @@ impl World {
             .into_iter()
             .map(|e| (crate::ecmodel::normalize(&e.name), e))
             .collect();
+        // Architect can also place static SMD meshes referenced by gfx.pck.
+        // Keep this archive independent from the model pack: GFX resources and
+        // their textures are authored under gfx/ and must never be looked up in
+        // models.pck by accident.
+        let mut gfx_pack = File::open(element.join("gfx.pck")).ok();
+        let gfx_entries: HashMap<String, crate::pck::Entry> = gfx_pack
+            .as_mut()
+            .and_then(|pack| crate::pck::directory(pack).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| {
+                let path = crate::ecmodel::normalize(&entry.name);
+                let path = if path.starts_with("gfx/") { path } else { format!("gfx/{path}") };
+                (path, entry)
+            })
+            .collect();
         Self::with_reader(device, format, assets, move |path| {
-            let entry = entries
-                .get(path)
-                .ok_or_else(|| format!("missing model texture: {path}"))?;
-            crate::pck::read_entry(&mut pack, entry)
+            let normalized = crate::ecmodel::normalize(path);
+            if normalized.starts_with("gfx/") {
+                let pack = gfx_pack.as_mut().ok_or_else(|| "gfx.pck is unavailable".to_owned())?;
+                let entry = gfx_entries.get(&normalized).ok_or_else(|| format!("missing GFX resource: {normalized}"))?;
+                crate::pck::read_entry(pack, entry)
+            } else {
+                let entry = entries.get(&normalized).ok_or_else(|| format!("missing model texture: {normalized}"))?;
+                crate::pck::read_entry(&mut pack, entry)
+            }
         })
     }
     pub fn with_reader(
@@ -398,9 +419,9 @@ impl World {
         let mut random = crate::model_playback::SceneRandom::new(1);
         for (index, placement) in placements.iter().enumerate() {
             let path = crate::ecmodel::normalize(&placement.path);
-            if !path.ends_with(".ecm") {
+            if !path.ends_with(".ecm") && !path.ends_with(".smd") {
                 self.reported.push(format!(
-                    "Architect placement {index} is not a supported ECM asset: {}",
+                    "Architect placement {index} is not a supported ECM or static SMD asset: {}",
                     placement.path
                 ));
                 continue;
@@ -409,9 +430,27 @@ impl World {
             let asset = if let Some(&asset) = self.editor_asset_cache.get(&path) {
                 asset
             } else {
-                match crate::model_asset::ModelAsset::load_with(&path, |dependency| {
-                    (self.read)(dependency)
-                }) {
+                let loaded = if path.ends_with(".ecm") {
+                    crate::model_asset::ModelAsset::load_with(&path, |dependency| (self.read)(dependency))
+                } else {
+                    (self.read)(&path)
+                        .and_then(|bytes| crate::ecmodel::parse_smd(&bytes))
+                        .and_then(|smd| {
+                            let parent = path.rsplit_once('/').map_or("", |value| value.0);
+                            let relative = |value: &str| {
+                                let value = crate::ecmodel::normalize(value);
+                                if value.starts_with("gfx/") || value.starts_with("models/") {
+                                    value
+                                } else {
+                                    format!("{parent}/{value}")
+                                }
+                            };
+                            let skeleton = relative(&smd.skeleton);
+                            let skins: Vec<_> = smd.skins.iter().map(|value| relative(value)).collect();
+                            crate::model_asset::ModelAsset::load_static_skins_with(&skeleton, &skins, |dependency| (self.read)(dependency))
+                        })
+                };
+                match loaded {
                     Ok(asset) => {
                         let asset_index = self.assets.assets.len();
                         self.assets.assets.push(asset);
