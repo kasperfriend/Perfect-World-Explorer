@@ -2523,8 +2523,8 @@ impl GpuPage {
         let bounds_bytes = (list.cmds.len() as u64)
             .saturating_mul(std::mem::size_of::<WorldGpuCullBounds>() as u64);
         let args_bytes = (list.cmds.len() as u64).saturating_mul(PAGE_DRAW_ARGS_SIZE);
-        let run_bytes = (run_count as u64)
-            .saturating_mul(std::mem::size_of::<WorldGpuCullRun>() as u64);
+        let run_bytes =
+            (run_count as u64).saturating_mul(std::mem::size_of::<WorldGpuCullRun>() as u64);
         let count_bytes = (run_count as u64).saturating_mul(std::mem::size_of::<u32>() as u64);
         let binding_limit = u64::from(limits.max_storage_buffer_binding_size);
         if bounds_bytes > binding_limit
