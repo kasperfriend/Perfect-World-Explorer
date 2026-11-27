@@ -1267,7 +1267,8 @@ impl Architect {
         if !self.enabled || self.current_map_id.is_empty() {
             return Vec::new();
         }
-        self.project
+        let mut placements = self
+            .project
             .objects
             .iter()
             .filter(|object| object.visible)
@@ -1295,7 +1296,49 @@ impl Architect {
                     map_id: self.current_map_id.to_ascii_lowercase(),
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+
+        // BMDs use the baked-scenery renderer, so publish the live placement
+        // preview to that renderer as well as the committed project objects.
+        if self.cursor == CursorMode::Place {
+            if let (Some(asset), Some(mut position)) = (
+                self.selected_asset.as_deref(),
+                self.brush_cursor_position,
+            ) {
+                if let Some(path) = Self::renderer_bmd_path(asset, &self.current_map_id) {
+                    if self.snap == SnapMode::Terrain {
+                        if let Some(map) = &self.map {
+                            position[1] = map.ground(position[0], position[2]) + 0.5;
+                        }
+                    } else if matches!(self.snap, SnapMode::Objects | SnapMode::Smart) {
+                        if let Some(target) = self.selected_scene_transform {
+                            position = target;
+                        } else if self.snap == SnapMode::Smart {
+                            if let Some(map) = &self.map {
+                                position[1] = map.ground(position[0], position[2]) + 0.5;
+                            }
+                        }
+                    }
+                    let exists = placements.iter().any(|placement| {
+                        placement.path == path
+                            && placement.position.iter().zip(position).all(|(a, b)| {
+                                (*a - b).abs() < 0.01
+                            })
+                    });
+                    if !exists {
+                        placements.push(crate::scene::EditorSceneryPlacement {
+                            path,
+                            position,
+                            direction: Vec3::Z.to_array(),
+                            up: Vec3::Y.to_array(),
+                            scale: 1.0,
+                            map_id: self.current_map_id.to_ascii_lowercase(),
+                        });
+                    }
+                }
+            }
+        }
+        placements
     }
 
     /// Current project's supported ECM placements, for the native GPU model
@@ -1393,6 +1436,7 @@ impl Architect {
             self.status = "This file is indexed but not yet placeable. The live render paths currently support ECM, static SMD, and litmodels.pck BMD scenery.".into();
             return;
         }
+        let before = self.project.objects.clone();
         let portable_asset = self.portable_asset_path(&asset);
         self.project.objects.push(PlacedObject {
             name: Path::new(&portable_asset)
@@ -1407,6 +1451,8 @@ impl Architect {
             rotation: [0.; 3],
             scale: 1.,
         });
+        self.object_history_action = true;
+        self.push_object_undo(before);
         let index = self.project.objects.len() - 1;
         self.selected_placement = Some(index);
         self.selected_placements.clear();
