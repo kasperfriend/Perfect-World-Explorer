@@ -212,7 +212,8 @@ struct Terrain {
     /// Native `CECSceneBlock` regional load/evict bits for the ornament class
     /// (`0x424020`). Owned here because `Terrain` lives on the streaming worker.
     scenery_residency: scenery_visibility::RegionResidency,
-    terrain_material_window: Option<Option<[usize; 4]>>,
+    /// Material footprint and source terrain revision represented by the far mesh.
+    terrain_material_window: Option<(Option<[usize; 4]>, u64)>,
     models: world_models::Assets,
     water_normals: Vec<Vec<image::RgbaImage>>,
     water_simple_frames: Vec<Vec<image::RgbaImage>>,
