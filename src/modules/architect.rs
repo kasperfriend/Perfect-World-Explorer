@@ -4356,6 +4356,35 @@ mod tests {
     }
 
     #[test]
+    fn renderer_scenery_placements_emit_map_scoped_bmd_instances() {
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element"),
+            None,
+            "a01".into(),
+        );
+        editor.enabled = true;
+        editor.project.source_map = "a01".into();
+        editor.project.objects.push(PlacedObject {
+            name: "BMD prop".into(),
+            asset: "element/litmodels.pck::litmodels/a01/1/litmodel_42.bmd".into(),
+            group: "Default".into(),
+            visible: true,
+            locked: false,
+            position: [10.0, 20.0, 30.0],
+            rotation: [0.0, std::f32::consts::FRAC_PI_2, 0.0],
+            scale: 2.0,
+        });
+
+        let placements = editor.renderer_scenery_placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].path, "litmodels/a01/1/litmodel_42.bmd");
+        assert_eq!(placements[0].position, [10.0, 20.0, 30.0]);
+        assert_eq!(placements[0].map_id, "a01");
+        assert!((placements[0].scale - 2.0).abs() < 0.0001);
+        assert!((placements[0].direction[0] - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
     fn renderer_bmd_paths_keep_map_namespace_and_reject_other_archives() {
         assert_eq!(
             Architect::renderer_bmd_path(
