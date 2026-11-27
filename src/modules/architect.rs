@@ -20,6 +20,13 @@ enum Dock {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransformMode {
+    Move,
+    Rotate,
+    Scale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CursorMode {
     Select,
     MultiSelect,
@@ -97,6 +104,7 @@ pub struct Architect {
     selected_project: Option<usize>,
     selected_map: String,
     cursor: CursorMode,
+    transform_mode: TransformMode,
     snap: SnapMode,
     brush: BrushMode,
     brush_radius: f32,
@@ -193,6 +201,7 @@ impl Architect {
             selected_project: None,
             selected_map: "__empty__".into(),
             cursor: CursorMode::Select,
+            transform_mode: TransformMode::Move,
             snap: SnapMode::Smart,
             brush: BrushMode::Raise,
             brush_radius: 24.,
@@ -1613,6 +1622,11 @@ impl Architect {
                     ui.selectable_value(&mut self.cursor, CursorMode::Place, "Place");
                     ui.selectable_value(&mut self.cursor, CursorMode::Sculpt, "Sculpt");
                     ui.separator();
+                    ui.label("Gizmo");
+                    ui.selectable_value(&mut self.transform_mode, TransformMode::Move, "Move");
+                    ui.selectable_value(&mut self.transform_mode, TransformMode::Rotate, "Rotate");
+                    ui.selectable_value(&mut self.transform_mode, TransformMode::Scale, "Scale");
+                    ui.separator();
                     egui::ComboBox::from_id_source("architect_snap")
                         .selected_text(format!(
                             "Snap: {}",
@@ -2809,7 +2823,7 @@ impl Architect {
                         }
                     }
                 }
-                let source_pick = if self.cursor == CursorMode::Select && axis_pick.is_none() {
+                let source_pick = if matches!(self.cursor, CursorMode::Select | CursorMode::MultiSelect) && axis_pick.is_none() {
                     pointer.and_then(|pointer| {
                         Self::pick_source_scene(pointer, screen, view_projection, scene, ornaments)
                     })
@@ -2839,8 +2853,9 @@ impl Architect {
                 } else {
                     nearest.map(|(index, _, _)| index)
                 };
-                let begin_marquee =
-                    self.cursor == CursorMode::MultiSelect && picked_placement.is_none();
+                let begin_marquee = self.cursor == CursorMode::MultiSelect
+                    && picked_placement.is_none()
+                    && !source_is_frontmost;
                 let begin_lasso = self.cursor == CursorMode::Lasso;
                 if self.cursor == CursorMode::MultiSelect {
                     if let Some(index) = picked_placement {
@@ -2882,10 +2897,19 @@ impl Architect {
                     if let Some((index, _, _, asset, position)) = source_pick {
                         self.selected_scene_object = Some(index);
                         self.selected_scene_transform = Some(position);
-                        self.selected_asset = Some(asset);
+                        self.selected_asset = Some(asset.clone());
+                        if self.cursor == CursorMode::MultiSelect {
+                            if self.multi_selection.insert(index) {
+                                self.multi_scene_items.insert(index, (asset, position));
+                            } else {
+                                self.multi_selection.remove(&index);
+                                self.multi_scene_items.remove(&index);
+                            }
+                        } else {
+                            self.multi_selection.clear();
+                            self.multi_scene_items.clear();
+                        }
                     }
-                    self.multi_selection.clear();
-                    self.multi_scene_items.clear();
                 } else {
                     self.selected_scene_object = None;
                     self.selected_scene_transform = None;
@@ -3243,6 +3267,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn multiselect_mode_keeps_source_scene_picks_out_of_marquee_fallback() {
+        let source_pick = Some((4usize, 0.2f32, 0.8f32, "models/tree.ecm".to_string(), [1., 2., 3.]));
+        let source_is_frontmost = source_pick.is_some();
+        let picked_placement: Option<usize> = None;
+        let begin_marquee = CursorMode::MultiSelect == CursorMode::MultiSelect
+            && picked_placement.is_none()
+            && !source_is_frontmost;
+        assert!(!begin_marquee);
+    }
+
+    #[test]
     fn source_scene_picking_uses_a_larger_target_for_trees_and_models() {
         assert!(
             Architect::source_pick_radius("trees/forest/tree.ecm")
@@ -3591,6 +3626,7 @@ mod tests {
             selected_project: None,
             selected_map: project.source_map.clone(),
             cursor: CursorMode::Select,
+            transform_mode: TransformMode::Move,
             snap: SnapMode::Smart,
             brush: BrushMode::Raise,
             brush_radius: 24.,
