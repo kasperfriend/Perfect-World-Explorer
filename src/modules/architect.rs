@@ -1040,6 +1040,50 @@ impl Architect {
             self.preview_message = "Hover or select an ECM/SMD model to preview it.".into();
             return;
         };
+        if let Some(path) = Self::renderer_bmd_path(asset, &self.current_map_id) {
+            self.preview = None;
+            let loaded = self
+                .preview_assets
+                .read_litmodel_resource(&path)
+                .and_then(|bytes| crate::bmd::Model::parse(&bytes));
+            match loaded {
+                Ok(model) => {
+                    let identity = crate::scene::Ornament {
+                        export_id: 0,
+                        offset: 0,
+                        position: [0.0; 3],
+                        direction: [0.0, 0.0, 1.0],
+                        up: [0.0, 1.0, 0.0],
+                        extra: 0,
+                        path: path.clone(),
+                        map_id: self.current_map_id.to_ascii_lowercase(),
+                    };
+                    let mut min = Vec3::splat(f32::INFINITY);
+                    let mut max = Vec3::splat(f32::NEG_INFINITY);
+                    for vertex in model.meshes.iter().flat_map(|mesh| &mesh.vertices) {
+                        let (position, _) =
+                            crate::gpu::editor_bmd_vertex_transform(&model, &identity, vertex, 1.0);
+                        if position.is_finite() {
+                            min = min.min(position);
+                            max = max.max(position);
+                        }
+                    }
+                    if min.is_finite() && max.is_finite() {
+                        self.preview_bounds
+                            .insert(path.clone(), (min.to_array(), max.to_array()));
+                        self.preview_message =
+                            "BMD bounds loaded from the client mesh. Its native materials are shown in the world viewport.".into();
+                    } else {
+                        self.preview_message =
+                            "This BMD contains no finite mesh geometry for selection bounds.".into();
+                    }
+                }
+                Err(error) => {
+                    self.preview_message = format!("Could not load BMD selection bounds: {error}");
+                }
+            }
+            return;
+        }
         match self.preview_path_for_asset(asset) {
             Ok(path) => {
                 let preview = self.preview.get_or_insert_with(|| {
@@ -1281,6 +1325,11 @@ impl Architect {
             path = format!("{namespace}{path}");
         }
         Some(path)
+    }
+
+    fn renderer_bounds_key(&self, asset: &str) -> Option<String> {
+        Self::renderer_asset_path(asset)
+            .or_else(|| Self::renderer_bmd_path(asset, &self.current_map_id))
     }
 
     fn renderer_tree_type(&self, asset: &str) -> Option<usize> {
@@ -3188,7 +3237,8 @@ impl Architect {
                         // Prefer the projected mesh footprint over a small
                         // origin-only click radius. This makes tall/wide models
                         // selectable where their visible geometry actually is.
-                        let projected_bounds = Self::renderer_asset_path(&object.asset)
+                        let projected_bounds = self
+                            .renderer_bounds_key(&object.asset)
                             .and_then(|path| self.preview_bounds.get(&path).copied())
                             .and_then(|(min, max)| {
                                 let rotation = glam::Quat::from_euler(
@@ -3845,7 +3895,8 @@ impl Architect {
             // Use the exact mesh bounds for this asset. If the mesh has not
             // been loaded yet, omit the outline rather than draw a misleading
             // guessed-size box that can be wildly wrong for PW models.
-            let Some((min, max)) = Self::renderer_asset_path(&asset)
+            let Some((min, max)) = self
+                .renderer_bounds_key(&asset)
                 .and_then(|path| self.preview_bounds.get(&path).copied())
             else {
                 continue;
