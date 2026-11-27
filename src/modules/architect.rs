@@ -652,7 +652,11 @@ impl Architect {
                     let belongs_here = erased_source_map.is_empty()
                         || self.current_map_id.is_empty()
                         || erased_source_map.eq_ignore_ascii_case(&self.current_map_id);
-                    belongs_here.then(|| map.heights.clear_edits()).and_then(Result::err)
+                    if belongs_here {
+                        map.heights.clear_edits().err()
+                    } else {
+                        None
+                    }
                 });
                 self.project = Project::default();
                 self.redo_strokes.clear();
