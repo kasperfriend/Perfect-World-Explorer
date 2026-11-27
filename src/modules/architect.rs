@@ -122,6 +122,7 @@ pub struct Architect {
     last_brush_position: Option<[f32; 3]>,
     object_dragging: bool,
     object_drag_y_offset: f32,
+    object_drag_xz_offset: [f32; 2],
     object_drag_axis: Option<usize>,
     object_drag_start_pointer: Option<egui::Pos2>,
     object_drag_start_position: [f32; 3],
@@ -202,6 +203,7 @@ impl Architect {
             last_brush_position: None,
             object_dragging: false,
             object_drag_y_offset: 0.,
+            object_drag_xz_offset: [0.; 2],
             object_drag_axis: None,
             object_drag_start_pointer: None,
             object_drag_start_position: [0.; 3],
@@ -1925,7 +1927,9 @@ impl Architect {
             if let Some(index) = self.selected_placement {
                 self.object_drag_start_position = self.project.objects[index].position;
                 if let Some(hit) = hit {
-                    self.object_drag_y_offset = self.project.objects[index].position[1] - hit.y;
+                    let position = self.project.objects[index].position;
+                    self.object_drag_y_offset = position[1] - hit.y;
+                    self.object_drag_xz_offset = [position[0] - hit.x, position[2] - hit.z];
                 }
             }
         }
@@ -1935,7 +1939,7 @@ impl Architect {
                     match self.object_drag_axis {
                         Some(0) => {
                             if let Some(hit) = hit {
-                                object.position[0] = hit.x;
+                                object.position[0] = hit.x + self.object_drag_xz_offset[0];
                             }
                         }
                         Some(1) => {
@@ -1948,12 +1952,16 @@ impl Architect {
                         }
                         Some(2) => {
                             if let Some(hit) = hit {
-                                object.position[2] = hit.z;
+                                object.position[2] = hit.z + self.object_drag_xz_offset[1];
                             }
                         }
                         _ => {
                             if let Some(hit) = hit {
-                                object.position = [hit.x, hit.y + self.object_drag_y_offset, hit.z];
+                                object.position = [
+                                    hit.x + self.object_drag_xz_offset[0],
+                                    hit.y + self.object_drag_y_offset,
+                                    hit.z + self.object_drag_xz_offset[1],
+                                ];
                             }
                         }
                     }
