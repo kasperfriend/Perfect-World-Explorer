@@ -895,7 +895,7 @@ fn build(
         },
         |x, y, level, cases| {
             let mut reader = heights_ref.reader();
-            let surface = crate::terrain_lod::block_surface(level, cases);
+            let surface = crate::terrain_lod::block_surface_cached(level, cases);
             let mut block_vertices = Vec::with_capacity(surface.grid.len());
             let mut low = [f32::INFINITY; 3];
             let mut high = [f32::NEG_INFINITY; 3];
@@ -924,7 +924,7 @@ fn build(
             }
             Ok((
                 block_vertices,
-                surface.indices,
+                surface.indices.clone(),
                 [low[0], low[1], low[2], high[0], high[1], high[2]],
             ))
         },
