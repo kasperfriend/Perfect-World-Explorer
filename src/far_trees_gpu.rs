@@ -945,7 +945,9 @@ impl FarTrees {
                             let norm = cross.normalize();
                             if is_foliage {
                                 let uses_authored_cutoff = authored_mips
-                                    && lod.frond_alpha_ref.is_some_and(|reference| reference >= 0.0);
+                                    && lod
+                                        .frond_alpha_ref
+                                        .is_some_and(|reference| reference >= 0.0);
                                 let frond_cutoff =
                                     raster_alpha_cutoff(authored_mips, lod.frond_alpha_ref);
                                 let (mask, albedo, hits) = sample_tri_alpha_mask49(
@@ -2251,8 +2253,11 @@ pub fn harvest_rt_tree_species_cancellable(
         };
         let src_tris = &sp.lods[chosen_lod_idx];
         let offset = glam::Vec3::from_array(pos);
-        let has_billboards = *billboard_lods[si][chosen_lod_idx]
-            .get_or_insert_with(|| src_tris.iter().any(|triangle| triangle.leaf_rho.is_finite()));
+        let has_billboards = *billboard_lods[si][chosen_lod_idx].get_or_insert_with(|| {
+            src_tris
+                .iter()
+                .any(|triangle| triangle.leaf_rho.is_finite())
+        });
         let local_triangles = if has_billboards {
             let cache = &mut transformed_lods[si][chosen_lod_idx];
             if cache.is_none() {
@@ -2339,10 +2344,8 @@ mod raywatcher_tree_tests {
         let uv1 = [1.0, 0.0];
         let uv2 = [0.0, 1.0];
         let cutoff = 84.0 / 255.0;
-        let (_, _, strict_hits) =
-            sample_tri_alpha_mask49(&image, uv0, uv1, uv2, cutoff, false);
-        let (_, _, inclusive_hits) =
-            sample_tri_alpha_mask49(&image, uv0, uv1, uv2, cutoff, true);
+        let (_, _, strict_hits) = sample_tri_alpha_mask49(&image, uv0, uv1, uv2, cutoff, false);
+        let (_, _, inclusive_hits) = sample_tri_alpha_mask49(&image, uv0, uv1, uv2, cutoff, true);
         assert_eq!(strict_hits, 0, "authored raster cutoff discards equality");
         assert_eq!(inclusive_hits, 49, "legacy raster cutoff keeps equality");
     }
