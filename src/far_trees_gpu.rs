@@ -330,6 +330,66 @@ fn approximate_client_distance(d2: f32) -> f32 {
     f32::from_bits((d2.to_bits() >> 1).wrapping_add(0x1fc0_0000))
 }
 
+/// Convert one species LOD's camera-facing leaf vertices once per scene build.
+/// The transformed local-space triangles are shared by every placement of the
+/// same species/LOD; placement-specific work is then only a translation.
+fn transform_tree_lod_for_view(
+    source: &[RtTreeTriangle],
+    view_direction: glam::Vec3,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<Vec<RtTreeTriangle>> {
+    let mut transformed = Vec::with_capacity(source.len());
+    for (index, triangle) in source.iter().enumerate() {
+        if index & 0x3ff == 0
+            && cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return None;
+        }
+        let mut moved = *triangle;
+        if moved.leaf_rho >= 0.0 {
+            let pivot = moved.leaf_center;
+            let rho = moved.leaf_rho;
+            let transform = |vertex: glam::Vec3| {
+                let relative = vertex - pivot;
+                let corner = [relative.x, relative.z, relative.y];
+                pivot + speedtree_leaf_corner(corner, view_direction, rho)
+            };
+            moved.a = transform(moved.a);
+            moved.b = transform(moved.b);
+            moved.c = transform(moved.c);
+            moved.normal = glam::Vec3::Y;
+            moved.leaf_center = glam::Vec3::ZERO;
+            moved.leaf_rho = -1.0;
+        }
+        transformed.push(moved);
+    }
+    Some(transformed)
+}
+
+/// Append a local-space tree LOD at one placement. Billboard transforms have
+/// already been resolved (and cached) before this hot per-instance loop.
+fn append_tree_lod_at(
+    out: &mut Vec<RtTreeTriangle>,
+    triangles: &[RtTreeTriangle],
+    offset: glam::Vec3,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> bool {
+    out.reserve(triangles.len());
+    for (index, triangle) in triangles.iter().enumerate() {
+        if index & 0x3ff == 0
+            && cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return false;
+        }
+        let mut moved = *triangle;
+        moved.a += offset;
+        moved.b += offset;
+        moved.c += offset;
+        out.push(moved);
+    }
+    true
+}
+
 /// Sample a real 7x7 (49-cell) barycentric alpha cutout bitmask and alpha-weighted
 /// linear albedo from `img` over triangle UVs `(u0, u1, u2)`.
 /// Matches the exact `(s, t)` barycentric mapping decoded by `accept_opacity` in HLSL/WGSL.
@@ -1993,6 +2053,14 @@ pub fn harvest_rt_tree_species_cancellable(
     }
     candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
+    // Each species/LOD has identical local geometry for every placement. Cache
+    // its camera-facing leaf transform once, rather than repeating three vertex
+    // transforms for every leaf triangle of every tree instance.
+    let mut transformed_lods: Vec<[Option<Vec<RtTreeTriangle>>; 3]> = species_list
+        .iter()
+        .map(|_| std::array::from_fn(|_| None))
+        .collect();
+
     let mut real_instances = 0usize;
     let mut real_tris = 0usize;
     let mut budget_skips = 0usize;
@@ -2027,32 +2095,23 @@ pub fn harvest_rt_tree_species_cancellable(
             continue;
         };
         let offset = glam::Vec3::from_array(pos);
-        out.reserve(src_tris.len());
-        for (triangle_index, t) in src_tris.iter().enumerate() {
-            if triangle_index & 0x3ff == 0 && cancelled(cancel) {
+        let source_has_billboards = src_tris.iter().any(|triangle| triangle.leaf_rho >= 0.0);
+        let local_triangles = if source_has_billboards {
+            let cache = &mut transformed_lods[si][lod_idx];
+            if cache.is_none() {
+                *cache = transform_tree_lod_for_view(src_tris, view_direction, cancel);
+            }
+            let Some(transformed) = cache.as_deref() else {
                 out.truncate(start_len);
                 return (0, 0, 0);
-            }
-            let mut moved = *t;
-            if moved.leaf_rho >= 0.0 {
-                let pivot = moved.leaf_center;
-                let rho = moved.leaf_rho;
-                let transform = |v: glam::Vec3| {
-                    let relative = v - pivot;
-                    let corner = [relative.x, relative.z, relative.y];
-                    pivot + speedtree_leaf_corner(corner, view_direction, rho)
-                };
-                moved.a = transform(moved.a);
-                moved.b = transform(moved.b);
-                moved.c = transform(moved.c);
-                moved.normal = glam::Vec3::Y;
-                moved.leaf_center = glam::Vec3::ZERO;
-                moved.leaf_rho = -1.0;
-            }
-            moved.a += offset;
-            moved.b += offset;
-            moved.c += offset;
-            out.push(moved);
+            };
+            transformed
+        } else {
+            src_tris
+        };
+        if !append_tree_lod_at(out, local_triangles, offset, cancel) {
+            out.truncate(start_len);
+            return (0, 0, 0);
         }
         real_instances += 1;
         real_tris += src_tris.len();
@@ -2116,7 +2175,7 @@ mod raywatcher_tree_tests {
             opacity: 0.65,
             alpha_mask: 0,
             leaf_center: glam::Vec3::ZERO,
-            leaf_rho: -1.0,
+            leaf_rho: 0.0,
         };
         let species = RtTreeSpecies {
             species_id: 0,
@@ -2124,7 +2183,7 @@ mod raywatcher_tree_tests {
             composite_size: (256, 256),
             composite_alpha_min: 0,
             composite_alpha_max: 255,
-            positions: vec![[10.0, 0.0, 10.0]],
+            positions: vec![[10.0, 0.0, 10.0], [20.0, 0.0, 10.0]],
             lods: vec![vec![branch, leaf], vec![branch]],
             lod_diags: vec![RtTreeLodDiag::default(); 2],
         };
@@ -2138,9 +2197,14 @@ mod raywatcher_tree_tests {
             10_000,
             &mut out,
         );
-        assert_eq!(real_inst, 1);
-        assert_eq!(real_tris, 2);
+        assert_eq!(real_inst, 2);
+        assert_eq!(real_tris, 4);
         assert_eq!(budget_skips, 0);
+        assert_eq!(out.len(), 4);
+        assert!(
+            (out[2].a - out[0].a - glam::Vec3::X * 10.0).length() < 1e-5,
+            "the cached billboard transform must be identical across placements"
+        );
         assert!(
             out.iter().any(|t| t.opacity < 0.99),
             "leaves must carry per-material alpha"
