@@ -225,7 +225,6 @@ impl Architect {
             marquee_start: None,
             marquee_current: None,
             lasso_points: Vec::new(),
-            lasso_points: Vec::new(),
             undo_objects: Vec::new(),
             redo_objects: Vec::new(),
             object_history_action: false,
@@ -2263,7 +2262,11 @@ impl Architect {
         let over_ui = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
         let hit = if matches!(
             self.cursor,
-            CursorMode::Sculpt | CursorMode::Select | CursorMode::MultiSelect | CursorMode::Lasso | CursorMode::Place
+            CursorMode::Sculpt
+                | CursorMode::Select
+                | CursorMode::MultiSelect
+                | CursorMode::Lasso
+                | CursorMode::Place
         ) && !over_ui
         {
             pointer.and_then(|position| {
@@ -2715,7 +2718,7 @@ impl Architect {
             ))
             .add(egui::Shape::line(
                 self.lasso_points.clone(),
-                egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 210, 175)),
+                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 210, 175)),
             ));
         }
         if let Some(index) = self
