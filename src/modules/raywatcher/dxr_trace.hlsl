@@ -438,13 +438,25 @@ bool occluded_point_light(float3 origin, float3 dir, float t_min, float t_max, f
     ray.TMin = t_min;
     ray.TMax = t_max;
 
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    // Point-light shadow rays also intersect alpha-tested tree foliage.
+    // Keep first-accepted-hit termination without forcing foliage cards opaque.
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
     q.TraceRayInline(
         scene_tlas,
-        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
+        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
         0xffu,
         ray);
-    q.Proceed();
+    while (q.Proceed()) {
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            break;
+        }
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
+            uint prim = q.CandidatePrimitiveIndex() + (q.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
+            if (accept_opacity(prim, q.CandidateTriangleBarycentrics(), 0u, tri_count)) {
+                q.CommitNonOpaqueTriangleHit();
+            }
+        }
+    }
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
         return false;
     }
@@ -452,7 +464,7 @@ bool occluded_point_light(float3 origin, float3 dir, float t_min, float t_max, f
         if (q.CommittedRayT() < dyn_skip) {
             float next_t = q.CommittedRayT() + 0.55;
             if (next_t < t_max) {
-                return occluded_fast(origin, dir, next_t, t_max);
+                return occluded_fast(origin, dir, next_t, t_max, opaque_offset, tri_count);
             }
             return false;
         }
