@@ -545,10 +545,16 @@ impl Architect {
     /// Recreate the current project's terrain from the immutable source plus
     /// its ordered strokes. This makes undo/redo deterministic and reversible.
     fn rebuild_terrain(&self) -> Result<(), String> {
-        let map = self.map.as_ref().ok_or("No terrain is loaded for sculpting")?;
+        let map = self
+            .map
+            .as_ref()
+            .ok_or("No terrain is loaded for sculpting")?;
         if !self.project.source_map.is_empty()
             && !self.current_map_id.is_empty()
-            && !self.project.source_map.eq_ignore_ascii_case(&self.current_map_id)
+            && !self
+                .project
+                .source_map
+                .eq_ignore_ascii_case(&self.current_map_id)
         {
             return Err(format!(
                 "Project belongs to map {}, but the loaded terrain is {}.",
