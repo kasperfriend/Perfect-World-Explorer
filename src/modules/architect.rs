@@ -1419,6 +1419,26 @@ impl Architect {
             self.selected_map = current_map.id.clone();
         }
         self.toolbar(ctx);
+        // Keep history shortcuts out of active text fields so Ctrl+Z edits a
+        // placement snapshot only when the user is working in the viewport or
+        // editor chrome, never while typing a name, group or filter.
+        if !ctx.wants_keyboard_input() {
+            let (undo, redo) = ctx.input(|input| {
+                let command = input.modifiers.command;
+                (
+                    command && input.key_pressed(egui::Key::Z) && !input.modifiers.shift,
+                    (command && input.key_pressed(egui::Key::Y))
+                        || (command
+                            && input.modifiers.shift
+                            && input.key_pressed(egui::Key::Z)),
+                )
+            });
+            if undo {
+                self.undo_objects();
+            } else if redo {
+                self.redo_objects();
+            }
+        }
         let screen = ctx.input(|input| input.screen_rect());
         let mut map_request = None;
 
