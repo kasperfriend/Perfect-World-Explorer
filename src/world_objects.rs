@@ -1745,21 +1745,6 @@ fn stage_page_atlas_mips(
         debug_assert_eq!(source.len(), row_bytes * (height * 2));
     }
 
-    let mut packed = vec![0u8; total_bytes];
-    for (mip, _width, height, row_bytes, padded_row_bytes, offset) in &levels {
-        let source = if *mip == 0 {
-            &page.atlas
-        } else {
-            &page.mips[(*mip - 1) as usize]
-        };
-        for row in 0..*height {
-            let src = row * *row_bytes;
-            let dst = *offset + row * *padded_row_bytes;
-            packed[dst..dst + *row_bytes]
-                .copy_from_slice(&source[src..src + *row_bytes]);
-        }
-    }
-
     let upload_size = std::num::NonZeroU64::new(total_bytes as u64)
         .expect("whole-world atlas upload must not be empty");
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1768,8 +1753,22 @@ fn stage_page_atlas_mips(
         usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    belt.write_buffer(encoder, &staging, 0, upload_size, device)
-        .copy_from_slice(&packed);
+    {
+        let mut mapped = belt.write_buffer(encoder, &staging, 0, upload_size, device);
+        for (mip, _width, height, row_bytes, padded_row_bytes, offset) in &levels {
+            let source = if *mip == 0 {
+                &page.atlas
+            } else {
+                &page.mips[(*mip - 1) as usize]
+            };
+            for row in 0..*height {
+                let src = row * *row_bytes;
+                let dst = *offset + row * *padded_row_bytes;
+                mapped[dst..dst + *row_bytes]
+                    .copy_from_slice(&source[src..src + *row_bytes]);
+            }
+        }
+    }
 
     for (mip, width, height, _, padded_row_bytes, offset) in levels {
         encoder.copy_buffer_to_texture(
