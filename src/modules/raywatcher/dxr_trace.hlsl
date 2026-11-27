@@ -1032,7 +1032,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     if (is_water && dot(normal, view_dir) > 0.0) {
         normal = -normal;
     }
-    bool is_glossy_trim = !is_water && roughness <= 0.36;
+    bool is_glossy_trim = false; // Reflections are water-only.
 
     bool layered = params.effects.w > 0.5;
     uint effects = uint(round(params.effects.y));
@@ -1264,17 +1264,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // Features #2 (Water Refraction & Underwater Caustics), #3 (Calibrated Glossy Trims),
         // #8 (Analytical Reflections of World Effects & Point Lights), #10 (Off-Screen Detail).
         float refl_dist = params.lens.y;
-        if (bits_reflections && (eff_roughness <= params.effects.x || metalness > 0.1)
-            && (!is_water || s == 0u)) {
+        if (bits_reflections && is_water && roughness <= params.effects.x && s == 0u) {
             // Native game water is a flat glossy dielectric: no animated wave
             // normals. Use the raster normal for both water and non-water surfaces.
             float3 refl_base_n = shade_normal;
-            // GGX remains for glossy scenery; native water is a perfect
-            // planar dielectric mirror and must not use stochastic microfacets.
+            // Water is the only reflective receiver and uses its exact planar normal.
             float3 h = refl_base_n;
-            if (!is_water) {
-                h = ggx_sample(refl_base_n, eff_roughness, rand01(state), rand01(state));
-            }
             float3 reflect_dir = reflect(view_dir, h);
             if (dot(reflect_dir, refl_base_n) <= 0.0) {
                 reflect_dir = reflect(view_dir, refl_base_n);
@@ -1285,9 +1280,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float m2 = m * m;
             float fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
             float3 fresnel_rgb = (metalness > 0.1) ? lerp(float3(fresnel, fresnel, fresnel), metal_tint * fresnel, metalness) : float3(fresnel, fresnel, fresnel);
-            float trim_scale = is_water
-                ? 1.0
-                : (metalness > 0.1 ? (0.48 * metalness) : (0.28 * (1.0 - smoothstep(0.24, 0.37, eff_roughness))));
+            float trim_scale = 1.0;
             // Opt #9: Use opacity-aware RT traversal so alpha-tested foliage (tree
             // leaves) is reflected correctly. closest_hit_fast forces opaque and
             // skips leaves, producing broken leaf reflections. Water needs no
@@ -2080,7 +2073,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         store_refl = float3(0.0, 0.0, 0.0);
     } else if (debug_mode == 8u) {
         float rkind = 0.0;
-        if (roughness <= params.effects.x) {
+        if (is_water && roughness <= params.effects.x) {
             float3 rdir = reflect(view_dir, normal);
             Hit rh = closest_hit(ray_origin, rdir, bias, params.lens.y, opaque_offset, tri_count);
             if (rh.index < tri_count) {
