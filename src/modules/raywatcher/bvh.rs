@@ -471,22 +471,10 @@ impl SceneGeometry {
             let (a_state, b_state, c_state, d_state) = std::thread::scope(|scope| {
                 let tb = &tri_bounds;
                 let ct = &centroids;
-                let build = |partition: &mut [u32]| {
-                    let mut state = BuildState {
-                        tri_bounds: tb,
-                        centroids: ct,
-                        cancel,
-                        nodes: Vec::with_capacity(estimated_node_capacity(partition.len())),
-                        order: Vec::with_capacity(partition.len()),
-                        depth: 0,
-                        widest: 0,
-                    };
-                    state.build_node(partition, 2).map(|_| state)
-                };
-                let a_handle = scope.spawn(|| build(a_idx));
-                let b_handle = scope.spawn(|| build(b_idx));
-                let c_handle = scope.spawn(|| build(c_idx));
-                let d_state = build(d_idx);
+                let a_handle = scope.spawn(move || build_parallel_partition(tb, ct, cancel, a_idx));
+                let b_handle = scope.spawn(move || build_parallel_partition(tb, ct, cancel, b_idx));
+                let c_handle = scope.spawn(move || build_parallel_partition(tb, ct, cancel, c_idx));
+                let d_state = build_parallel_partition(tb, ct, cancel, d_idx);
                 (
                     a_handle.join().expect("BVH worker A panicked"),
                     b_handle.join().expect("BVH worker B panicked"),
@@ -865,6 +853,27 @@ impl<'a> BuildState<'a> {
     }
 }
 
+
+
+/// Build one independent subtree at the depth below the two synthetic
+/// top-level grouping nodes used by the four-way parallel builder.
+fn build_parallel_partition<'a>(
+    tri_bounds: &'a [(Vec3, Vec3)],
+    centroids: &'a [Vec3],
+    cancel: Option<&'a AtomicBool>,
+    partition: &mut [u32],
+) -> Option<BuildState<'a>> {
+    let mut state = BuildState {
+        tri_bounds,
+        centroids,
+        cancel,
+        nodes: Vec::with_capacity(estimated_node_capacity(partition.len())),
+        order: Vec::with_capacity(partition.len()),
+        depth: 0,
+        widest: 0,
+    };
+    state.build_node(partition, 2).map(|_| state)
+}
 
 /// Compute the exact bounds of an indexed triangle partition while preserving
 /// cancellation responsiveness during large parallel BVH builds.
