@@ -77,6 +77,7 @@ struct Project {
 pub struct Architect {
     enabled: bool,
     client_root: PathBuf,
+    current_map_id: String,
     map: Option<crate::navigation::MapSpace>,
     project_root: PathBuf,
     project: Project,
@@ -118,7 +119,11 @@ pub struct Architect {
 }
 
 impl Architect {
-    pub fn new(element: PathBuf, map: Option<crate::navigation::MapSpace>) -> Self {
+    pub fn new(
+        element: PathBuf,
+        map: Option<crate::navigation::MapSpace>,
+        current_map_id: String,
+    ) -> Self {
         let data_root = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
@@ -140,6 +145,7 @@ impl Architect {
         let mut editor = Self {
             enabled: false,
             client_root,
+            current_map_id,
             map,
             project_root,
             project: Project::default(),
@@ -388,6 +394,15 @@ impl Architect {
     /// same sparse height/normal overrides through MapSpace.
     fn apply_stroke(&self, stroke: &TerrainStroke) -> Result<usize, String> {
         let map = self.map.as_ref().ok_or("No terrain is loaded for sculpting")?;
+        if !self.project.source_map.is_empty()
+            && !self.current_map_id.is_empty()
+            && !self.project.source_map.eq_ignore_ascii_case(&self.current_map_id)
+        {
+            return Err(format!(
+                "Project belongs to map {}, but the loaded terrain is {}.",
+                self.project.source_map, self.current_map_id
+            ));
+        }
         if map.width < 2 || map.height < 2 || !map.spacing.is_finite() || map.spacing <= 0. {
             return Err("Terrain dimensions or spacing are invalid".into());
         }
@@ -1530,6 +1545,7 @@ mod tests {
         let editor = Architect {
             enabled: false,
             client_root: PathBuf::from("/client"),
+            current_map_id: "a01".into(),
             map: None,
             project_root: path.parent().unwrap().to_path_buf(),
             project: project.clone(),
