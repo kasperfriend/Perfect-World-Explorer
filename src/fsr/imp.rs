@@ -1114,6 +1114,13 @@ pub(crate) struct NativeCommandRing {
 }
 
 impl NativeCommandRing {
+    /// Number of independently reusable command-list slots in this ring.
+    /// Per-slot upload resources must use this count to avoid indexing past
+    /// their own storage when the ring depth changes.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
     pub(crate) fn new(raw_device: &d3d12::Device, tag: &str) -> Result<Self, String> {
         let (fence, hr) = raw_device.create_fence(0);
         if hr < 0 {
