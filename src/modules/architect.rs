@@ -1349,7 +1349,7 @@ impl Architect {
                             )
                             .clicked()
                         {
-                            self.enabled = false;
+                            self.set_active(false);
                         }
                     });
                 });
