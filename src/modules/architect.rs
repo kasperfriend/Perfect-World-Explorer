@@ -3352,6 +3352,8 @@ mod tests {
             project_files: Vec::new(),
             directory_cache: HashMap::new(),
             archive_cache: HashMap::new(),
+            archive_detail_cache: HashMap::new(),
+            archive_details: Vec::new(),
             project_name: project.name.clone(),
             selected_project: None,
             selected_map: project.source_map.clone(),
