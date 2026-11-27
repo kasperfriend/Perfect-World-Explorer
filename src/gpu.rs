@@ -2534,25 +2534,50 @@ impl Renderer {
                         ));
                     }
                 } else {
+                    // A page can contain a large texture atlas and seven mip
+                    // levels. Spawning one OS thread per page made startup
+                    // oversubscribe the CPU and multiplied peak upload memory
+                    // when a map had many local pages. Keep the uploads parallel,
+                    // but bound concurrency and preserve source-page order.
+                    let worker_count = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
+                        .min(4)
+                        .min(initial_local_pages.len());
+                    let batch_size = initial_local_pages.len().div_ceil(worker_count);
+                    let mut pages = initial_local_pages.into_iter();
+                    let mut batches = Vec::with_capacity(worker_count);
+                    loop {
+                        let batch: Vec<_> = pages.by_ref().take(batch_size).collect();
+                        if batch.is_empty() {
+                            break;
+                        }
+                        batches.push(batch);
+                    }
                     std::thread::scope(|ps| {
-                        let handles: Vec<_> = initial_local_pages
+                        let handles: Vec<_> = batches
                             .into_iter()
-                            .map(|page| {
+                            .map(|batch| {
                                 ps.spawn(move || {
-                                    crate::world_objects::GpuPage::upload(
-                                        device_ref,
-                                        queue_ref,
-                                        layout_ref,
-                                        sampler_ref,
-                                        uniform_ref,
-                                        reflected_ref,
-                                        page,
-                                    )
+                                    batch
+                                        .into_iter()
+                                        .map(|page| {
+                                            crate::world_objects::GpuPage::upload(
+                                                device_ref,
+                                                queue_ref,
+                                                layout_ref,
+                                                sampler_ref,
+                                                uniform_ref,
+                                                reflected_ref,
+                                                page,
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
                                 })
                             })
                             .collect();
-                        for h in handles {
-                            uploaded.push(h.join().unwrap());
+                        for handle in handles {
+                            uploaded.extend(handle.join().unwrap());
                         }
                     });
                 }
