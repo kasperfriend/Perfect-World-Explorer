@@ -24,6 +24,7 @@ enum CursorMode {
     Select,
     MultiSelect,
     Place,
+    Sculpt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +117,9 @@ pub struct Architect {
     tree_filter: String,
     object_filter: String,
     show_scene_objects: bool,
+    brush_cursor_position: Option<[f32; 3]>,
+    brush_dragging: bool,
+    last_brush_position: Option<[f32; 3]>,
 }
 
 impl Architect {
@@ -184,6 +188,9 @@ impl Architect {
             tree_filter: String::new(),
             object_filter: String::new(),
             show_scene_objects: true,
+            brush_cursor_position: None,
+            brush_dragging: false,
+            last_brush_position: None,
         };
         editor.refresh_projects();
         editor
@@ -1021,6 +1028,7 @@ impl Architect {
                     ui.selectable_value(&mut self.cursor, CursorMode::Select, "Select");
                     ui.selectable_value(&mut self.cursor, CursorMode::MultiSelect, "Multi-select");
                     ui.selectable_value(&mut self.cursor, CursorMode::Place, "Place");
+                    ui.selectable_value(&mut self.cursor, CursorMode::Sculpt, "Sculpt");
                     ui.separator();
                     egui::ComboBox::from_id_source("architect_snap")
                         .selected_text(format!(
@@ -1078,6 +1086,38 @@ impl Architect {
             });
     }
 
+    fn terrain_hit(pointer: egui::Pos2, viewport: egui::Rect, view_projection: glam::Mat4, map: &crate::navigation::MapSpace) -> Option<Vec3> {
+        if map.width < 2 || map.height < 2 || !map.spacing.is_finite() || map.spacing <= 0. { return None; }
+        let uv = egui::vec2((pointer.x - viewport.left()) / viewport.width().max(1.) * 2. - 1., 1. - (pointer.y - viewport.top()) / viewport.height().max(1.) * 2.);
+        let inverse = view_projection.inverse();
+        if !inverse.is_finite() { return None; }
+        let near = inverse.project_point3(Vec3::new(uv.x, uv.y, 1.));
+        let far = inverse.project_point3(Vec3::new(uv.x, uv.y, 0.));
+        let direction = (far - near).normalize_or_zero();
+        if !near.is_finite() || !direction.is_finite() || direction.length_squared() < 0.5 { return None; }
+        let [width, height] = map.world_size();
+        let delta = |p: Vec3| -> Option<f32> {
+            if p.x < -width * 0.5 || p.x > width * 0.5 || p.z < -height * 0.5 || p.z > height * 0.5 { return None; }
+            Some(p.y - map.ground(p.x, p.z))
+        };
+        let mut last_t = 0.;
+        let mut last_delta = delta(near)?;
+        for step in 1..=512 {
+            let t = step as f32 * 64.;
+            let p = near + direction * t;
+            let Some(d) = delta(p) else { continue; };
+            if last_delta >= 0. && d <= 0. {
+                let (mut lo, mut hi) = (last_t, t);
+                for _ in 0..12 { let mid = (lo + hi) * 0.5; if delta(near + direction * mid).is_some_and(|v| v > 0.) { lo = mid; } else { hi = mid; } }
+                let mut hit = near + direction * ((lo + hi) * 0.5);
+                hit.y = map.ground(hit.x, hit.z) + 0.05;
+                return Some(hit);
+            }
+            last_t = t; last_delta = d;
+        }
+        None
+    }
+
     /// Returns a requested client map ID when the user presses "Load map".
     pub fn ui(
         &mut self,
@@ -1087,6 +1127,7 @@ impl Architect {
         scene: &crate::scene::Scene,
         ornaments: &[crate::scene::Ornament],
         camera: Vec3,
+        view_projection: glam::Mat4,
     ) -> Option<String> {
         if !self.enabled {
             return None;
@@ -1586,6 +1627,44 @@ impl Architect {
                     }
                 });
             });
+        let (pointer, down, pressed, released) = ctx.input(|i| (i.pointer.hover_pos(), i.pointer.primary_down(), i.pointer.button_pressed(egui::PointerButton::Primary), i.pointer.button_released(egui::PointerButton::Primary)));
+        let over_ui = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
+        let hit = if self.cursor == CursorMode::Sculpt && !over_ui { pointer.and_then(|p| self.map.as_ref().and_then(|m| Self::terrain_hit(p, screen, view_projection, m))) } else { None };
+        self.brush_cursor_position = hit.map(Vec3::to_array);
+        if pressed && self.cursor == CursorMode::Sculpt && !over_ui && hit.is_some() { self.brush_dragging = true; self.last_brush_position = None; }
+        if self.brush_dragging && down {
+            if let Some(position) = hit {
+                let spacing = self.map.as_ref().map_or(1., |m| m.spacing);
+                let step = (self.brush_radius * 0.18).max(spacing).max(0.25);
+                if self.last_brush_position.is_none_or(|last| (position - Vec3::from_array(last)).length() >= step) {
+                    let stroke = TerrainStroke { mode: self.brush, position: position.to_array(), radius: self.brush_radius, strength: if self.brush == BrushMode::Flatten { self.flatten_height } else { self.brush_strength } };
+                    match self.apply_stroke(&stroke) {
+                        Ok(cells) if cells > 0 => { self.project.strokes.push(stroke); self.redo_strokes.clear(); self.last_brush_position = Some(position.to_array()); self.status = format!("Sculpted {cells} terrain cells · {} dabs", self.project.strokes.len()); }
+                        Ok(_) => { self.last_brush_position = Some(position.to_array()); }
+                        Err(error) => self.status = error,
+                    }
+                }
+            }
+        }
+        if released || !down { self.brush_dragging = false; self.last_brush_position = None; }
+        if self.cursor == CursorMode::Sculpt {
+            if let (Some(position), Some(map)) = (self.brush_cursor_position, self.map.as_ref()) {
+                let center = Vec3::from_array(position);
+                let mut points = Vec::with_capacity(65);
+                for n in 0..=64 {
+                    let angle = n as f32 * std::f32::consts::TAU / 64.;
+                    let x = center.x + angle.cos() * self.brush_radius;
+                    let z = center.z + angle.sin() * self.brush_radius;
+                    let world = Vec3::new(x, map.ground(x, z) + 0.12, z);
+                    let clip = view_projection.project_point3(world);
+                    if clip.is_finite() && (0.0..=1.0).contains(&clip.z) { points.push(egui::pos2(screen.left() + (clip.x + 1.) * 0.5 * screen.width(), screen.top() + (1. - clip.y) * 0.5 * screen.height())); }
+                }
+                if points.len() > 2 {
+                    let color = match self.brush { BrushMode::Raise => egui::Color32::from_rgb(90,230,130), BrushMode::Lower => egui::Color32::from_rgb(245,110,90), BrushMode::Flatten => egui::Color32::from_rgb(100,180,255), BrushMode::Smooth => egui::Color32::from_rgb(220,190,90), BrushMode::Paint => egui::Color32::GRAY };
+                    ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("architect_brush_cursor"))).add(egui::Shape::line(points, egui::Stroke::new(1.8, color)));
+                }
+            }
+        }
         map_request
     }
 }
