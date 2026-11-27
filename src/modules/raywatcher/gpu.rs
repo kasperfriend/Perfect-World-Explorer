@@ -5165,6 +5165,10 @@ impl RaywatcherGpu {
                 if let Err(err) = tracer.resize(device, self.grid_extent, self.render_extent) {
                     self.dxr_failed = true;
                     eprintln!("[Raywatcher] DXR target resize after background init failed ({err}); using Software");
+                    retire_dxr_async(tracer);
+                    if let Some(old) = self.dxr.take() {
+                        retire_dxr_async(old);
+                    }
                 } else {
                     // Swap only after the replacement tracer is fully ready.
                     // DxrTracer::drop waits for its native queue, so retire the
