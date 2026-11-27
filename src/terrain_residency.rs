@@ -84,6 +84,26 @@ impl Residency {
         self.triangles
     }
 
+    fn remove_block(&mut self, key: (usize, usize)) -> bool {
+        let Some(block) = self.blocks.remove(&key) else {
+            return false;
+        };
+        self.triangles = self
+            .triangles
+            .saturating_sub((block.indices.len() / 3) as u32);
+        true
+    }
+
+    fn insert_block(&mut self, key: (usize, usize), block: Block) {
+        let new_triangles = (block.indices.len() / 3) as u32;
+        if let Some(previous) = self.blocks.insert(key, block) {
+            self.triangles = self
+                .triangles
+                .saturating_sub((previous.indices.len() / 3) as u32);
+        }
+        self.triangles = self.triangles.saturating_add(new_triangles);
+    }
+
     /// Apply one window to the resident set: evict blocks outside it, build the
     /// blocks that entered and re-mesh the ones whose level changed. `level_of`
     /// returns `0` for a block the rule does not draw.
@@ -131,12 +151,7 @@ impl Residency {
                 let (level, cases) = state_of(x, y);
                 if level == 0 {
                     // No mesh for this block (`block+0x70 == 0`).
-                    if let Some(block) = self.blocks.remove(&(x, y)) {
-                        self.triangles = self
-                            .triangles
-                            .saturating_sub((block.indices.len() / 3) as u32);
-                        census.evicted += 1;
-                    }
+                    census.evicted += usize::from(self.remove_block((x, y)));
                     continue;
                 }
                 let stale = match self.blocks.get(&(x, y)) {
@@ -148,16 +163,12 @@ impl Residency {
                 }
                 let (vertices, indices, bounds) = build(x, y, level)
                     .map_err(|e| format!("terrain block ({x},{y}) level {level}: {e}"))?;
-                if let Some(previous) = self.blocks.get(&(x, y)) {
-                    self.triangles = self
-                        .triangles
-                        .saturating_sub((previous.indices.len() / 3) as u32);
+                if self.blocks.contains_key(&(x, y)) {
                     census.remeshed += 1;
                 } else {
                     census.loaded += 1;
                 }
-                self.triangles = self.triangles.saturating_add((indices.len() / 3) as u32);
-                self.blocks.insert(
+                self.insert_block(
                     (x, y),
                     Block {
                         level,
@@ -191,7 +202,16 @@ impl Residency {
     {
         let mut census = Census::default();
         let before = self.blocks.len();
-        self.blocks.retain(|&(x, y), _| window.contains(x, y));
+        let mut evicted_triangles = 0u32;
+        self.blocks.retain(|&(x, y), block| {
+            let keep = window.contains(x, y);
+            if !keep {
+                evicted_triangles = evicted_triangles
+                    .saturating_add((block.indices.len() / 3) as u32);
+            }
+            keep
+        });
+        self.triangles = self.triangles.saturating_sub(evicted_triangles);
         census.evicted = before - self.blocks.len();
 
         let mut stale: Vec<(usize, usize, u8, [u8; 4], bool)> = Vec::new();
@@ -199,7 +219,7 @@ impl Residency {
             for x in window.x0..window.x1 {
                 let (level, cases) = state_of(x, y);
                 if level == 0 {
-                    census.evicted += usize::from(self.blocks.remove(&(x, y)).is_some());
+                    census.evicted += usize::from(self.remove_block((x, y)));
                     continue;
                 }
                 match self.blocks.get(&(x, y)) {
@@ -266,7 +286,7 @@ impl Residency {
                     } else {
                         census.loaded += 1;
                     }
-                    self.blocks.insert(
+                    self.insert_block(
                         (x, y),
                         Block {
                             level,
@@ -286,7 +306,7 @@ impl Residency {
                     } else {
                         census.loaded += 1;
                     }
-                    self.blocks.insert(
+                    self.insert_block(
                         (x, y),
                         Block {
                             level,
@@ -307,7 +327,7 @@ impl Residency {
                 } else {
                     census.loaded += 1;
                 }
-                self.blocks.insert(
+                self.insert_block(
                     (x, y),
                     Block {
                         level,
