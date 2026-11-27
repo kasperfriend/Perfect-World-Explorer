@@ -1310,7 +1310,24 @@ impl Architect {
                 }
                 ui.separator();
                 if ui.button("＋ New empty world project").clicked() {
+                    let previous_source = self.project.source_map.clone();
+                    let belongs_here = previous_source.is_empty()
+                        || previous_source.eq_ignore_ascii_case(&current_map.id);
+                    let reset_error = if belongs_here {
+                        self.map
+                            .as_ref()
+                            .and_then(|map| map.heights.clear_edits().err())
+                    } else {
+                        None
+                    };
                     self.project = Project::default();
+                    self.redo_strokes.clear();
+                    self.undo_objects.clear();
+                    self.redo_objects.clear();
+                    self.object_drag_snapshot = None;
+                    self.object_dragging = false;
+                    self.brush_dragging = false;
+                    self.last_brush_position = None;
                     self.project_name = "Untitled World".into();
                     self.selected_map = "__empty__".into();
                     self.selected_project = None;
@@ -1320,6 +1337,9 @@ impl Architect {
                     self.multi_selection.clear();
                     self.multi_scene_items.clear();
                     self.status = "New empty project. Choose a client map as its source when ready.".into();
+                    if let Some(error) = reset_error {
+                        self.status = format!("New project created, but previous terrain edits could not be cleared: {error}");
+                    }
                 }
                 ui.heading("Custom worlds");
                 if ui.small_button("Refresh saved worlds").clicked() {
