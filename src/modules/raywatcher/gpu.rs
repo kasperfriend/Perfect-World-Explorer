@@ -793,7 +793,10 @@ fn closest_hit(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> Hit
     if (box_hit(nodes[0].bounds_min.xyz, nodes[0].bounds_max.xyz, origin, inv_dir, t_min, hit.t) < 0.0) {
         return hit;
     }
-    var stack: array<u32, 64>;
+    // MAX_DEPTH is 40: near-first DFS needs at most one deferred sibling per
+    // level, plus the active child. 42 slots preserve a safety margin while
+    // cutting per-invocation private stack storage by one third.
+    var stack: array<u32, 42>;
     var sp = 1u;
     stack[0] = 0u;
     loop {
@@ -822,12 +825,12 @@ fn closest_hit(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> Hit
             if (lh >= 0.0 && rh >= 0.0) {
                 let near = select(right, left, lh <= rh);
                 let far = select(left, right, lh <= rh);
-                if (sp < 63u) { stack[sp] = far; sp = sp + 1u; }
-                if (sp < 63u) { stack[sp] = near; sp = sp + 1u; }
+                if (sp < 42u) { stack[sp] = far; sp = sp + 1u; }
+                if (sp < 42u) { stack[sp] = near; sp = sp + 1u; }
             } else if (lh >= 0.0) {
-                if (sp < 63u) { stack[sp] = left; sp = sp + 1u; }
+                if (sp < 42u) { stack[sp] = left; sp = sp + 1u; }
             } else if (rh >= 0.0) {
-                if (sp < 63u) { stack[sp] = right; sp = sp + 1u; }
+                if (sp < 42u) { stack[sp] = right; sp = sp + 1u; }
             }
         }
     }
@@ -881,7 +884,10 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32, seed: u32
     if (box_hit(nodes[0].bounds_min.xyz, nodes[0].bounds_max.xyz, origin, inv_dir, t_min, t_max) < 0.0) {
         return false;
     }
-    var stack: array<u32, 64>;
+    // MAX_DEPTH is 40: near-first DFS needs at most one deferred sibling per
+    // level, plus the active child. 42 slots preserve a safety margin while
+    // cutting per-invocation private stack storage by one third.
+    var stack: array<u32, 42>;
     var sp = 1u;
     stack[0] = 0u;
     loop {
@@ -910,12 +916,12 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32, seed: u32
             if (lh >= 0.0 && rh >= 0.0) {
                 let near = select(right, left, lh <= rh);
                 let far = select(left, right, lh <= rh);
-                if (sp < 63u) { stack[sp] = far; sp = sp + 1u; }
-                if (sp < 63u) { stack[sp] = near; sp = sp + 1u; }
+                if (sp < 42u) { stack[sp] = far; sp = sp + 1u; }
+                if (sp < 42u) { stack[sp] = near; sp = sp + 1u; }
             } else if (lh >= 0.0) {
-                if (sp < 63u) { stack[sp] = left; sp = sp + 1u; }
+                if (sp < 42u) { stack[sp] = left; sp = sp + 1u; }
             } else if (rh >= 0.0) {
-                if (sp < 63u) { stack[sp] = right; sp = sp + 1u; }
+                if (sp < 42u) { stack[sp] = right; sp = sp + 1u; }
             }
         }
     }
@@ -6102,6 +6108,19 @@ impl RaywatcherGpu {
     /// The ray grid the trace pass runs at.
     pub fn grid_extent(&self) -> (u32, u32) {
         self.grid_extent
+    }
+}
+
+#[cfg(test)]
+mod software_bvh_stack_tests {
+    use super::*;
+
+    #[test]
+    fn software_shader_stack_covers_the_maximum_bvh_depth() {
+        const STACK_SIZE: usize = super::super::bvh::MAX_DEPTH as usize + 2;
+        assert_eq!(STACK_SIZE, 42);
+        assert_eq!(RAY_SHADER.matches("var stack: array<u32, 42>;").count(), 2);
+        assert_eq!(RAY_SHADER.matches("sp < 42u").count(), 8);
     }
 }
 
