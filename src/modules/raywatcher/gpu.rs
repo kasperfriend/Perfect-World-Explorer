@@ -6720,6 +6720,95 @@ mod phase_r1_tests {
     }
 
     #[test]
+    fn point_light_bvh_ray_queries_preserve_every_reflection_glow_candidate() {
+        let mut positions = [[0.0f32; 4]; MAX_RAY_LIGHTS];
+        for (i, light) in positions.iter_mut().enumerate() {
+            *light = [
+                (i as f32 * 17.0).sin() * 90.0,
+                (i as f32 * 7.0).cos() * 35.0,
+                (i as f32 * 13.0).sin() * 75.0,
+                0.2 + (i % 17) as f32 * 1.2,
+            ];
+        }
+        let (nodes, order) = build_point_light_bvh(&positions, MAX_RAY_LIGHTS);
+        let mut seed = 0x91e1_0da5u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32 * 2.0 - 1.0
+        };
+        let mut exercised = 0usize;
+        for _ in 0..256 {
+            let origin = glam::Vec3::new(next() * 45.0, next() * 24.0, next() * 45.0);
+            let direction = glam::Vec3::new(next(), next(), next()).normalize();
+            let max_t = 360.0f32;
+            let mut candidates = Vec::new();
+            let mut stack = vec![0usize];
+            while let Some(index) = stack.pop() {
+                let node = &nodes[index];
+                let mut entry = 0.8f32;
+                let mut exit = max_t;
+                let mut intersects = true;
+                for axis in 0..3 {
+                    let minimum = node.min[axis];
+                    let maximum = node.max[axis];
+                    let ray_origin = origin[axis];
+                    let ray_direction = direction[axis];
+                    if ray_direction.abs() < 1e-12 {
+                        if ray_origin < minimum || ray_origin > maximum {
+                            intersects = false;
+                            break;
+                        }
+                    } else {
+                        let inv = 1.0 / ray_direction;
+                        let t0 = (minimum - ray_origin) * inv;
+                        let t1 = (maximum - ray_origin) * inv;
+                        entry = entry.max(t0.min(t1));
+                        exit = exit.min(t0.max(t1));
+                        if entry > exit {
+                            intersects = false;
+                            break;
+                        }
+                    }
+                }
+                if !intersects {
+                    continue;
+                }
+                if node.min[3] >= 0.0 {
+                    let first = node.max[3] as usize;
+                    let count = node.min[3] as usize;
+                    candidates.extend_from_slice(&order[first..first + count]);
+                } else {
+                    stack.push(node.max[3] as usize);
+                    stack.push(index + 1);
+                }
+            }
+            candidates.sort_unstable();
+            for (index, light) in positions.iter().enumerate() {
+                if light[3] <= 0.1 {
+                    continue;
+                }
+                let to_light = glam::Vec3::new(light[0], light[1], light[2]) - origin;
+                let t_proj = to_light.dot(direction);
+                if t_proj <= 0.8 || t_proj >= max_t {
+                    continue;
+                }
+                let d2 = (to_light.length_squared() - t_proj * t_proj).max(0.0);
+                let core = (light[3] * 0.11).clamp(0.5, 3.2);
+                if d2 < core * core * 6.0 {
+                    exercised += 1;
+                    assert!(
+                        candidates.binary_search(&(index as u32)).is_ok(),
+                        "reflection BVH pruned glow candidate {index}"
+                    );
+                }
+            }
+        }
+        assert!(exercised > 0, "the test rays must exercise reflection glow candidates");
+    }
+
+    #[test]
     fn point_light_pack_culls_only_lights_outside_the_far_influence_sphere() {
         let lighting = super::super::frame::LightingRecord::default();
         let params = super::super::frame::FrameParams {
