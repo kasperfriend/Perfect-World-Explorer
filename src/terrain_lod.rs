@@ -237,7 +237,10 @@ pub fn block_surface(level: u8, cases: [u8; 4]) -> BlockSurface {
     let mut b = SurfaceBuilder {
         s,
         grid: Vec::with_capacity((u + 1) * (u + 1)),
-        index_of: Default::default(),
+        // The surface's integer grid is dense and bounded (at most 33x33).
+        // A direct index table avoids allocating and hashing a HashMap for
+        // every block/LOD combination generated during terrain rebuilds.
+        index_of: vec![u32::MAX; (u + 1) * (u + 1)],
         indices: Vec::with_capacity(u * u * 6),
     };
     // Interior: `q x q` cells at `step`, spanning 1 ..= u-1 in step units.
@@ -318,19 +321,22 @@ pub fn block_surface(level: u8, cases: [u8; 4]) -> BlockSurface {
 struct SurfaceBuilder {
     s: usize,
     grid: Vec<[u32; 2]>,
-    index_of: std::collections::HashMap<(usize, usize), u32>,
+    index_of: Vec<u32>,
     indices: Vec<u32>,
 }
 
 impl SurfaceBuilder {
     /// Vertex for the block-step coordinate `(i, j)`.
     fn v(&mut self, i: usize, j: usize) -> u32 {
-        if let Some(&index) = self.index_of.get(&(i, j)) {
-            return index;
+        let width = CELLS / self.s + 1;
+        let slot = j * width + i;
+        let existing = self.index_of[slot];
+        if existing != u32::MAX {
+            return existing;
         }
         let index = self.grid.len() as u32;
         self.grid.push([(i * self.s) as u32, (j * self.s) as u32]);
-        self.index_of.insert((i, j), index);
+        self.index_of[slot] = index;
         index
     }
     fn tri(&mut self, a: u32, b: u32, c: u32) {
