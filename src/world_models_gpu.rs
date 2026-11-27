@@ -347,7 +347,7 @@ impl World {
         })
     }
     /// Replace Architect's transient project layer without disturbing native map
-    /// instances. Asset geometry is cached by normalized ECM path; edits only
+    /// instances. Asset geometry is cached by normalized ECM/SMD path; edits only
     /// update placement transforms and invalidate only the affected poses.
     pub fn sync_editor_placements(&mut self, placements: &[EditorPlacement]) {
         if self.editor_placements == placements {
@@ -370,7 +370,7 @@ impl World {
                 .enumerate()
                 .map(|(index, placement)| {
                     let path = crate::ecmodel::normalize(&placement.path);
-                    if !path.ends_with(".ecm")
+                    if (!path.ends_with(".ecm") && !path.ends_with(".smd"))
                         || self.assets.instances[self.native_instance_count + index]
                             .placement
                             .path
