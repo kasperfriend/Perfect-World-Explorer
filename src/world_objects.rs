@@ -48,6 +48,10 @@ fn page_vertex_limit() -> usize {
 pub struct PlacementRange {
     pub start: u32,
     pub end: u32,
+    /// Contiguous transformed vertex block for this mesh. Bounds can be
+    /// computed without rescanning its index list.
+    pub vertex_start: u32,
+    pub vertex_end: u32,
     pub export_id: u32,
     /// Original model/mesh encounter order, independent of storage chunking.
     pub order: u64,
@@ -771,33 +775,35 @@ impl Page {
         for placement in &self.placements {
             let mut min = [f32::INFINITY; 3];
             let mut max = [f32::NEG_INFINITY; 3];
-            let mut has_sdr = false;
-            let start = (placement.start as usize).min(self.indices.len());
-            let end = (placement.end as usize).min(self.indices.len());
-            if start < end {
-                // Every placement is emitted as one contiguous vertex block.
-                // Its index range can therefore provide a conservative vertex
-                // interval: scan positions linearly once for bounds instead of
-                // performing three min/max updates and a random vertex lookup
-                // for every triangle index (typically ~3x the vertex count).
-                let mut first_vertex = usize::MAX;
-                let mut last_vertex = 0usize;
-                for &index in &self.indices[start..end] {
-                    let index = index as usize;
-                    if index < self.vertices.len() {
-                        first_vertex = first_vertex.min(index);
-                        last_vertex = last_vertex.max(index);
-                        let kind = self.vertices[index].kind;
-                        has_sdr |= (kind > 2.01 && kind < 2.03) || (kind > 2.11 && kind < 2.13);
+            let vertex_start = placement.vertex_start as usize;
+            let vertex_end = placement.vertex_end as usize;
+            if vertex_start < vertex_end && vertex_end <= self.vertices.len() {
+                let vertices = &self.vertices[vertex_start..vertex_end];
+                // The builder appends each mesh's transformed vertices as one
+                // contiguous block and assigns one material kind to that mesh.
+                // Use that known range directly: no second walk over triangle
+                // indices is needed to rediscover the same vertex interval.
+                for vertex in vertices {
+                    for axis in 0..3 {
+                        min[axis] = min[axis].min(vertex.pos[axis]);
+                        max[axis] = max[axis].max(vertex.pos[axis]);
                     }
                 }
-                if first_vertex != usize::MAX {
-                    for vertex in &self.vertices[first_vertex..=last_vertex] {
-                        for axis in 0..3 {
-                            min[axis] = min[axis].min(vertex.pos[axis]);
-                            max[axis] = max[axis].max(vertex.pos[axis]);
-                        }
-                    }
+                let kind = vertices[0].kind;
+                let has_sdr = (kind > 2.01 && kind < 2.03) || (kind > 2.11 && kind < 2.13);
+                self.page_has_sdr |= has_sdr;
+                self.bounds.push(PlacementBounds { min, max, has_sdr });
+            } else {
+                self.bounds.push(PlacementBounds {
+                    min,
+                    max,
+                    has_sdr: false,
+                });
+            }
+            if min[0] <= max[0] {
+                for axis in 0..3 {
+                    self.page_min[axis] = self.page_min[axis].min(min[axis]);
+                    self.page_max[axis] = self.page_max[axis].max(max[axis]);
                 }
             }
             if min[0] <= max[0] {
@@ -806,8 +812,6 @@ impl Page {
                     self.page_max[axis] = self.page_max[axis].max(max[axis]);
                 }
             }
-            self.page_has_sdr |= has_sdr;
-            self.bounds.push(PlacementBounds { min, max, has_sdr });
         }
         if self.shared_atlas.is_some() {
             assert!(self.atlas.is_empty() && self.mips.is_empty());
@@ -1613,6 +1617,8 @@ fn run(
                     page.placements.push(PlacementRange {
                         start: range_start,
                         end: range_end,
+                        vertex_start: base,
+                        vertex_end: base + vertex_count as u32,
                         export_id: objects.ornaments[id].export_id,
                         order: ((id as u64) << 32) | mesh_index as u64,
                         visibility,
@@ -3186,6 +3192,8 @@ mod page_tests {
         PlacementRange {
             start,
             end,
+            vertex_start: 0,
+            vertex_end: 0,
             export_id: 0,
             order,
             visibility: Visibility { reflect, refract },
