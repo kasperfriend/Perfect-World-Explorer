@@ -3126,8 +3126,13 @@ impl Architect {
             match self.transform_mode {
                 TransformMode::Move => {
                     if !self.object_drag_group.is_empty() {
-                        if let (Some(start), Some(current)) = (self.object_drag_start_hit, hit) {
-                            let delta = Vec3::from_array(current.to_array()) - Vec3::from_array(start);
+                        let delta = match self.object_drag_axis {
+                            Some(0) => self.object_drag_start_hit.zip(hit).map(|(start, current)| Vec3::X * (current[0] - start[0])),
+                            Some(1) => self.object_drag_start_pointer.zip(pointer).map(|(start, current)| Vec3::Y * (-(current.y - start.y) * 0.1)),
+                            Some(2) => self.object_drag_start_hit.zip(hit).map(|(start, current)| Vec3::Z * (current[2] - start[2])),
+                            _ => self.object_drag_start_hit.zip(hit).map(|(start, current)| Vec3::from_array(current) - Vec3::from_array(start)),
+                        };
+                        if let Some(delta) = delta {
                             for (index, position) in &self.object_drag_group {
                                 if let Some(object) = self.project.objects.get_mut(*index) {
                                     object.position = (Vec3::from_array(*position) + delta).to_array();
