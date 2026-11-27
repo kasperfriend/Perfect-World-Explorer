@@ -1487,6 +1487,8 @@ fn build(
                 page.placements.push(crate::world_objects::PlacementRange {
                     start: range_start,
                     end: range_end,
+                    vertex_start: base,
+                    vertex_end: base + mesh.vertices.len() as u32,
                     export_id: t.objects.ornaments[id].export_id,
                     order: 0,
                     visibility,
