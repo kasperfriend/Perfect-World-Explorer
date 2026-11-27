@@ -2759,6 +2759,34 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_viewport_gesture_discards_marquee_and_transform_state() {
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element/element.data"),
+            None,
+            "a01".into(),
+        );
+        editor.marquee_start = Some(egui::pos2(10.0, 20.0));
+        editor.marquee_current = Some(egui::pos2(80.0, 90.0));
+        editor.object_dragging = true;
+        editor.object_drag_axis = Some(1);
+        editor.object_drag_start_pointer = Some(egui::pos2(40.0, 50.0));
+        editor.object_drag_start_hit = Some([1.0, 2.0, 3.0]);
+        editor.object_drag_group.push((0, [1.0, 2.0, 3.0]));
+        editor.object_drag_snapshot = Some(Vec::new());
+
+        editor.cancel_object_drag();
+
+        assert!(!editor.object_dragging);
+        assert_eq!(editor.object_drag_axis, None);
+        assert_eq!(editor.object_drag_start_pointer, None);
+        assert_eq!(editor.object_drag_start_hit, None);
+        assert!(editor.object_drag_group.is_empty());
+        assert!(editor.object_drag_snapshot.is_none());
+        assert_eq!(editor.marquee_start, None);
+        assert_eq!(editor.marquee_current, None);
+    }
+
+    #[test]
     fn object_undo_redo_restores_complete_placement_snapshots() {
         let mut editor = Architect::new(
             PathBuf::from("/client/element/element.data"),
