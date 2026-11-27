@@ -1076,7 +1076,10 @@ impl World {
         // defer expensive skinning/mesh generation for off-frustum models while
         // still advancing their playback clocks.
         let defer_offscreen_poses = self.pose_culling
-            && !self.producers.iter().any(|producer| producer.hook.is_some());
+            && !self
+                .producers
+                .iter()
+                .any(|producer| producer.hook.is_some());
         let len = self.slots.len();
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
