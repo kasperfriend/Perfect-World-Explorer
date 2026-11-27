@@ -1459,39 +1459,40 @@ fn run(
                         return Ok(());
                     }
                 }
-                let (page, slot, is_shared_builder) = if let Some(shared) = shared_slots.get(&key).copied() {
-                    let target = shared_geometry
-                        .entry(shared.source)
-                        .or_insert_with(|| Builder::shared(shared.source, shared.height));
-                    if target.vertices.len() + mesh.vertices.len() > max_vertices
-                        && !target.indices.is_empty()
-                    {
-                        let ready = std::mem::replace(
-                            target,
-                            Builder::shared(shared.source, shared.height),
-                        );
-                        shared_geometry_vertices =
-                            shared_geometry_vertices.saturating_sub(ready.vertices.len());
-                        shared_geometry_full.remove(&shared.source);
-                        pages += 1;
-                        if !finisher.submit(ready, id) {
-                            return Ok(());
+                let (page, slot, is_shared_builder) =
+                    if let Some(shared) = shared_slots.get(&key).copied() {
+                        let target = shared_geometry
+                            .entry(shared.source)
+                            .or_insert_with(|| Builder::shared(shared.source, shared.height));
+                        if target.vertices.len() + mesh.vertices.len() > max_vertices
+                            && !target.indices.is_empty()
+                        {
+                            let ready = std::mem::replace(
+                                target,
+                                Builder::shared(shared.source, shared.height),
+                            );
+                            shared_geometry_vertices =
+                                shared_geometry_vertices.saturating_sub(ready.vertices.len());
+                            shared_geometry_full.remove(&shared.source);
+                            pages += 1;
+                            if !finisher.submit(ready, id) {
+                                return Ok(());
+                            }
                         }
-                    }
-                    (target, shared.slot, Some(shared.source))
-                } else {
-                    let (slot, turned) = allocate_slot(&mut page, key, tex)?;
-                    if let Some(finished) = turned {
-                        atlas_pages += 1;
-                        atlas_bytes += atlas_mip_bytes(finished.used_height);
-                        remember_atlas(&finished, pages, &mut shared_slots);
-                        pages += 1;
-                        if !finisher.submit(finished, id) {
-                            return Ok(());
+                        (target, shared.slot, Some(shared.source))
+                    } else {
+                        let (slot, turned) = allocate_slot(&mut page, key, tex)?;
+                        if let Some(finished) = turned {
+                            atlas_pages += 1;
+                            atlas_bytes += atlas_mip_bytes(finished.used_height);
+                            remember_atlas(&finished, pages, &mut shared_slots);
+                            pages += 1;
+                            if !finisher.submit(finished, id) {
+                                return Ok(());
+                            }
                         }
-                    }
-                    (&mut page, slot, None)
-                };
+                        (&mut page, slot, None)
+                    };
                 let base = page.vertices.len() as u32;
                 let range_start = page.indices.len() as u32;
                 let ox = slot.x as f32 / SIDE as f32;
