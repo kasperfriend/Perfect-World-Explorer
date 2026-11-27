@@ -1343,12 +1343,15 @@ impl Architect {
                 self.selected_scene_transform.unwrap_or([0.; 3]),
             ));
         }
+
+        let before = self.project.objects.clone();
+        let mut created = Vec::new();
         for (_, asset, position) in items {
             if Self::renderer_asset_path(&asset).is_none() {
-                self.status = "One or more selected items are not supported game models (ECM or static SMD); those items cannot be copied into the editable layer.".into();
                 continue;
             }
             let portable_asset = self.portable_asset_path(&asset);
+            let index = self.project.objects.len();
             self.project.objects.push(PlacedObject {
                 name: Path::new(&portable_asset)
                     .file_stem()
@@ -1362,11 +1365,22 @@ impl Architect {
                 rotation: [0.; 3],
                 scale: 1.,
             });
+            created.push(index);
         }
-        self.selected_placement = Some(self.project.objects.len() - 1);
+        if created.is_empty() {
+            self.status = "The selected client scene items are not supported for editing yet. Only ECM and static SMD models can be copied into the project layer.".into();
+            return;
+        }
+
+        self.object_history_action = true;
+        self.push_object_undo(before);
+        self.selected_placements = created.iter().copied().collect();
+        self.selected_placement = created.last().copied();
+        self.selected_scene_object = None;
+        self.selected_scene_transform = None;
         self.status = format!(
-            "Copied {} selected client scene item(s) into the editable project layer.",
-            self.multi_selection.len().max(1)
+            "Copied {} supported client scene item(s) into the editable project layer.",
+            created.len()
         );
     }
 
@@ -3879,6 +3893,38 @@ mod tests {
         editor.undo_objects();
         assert_eq!(editor.project.objects.len(), 1);
         assert_eq!(editor.project.objects[0].position, [10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn duplicating_source_scene_items_selects_all_copies_and_is_undoable() {
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element/element.data"),
+            None,
+            "a01".into(),
+        );
+        editor.enabled = true;
+        editor.project.source_map = "a01".into();
+        editor.multi_scene_items.insert(
+            3,
+            ("element/models.pck::models/buildings/gate.ecm".into(), [1., 2., 3.]),
+        );
+        editor.multi_scene_items.insert(
+            8,
+            ("element/models.pck::models/buildings/tower.ecm".into(), [4., 5., 6.]),
+        );
+
+        editor.duplicate_selected_scene_item();
+
+        assert_eq!(editor.project.objects.len(), 2);
+        assert_eq!(editor.selected_placements, HashSet::from([0, 1]));
+        assert_eq!(editor.selected_placement, Some(1));
+        assert_eq!(editor.project.objects[0].position, [1., 2., 3.]);
+        assert_eq!(editor.project.objects[1].position, [4., 5., 6.]);
+
+        editor.undo_objects();
+        assert!(editor.project.objects.is_empty());
+        assert!(editor.selected_placements.is_empty());
+        assert_eq!(editor.selected_placement, None);
     }
 
     #[test]
