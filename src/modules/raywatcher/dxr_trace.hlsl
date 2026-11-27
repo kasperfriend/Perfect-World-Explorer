@@ -479,7 +479,7 @@ bool occluded_point_light(float3 origin, float3 dir, float t_min, float t_max, f
             if (k > 1.5 && k < 2.5) {
                 float next_t = q.CommittedRayT() + 0.85;
                 if (next_t < t_max) {
-                    return occluded_fast(origin, dir, next_t, t_max);
+                    return occluded_fast(origin, dir, next_t, t_max, opaque_offset, tri_count);
                 }
                 return false;
             }
