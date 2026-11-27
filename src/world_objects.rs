@@ -1764,8 +1764,7 @@ fn stage_page_atlas_mips(
             for row in 0..*height {
                 let src = row * *row_bytes;
                 let dst = *offset + row * *padded_row_bytes;
-                mapped[dst..dst + *row_bytes]
-                    .copy_from_slice(&source[src..src + *row_bytes]);
+                mapped[dst..dst + *row_bytes].copy_from_slice(&source[src..src + *row_bytes]);
             }
         }
     }
