@@ -321,7 +321,11 @@ impl World {
         // lightweight placement matrices and scene records: rebuilding slots
         // here would discard draw objects and reinitialize animation playback
         // on every mouse movement, even though the model geometry did not move.
-        let editor_instances = self.assets.instances.len().saturating_sub(self.native_instance_count);
+        let editor_instances = self
+            .assets
+            .instances
+            .len()
+            .saturating_sub(self.native_instance_count);
         let editor_slots = self.slots.len().saturating_sub(self.native_instance_count);
         if placements.len() == editor_instances && placements.len() == editor_slots {
             let updates = placements
@@ -337,11 +341,7 @@ impl World {
                     {
                         return None;
                     }
-                    editor_scene_transform(
-                        placement,
-                        u32::try_from(index).unwrap_or(u32::MAX),
-                    )
-                    .ok()
+                    editor_scene_transform(placement, u32::try_from(index).unwrap_or(u32::MAX)).ok()
                 })
                 .collect::<Option<Vec<_>>>();
             if let Some(updates) = updates {
