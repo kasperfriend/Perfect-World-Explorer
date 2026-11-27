@@ -1518,22 +1518,74 @@ fn run(
                 let oy = slot.y as f32 / SIDE as f32;
                 let sx = slot.w as f32 / SIDE as f32;
                 let sy = slot.h as f32 / SIDE as f32;
-                for v in &mesh.vertices {
-                    let pos = origin
-                        + scaled_x * v.position[0]
-                        + scaled_y * v.position[1]
-                        + scaled_z * v.position[2];
-                    let normal =
-                        (x * v.normal[0] + y * v.normal[1] + z * v.normal[2]).normalize_or_zero();
-                    page.vertices.push(Vertex {
-                        pos: pos.to_array(),
-                        normal: normal.to_array(),
-                        uv: [ox + v.uv[0] * sx, oy + v.uv[1] * sy],
-                        color: [ox, oy, sx, sy],
-                        kind,
-                        diffuse: v.day_diffuse,
-                        night_diffuse: v.night_diffuse,
+                // Large meshes are embarrassingly parallel: each output vertex
+                // depends only on its source vertex and this placement transform.
+                // Reserve the final page range once, then let scoped workers fill
+                // disjoint slices. Chunk order is fixed, so the resulting vertex
+                // and index buffers remain byte-for-byte ordered as before.
+                let vertex_count = mesh.vertices.len();
+                let vertex_start = page.vertices.len();
+                page.vertices
+                    .resize(vertex_start + vertex_count, Vertex::zeroed());
+                let workers = if vertex_count >= 32_768 {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
+                        .min(4)
+                        .min(vertex_count.div_ceil(8_192))
+                } else {
+                    1
+                };
+                if workers > 1 {
+                    let chunk_size = vertex_count.div_ceil(workers);
+                    std::thread::scope(|scope| {
+                        for (chunk_index, dst) in page.vertices[vertex_start..]
+                            .chunks_mut(chunk_size)
+                            .enumerate()
+                        {
+                            let start = chunk_index * chunk_size;
+                            let src = &mesh.vertices[start..start + dst.len()];
+                            scope.spawn(move || {
+                                for (v, out) in src.iter().zip(dst.iter_mut()) {
+                                    let pos = origin
+                                        + scaled_x * v.position[0]
+                                        + scaled_y * v.position[1]
+                                        + scaled_z * v.position[2];
+                                    let normal = (x * v.normal[0]
+                                        + y * v.normal[1]
+                                        + z * v.normal[2])
+                                        .normalize_or_zero();
+                                    *out = Vertex {
+                                        pos: pos.to_array(),
+                                        normal: normal.to_array(),
+                                        uv: [ox + v.uv[0] * sx, oy + v.uv[1] * sy],
+                                        color: [ox, oy, sx, sy],
+                                        kind,
+                                        diffuse: v.day_diffuse,
+                                        night_diffuse: v.night_diffuse,
+                                    };
+                                }
+                            });
+                        }
                     });
+                } else {
+                    for (v, out) in mesh.vertices.iter().zip(&mut page.vertices[vertex_start..]) {
+                        let pos = origin
+                            + scaled_x * v.position[0]
+                            + scaled_y * v.position[1]
+                            + scaled_z * v.position[2];
+                        let normal =
+                            (x * v.normal[0] + y * v.normal[1] + z * v.normal[2]).normalize_or_zero();
+                        *out = Vertex {
+                            pos: pos.to_array(),
+                            normal: normal.to_array(),
+                            uv: [ox + v.uv[0] * sx, oy + v.uv[1] * sy],
+                            color: [ox, oy, sx, sy],
+                            kind,
+                            diffuse: v.day_diffuse,
+                            night_diffuse: v.night_diffuse,
+                        };
+                    }
                 }
                 if let Some(source) = is_shared_builder {
                     shared_geometry_vertices =
