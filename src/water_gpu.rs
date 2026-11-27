@@ -880,7 +880,7 @@ impl WaterGpu {
     /// alpha after the clipped scene, preserving color and scene depth.
     pub fn render_edge(
         &self,
-        device: &wgpu::Device,
+        e: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
         matrix: glam::Mat4,
         plane: f32,
@@ -895,7 +895,6 @@ impl WaterGpu {
             params: [plane, 1. / 0.66, 0., 0.],
         };
         queue.write_buffer(&self.edge_uniform, 0, bytemuck::bytes_of(&params));
-        let mut e = device.create_command_encoder(&Default::default());
         let target = self.refraction();
         {
             let mut pass = e.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -931,7 +930,6 @@ impl WaterGpu {
             pass.set_index_buffer(near.1.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..near.2, 0, 0..1);
         }
-        queue.submit(Some(e.finish()));
     }
     pub fn draw_water(
         &self,
