@@ -569,7 +569,7 @@ impl Reader {
                 + index_count * 4
                 + atlas_len
                 + mip_bytes
-                + placement_count * 22
+                + placement_count * 30
                 + bounds_count * 25
                 + 32;
             let mut slab = vec![0u8; 105 + body_len];
