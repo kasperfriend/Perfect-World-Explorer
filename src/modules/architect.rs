@@ -1434,9 +1434,7 @@ impl Architect {
                 (
                     command && input.key_pressed(egui::Key::Z) && !input.modifiers.shift,
                     (command && input.key_pressed(egui::Key::Y))
-                        || (command
-                            && input.modifiers.shift
-                            && input.key_pressed(egui::Key::Z)),
+                        || (command && input.modifiers.shift && input.key_pressed(egui::Key::Z)),
                 )
             });
             if undo {
