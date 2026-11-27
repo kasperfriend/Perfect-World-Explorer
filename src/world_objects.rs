@@ -2047,8 +2047,14 @@ impl GpuPage {
         }
         if !index_data.is_empty() {
             let size = std::num::NonZeroU64::new(index_bytes).expect("non-empty index upload");
-            belt.write_buffer(encoder, &geometry, vertex_offset + index_offset, size, device)
-                .copy_from_slice(index_data);
+            belt.write_buffer(
+                encoder,
+                &geometry,
+                vertex_offset + index_offset,
+                size,
+                device,
+            )
+            .copy_from_slice(index_data);
         }
         Self {
             geometry,
