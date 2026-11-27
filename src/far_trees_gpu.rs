@@ -2402,6 +2402,47 @@ mod raywatcher_tree_tests {
     }
 
     #[test]
+    fn tree_harvest_counts_fallback_lods_before_skipping_nearest_sort() {
+        let tri = RtTreeTriangle {
+            a: glam::Vec3::ZERO,
+            b: glam::Vec3::X,
+            c: glam::Vec3::Y,
+            normal: glam::Vec3::Z,
+            albedo: [0.2, 0.3, 0.1],
+            roughness: 0.8,
+            opacity: 1.0,
+            alpha_mask: 0,
+            leaf_center: glam::Vec3::ZERO,
+            leaf_rho: -1.0,
+        };
+        let species = RtTreeSpecies {
+            species_id: 5,
+            height: 8.0,
+            composite_size: (64, 64),
+            composite_alpha_min: 0,
+            composite_alpha_max: 255,
+            positions: vec![[20.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
+            // The selected near LOD is empty, so the first usable fallback
+            // must be included in the total used to decide whether sorting is safe.
+            lods: vec![Vec::new(), vec![tri]],
+            lod_diags: vec![RtTreeLodDiag::default(); 2],
+        };
+        let mut out = Vec::new();
+        let result = harvest_rt_tree_species(
+            &[species],
+            glam::Vec3::ZERO,
+            glam::Vec3::X,
+            100.0,
+            1.0,
+            1,
+            &mut out,
+        );
+        assert_eq!(result, (1, 1, 1));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].a.x, 5.0, "fallback geometry still prioritizes nearest tree");
+    }
+
+    #[test]
     fn raster_lod_selection_uses_species_height_scale_and_transition_windows() {
         assert_eq!(raster_lod_index(49.0, 10.0, 1.0, 3), 0);
         assert_eq!(raster_lod_index(54.0, 10.0, 1.0, 3), 0);
