@@ -4446,6 +4446,34 @@ mod tests {
     }
 
     #[test]
+    fn renderer_tree_placements_export_tree_type_yaw_and_scale() {
+        let mut editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
+        editor.enabled = true;
+        editor.project.source_map = "a01".into();
+        editor.tree_types = vec![crate::scene::TreeType {
+            tree: "trees/pine.spt".into(),
+            composite: "trees/pine.dds".into(),
+        }];
+        editor.project.objects.push(PlacedObject {
+            name: "Pine".into(),
+            asset: "element/trees.pck::trees/pine.spt".into(),
+            group: "Default".into(),
+            visible: true,
+            locked: false,
+            position: [10.0, 20.0, 30.0],
+            rotation: [0.0, 1.25, 0.0],
+            scale: 1.75,
+        });
+
+        let placements = editor.renderer_tree_placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].tree_type, 0);
+        assert_eq!(placements[0].position, [10.0, 20.0, 30.0]);
+        assert!((placements[0].yaw - 1.25).abs() < 0.0001);
+        assert!((placements[0].scale - 1.75).abs() < 0.0001);
+    }
+
+    #[test]
     fn renderer_scenery_placements_emit_map_scoped_bmd_instances() {
         let mut editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
         editor.enabled = true;
