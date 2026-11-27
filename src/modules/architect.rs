@@ -234,6 +234,10 @@ impl Architect {
         self.enabled = enabled;
         if enabled {
             self.status = "Architect enabled. The original world remains unchanged.".into();
+        } else {
+            self.cancel_object_drag();
+            self.brush_dragging = false;
+            self.last_brush_position = None;
         }
     }
 
@@ -834,6 +838,7 @@ impl Architect {
                 } else {
                     None
                 };
+                self.cancel_object_drag();
                 self.project = project;
                 self.redo_strokes.clear();
                 self.undo_objects.clear();
@@ -879,6 +884,7 @@ impl Architect {
                         None
                     }
                 });
+                self.cancel_object_drag();
                 self.project = Project::default();
                 self.redo_strokes.clear();
                 self.undo_objects.clear();
@@ -1495,8 +1501,7 @@ impl Architect {
                     self.redo_strokes.clear();
                     self.undo_objects.clear();
                     self.redo_objects.clear();
-                    self.object_drag_snapshot = None;
-                    self.object_dragging = false;
+                    self.cancel_object_drag();
                     self.brush_dragging = false;
                     self.last_brush_position = None;
                     self.project_name = "Untitled World".into();
@@ -1548,6 +1553,7 @@ impl Architect {
                     ui.colored_label(egui::Color32::LIGHT_RED, "Clear every unsaved placement and terrain operation in this project?");
                     ui.horizontal(|ui| {
                         if ui.button("Confirm clear").clicked() {
+                            self.cancel_object_drag();
                             self.project.objects.clear();
                             self.project.strokes.clear();
                             self.selected_placement = None;
@@ -2671,12 +2677,14 @@ mod tests {
         editor.selected_placements.insert(0);
         editor.object_dragging = true;
         editor.object_drag_group.push((0, original.position));
+        editor.object_drag_snapshot = Some(vec![original.clone()]);
         editor.undo_objects();
         assert_eq!(editor.project.objects[0].position, original.position);
         assert_eq!(editor.selected_placement, None);
         assert!(editor.selected_placements.is_empty());
         assert!(!editor.object_dragging);
         assert!(editor.object_drag_group.is_empty());
+        assert!(editor.object_drag_snapshot.is_none());
 
         editor.selected_placement = Some(0);
         editor.selected_placements.insert(0);
