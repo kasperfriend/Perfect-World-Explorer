@@ -384,8 +384,11 @@ impl Harvester {
     }
 
     /// Whether the frustum ray scene needs to be rebuilt based on hysteresis
-    /// (`>= max(256, 0.25 * view_distance)` horizontal camera travel) or world
-    /// content/config changes.
+    /// (>= max(256, 0.25 * view_distance) horizontal camera travel) or
+    /// world content/config changes. Camera rotation alone deliberately does
+    /// not invalidate cached RT tree geometry: SpeedTree leaf cards are
+    /// view-oriented sprites, and rebuilding them while turning makes their
+    /// shadows visibly rotate across the ground.
     pub fn needs_frustum_rebuild(
         &self,
         config: HarvestConfig,
@@ -394,67 +397,15 @@ impl Harvester {
         terrain_generation: u64,
         content_hash: u64,
     ) -> bool {
-        self.needs_frustum_rebuild_impl(
-            config,
-            eye,
-            view_distance,
-            terrain_generation,
-            content_hash,
-            None,
-        )
-    }
-
-    /// Camera-facing SpeedTree leaves are part of the RT geometry, so a
-    /// meaningful view-sector change must rebuild them even when the eye stays
-    /// still. The view key is deliberately quantised to avoid rebuilding for
-    /// sub-degree mouse motion.
-    pub fn needs_frustum_rebuild_for_view(
-        &self,
-        config: HarvestConfig,
-        eye: Vec3,
-        view_forward: Vec3,
-        view_distance: f32,
-        terrain_generation: u64,
-        content_hash: u64,
-    ) -> bool {
-        self.needs_frustum_rebuild_impl(
-            config,
-            eye,
-            view_distance,
-            terrain_generation,
-            content_hash,
-            Some(frustum_view_key(view_forward, view_distance)),
-        )
-    }
-
-    fn needs_frustum_rebuild_impl(
-        &self,
-        config: HarvestConfig,
-        eye: Vec3,
-        view_distance: f32,
-        terrain_generation: u64,
-        content_hash: u64,
-        expected_view_key: Option<u64>,
-    ) -> bool {
         if self.cached.is_none() {
             return true;
         }
         let far_bucket = (view_distance / 128.0).round() as u32;
-        // World/config changes are correctness invalidations, not camera-motion
-        // churn. Never hide newly streamed pages or terrain behind the movement
-        // cooldown; only apply hysteresis after the content keys match.
         if self.last_build_config != Some(config)
             || self.last_build_terrain_gen != terrain_generation
             || self.last_build_content_hash != content_hash
             || self.last_build_far_bucket != far_bucket
         {
-            return true;
-        }
-        if expected_view_key.is_some_and(|key| {
-            self.cached
-                .as_ref()
-                .is_some_and(|(signature, _)| signature.frustum_key != key)
-        }) {
             return true;
         }
         if let Some(t) = self.last_build_finished {
@@ -471,25 +422,19 @@ impl Harvester {
         }
     }
 
-    /// Fast-path cache check for [`Self::scene_frustum`].
+    /// Fast-path cache check for scene_frustum. view_forward is intentionally
+    /// ignored so rotating the camera leaves RT foliage shadows stable.
     #[allow(clippy::too_many_arguments)]
     pub fn cached_if_unchanged_frustum(
         &self,
         config: HarvestConfig,
         eye: Vec3,
-        view_forward: Vec3,
+        _view_forward: Vec3,
         view_distance: f32,
         terrain_generation: u64,
         content_hash: u64,
     ) -> Option<std::sync::Arc<SceneGeometry>> {
-        if self.needs_frustum_rebuild_for_view(
-            config,
-            eye,
-            view_forward,
-            view_distance,
-            terrain_generation,
-            content_hash,
-        ) {
+        if self.needs_frustum_rebuild(config, eye, view_distance, terrain_generation, content_hash) {
             None
         } else {
             self.cached.as_ref().map(|(_, scene)| scene.clone())
@@ -845,14 +790,7 @@ impl Harvester {
             terrain_generation,
             content_hash,
         );
-        if !self.needs_frustum_rebuild_for_view(
-            config,
-            eye,
-            view_forward,
-            view_distance,
-            terrain_generation,
-            content_hash,
-        ) {
+        if !self.needs_frustum_rebuild(config, eye, view_distance, terrain_generation, content_hash) {
             if let Some((_, scene)) = &self.cached {
                 return scene.clone();
             }
@@ -1238,36 +1176,20 @@ pub fn proxy_from_box(centre: Vec3, half: Vec3, matrix: &Mat4, albedo: [f32; 3])
     }
 }
 
-fn frustum_view_key(view_forward: Vec3, view_distance: f32) -> u64 {
-    let direction = view_forward.normalize_or_zero();
-    let yaw = direction.z.atan2(direction.x);
-    let pitch = direction.y.clamp(-1.0, 1.0).asin();
-    // 32 yaw sectors (11.25 degrees) and 16 pitch sectors (11.25 degrees).
-    // This tracks the camera-facing foliage transform without reacting to
-    // every tiny mouse delta.
-    let yaw_bin =
-        (((yaw + std::f32::consts::PI) / std::f32::consts::TAU * 32.0).floor() as u32).min(31);
-    let pitch_bin = (((pitch + std::f32::consts::FRAC_PI_2) / std::f32::consts::PI * 16.0).floor()
-        as u32)
-        .min(15);
-    let far_bucket = ((view_distance / 128.0).round() as u32) as u64;
-    (far_bucket & 0xffff) | ((yaw_bin as u64) << 16) | ((pitch_bin as u64) << 21) | (1u64 << 63)
-}
-
 fn frustum_signature(
     config: HarvestConfig,
     eye: Vec3,
-    view_forward: Vec3,
+    _view_forward: Vec3,
     view_distance: f32,
     terrain_generation: u64,
     content_hash: u64,
 ) -> Signature {
-    // Snap the spatial anchor, but retain a quantised view sector because the
-    // runtime SpeedTree billboard transform follows the raster camera. Distant
-    // geometry still covers the full 360-degree world around the camera.
+    // Camera rotation does not rebuild view-facing leaf cards: keep the RT
+    // approximation stable until position, distance or scene content changes.
     let snap = config.chunk_size.max(256.0);
     let anchor = ((eye.x / snap).round() as i32, (eye.z / snap).round() as i32);
-    let frustum_key = frustum_view_key(view_forward, view_distance);
+    let far_bucket = ((view_distance / 128.0).round() as u32) as u64;
+    let frustum_key = (far_bucket & 0xffff) | (1u64 << 63);
     Signature {
         config,
         anchor,
@@ -2304,7 +2226,7 @@ mod tests {
     }
 
     #[test]
-    fn camera_rotation_refreshes_camera_facing_tree_billboards_by_view_sector() {
+    fn rotating_camera_reuses_cached_tree_shadow_geometry() {
         let mut harvester = Harvester::new();
         let config = HarvestConfig::default();
         let eye = Vec3::new(10.0, 20.0, 10.0);
@@ -2325,19 +2247,13 @@ mod tests {
             &[],
             &[],
         );
-        // A small mouse delta inside the same 11.25-degree view sector is a
-        // cache hit, but a 180-degree turn must refresh billboard geometry.
-        let nearby = Vec3::new(0.01, 0.0, -1.0).normalize();
+        // A 180-degree camera turn must keep the same cached RT geometry.
+        // Raster cards face the camera, but the RT shadow approximation is
+        // intentionally frozen until a real scene rebuild.
         let cached = harvester
-            .cached_if_unchanged_frustum(config, eye, nearby, 1000.0, 1, 42)
-            .expect("sub-sector camera motion must reuse the cached scene");
+            .cached_if_unchanged_frustum(config, eye, Vec3::Z, 1000.0, 1, 42)
+            .expect("camera rotation must not rebuild view-facing leaf geometry");
         assert!(std::sync::Arc::ptr_eq(&first, &cached));
-        assert!(
-            harvester
-                .cached_if_unchanged_frustum(config, eye, Vec3::Z, 1000.0, 1, 42)
-                .is_none(),
-            "a new view sector must rebuild camera-facing leaf geometry"
-        );
     }
 
     #[test]
