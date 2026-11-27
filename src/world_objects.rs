@@ -1404,6 +1404,13 @@ fn run(
             let z = basis(model.direction);
             let y = basis(model.up);
             let x = y.cross(z).normalize_or_zero();
+            // Placement transform is invariant across every mesh vertex. Hoist
+            // the translation conversion and scaled basis vectors out of the
+            // vertex loop instead of rebuilding/re-scaling them per vertex.
+            let origin = Vec3::from_array(model.position);
+            let scaled_x = x * model.scale[0];
+            let scaled_y = y * model.scale[1];
+            let scaled_z = z * model.scale[2];
             for (mesh_index, mesh) in model.meshes.iter().enumerate() {
                 // Stage, culling and alpha state come from the single recovered
                 // table, not from per-asset guesses.
@@ -1494,10 +1501,10 @@ fn run(
                         shared_geometry_vertices.saturating_add(mesh.vertices.len());
                 }
                 for v in &mesh.vertices {
-                    let pos = Vec3::from_array(model.position)
-                        + x * (v.position[0] * model.scale[0])
-                        + y * (v.position[1] * model.scale[1])
-                        + z * (v.position[2] * model.scale[2]);
+                    let pos = origin
+                        + scaled_x * v.position[0]
+                        + scaled_y * v.position[1]
+                        + scaled_z * v.position[2];
                     let normal =
                         (x * v.normal[0] + y * v.normal[1] + z * v.normal[2]).normalize_or_zero();
                     page.vertices.push(Vertex {
