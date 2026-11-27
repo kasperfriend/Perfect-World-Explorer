@@ -5671,7 +5671,9 @@ pub fn run(
         .name("world-streaming".into())
         .spawn(move || {
             let mut residency = crate::terrain_residency::Residency::default();
-            while let Ok((x, z, detail, grass_atlas_key, skip_local_scenery, editor_scenery)) = request_rx.recv() {
+            while let Ok((x, z, detail, grass_atlas_key, skip_local_scenery, editor_scenery)) =
+                request_rx.recv()
+            {
                 let started = Instant::now();
                 if t.objects.set_editor_ornaments(&editor_scenery) {
                     t.scenery_placements = None;
