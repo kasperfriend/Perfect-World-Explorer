@@ -373,7 +373,10 @@ impl DenoiseParams {
     ) -> Self {
         let history_valid = params.history_valid > 0 && prev_view_projection.is_some();
         let prev_vp = prev_view_projection.unwrap_or(unjittered_vp);
-        let unjittered_inv = unjittered_vp.inverse();
+        // The raster depth buffer was rendered with the current upscaler jitter.
+        // Reconstruct it with that exact inverse, then project into the previous
+        // frame's unjittered view-projection to remove jitter from history lookup.
+        let current_inv = params.inv_view_projection;
         Self {
             extent: [
                 extent.0 as f32,
@@ -402,8 +405,8 @@ impl DenoiseParams {
                 },
             ],
             frame: [params.jitter.0, params.jitter.1, params.frame as f32, 0.],
-            inv_view_projection: unjittered_inv.to_cols_array_2d(),
-            prev_view_projection: (prev_vp * unjittered_inv).to_cols_array_2d(),
+            inv_view_projection: current_inv.to_cols_array_2d(),
+            prev_view_projection: (prev_vp * current_inv).to_cols_array_2d(),
         }
     }
 }
