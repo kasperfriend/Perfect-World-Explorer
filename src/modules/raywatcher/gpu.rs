@@ -5076,6 +5076,7 @@ impl RaywatcherGpu {
                     &self.grid.gbuf_norm,
                     &self.grid.gbuf_raster,
                     &self.screen_raster_tex,
+                    plan.effects.reflections || plan.effects.global_illumination,
                     &self.sky_env_tex,
                     self.sky_env_dirty,
                     &self.terrain_map_tex,
