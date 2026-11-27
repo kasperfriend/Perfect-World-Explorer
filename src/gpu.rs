@@ -4138,10 +4138,9 @@ impl Renderer {
             let _ = std::fs::create_dir_all(&log_dir);
             let _ = std::fs::write(log_dir.join("raywatcher-diag.log"), report);
         }
-        if self.raywatcher_harvest.needs_frustum_rebuild_for_view(
+        if self.raywatcher_harvest.needs_frustum_rebuild(
             config,
             camera.pos,
-            view_forward,
             view_distance,
             0,
             content_hash,
