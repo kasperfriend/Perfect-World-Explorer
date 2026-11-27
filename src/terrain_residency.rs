@@ -313,34 +313,44 @@ impl Residency {
         vertices: &mut Vec<Vertex>,
         indices: &mut Vec<u32>,
     ) -> Vec<Span> {
-        // One exact allocation, not geometric growth of a second near mesh.
-        let mut collected = Vec::with_capacity(window.blocks().min(self.blocks.len()));
-        let (mut total_v, mut total_i) = (0, 0);
+        // Count first, then append directly in window order. Keeping a
+        // temporary Vec of (coordinate, &Block) used to allocate and retain a
+        // second list on every terrain-window rebuild even though the resident
+        // HashMap already provides all the data needed for both passes.
+        let (mut total_v, mut total_i, mut span_count) = (0, 0, 0);
         for y in window.y0..window.y1 {
             for x in window.x0..window.x1 {
                 if let Some(block) = self.blocks.get(&(x, y)) {
                     if !block.indices.is_empty() {
                         total_v += block.vertices.len();
                         total_i += block.indices.len();
-                        collected.push(((x, y), block));
+                        span_count += 1;
                     }
                 }
             }
         }
         vertices.reserve_exact(total_v);
         indices.reserve_exact(total_i);
-        let mut spans = Vec::with_capacity(collected.len());
-        for ((x, y), block) in collected {
-            let base = vertices.len() as u32;
-            let start = indices.len() as u32;
-            vertices.extend_from_slice(&block.vertices);
-            indices.extend(block.indices.iter().map(|i| base + *i));
-            spans.push(Span {
-                block: (x, y),
-                start,
-                count: block.indices.len() as u32,
-                bounds: block.bounds,
-            });
+        let mut spans = Vec::with_capacity(span_count);
+        for y in window.y0..window.y1 {
+            for x in window.x0..window.x1 {
+                let Some(block) = self.blocks.get(&(x, y)) else {
+                    continue;
+                };
+                if block.indices.is_empty() {
+                    continue;
+                }
+                let base = vertices.len() as u32;
+                let start = indices.len() as u32;
+                vertices.extend_from_slice(&block.vertices);
+                indices.extend(block.indices.iter().map(|i| base + *i));
+                spans.push(Span {
+                    block: (x, y),
+                    start,
+                    count: block.indices.len() as u32,
+                    bounds: block.bounds,
+                });
+            }
         }
 
         spans
