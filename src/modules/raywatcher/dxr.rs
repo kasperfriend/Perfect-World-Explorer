@@ -882,7 +882,7 @@ mod imp {
     // 3: t3 world position; 4: t4 normal; 5: t5 ray-grid raster colour
     // 6: t6 sky/cloud atlas; 7: t7 terrain albedo; 8: t8 full-resolution raster colour
     // 9..13: u0..u4 output planes; 14: u5 radiance cache; 15: u6 ReSTIR reservoirs
-    const RADIANCE_CACHE_CELLS: u32 = 65_536;
+    const RADIANCE_CACHE_CELLS: u32 = 1;
     const HEAP_SLOTS: u32 = 16;
 
     impl Drop for DxrTracer {
@@ -1011,7 +1011,6 @@ mod imp {
             };
             tracer.write_scene_descriptors();
             tracer.write_target_descriptors();
-            tracer.initialize_radiance_cache()?;
             eprintln!(
                 "[Raywatcher] DXR init profile: pipeline={}ms, scene+AS={}ms ({} triangles), targets/cache={}ms, total={}ms",
                 pipeline_ms,
@@ -1021,49 +1020,6 @@ mod imp {
                 startup_started.elapsed().as_millis(),
             );
             Ok(tracer)
-        }
-
-        /// Clear the DXR cache before its first query. DEFAULT-heap resources are
-        /// not implicitly zeroed; leaving this packed atomic array undefined lets
-        /// arbitrary VRAM bits masquerade as valid confidence and coloured GI.
-        fn initialize_radiance_cache(&mut self) -> Result<(), String> {
-            let size = self.radiance_cache.size;
-            let mut staging = unsafe {
-                RawBuffer::create(
-                    self.raw_device.as_mut_ptr(),
-                    size,
-                    d12::D3D12_HEAP_TYPE_UPLOAD,
-                    d12::D3D12_RESOURCE_FLAG_NONE,
-                    d12::D3D12_RESOURCE_STATE_GENERIC_READ,
-                )?
-            };
-            unsafe {
-                staging.map_persistent()?;
-                staging.write_upload(&vec![0u8; size as usize])?;
-                let slot_idx = self.ring.acquire("DXR-Radiance-Cache-Init")?;
-                let list = self.ring.slot_mut(slot_idx).list.as_mut_ptr();
-                (*list).CopyBufferRegion(
-                    self.radiance_cache.resource,
-                    0,
-                    staging.resource,
-                    0,
-                    size,
-                );
-                let mut barrier: d12::D3D12_RESOURCE_BARRIER = zeroed();
-                barrier.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                *barrier.u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
-                    pResource: self.radiance_cache.resource,
-                    Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    StateBefore: d12::D3D12_RESOURCE_STATE_COPY_DEST,
-                    StateAfter: d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                };
-                (*list).ResourceBarrier(1, &barrier);
-                self.ring
-                    .retire(slot_idx, &self.raw_queue, "DXR-Radiance-Cache-Init")?;
-                let fence = self.ring.current_fence();
-                self.retired_buffers.push((fence, vec![staging]));
-            }
-            Ok(())
         }
 
         unsafe fn create_pipeline(
