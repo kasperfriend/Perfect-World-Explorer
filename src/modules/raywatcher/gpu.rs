@@ -3023,33 +3023,6 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// The compose shader: writes the final render-extent colour and guide planes
 /// (resampling the ray-grid guides cleanly onto render-extent pixels).
-pub const COMPOSE_SHADER: &str = r#"
-@group(0) @binding(0) var colour: texture_2d<f32>;
-@group(0) @binding(1) var moments: texture_2d<f32>;
-@group(0) @binding(2) var guide: texture_2d<f32>;
-@group(0) @binding(3) var reflection: texture_2d<f32>;
-@group(0) @binding(4) var out_colour: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(5) var out_guide: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(6) var<uniform> extent: vec4<f32>;
-
-@compute @workgroup_size(8, 8, 1)
-fn compose_pass(@builtin(global_invocation_id) id: vec3<u32>) {
-    let size = vec2<i32>(i32(extent.x), i32(extent.y));
-    let pixel = vec2<i32>(i32(id.x), i32(id.y));
-    if (id.x >= u32(size.x) || id.y >= u32(size.y)) { return; }
-    let c = textureLoad(colour, pixel, 0);
-    let m = textureLoad(moments, pixel, 0);
-    let gdim = vec2<f32>(textureDimensions(guide));
-    let grid_scale = gdim / extent.xy;
-    let gcoord = vec2<i32>(clamp((vec2<f32>(pixel) + vec2<f32>(0.5)) * grid_scale, vec2<f32>(0.0), gdim - vec2<f32>(1.0)));
-    let g = textureLoad(guide, gcoord, 0);
-    let r = textureLoad(reflection, gcoord, 0);
-    textureStore(out_colour, pixel, c);
-    let variance = max(m.y - m.x * m.x, 0.0);
-    textureStore(out_guide, pixel, vec4<f32>(m.z, g.x, r.w, variance));
-}
-"#;
-
 const BLIT_SHADER: &str = r#"
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var src_samp: sampler;
@@ -3324,8 +3297,6 @@ struct Pipelines {
     screen_raster_copy_layout: wgpu::BindGroupLayout,
     screen_raster_copy: wgpu::ComputePipeline,
     denoise_layout: wgpu::BindGroupLayout,
-    compose: wgpu::ComputePipeline,
-    compose_layout: wgpu::BindGroupLayout,
     blit_module: wgpu::ShaderModule,
     blit_layout: wgpu::BindGroupLayout,
     blit_sampler: wgpu::Sampler,
@@ -3381,10 +3352,6 @@ impl Pipelines {
         let denoise_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raywatcher denoise"),
             source: wgpu::ShaderSource::Wgsl(DENOISE_SHADER.into()),
-        });
-        let compose_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("raywatcher compose"),
-            source: wgpu::ShaderSource::Wgsl(COMPOSE_SHADER.into()),
         });
         let screen_raster_copy_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raywatcher full-resolution raster copy"),
@@ -3544,39 +3511,6 @@ impl Pipelines {
             module: &trace_module,
             entry_point: "trace_pass",
         });
-        let compose_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("raywatcher compose"),
-            entries: &[
-                texture_entry(0, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(1, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(2, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(3, wgpu::TextureSampleType::Float { filterable: true }),
-                storage_texture_entry(4, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
-                storage_texture_entry(5, wgpu::StorageTextureAccess::WriteOnly, GUIDE_FORMAT),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let compose_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("raywatcher compose"),
-                bind_group_layouts: &[&compose_layout],
-                push_constant_ranges: &[],
-            });
-        let compose = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("raywatcher compose"),
-            layout: Some(&compose_pipeline_layout),
-            module: &compose_module,
-            entry_point: "compose_pass",
-        });
         let temporal = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("raywatcher temporal"),
             layout: Some(&denoise_pipeline),
@@ -3600,8 +3534,6 @@ impl Pipelines {
             screen_raster_copy_layout,
             screen_raster_copy,
             denoise_layout,
-            compose,
-            compose_layout,
             blit_module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("raywatcher blit"),
                 source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
@@ -3995,8 +3927,6 @@ pub struct RaywatcherGpu {
     filter_moments: [wgpu::TextureView; 2],
     temporal_bind_group: wgpu::BindGroup,
     atrous_bind_groups: Vec<wgpu::BindGroup>,
-    compose_bind_groups: [wgpu::BindGroup; 2],
-    compose_uniforms: wgpu::Buffer,
     composite_uniforms: wgpu::Buffer,
     radiance_cache: wgpu::Buffer,
     restir_reservoirs: wgpu::Buffer,
@@ -4049,11 +3979,6 @@ pub struct RaywatcherGpu {
     /// Interpolated result, at the render extent, for the upscaler to consume.
     pub output: wgpu::Texture,
     pub output_view: wgpu::TextureView,
-    /// Guide planes at render extent: `x` the sky visibility, `y` the reflection
-    /// hit distance, `z` the filtered variance, `w` the depth. Handed to the ray
-    /// reconstruction providers and to the debug view.
-    pub guide: wgpu::Texture,
-    pub guide_view: wgpu::TextureView,
     /// Previous frame's view-projection matrix for static camera reprojection.
     prev_view_projection: Option<glam::Mat4>,
     /// Frames rendered since the last reset, saturating, for the history bit.
@@ -4309,15 +4234,6 @@ impl RaywatcherGpu {
             }],
         });
         let (output, output_view) = plane(device, "raywatcher output", w, h, COLOUR_FORMAT);
-        let (guide, guide_view) = plane(device, "raywatcher output guide", w, h, GUIDE_FORMAT);
-        let compose_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("raywatcher compose params"),
-            // `var<uniform> extent: vec4<f32>` is 16 bytes in WGSL (verified
-            // under wgpu::InstanceFlags::VALIDATION).
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let composite_uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("raywatcher composite params"),
             contents: bytemuck::bytes_of(&[1.25f32, 0.0, 0.0, 0.0]),
@@ -4369,28 +4285,6 @@ impl RaywatcherGpu {
             &temporal_colour,
             &temporal_moments,
         );
-        let compose_bind_groups = [
-            Self::compose_binding(
-                device,
-                &pipelines,
-                &compose_uniforms,
-                &grid,
-                &filter_colour[0],
-                &filter_moments[0],
-                &output_view,
-                &guide_view,
-            ),
-            Self::compose_binding(
-                device,
-                &pipelines,
-                &compose_uniforms,
-                &grid,
-                &filter_colour[1],
-                &filter_moments[1],
-                &output_view,
-                &guide_view,
-            ),
-        ];
         let blit_bind_group = Self::blit_binding(device, &pipelines, &output_view);
         Self {
             device: device_handle,
@@ -4437,8 +4331,6 @@ impl RaywatcherGpu {
             filter_moments,
             temporal_bind_group,
             atrous_bind_groups,
-            compose_bind_groups,
-            compose_uniforms,
             composite_uniforms,
             radiance_cache,
             restir_reservoirs,
@@ -4471,8 +4363,6 @@ impl RaywatcherGpu {
             terrain_map_scratch: None,
             output,
             output_view,
-            guide,
-            guide_view,
             prev_view_projection: None,
             frames: 0,
             traced_last_frame: false,
@@ -4715,52 +4605,6 @@ impl RaywatcherGpu {
         groups
     }
 
-    fn compose_binding(
-        device: &wgpu::Device,
-        pipelines: &Pipelines,
-        uniforms: &wgpu::Buffer,
-        grid: &GridTargets,
-        colour: &wgpu::TextureView,
-        moments: &wgpu::TextureView,
-        output: &wgpu::TextureView,
-        guide: &wgpu::TextureView,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("raywatcher compose"),
-            layout: &pipelines.compose_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(colour),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(moments),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&grid.guide_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&grid.reflection_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(output),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(guide),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: uniforms.as_entire_binding(),
-                },
-            ],
-        })
-    }
-
     fn blit_binding(
         device: &wgpu::Device,
         pipelines: &Pipelines,
@@ -4861,28 +4705,6 @@ impl RaywatcherGpu {
                 &self.temporal_colour,
                 &self.temporal_moments,
             );
-            self.compose_bind_groups = [
-                Self::compose_binding(
-                    device,
-                    pipelines,
-                    &self.compose_uniforms,
-                    &self.grid,
-                    &self.filter_colour[0],
-                    &self.filter_moments[0],
-                    &self.output_view,
-                    &self.guide_view,
-                ),
-                Self::compose_binding(
-                    device,
-                    pipelines,
-                    &self.compose_uniforms,
-                    &self.grid,
-                    &self.filter_colour[1],
-                    &self.filter_moments[1],
-                    &self.output_view,
-                    &self.guide_view,
-                ),
-            ];
             if let Some(rr) = self.dlss_rr.as_mut() {
                 rr.invalidate_prep();
             }
@@ -4977,28 +4799,6 @@ impl RaywatcherGpu {
             &temporal_colour,
             &temporal_moments,
         );
-        self.compose_bind_groups = [
-            Self::compose_binding(
-                device,
-                pipelines,
-                &self.compose_uniforms,
-                &self.grid,
-                &filter_colour[0],
-                &filter_moments[0],
-                &output_view,
-                &guide_view,
-            ),
-            Self::compose_binding(
-                device,
-                pipelines,
-                &self.compose_uniforms,
-                &self.grid,
-                &filter_colour[1],
-                &filter_moments[1],
-                &output_view,
-                &guide_view,
-            ),
-        ];
         if let Some(rr) = self.dlss_rr.as_mut() {
             if rr.extent() != (w, h) {
                 self.dlss_rr = None;
@@ -5032,8 +4832,6 @@ impl RaywatcherGpu {
         self.gbuf_prep_bind_group = None;
         self.output = output;
         self.output_view = output_view;
-        self.guide = guide;
-        self.guide_view = guide_view;
         // A resize invalidates every reprojection.
         self.prev_view_projection = None;
         self.frames = 0;
@@ -7036,7 +6834,6 @@ mod phase_r1_tests {
             ("GBUF_PREP_SHADER", GBUF_PREP_SHADER),
             ("RAY_SHADER", RAY_SHADER),
             ("DENOISE_SHADER", DENOISE_SHADER),
-            ("COMPOSE_SHADER", COMPOSE_SHADER),
             ("BLIT_SHADER", BLIT_SHADER),
             ("COMPOSITE_SHADER", COMPOSITE_SHADER),
         ];
