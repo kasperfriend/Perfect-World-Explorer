@@ -3970,10 +3970,9 @@ impl Renderer {
             && self.raywatcher_gpu.as_ref().is_some_and(|gpu| {
                 gpu.render_extent() == render_extent && gpu.can_replace_raster_effects()
             });
-        // The previous completed RT image remains valid while a new scene/AS
-        // is prepared. Do not toggle the native mirror based on CPU harvester
-        // activity: that made reflections alternate every time a background
-        // build started/finished, despite an unchanged RT output.
+        // The active tracer continues producing fresh frames while a new
+        // scene/AS is prepared. Keep the replacement decision stable across
+        // CPU harvest completion so raster effects do not flicker at the swap.
         RasterOverrides::for_plan_when_ready(&plan, rt_output_ready)
     }
 
