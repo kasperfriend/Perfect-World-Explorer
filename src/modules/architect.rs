@@ -2852,6 +2852,32 @@ mod tests {
     }
 
     #[test]
+    fn lasso_selection_contains_polygon_interior_and_excludes_exterior() {
+        let polygon = vec![
+            egui::pos2(10.0, 10.0),
+            egui::pos2(90.0, 15.0),
+            egui::pos2(70.0, 80.0),
+            egui::pos2(20.0, 70.0),
+        ];
+        assert!(Architect::lasso_contains(
+            &polygon,
+            egui::pos2(40.0, 40.0)
+        ));
+        assert!(Architect::lasso_contains(
+            &polygon,
+            egui::pos2(50.0, 20.0)
+        ));
+        assert!(!Architect::lasso_contains(
+            &polygon,
+            egui::pos2(100.0, 90.0)
+        ));
+        assert!(!Architect::lasso_contains(
+            &polygon[..2],
+            egui::pos2(40.0, 40.0)
+        ));
+    }
+
+    #[test]
     fn cancelling_viewport_gesture_discards_marquee_and_transform_state() {
         let mut editor = Architect::new(
             PathBuf::from("/client/element/element.data"),
