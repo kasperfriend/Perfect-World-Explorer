@@ -1369,6 +1369,7 @@ fn run(
     // each object batch made world construction scale with the number of
     // distinct shared atlas sources.
     let mut shared_geometry_vertices = 0usize;
+    let mut shared_geometry_full = std::collections::HashSet::<usize>::new();
     let mut skipped = 0usize;
     let mut pages = 0usize;
     let mut atlas_pages = 0usize;
@@ -1471,12 +1472,13 @@ fn run(
                         );
                         shared_geometry_vertices =
                             shared_geometry_vertices.saturating_sub(ready.vertices.len());
+                        shared_geometry_full.remove(&shared.source);
                         pages += 1;
                         if !finisher.submit(ready, id) {
                             return Ok(());
                         }
                     }
-                    (target, shared.slot, true)
+                    (target, shared.slot, Some(shared.source))
                 } else {
                     let (slot, turned) = allocate_slot(&mut page, key, tex)?;
                     if let Some(finished) = turned {
@@ -1488,7 +1490,7 @@ fn run(
                             return Ok(());
                         }
                     }
-                    (&mut page, slot, false)
+                    (&mut page, slot, None)
                 };
                 let base = page.vertices.len() as u32;
                 let range_start = page.indices.len() as u32;
@@ -1496,10 +1498,6 @@ fn run(
                 let oy = slot.y as f32 / SIDE as f32;
                 let sx = slot.w as f32 / SIDE as f32;
                 let sy = slot.h as f32 / SIDE as f32;
-                if is_shared_builder {
-                    shared_geometry_vertices =
-                        shared_geometry_vertices.saturating_add(mesh.vertices.len());
-                }
                 for v in &mesh.vertices {
                     let pos = origin
                         + scaled_x * v.position[0]
@@ -1516,6 +1514,13 @@ fn run(
                         diffuse: v.day_diffuse,
                         night_diffuse: v.night_diffuse,
                     });
+                }
+                if let Some(source) = is_shared_builder {
+                    shared_geometry_vertices =
+                        shared_geometry_vertices.saturating_add(mesh.vertices.len());
+                    if page.vertices.len() >= max_vertices {
+                        shared_geometry_full.insert(source);
+                    }
                 }
                 page.indices
                     .extend(mesh.indices.iter().map(|&n| base + n as u32));
@@ -1536,25 +1541,20 @@ fn run(
         // total buffered shared vertices exceeds 2x `max_vertices`) instead of
         // emitting tiny fragmented pages after every batch.
         if shared_geometry_vertices >= max_vertices.saturating_mul(2)
-            || shared_geometry
-                .values()
-                .any(|b| b.vertices.len() >= max_vertices)
+            || !shared_geometry_full.is_empty()
         {
             let mut flush_sources: Vec<usize> =
                 if shared_geometry_vertices >= max_vertices.saturating_mul(2) {
                     shared_geometry.keys().copied().collect()
                 } else {
-                    shared_geometry
-                        .iter()
-                        .filter(|(_, b)| b.vertices.len() >= max_vertices)
-                        .map(|(&s, _)| s)
-                        .collect()
+                    shared_geometry_full.iter().copied().collect()
                 };
             flush_sources.sort_unstable();
             for source in flush_sources {
                 if let Some(builder) = shared_geometry.remove(&source) {
                     shared_geometry_vertices =
                         shared_geometry_vertices.saturating_sub(builder.vertices.len());
+                    shared_geometry_full.remove(&source);
                     if !builder.indices.is_empty() {
                         pages += 1;
                         if !finisher.submit(builder, end) {
