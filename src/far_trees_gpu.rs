@@ -2673,6 +2673,14 @@ mod raywatcher_tree_tests {
                         "cached transform diverged for rho={rho}: {got:?} vs {expected:?}"
                     );
                 }
+                assert_eq!(
+                    actual.normal, source[0].normal,
+                    "billboard transform must preserve the raster-authored leaf normal for rho={rho}"
+                );
+                assert_eq!(
+                    actual.leaf_rho, NO_LEAF_RHO,
+                    "transformed leaf must be marked as already facing the current view"
+                );
             }
         }
     }
