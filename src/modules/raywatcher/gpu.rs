@@ -478,8 +478,6 @@ pub struct GbufPrepParams {
 
 /// CPU mirror of [`GBUF_PREP_SHADER`]'s plane-and-height water classification
 /// (`0.06` on native water, `0.92` on matte land).
-const WATER_HEIGHT_TOLERANCE: f32 = 0.25;
-
 pub fn classify_surface_roughness(
     normal: glam::Vec3,
     world_pos: glam::Vec3,
@@ -494,7 +492,7 @@ pub fn classify_surface_roughness(
             && world_pos.x <= x1
             && world_pos.z >= z0
             && world_pos.z <= z1
-            && (world_pos.y - w.height).abs() < WATER_HEIGHT_TOLERANCE
+            && (world_pos.y - w.height).abs() < 0.15
         {
             return 0.06;
         }
@@ -660,7 +658,7 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
             let height = prep.water_heights[wi / 4u][wi % 4u];
             if (p.x >= bounds.x && p.x <= bounds.y
                 && p.z >= bounds.z && p.z <= bounds.w
-                && abs(p.y - height) < WATER_HEIGHT_TOLERANCE)
+                && abs(p.y - height) < 0.15)
             {
                 roughness = 0.06;
                 // Keep the tagged water normal facing the camera on either side
@@ -7285,18 +7283,6 @@ mod reflection_sampling_regression_tests {
     const GPU_SOURCE: &str = include_str!("gpu.rs");
 
     #[test]
-    fn water_classification_tolerates_animated_surface_displacement() {
-        let water = [super::super::harvest::WaterSurface {
-            bounds: [-10.0, 10.0, -10.0, 10.0],
-            height: 0.0,
-        }];
-        assert_eq!(
-            classify_surface_roughness(glam::Vec3::Y, glam::Vec3::new(0.0, 0.20, 0.0), &water),
-            0.06
-        );
-    }
-
-    #[test]
     fn temporal_reprojection_uses_bilinear_depth_validated_history() {
         assert!(DENOISE_SHADER.contains("let sample_pos = source - vec2<f32>(0.5)"));
         assert!(DENOISE_SHADER.contains("depth_error > 0.05"));
@@ -7341,8 +7327,11 @@ mod reflection_sampling_regression_tests {
     }
 
     #[test]
-    fn water_reflection_history_is_not_clamped_to_noisy_neighbourhood_samples() {
-        assert!(DENOISE_SHADER.contains("prev.colour,\n            is_glossy,"));
+    fn water_reflection_history_uses_a_loose_neighbourhood_clamp() {
+        assert!(DENOISE_SHADER.contains("water_clamp_radius"));
+        assert!(DENOISE_SHADER.contains("mean - water_clamp_radius"));
+        assert!(DENOISE_SHADER.contains("mean + water_clamp_radius"));
+        assert!(DENOISE_SHADER.contains("is_glossy"));
     }
 
     #[test]
