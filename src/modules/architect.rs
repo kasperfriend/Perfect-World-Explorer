@@ -1260,9 +1260,9 @@ impl Architect {
                     .chars()
                     .next()
                     .is_some_and(|character| character.is_ascii_alphabetic())
-                    && first
-                        .chars()
-                        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+                    && first.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                    })
                 {
                     // A different map namespace must never be silently nested
                     // under the active map's prefix.
