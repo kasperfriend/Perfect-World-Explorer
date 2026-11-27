@@ -7114,6 +7114,7 @@ pub fn run(
                                 let upload_started = std::time::Instant::now();
                                 let uploaded = crate::world_objects::GpuPage::upload_world_ref_staged(
                                     &renderer.device,
+                                    &renderer.queue,
                                     &renderer.layout,
                                     &renderer.sampler,
                                     &renderer.uniform,
