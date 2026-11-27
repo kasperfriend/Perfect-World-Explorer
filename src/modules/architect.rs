@@ -229,6 +229,25 @@ impl Architect {
 
     fn refresh_projects(&mut self) {
         self.project_files.clear();
+        // Recover a project if the process stopped after preserving the old
+        // file but before publishing its staged replacement.
+        if let Ok(entries) = fs::read_dir(&self.project_root) {
+            for entry in entries.flatten() {
+                let backup = entry.path();
+                if backup
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.to_ascii_lowercase().ends_with(".pwa.bak"))
+                {
+                    let target = backup.with_extension("");
+                    if target.exists() {
+                        let _ = fs::remove_file(&backup);
+                    } else {
+                        let _ = fs::rename(&backup, target);
+                    }
+                }
+            }
+        }
         let Ok(entries) = fs::read_dir(&self.project_root) else {
             return;
         };
