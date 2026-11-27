@@ -3698,9 +3698,9 @@ pub struct RaywatcherGpu {
     dlss_rr: Option<super::reconstruct::DlssRayReconstructor>,
     dlss_rr_failed: bool,
     dlss_rr_error: Option<String>,
-    blit_pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+    blit_pipeline: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     blit_bind_group: wgpu::BindGroup,
-    composite_pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+    composite_pipeline: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     raster_copy: Option<(
         wgpu::TextureFormat,
         (u32, u32),
@@ -4010,9 +4010,9 @@ impl RaywatcherGpu {
             dlss_rr: None,
             dlss_rr_failed: false,
             dlss_rr_error: None,
-            blit_pipeline: None,
+            blit_pipeline: Vec::new(),
             blit_bind_group,
-            composite_pipeline: None,
+            composite_pipeline: Vec::new(),
             raster_copy: None,
             screen_raster_tex,
             screen_raster_view,
@@ -5480,11 +5480,8 @@ impl RaywatcherGpu {
         encoder: &mut wgpu::CommandEncoder,
         anchor: (f32, f32),
     ) {
-        if self
-            .blit_pipeline
-            .as_ref()
-            .is_none_or(|(fmt, _)| *fmt != COLOUR_FORMAT)
-        {
+        if !self.blit_pipeline.iter().any(|(fmt, _)| *fmt == COLOUR_FORMAT) {
+
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("raywatcher blit"),
                 bind_group_layouts: &[&self.pipelines.blit_layout],
@@ -5512,11 +5509,12 @@ impl RaywatcherGpu {
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
             });
-            self.blit_pipeline = Some((COLOUR_FORMAT, pipe));
+            self.blit_pipeline.push((COLOUR_FORMAT, pipe));
         }
-        let (Some((_, ref pipe)), Some((_, _, _, _, _, ref bg))) =
-            (&self.blit_pipeline, &self.terrain_map_scratch)
-        else {
+        let Some((_, pipe)) = self.blit_pipeline.iter().find(|(fmt, _)| *fmt == COLOUR_FORMAT) else {
+            return;
+        };
+        let Some((_, _, _, _, _, bg)) = self.terrain_map_scratch.as_ref() else {
             return;
         };
         let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -5950,11 +5948,8 @@ impl RaywatcherGpu {
             ]),
         );
         let target_format = destination.format();
-        if self
-            .composite_pipeline
-            .as_ref()
-            .is_none_or(|(fmt, _)| *fmt != target_format)
-        {
+        if !self.composite_pipeline.iter().any(|(fmt, _)| *fmt == target_format) {
+
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("raywatcher composite"),
                 bind_group_layouts: &[&self.pipelines.composite_layout],
@@ -5982,11 +5977,12 @@ impl RaywatcherGpu {
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
             });
-            self.composite_pipeline = Some((target_format, pipe));
+            self.composite_pipeline.push((target_format, pipe));
         }
-        let (Some((_, ref pipe)), Some((_, _, _, _, ref bg))) =
-            (&self.composite_pipeline, &self.raster_copy)
-        else {
+        let Some((_, pipe)) = self.composite_pipeline.iter().find(|(fmt, _)| *fmt == target_format) else {
+            return;
+        };
+        let Some((_, _, _, _, bg)) = self.raster_copy.as_ref() else {
             return;
         };
         let dst_view = destination.create_view(&Default::default());
@@ -6048,11 +6044,8 @@ impl RaywatcherGpu {
             return;
         }
         let target_format = destination.format();
-        if self
-            .blit_pipeline
-            .as_ref()
-            .is_none_or(|(fmt, _)| *fmt != target_format)
-        {
+        if !self.blit_pipeline.iter().any(|(fmt, _)| *fmt == target_format) {
+
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("raywatcher blit"),
                 bind_group_layouts: &[&self.pipelines.blit_layout],
@@ -6080,9 +6073,9 @@ impl RaywatcherGpu {
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
             });
-            self.blit_pipeline = Some((target_format, pipe));
+            self.blit_pipeline.push((target_format, pipe));
         }
-        let Some((_, ref pipe)) = self.blit_pipeline else {
+        let Some((_, pipe)) = self.blit_pipeline.iter().find(|(fmt, _)| *fmt == target_format) else {
             return;
         };
         let dst_view = destination.create_view(&Default::default());
