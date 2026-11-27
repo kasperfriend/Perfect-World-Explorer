@@ -858,6 +858,14 @@ fn build(
     // re-meshed, and blocks the window leaves release their geometry.
     let mut terrain_reader = t.heights.reader();
     let terrain_revision = terrain_reader.revision();
+    if t
+        .terrain_material_window
+        .is_some_and(|(_, previous_revision)| previous_revision != terrain_revision)
+    {
+        // Every cached near block and the whole-world LOD depend on heights and
+        // normals. Discard the old CPU block meshes before rebuilding them.
+        *residency = crate::terrain_residency::Residency::default();
+    }
     let census = residency.update_stitched(
         &win,
         |x, y| {
@@ -1617,7 +1625,7 @@ fn build(
             t.height / t.materials.mask_grid,
         )
     });
-    let terrain_upload = if t.terrain_material_window != Some(mask_window) {
+    let terrain_upload = if t.terrain_material_window != Some((mask_window, terrain_revision)) {
         let materials = if t.terrain_material_window.is_none() {
             t.materials.take_window(mask_window)
         } else {
@@ -1640,7 +1648,7 @@ fn build(
         } else {
             Some(crate::terrain_gpu::world_mesh(t, 4)?)
         };
-        t.terrain_material_window = Some(mask_window);
+        t.terrain_material_window = Some((mask_window, terrain_revision));
         Some(crate::terrain_gpu::TerrainUpload { materials, far })
     } else {
         None
