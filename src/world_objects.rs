@@ -3914,7 +3914,8 @@ mod page_tests {
         assert!(world_command_survives_gpu_cull(&invalid, &cull, false));
         invalid.end = invalid.start;
         assert!(!world_command_survives_gpu_cull(&invalid, &cull, false));
-        assert!(WORLD_GPU_CULL_WGSL.contains("instance_count = select(0u, 1u, visible)"));
+        assert!(WORLD_GPU_CULL_WGSL.contains("counts[group.x] = output_count;"));
+        assert!(WORLD_GPU_CULL_WGSL.contains("draw_args[output_index].instance_count = 1u;"));
     }
 
     #[test]
