@@ -4,7 +4,7 @@ Architect is an optional world-authoring workspace registered through the normal
 
 ## Entering and leaving
 
-Open the main menu and choose ARCHITECT | WORLD EDITOR. The original HUD and viewer panels are hidden while the existing GPU world renderer remains the viewport. Use the red Turn off Architect control in the top toolbar to return to the normal viewer.
+Open the main menu, choose MODULES, select Architect in the installed-module list, then choose Enable Architect. The original HUD and viewer panels are hidden while the existing GPU world renderer remains the viewport. Use the red Turn off Architect control in the top toolbar to return to the normal viewer.
 
 ## Workspace
 
