@@ -1824,7 +1824,11 @@ impl Architect {
             )
         });
         let over_ui = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
-        let hit = if matches!(self.cursor, CursorMode::Sculpt | CursorMode::Select | CursorMode::Place) && !over_ui {
+        let hit = if matches!(
+            self.cursor,
+            CursorMode::Sculpt | CursorMode::Select | CursorMode::Place
+        ) && !over_ui
+        {
             pointer.and_then(|position| {
                 self.map.as_ref().and_then(|map| {
                     Self::terrain_hit(position, screen, view_projection, map)
@@ -1875,7 +1879,7 @@ impl Architect {
                             )
                         })
                     };
-                    if let Some(center) = project_point(origin) {
+                    if project_point(origin).is_some() {
                         for (axis_index, axis) in
                             [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate()
                         {
@@ -1886,7 +1890,6 @@ impl Architect {
                                 break;
                             }
                         }
-                        let _ = center;
                     }
                 }
             }
@@ -2035,7 +2038,7 @@ impl Architect {
                 })
             };
             if let Some(center) = project_point(origin) {
-                    let painter = ctx.layer_painter(egui::LayerId::new(
+                let painter = ctx.layer_painter(egui::LayerId::new(
                     egui::Order::Foreground,
                     egui::Id::new("architect_transform_gizmo"),
                 ));
