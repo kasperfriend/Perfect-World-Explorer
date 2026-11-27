@@ -405,6 +405,8 @@ pub struct Preview {
     center: Vec3,
     pub pan: Vec3,
     radius: f32,
+    bounds_min: Vec3,
+    bounds_max: Vec3,
     updated: std::time::Instant,
     elapsed: f32,
     pub action: usize,
@@ -437,6 +439,8 @@ impl Preview {
             center: Vec3::ZERO,
             pan: Vec3::ZERO,
             radius: 1.,
+            bounds_min: Vec3::ZERO,
+            bounds_max: Vec3::ZERO,
             updated: std::time::Instant::now(),
             elapsed: 0.,
             action: 0,
@@ -530,6 +534,8 @@ impl Preview {
                         return Err("Model contains no finite geometry".into());
                     }
                     self.center = (min + max) * 0.5;
+                    self.bounds_min = min;
+                    self.bounds_max = max;
                     self.pan = Vec3::ZERO;
                     self.radius = ((max - min).length() * 0.5).max(0.1);
                     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -645,6 +651,14 @@ impl Preview {
         }
         queue.submit(Some(encoder.finish()));
     }
+    /// Local-space geometry bounds from the currently loaded client mesh.
+    /// These are used by Architect for selection outlines, not guessed object sizes.
+    pub fn model_bounds(&self) -> Option<([f32; 3], [f32; 3])> {
+        self.asset
+            .as_ref()
+            .map(|_| (self.bounds_min.to_array(), self.bounds_max.to_array()))
+    }
+
     /// Draw an interactive preview for compact asset-browser popups.
     /// Left-drag orbits, Shift+left-drag pans, and the wheel zooms while the
     /// pointer is over the image. The response is returned so the owning
