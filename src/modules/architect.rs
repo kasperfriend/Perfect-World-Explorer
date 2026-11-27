@@ -1301,6 +1301,22 @@ impl Architect {
         );
     }
 
+    /// Screen-space hit radius for source-scene objects. The serialized
+    /// placement point is not the mesh centre for many trees, ornaments and
+    /// effects, so a small fixed 20 px anchor target was too easy to miss.
+    fn source_pick_radius(asset: &str) -> f32 {
+        let path = asset.to_ascii_lowercase();
+        if path.contains("tree") || path.contains("litmodels/") || path.contains("scenery") {
+            52.0
+        } else if path.ends_with(".ecm") || path.ends_with(".bmd") || path.ends_with(".smd") {
+            40.0
+        } else if path.ends_with(".gfx") || path.contains("effect") {
+            34.0
+        } else {
+            30.0
+        }
+    }
+
     fn scene_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -1736,7 +1752,9 @@ impl Architect {
         if asset_dock_changed {
             asset_panel = asset_panel.current_pos(asset_pos);
         }
-        asset_panel.show(ctx, |ui| {
+        let previous_hovered_asset = self.hovered_asset.clone();
+        self.hovered_asset = None;
+        let asset_panel_response = asset_panel.show(ctx, |ui| {
                 ui.horizontal(|ui| { ui.heading("Client explorer"); Self::dock_picker(ui, &mut self.right_dock); });
                 ui.label(egui::RichText::new("Loose client files are browsed lazily. Select a PCK archive to index its internal asset paths on demand.").small().weak());
                 ui.horizontal(|ui| {
@@ -1748,7 +1766,6 @@ impl Architect {
                         self.archive_entries.clear();
                     }
                 });
-                self.hovered_asset = None;
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                     self.show_tree(ui, &self.client_root.clone(), 0, camera);
                 });
@@ -1795,8 +1812,17 @@ impl Architect {
                 }
             });
 
-        if self.selected_asset.is_some() || self.hovered_asset.is_some() {
-            egui::Window::new("Asset preview")
+        let asset_panel_hovered = asset_panel_response
+            .as_ref()
+            .is_some_and(|response| response.response.hovered());
+        let preview_asset = self
+            .hovered_asset
+            .clone()
+            .or_else(|| previous_hovered_asset.clone())
+            .or_else(|| self.selected_asset.clone());
+        let mut preview_window_hovered = false;
+        if preview_asset.is_some() {
+            let preview_response = egui::Window::new("Asset preview")
                 .id(egui::Id::new("architect_asset_preview"))
                 .default_pos(egui::pos2(
                     (screen.width() - 330.).max(12.),
@@ -1808,12 +1834,13 @@ impl Architect {
                     let label = self
                         .hovered_asset
                         .as_deref()
+                        .or(previous_hovered_asset.as_deref())
                         .or(self.selected_asset.as_deref())
                         .unwrap_or("");
                     ui.label(egui::RichText::new(label).small().strong());
                     if self.preview_message.is_empty() {
-                        if let Some(preview) = &self.preview {
-                            preview.show(
+                        if let Some(preview) = &mut self.preview {
+                            preview.show_interactive(
                                 ui,
                                 egui::vec2(
                                     ui.available_width().min(280.),
@@ -1825,7 +1852,11 @@ impl Architect {
                         ui.label(egui::RichText::new(&self.preview_message).small().weak());
                     }
                     if ui.button("Select this asset").clicked() {
-                        if let Some(asset) = self.hovered_asset.clone() {
+                        if let Some(asset) = self
+                            .hovered_asset
+                            .clone()
+                            .or_else(|| previous_hovered_asset.clone())
+                        {
                             self.selected_asset = Some(asset);
                         }
                     }
@@ -2565,7 +2596,7 @@ impl Architect {
                     self.selected_scene_transform = None;
                 } else if let Some(pointer) = pointer {
                     let mut scene_index = 0usize;
-                    let mut nearest_scene: Option<(usize, f32, String, [f32; 3])> = None;
+                    let mut nearest_scene: Option<(usize, f32, f32, String, [f32; 3])> = None;
                     let mut consider = |asset: &str, position: [f32; 3]| {
                         let clip = view_projection.project_point3(Vec3::from_array(position));
                         if clip.is_finite() && (0.0..=1.0).contains(&clip.z) {
@@ -2574,13 +2605,28 @@ impl Architect {
                                 screen.top() + (1. - clip.y) * 0.5 * screen.height(),
                             );
                             let distance = point.distance(pointer);
-                            if distance <= 20.
-                                && nearest_scene
-                                    .as_ref()
-                                    .is_none_or(|(_, best, _, _)| distance < *best)
+                            // A scene object's origin is often inside its mesh or
+                            // far below its visible canopy. Use a class-aware
+                            // screen-space hit envelope rather than requiring a
+                            // near-pixel-perfect click on the serialized origin.
+                            let radius = Self::source_pick_radius(asset);
+                            let score = distance / radius;
+                            if score <= 1.0
+                                && nearest_scene.as_ref().is_none_or(
+                                    |(_, best_score, best_depth, _, _)| {
+                                        score < *best_score - 0.025
+                                            || ((score - *best_score).abs() <= 0.025
+                                                && clip.z < *best_depth)
+                                    },
+                                )
                             {
-                                nearest_scene =
-                                    Some((scene_index, distance, asset.to_string(), position));
+                                nearest_scene = Some((
+                                    scene_index,
+                                    score,
+                                    clip.z,
+                                    asset.to_string(),
+                                    position,
+                                ));
                             }
                         }
                         scene_index += 1;
@@ -2604,7 +2650,7 @@ impl Architect {
                     for ornament in ornaments {
                         consider(&ornament.path, ornament.position);
                     }
-                    if let Some((index, _, asset, position)) = nearest_scene {
+                    if let Some((index, _, _, asset, position)) = nearest_scene {
                         self.selected_scene_object = Some(index);
                         self.selected_scene_transform = Some(position);
                         self.selected_asset = Some(asset);
@@ -2964,6 +3010,14 @@ impl Architect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_scene_picking_uses_a_larger_target_for_trees_and_models() {
+        assert!(Architect::source_pick_radius("trees/forest/tree.ecm")
+            > Architect::source_pick_radius("effects/small.gfx"));
+        assert!(Architect::source_pick_radius("models/building.ecm")
+            >= Architect::source_pick_radius("misc/unknown.bin"));
+    }
 
     #[test]
     fn viewport_ray_hits_flat_terrain_at_view_center() {
