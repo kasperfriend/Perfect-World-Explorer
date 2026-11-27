@@ -2079,7 +2079,11 @@ impl GpuPage {
             &[],
         );
         pass.set_vertex_buffer(0, self.geometry.slice(0..self.vertex_bytes));
-        pass.set_index_buffer(self.geometry.slice(self.index_offset..self.index_offset + self.index_bytes), wgpu::IndexFormat::Uint32);
+        pass.set_index_buffer(
+            self.geometry
+                .slice(self.index_offset..self.index_offset + self.index_bytes),
+            wgpu::IndexFormat::Uint32,
+        );
         if self.placements.is_empty() {
             eprintln!("scenery page has no placement visibility ranges; drawing all indices");
             pass.draw_indexed(0..self.count, 0, 0..1);
@@ -2152,7 +2156,11 @@ impl GpuPage {
             if bound != Some(cmd.page) {
                 pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
                 pass.set_vertex_buffer(0, p.geometry.slice(0..p.vertex_bytes));
-                pass.set_index_buffer(p.geometry.slice(p.index_offset..p.index_offset + p.index_bytes), wgpu::IndexFormat::Uint32);
+                pass.set_index_buffer(
+                    p.geometry
+                        .slice(p.index_offset..p.index_offset + p.index_bytes),
+                    wgpu::IndexFormat::Uint32,
+                );
                 bound = Some(cmd.page);
             }
             pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
@@ -2296,7 +2304,11 @@ impl GpuPage {
                         );
                     }
                     pass.set_vertex_buffer(0, page.geometry.slice(0..page.vertex_bytes));
-                    pass.set_index_buffer(page.geometry.slice(page.index_offset..page.index_offset + page.index_bytes), wgpu::IndexFormat::Uint32);
+                    pass.set_index_buffer(
+                        page.geometry
+                            .slice(page.index_offset..page.index_offset + page.index_bytes),
+                        wgpu::IndexFormat::Uint32,
+                    );
                     bound_page = Some(run.page);
                 }
                 let offset = u64::from(run.first_record) * PAGE_DRAW_ARGS_SIZE;
@@ -2514,7 +2526,11 @@ impl GpuPage {
                         );
                     }
                     pass.set_vertex_buffer(0, page.geometry.slice(0..page.vertex_bytes));
-                    pass.set_index_buffer(page.geometry.slice(page.index_offset..page.index_offset + page.index_bytes), wgpu::IndexFormat::Uint32);
+                    pass.set_index_buffer(
+                        page.geometry
+                            .slice(page.index_offset..page.index_offset + page.index_bytes),
+                        wgpu::IndexFormat::Uint32,
+                    );
                     bound_page = Some(run.page);
                 }
                 if run.record_count > 1 {
@@ -2546,7 +2562,11 @@ impl GpuPage {
                         );
                     }
                     pass.set_vertex_buffer(0, page.geometry.slice(0..page.vertex_bytes));
-                    pass.set_index_buffer(page.geometry.slice(page.index_offset..page.index_offset + page.index_bytes), wgpu::IndexFormat::Uint32);
+                    pass.set_index_buffer(
+                        page.geometry
+                            .slice(page.index_offset..page.index_offset + page.index_bytes),
+                        wgpu::IndexFormat::Uint32,
+                    );
                     bound_page = Some(cmd.page);
                 }
                 pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
@@ -2590,7 +2610,11 @@ impl GpuPage {
             &[],
         );
         pass.set_vertex_buffer(0, self.geometry.slice(0..self.vertex_bytes));
-        pass.set_index_buffer(self.geometry.slice(self.index_offset..self.index_offset + self.index_bytes), wgpu::IndexFormat::Uint32);
+        pass.set_index_buffer(
+            self.geometry
+                .slice(self.index_offset..self.index_offset + self.index_bytes),
+            wgpu::IndexFormat::Uint32,
+        );
         if self.placements.is_empty() {
             pass.draw_indexed(0..self.count, 0, 0..1);
             return;
