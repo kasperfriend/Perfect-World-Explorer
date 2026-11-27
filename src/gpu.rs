@@ -234,10 +234,9 @@ mod raster_fog_range_tests {
         };
         let (raster, rt) = split_raster_and_rt_fog(authored, Some(200.));
         assert_eq!((raster.start, raster.end), (20., 500.));
-        assert_eq!(
-            (rt.start, rt.end),
-            crate::terrain_cutoff::fit_fog(20., 500., 200.)
-        );
+        let [expected_start, expected_end] =
+            crate::terrain_cutoff::fit_fog(20., 500., 200.);
+        assert_eq!((rt.start, rt.end), (expected_start, expected_end));
         assert_eq!(raster.color, rt.color);
         assert_eq!(raster.enabled, rt.enabled);
     }
