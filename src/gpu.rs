@@ -5261,7 +5261,12 @@ impl Renderer {
         // CPU time in zones with many authored water surfaces.
         let mut visible = std::mem::take(&mut self.visible_water_batches);
         visible.clear();
-        visible.extend(self.water_batches.iter().filter(|b| b.visible(matrix)).cloned());
+        visible.extend(
+            self.water_batches
+                .iter()
+                .filter(|b| b.visible(matrix))
+                .cloned(),
+        );
         let has_visible_complex_water = visible.iter().any(|b| !b.simple);
         // The main depth is copied into the water's `terrain_depth` for the edge
         // reconstruction, which only the water surface reads (and only when it is
