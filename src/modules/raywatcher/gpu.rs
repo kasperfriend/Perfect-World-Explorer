@@ -132,10 +132,13 @@ fn build_point_light_bvh(
         for &index in indices.iter() {
             let light = positions[index as usize];
             let center = Vec3::new(light[0], light[1], light[2]);
-            // Expand slightly to cover CPU/GPU float-rounding differences at
-            // the strict influence-sphere boundary; this can only add work.
-            let padding = (light[3].abs() * 1e-5).max(1e-4);
-            let radius = Vec3::splat(light[3].max(0.0) + padding);
+            // Cover both direct-light spheres and the wider reflected-glow
+            // tube around a reflection ray. The small pad covers CPU/GPU
+            // float-rounding differences at strict influence boundaries.
+            let direct_radius = light[3].max(0.0);
+            let reflection_radius = (direct_radius * 0.11).clamp(0.5, 3.2) * 6.0f32.sqrt();
+            let padding = (direct_radius.abs() * 1e-5).max(1e-4);
+            let radius = Vec3::splat(direct_radius.max(reflection_radius) + padding);
             minimum = minimum.min(center - radius);
             maximum = maximum.max(center + radius);
         }
@@ -6616,9 +6619,11 @@ mod phase_r1_tests {
                 assert!(!seen[index], "light {index} appears in more than one leaf");
                 seen[index] = true;
                 let light = positions[index];
+                let influence_radius = light[3]
+                    .max((light[3] * 0.11).clamp(0.5, 3.2) * 6.0f32.sqrt());
                 for axis in 0..3 {
-                    assert!(node.min[axis] <= light[axis] - light[3]);
-                    assert!(node.max[axis] >= light[axis] + light[3]);
+                    assert!(node.min[axis] <= light[axis] - influence_radius);
+                    assert!(node.max[axis] >= light[axis] + influence_radius);
                 }
             }
         }
