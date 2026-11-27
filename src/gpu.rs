@@ -5607,9 +5607,12 @@ impl Renderer {
                     camera,
                     Pass::Refraction,
                 );
-                self.queue.submit(Some(re.finish()));
+                // Append edge-alpha rendering to the refraction command
+                // buffer. It targets the same refraction image and must run
+                // after the clipped scene, so a separate queue submission is
+                // unnecessary; command order within this encoder is sufficient.
                 self.water.render_edge(
-                    &self.device,
+                    &mut re,
                     &self.queue,
                     matrix,
                     plane,
@@ -5618,6 +5621,7 @@ impl Renderer {
                     self.terrain_gpu.edge_mesh(),
                     (&self.vertex, &self.index, self.terrain_end),
                 );
+                self.queue.submit(Some(re.finish()));
             } else {
                 // Client 0x7cca50 renders the sky and the scene above this
                 // water height into its refraction target, using air fog.
