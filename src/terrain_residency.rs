@@ -536,6 +536,56 @@ mod tests {
     }
 
     #[test]
+    fn parallel_updates_keep_the_triangle_census_incremental() {
+        let mut residency = Residency::default();
+        let first = window(0, 0, 3, 2);
+        let census = residency
+            .update_stitched_parallel(
+                &first,
+                |_, _| (3, [0; 4]),
+                |x, _, _, _| Ok(block(x as f32)),
+            )
+            .unwrap();
+        assert_eq!(census.loaded, 6);
+        assert_eq!(census.triangles, 6);
+        assert_eq!(residency.triangles(), 6);
+
+        let unchanged = residency
+            .update_stitched_parallel(
+                &first,
+                |_, _| (3, [0; 4]),
+                |_, _, _, _| panic!("unchanged terrain blocks must not be rebuilt"),
+            )
+            .unwrap();
+        assert_eq!(unchanged.loaded, 0);
+        assert_eq!(unchanged.remeshed, 0);
+        assert_eq!(unchanged.triangles, 6);
+
+        let shifted = window(1, 0, 4, 2);
+        let moved = residency
+            .update_stitched_parallel(
+                &shifted,
+                |_, _| (3, [0; 4]),
+                |x, _, _, _| Ok(block(x as f32)),
+            )
+            .unwrap();
+        assert_eq!(moved.evicted, 2);
+        assert_eq!(moved.loaded, 2);
+        assert_eq!(moved.triangles, 6);
+
+        let disabled = residency
+            .update_stitched_parallel(
+                &shifted,
+                |x, _| (if x == 1 { 0 } else { 3 }, [0; 4]),
+                |_, _, _, _| panic!("level-zero blocks must not be built"),
+            )
+            .unwrap();
+        assert_eq!(disabled.evicted, 1);
+        assert_eq!(disabled.triangles, 5);
+        assert_eq!(residency.triangles(), 5);
+    }
+
+    #[test]
     fn neighbor_stitch_changes_invalidate_an_unchanged_level() {
         let mut r = Residency::default();
         let win = window(0, 0, 2, 1);
