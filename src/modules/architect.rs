@@ -91,6 +91,8 @@ pub struct Architect {
     project_files: Vec<PathBuf>,
     directory_cache: HashMap<PathBuf, Vec<ExplorerEntry>>,
     archive_cache: HashMap<PathBuf, Vec<String>>,
+    archive_detail_cache: HashMap<PathBuf, Vec<(String, u32, u32)>>,
+    archive_details: Vec<(String, u32, u32)>,
     project_name: String,
     selected_project: Option<usize>,
     selected_map: String,
@@ -184,6 +186,8 @@ impl Architect {
             project_files: Vec::new(),
             directory_cache: HashMap::new(),
             archive_cache: HashMap::new(),
+            archive_detail_cache: HashMap::new(),
+            archive_details: Vec::new(),
             project_name: "Untitled World".into(),
             selected_project: None,
             selected_map: "__empty__".into(),
@@ -1363,6 +1367,11 @@ impl Architect {
         self.archive_error = None;
         if let Some(entries) = self.archive_cache.get(&path) {
             self.archive_entries = entries.clone();
+            self.archive_details = self
+                .archive_detail_cache
+                .get(&path)
+                .cloned()
+                .unwrap_or_default();
             self.status = format!(
                 "Loaded {} cached archive entries.",
                 self.archive_entries.len()
@@ -1374,9 +1383,16 @@ impl Architect {
             .and_then(|mut file| crate::pck::directory(&mut file));
         match result {
             Ok(entries) => {
-                self.archive_entries = entries.into_iter().map(|entry| entry.name).collect();
+                let mut details = entries
+                    .into_iter()
+                    .map(|entry| (entry.name, entry.size, entry.compressed))
+                    .collect::<Vec<_>>();
+                details.sort_by(|left, right| left.0.to_ascii_lowercase().cmp(&right.0.to_ascii_lowercase()));
+                self.archive_entries = details.iter().map(|(name, _, _)| name.clone()).collect();
                 self.archive_cache
                     .insert(path.clone(), self.archive_entries.clone());
+                self.archive_detail_cache.insert(path.clone(), details.clone());
+                self.archive_details = details;
                 self.status = format!(
                     "Indexed {} archive entries from {}.",
                     self.archive_entries.len(),
@@ -1762,6 +1778,8 @@ impl Architect {
                     if ui.small_button("Refresh files").clicked() {
                         self.directory_cache.clear();
                         self.archive_cache.clear();
+                        self.archive_detail_cache.clear();
+                        self.archive_details.clear();
                         self.selected_archive = None;
                         self.archive_entries.clear();
                     }
@@ -1776,17 +1794,28 @@ impl Architect {
                     if let Some(error) = &self.archive_error {
                         ui.colored_label(egui::Color32::LIGHT_RED, error);
                     } else {
-                        ui.label(format!("{} indexed entries", self.archive_entries.len()));
-                        let archive_entries = self.archive_entries.clone();
+                        let archive_details = self.archive_details.clone();
+                        let ecm_count = archive_details.iter().filter(|(name, _, _)| name.to_ascii_lowercase().ends_with(".ecm")).count();
+                        let smd_count = archive_details.iter().filter(|(name, _, _)| name.to_ascii_lowercase().ends_with(".smd")).count();
+                        let bmd_count = archive_details.iter().filter(|(name, _, _)| name.to_ascii_lowercase().ends_with(".bmd")).count();
+                        let gfx_count = archive_details.iter().filter(|(name, _, _)| name.to_ascii_lowercase().ends_with(".gfx")).count();
+                        ui.label(format!(
+                            "{} files · {ecm_count} ECM · {smd_count} SMD · {bmd_count} BMD · {gfx_count} GFX",
+                            archive_details.len()
+                        ));
                         let filter = self.tree_filter.to_lowercase();
-                        let filtered = archive_entries.iter().filter(|entry| filter.is_empty() || entry.to_lowercase().contains(&filter)).collect::<Vec<_>>();
+                        let filtered = archive_details.iter().filter(|(entry, _, _)| filter.is_empty() || entry.to_lowercase().contains(&filter)).collect::<Vec<_>>();
                         let row_height = ui.text_style_height(&egui::TextStyle::Body);
                         egui::ScrollArea::vertical().max_height(180.).show_rows(ui, row_height, filtered.len(), |ui, rows| {
                             for row in rows {
-                                let entry = filtered[row];
+                                let (entry, size, compressed) = filtered[row];
                                 let asset = format!("{}::{}", archive.display(), entry);
                                 let label = Path::new(entry).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| entry.clone());
-                                let response = ui.selectable_label(self.selected_asset.as_deref() == Some(asset.as_str()), format!("📦 {label}"));
+                                let response = ui.selectable_label(self.selected_asset.as_deref() == Some(asset.as_str()), format!("📦 {label} · {size} B"));
+                                response.on_hover_text(format!(
+                                    "{entry}\nType: {}\nUnpacked: {size} bytes\nStored: {compressed} bytes",
+                                    Path::new(entry).extension().and_then(|extension| extension.to_str()).unwrap_or("unknown").to_ascii_uppercase()
+                                ));
                                 if response.hovered() { self.hovered_asset = Some(asset.clone()); }
                                 if response.clicked() {
                                     self.selected_asset = Some(asset.clone());
