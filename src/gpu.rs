@@ -594,6 +594,85 @@ fn basis(v: [f32; 3]) -> Vec3 {
         v.normalize()
     }
 }
+
+/// Compose a BMD's local transform with an Architect scene-instance transform.
+/// Native map scenery keeps its recovered legacy path; only the editor-owned
+/// tail uses this function so project position/yaw/scale replace the source
+/// object's placement while preserving the BMD's own local pivot and axes.
+pub(crate) fn editor_bmd_vertex_transform(
+    model: &crate::bmd::Model,
+    ornament: &crate::scene::Ornament,
+    vertex: &crate::bmd::Vertex,
+    instance_scale: f32,
+) -> (Vec3, Vec3) {
+    let model_z = basis(model.direction);
+    let model_y = basis(model.up);
+    let model_x = model_y.cross(model_z).normalize_or_zero();
+    let instance_z = basis(ornament.direction);
+    let instance_y = basis(ornament.up);
+    let instance_x = instance_y.cross(instance_z).normalize_or_zero();
+
+    let local_position = Vec3::from_array(model.position)
+        + model_x * (vertex.position[0] * model.scale[0])
+        + model_y * (vertex.position[1] * model.scale[1])
+        + model_z * (vertex.position[2] * model.scale[2]);
+    let world_position = Vec3::from_array(ornament.position)
+        + instance_x * (local_position.x * instance_scale)
+        + instance_y * (local_position.y * instance_scale)
+        + instance_z * (local_position.z * instance_scale);
+
+    let local_normal = (model_x * vertex.normal[0]
+        + model_y * vertex.normal[1]
+        + model_z * vertex.normal[2])
+        .normalize_or_zero();
+    let world_normal = (instance_x * local_normal.x
+        + instance_y * local_normal.y
+        + instance_z * local_normal.z)
+        .normalize_or_zero();
+    (world_position, world_normal)
+}
+
+#[cfg(test)]
+mod editor_bmd_transform_tests {
+    use super::*;
+
+    #[test]
+    fn editor_bmd_transform_applies_instance_position_yaw_and_scale() {
+        let model = crate::bmd::Model {
+            scale: [1.0; 3],
+            direction: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            position: [0.0; 3],
+            meshes: Vec::new(),
+            collision: Vec::new(),
+        };
+        let ornament = crate::scene::Ornament {
+            export_id: 1,
+            offset: 0,
+            position: [10.0, 20.0, 30.0],
+            direction: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            extra: 0,
+            path: "litmodels/a01/1/test.bmd".into(),
+            map_id: "a01".into(),
+        };
+        let vertex = crate::bmd::Vertex {
+            position: [1.0, 0.0, 0.0],
+            uv: [0.0; 2],
+            normal: [1.0, 0.0, 0.0],
+            diffuse: 0,
+            day_diffuse: 0,
+            night_diffuse: 0,
+        };
+        let (position, normal) =
+            editor_bmd_vertex_transform(&model, &ornament, &vertex, 2.0);
+        assert!((position.x - 10.0).abs() < 0.0001);
+        assert!((position.y - 20.0).abs() < 0.0001);
+        assert!((position.z - 28.0).abs() < 0.0001);
+        assert!((normal.x - 0.0).abs() < 0.0001);
+        assert!((normal.z + 1.0).abs() < 0.0001);
+    }
+}
 fn push_quad(v: &mut Vec<Vertex>, i: &mut Vec<u32>, points: [[f32; 3]; 4], color: [f32; 4]) {
     let n = v.len() as u32;
     for p in points {
@@ -1395,7 +1474,9 @@ fn build(
         // EC-BSD +36 flags, recovered at 0x489f0b/0x489f12. Keep them on the
         // page's index ranges; a hidden placement must not be submitted in a
         // secondary view just because the page itself is resident.
-        let visibility = Visibility::from_extra(t.objects.ornaments[id].extra);
+        let ornament = &t.objects.ornaments[id];
+        let editor_owned = id >= t.objects.native_ornament_count();
+        let visibility = Visibility::from_extra(ornament.extra);
         let z = basis(model.direction);
         let y = basis(model.up);
         let x = y.cross(z).normalize_or_zero();
@@ -1432,12 +1513,17 @@ fn build(
             let sx = slot.w as f32 / ATLAS as f32;
             let sy = slot.h as f32 / ATLAS as f32;
             for vert in &mesh.vertices {
-                let p = Vec3::from_array(model.position)
-                    + x * (vert.position[0] * model.scale[0] * instance_scale)
-                    + y * (vert.position[1] * model.scale[1] * instance_scale)
-                    + z * (vert.position[2] * model.scale[2] * instance_scale);
-                let n = (x * vert.normal[0] + y * vert.normal[1] + z * vert.normal[2])
-                    .normalize_or_zero();
+                let (p, n) = if editor_owned {
+                    editor_bmd_vertex_transform(model, ornament, vert, instance_scale)
+                } else {
+                    let position = Vec3::from_array(model.position)
+                        + x * (vert.position[0] * model.scale[0] * instance_scale)
+                        + y * (vert.position[1] * model.scale[1] * instance_scale)
+                        + z * (vert.position[2] * model.scale[2] * instance_scale);
+                    let normal = (x * vert.normal[0] + y * vert.normal[1] + z * vert.normal[2])
+                        .normalize_or_zero();
+                    (position, normal)
+                };
                 page.vertices.push(Vertex {
                     pos: p.to_array(),
                     normal: n.to_array(),
