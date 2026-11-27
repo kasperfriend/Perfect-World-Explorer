@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use glam::Vec3;
 use wgpu::util::DeviceExt;
 
 use super::bvh::{BvhNode, RayMaterial, RayTriangle};
