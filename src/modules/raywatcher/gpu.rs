@@ -6650,8 +6650,8 @@ mod phase_r1_tests {
                 assert!(!seen[index], "light {index} appears in more than one leaf");
                 seen[index] = true;
                 let light = positions[index];
-                let influence_radius = light[3]
-                    .max((light[3] * 0.11).clamp(0.5, 3.2) * 6.0f32.sqrt());
+                let influence_radius =
+                    light[3].max((light[3] * 0.11).clamp(0.5, 3.2) * 6.0f32.sqrt());
                 for axis in 0..3 {
                     assert!(node.min[axis] <= light[axis] - influence_radius);
                     assert!(node.max[axis] >= light[axis] + influence_radius);
@@ -6978,8 +6978,12 @@ mod shader_optimization_regression_tests {
         assert!(dxr.contains("uint light_stack[16]"));
         assert!(RAY_SHADER.contains("var stack: array<u32, 8>"));
         assert!(dxr.contains("uint stack[8]"));
-        assert!(RAY_SHADER.contains("box_hit(node_min.xyz, node_max.xyz, origin, inv_dir, 0.8, max_t)"));
-        assert!(dxr.contains("light_bvh_box_hit(node_min.xyz, node_max.xyz, origin, inv_dir, 0.8, max_reach)"));
+        assert!(
+            RAY_SHADER.contains("box_hit(node_min.xyz, node_max.xyz, origin, inv_dir, 0.8, max_t)")
+        );
+        assert!(dxr.contains(
+            "light_bvh_box_hit(node_min.xyz, node_max.xyz, origin, inv_dir, 0.8, max_reach)"
+        ));
         assert!(RAY_SHADER.contains("let leaf_count = u32(node_min.w)"));
         assert!(dxr.contains("uint leaf_count = (uint)node_min.w"));
     }
