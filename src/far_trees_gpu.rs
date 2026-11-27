@@ -2243,6 +2243,51 @@ mod raywatcher_tree_tests {
     }
 
     #[test]
+    fn budget_fallback_uses_the_actual_lod_for_billboard_transform_cache() {
+        let branch = RtTreeTriangle {
+            a: glam::Vec3::ZERO,
+            b: glam::Vec3::X,
+            c: glam::Vec3::Y,
+            normal: glam::Vec3::Z,
+            albedo: [0.2, 0.3, 0.1],
+            roughness: 0.8,
+            opacity: 1.0,
+            alpha_mask: 0,
+            leaf_center: glam::Vec3::ZERO,
+            leaf_rho: -1.0,
+        };
+        let leaf = RtTreeTriangle {
+            leaf_rho: 0.25,
+            opacity: 0.6,
+            ..branch
+        };
+        let species = RtTreeSpecies {
+            species_id: 2,
+            height: 8.0,
+            composite_size: (64, 64),
+            composite_alpha_min: 0,
+            composite_alpha_max: 255,
+            positions: vec![[1.0, 0.0, 1.0]],
+            lods: vec![vec![branch, branch], vec![leaf]],
+            lod_diags: vec![RtTreeLodDiag::default(); 2],
+        };
+        let mut out = Vec::new();
+        let result = harvest_rt_tree_species(
+            &[species],
+            glam::Vec3::ZERO,
+            glam::Vec3::X,
+            100.0,
+            1.0,
+            1,
+            &mut out,
+        );
+        assert_eq!(result, (1, 1, 0));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].leaf_rho, -1.0, "fallback LOD billboard must be transformed");
+        assert_eq!(out[0].normal, glam::Vec3::Y);
+    }
+
+    #[test]
     fn raster_lod_selection_uses_species_height_scale_and_transition_windows() {
         assert_eq!(raster_lod_index(49.0, 10.0, 1.0, 3), 0);
         assert_eq!(raster_lod_index(54.0, 10.0, 1.0, 3), 0);
