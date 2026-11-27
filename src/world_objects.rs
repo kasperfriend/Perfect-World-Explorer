@@ -764,14 +764,29 @@ impl Page {
             let start = (placement.start as usize).min(self.indices.len());
             let end = (placement.end as usize).min(self.indices.len());
             if start < end {
+                // Every placement is emitted as one contiguous vertex block.
+                // Its index range can therefore provide a conservative vertex
+                // interval: scan positions linearly once for bounds instead of
+                // performing three min/max updates and a random vertex lookup
+                // for every triangle index (typically ~3x the vertex count).
+                let mut first_vertex = usize::MAX;
+                let mut last_vertex = 0usize;
                 for &index in &self.indices[start..end] {
-                    if let Some(vertex) = self.vertices.get(index as usize) {
+                    let index = index as usize;
+                    if index < self.vertices.len() {
+                        first_vertex = first_vertex.min(index);
+                        last_vertex = last_vertex.max(index);
+                        let kind = self.vertices[index].kind;
+                        has_sdr |= (kind > 2.01 && kind < 2.03)
+                            || (kind > 2.11 && kind < 2.13);
+                    }
+                }
+                if first_vertex != usize::MAX {
+                    for vertex in &self.vertices[first_vertex..=last_vertex] {
                         for axis in 0..3 {
                             min[axis] = min[axis].min(vertex.pos[axis]);
                             max[axis] = max[axis].max(vertex.pos[axis]);
                         }
-                        has_sdr |= (vertex.kind > 2.01 && vertex.kind < 2.03)
-                            || (vertex.kind > 2.11 && vertex.kind < 2.13);
                     }
                 }
             }
