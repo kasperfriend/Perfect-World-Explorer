@@ -279,7 +279,9 @@ impl World {
     }
 
     pub fn set_frustum(&mut self, frustum: Option<[[f32; 4]; 6]>) {
-        self.frustum = frustum;
+        // Normalize once per view rather than taking six square roots for
+        // every retained model slot on every main/reflection/refraction pass.
+        self.frustum = frustum.map(normalize_frustum_planes);
     }
     /// Attach the real GFX archive so installed producers can load their roots.
     /// Root text is GBK-decoded here; the owner manager never guesses an
@@ -1450,10 +1452,26 @@ impl World {
     }
 }
 
+fn normalize_frustum_planes(mut planes: [[f32; 4]; 6]) -> [[f32; 4]; 6] {
+    for plane in &mut planes {
+        let [a, b, c, d] = *plane;
+        let len_squared = a * a + b * b + c * c;
+        if len_squared.is_finite() && len_squared > 1.0e-12 {
+            let inverse_len = len_squared.sqrt().recip();
+            *plane = [a * inverse_len, b * inverse_len, c * inverse_len, d * inverse_len];
+        } else {
+            // A degenerate/non-finite plane must not reject scene geometry.
+            *plane = [0.0; 4];
+        }
+    }
+    planes
+}
+
 fn sphere_in_frustum(planes: &[[f32; 4]; 6], center: [f32; 3], radius: f32) -> bool {
     for &[a, b, c, d] in planes {
-        let len = (a * a + b * b + c * c).sqrt();
-        if len > 0.0 && a * center[0] + b * center[1] + c * center[2] + d < -radius * len {
+        // Planes are normalized by set_frustum; the hot loop is just a dot
+        // product and radius comparison.
+        if a * center[0] + b * center[1] + c * center[2] + d < -radius {
             return false;
         }
     }
@@ -1566,6 +1584,20 @@ fn event_milliseconds(event: &crate::ecmodel::EcmEvent, key: &str) -> Result<f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_frustum_planes_preserve_sphere_visibility() {
+        let planes = [
+            [2.0, 0.0, 0.0, 10.0], [-3.0, 0.0, 0.0, 30.0],
+            [0.0, 4.0, 0.0, 20.0], [0.0, -5.0, 0.0, 50.0],
+            [0.0, 0.0, 6.0, 60.0], [0.0, 0.0, -7.0, 70.0],
+        ];
+        let normalized = normalize_frustum_planes(planes);
+        assert!(sphere_in_frustum(&normalized, [0.0; 3], 9.9));
+        assert!(!sphere_in_frustum(&normalized, [-20.0, 0.0, 0.0], 1.0));
+        assert_eq!(normalize_frustum_planes([[0.0; 4]; 6]), [[0.0; 4]; 6]);
+        assert!(sphere_in_frustum(&normalize_frustum_planes([[0.0; 4]; 6]), [1.0e9; 3], 0.0));
+    }
 
     /// `FadeGFX` is `SetAlphaTransition(alpha, 3000)`: a full ramp takes three
     /// seconds at any frame rate, and the step never overshoots.
