@@ -3526,8 +3526,7 @@ impl Architect {
                     }
                 }
                 TransformMode::Scale => {
-                    if let (Some(start), Some(current)) =
-                        (self.object_drag_start_pointer, pointer)
+                    if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer)
                     {
                         let factor = (-(current.y - start.y) * 0.01).exp().clamp(0.05, 20.0);
                         for index in indices {
@@ -3703,7 +3702,7 @@ impl Architect {
                         {
                             painter.circle_stroke(center, radius, egui::Stroke::new(3.0, color));
                         }
-                    },
+                    }
                     TransformMode::Scale => {
                         for (axis, color) in axes {
                             if let Some(end) = axis_end(axis) {
@@ -4388,11 +4387,7 @@ mod tests {
 
     #[test]
     fn renderer_scenery_placements_emit_map_scoped_bmd_instances() {
-        let mut editor = Architect::new(
-            PathBuf::from("/client/element"),
-            None,
-            "a01".into(),
-        );
+        let mut editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
         editor.enabled = true;
         editor.project.source_map = "a01".into();
         editor.project.objects.push(PlacedObject {
