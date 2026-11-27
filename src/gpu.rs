@@ -7185,6 +7185,7 @@ pub fn run(
                             }
                             let show_librarian_preview = menu_page==MenuPage::Modules && !renderer.modules.architect_active();
                             renderer.modules.prepare_librarian_preview(&renderer.device, &renderer.queue, &mut egui_renderer, format, show_librarian_preview);
+                            renderer.modules.prepare_architect_preview(&renderer.device, &renderer.queue, &mut egui_renderer, format);
                             // On-screen mark: the active upscaler / frame-generation
                             // path, so a player can see it is really on. Shown even
                             // with the menu closed (the egui pass runs for it too).
