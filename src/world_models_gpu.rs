@@ -120,6 +120,12 @@ pub struct AlphaStatus {
     pub slots: usize,
 }
 
+fn editor_transform_changed(previous: &EditorPlacement, next: &EditorPlacement) -> bool {
+    previous.position != next.position
+        || previous.rotation != next.rotation
+        || previous.scale != next.scale
+}
+
 fn editor_scene_transform(
     placement: &EditorPlacement,
     export_id: u32,
@@ -341,11 +347,9 @@ impl World {
                     {
                         return None;
                     }
-                    if self.editor_placements.get(index).is_some_and(|previous| {
-                        previous.position == placement.position
-                            && previous.rotation == placement.rotation
-                            && previous.scale == placement.scale
-                    }) {
+                    if self.editor_placements
+                        .get(index)
+                        .is_some_and(|previous| !editor_transform_changed(previous, placement)) {
                         return Some((
                             self.assets.instances[self.native_instance_count + index]
                                 .placement
@@ -363,9 +367,7 @@ impl World {
             if let Some(updates) = updates {
                 for (index, (scene_placement, transform)) in updates.into_iter().enumerate() {
                     let unchanged = self.editor_placements.get(index).is_some_and(|previous| {
-                        previous.position == placements[index].position
-                            && previous.rotation == placements[index].rotation
-                            && previous.scale == placements[index].scale
+                        !editor_transform_changed(previous, &placements[index])
                     });
                     if unchanged {
                         continue;
@@ -1759,6 +1761,26 @@ fn event_milliseconds(event: &crate::ecmodel::EcmEvent, key: &str) -> Result<f32
 #[cfg(test)]
 mod architect_placement_tests {
     use super::*;
+
+    #[test]
+    fn transform_change_detection_only_flags_changed_transform_fields() {
+        let original = EditorPlacement {
+            path: "models/test.ecm".into(),
+            position: [1., 2., 3.],
+            rotation: [0., 0., 0.],
+            scale: 1.,
+        };
+        assert!(!editor_transform_changed(&original, &original));
+        let mut moved = original.clone();
+        moved.position[0] += 1.;
+        assert!(editor_transform_changed(&original, &moved));
+        let mut rotated = original.clone();
+        rotated.rotation[1] = 0.5;
+        assert!(editor_transform_changed(&original, &rotated));
+        let mut scaled = original.clone();
+        scaled.scale = 2.;
+        assert!(editor_transform_changed(&original, &scaled));
+    }
 
     #[test]
     fn editor_transform_preserves_position_and_applies_rotation_and_scale() {
