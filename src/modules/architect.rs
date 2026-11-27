@@ -122,6 +122,9 @@ pub struct Architect {
     last_brush_position: Option<[f32; 3]>,
     object_dragging: bool,
     object_drag_y_offset: f32,
+    object_drag_snapshot: Option<Vec<PlacedObject>>,
+    undo_objects: Vec<Vec<PlacedObject>>,
+    redo_objects: Vec<Vec<PlacedObject>>,
 }
 
 impl Architect {
@@ -195,6 +198,9 @@ impl Architect {
             last_brush_position: None,
             object_dragging: false,
             object_drag_y_offset: 0.,
+            object_drag_snapshot: None,
+            undo_objects: Vec::new(),
+            redo_objects: Vec::new(),
         };
         editor.refresh_projects();
         editor
@@ -621,6 +627,29 @@ impl Architect {
         Ok(())
     }
 
+    fn push_object_undo(&mut self, snapshot: Vec<PlacedObject>) {
+        if snapshot == self.project.objects { return; }
+        self.undo_objects.push(snapshot);
+        if self.undo_objects.len() > 128 { self.undo_objects.remove(0); }
+        self.redo_objects.clear();
+    }
+
+    fn undo_objects(&mut self) {
+        if let Some(previous) = self.undo_objects.pop() {
+            self.redo_objects.push(std::mem::replace(&mut self.project.objects, previous));
+            self.selected_placement = self.selected_placement.filter(|index| *index < self.project.objects.len());
+            self.status = "Undid object edit.".into();
+        }
+    }
+
+    fn redo_objects(&mut self) {
+        if let Some(next) = self.redo_objects.pop() {
+            self.undo_objects.push(std::mem::replace(&mut self.project.objects, next));
+            self.selected_placement = self.selected_placement.filter(|index| *index < self.project.objects.len());
+            self.status = "Redid object edit.".into();
+        }
+    }
+
     fn save_named(&mut self) -> bool {
         let name = self.project_name.trim();
         if name.is_empty() {
@@ -666,6 +695,8 @@ impl Architect {
                 };
                 self.project = project;
                 self.redo_strokes.clear();
+                self.undo_objects.clear();
+                self.redo_objects.clear();
                 let replay_error = self.rebuild_terrain().err();
                 self.selected_placement = None;
                 self.selected_scene_object = None;
@@ -708,6 +739,8 @@ impl Architect {
                 });
                 self.project = Project::default();
                 self.redo_strokes.clear();
+                self.undo_objects.clear();
+                self.redo_objects.clear();
                 self.project_name = "Untitled World".into();
                 self.selected_project = None;
                 self.selected_placement = None;
@@ -1177,6 +1210,7 @@ impl Architect {
         if !self.enabled {
             return None;
         }
+        let objects_before_ui = self.project.objects.clone();
         if self.selected_map.is_empty() || self.selected_map == "__empty__" {
             self.selected_map = current_map.id.clone();
         }
@@ -1642,10 +1676,9 @@ impl Architect {
                             }
                         }
                     }
-                    if ui.button("Undo last placement").clicked() {
-                        self.project.objects.pop();
-                        self.selected_placement = None;
-                    }
+                    if ui.button("Undo object edit").clicked() { self.undo_objects(); }
+                    if ui.button("Redo object edit").clicked() { self.redo_objects(); }
+                    if ui.button("Undo last placement").clicked() { self.undo_objects(); }
                 });
                 ui.label(format!("{} stored brush operations · {} stored placements", self.project.strokes.len(), self.project.objects.len()));
                 ui.label(egui::RichText::new("Brush edits update the shared terrain, navigation and rendered mesh. Paint remains unavailable.").small().weak());
@@ -1691,6 +1724,7 @@ impl Architect {
             }
             self.selected_placement = nearest.map(|(index, _)| index);
             self.object_dragging = self.selected_placement.is_some() && hit.is_some();
+            self.object_drag_snapshot = self.object_dragging.then(|| self.project.objects.clone());
             if let (Some(index), Some(hit)) = (self.selected_placement, hit) {
                 self.object_drag_y_offset = self.project.objects[index].position[1] - hit.y;
             }
@@ -1702,7 +1736,12 @@ impl Architect {
                 }
             }
         }
-        if released || !down { self.object_dragging = false; }
+        if released || !down {
+            if self.object_dragging {
+                if let Some(snapshot) = self.object_drag_snapshot.take() { self.push_object_undo(snapshot); }
+            }
+            self.object_dragging = false;
+        }
         if pressed && self.cursor == CursorMode::Sculpt && !over_ui && hit.is_some() { self.brush_dragging = true; self.last_brush_position = None; }
         if self.brush_dragging && down {
             if let Some(position) = hit {
@@ -1751,6 +1790,9 @@ impl Architect {
                     ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("architect_brush_cursor"))).add(egui::Shape::line(points, egui::Stroke::new(1.8, color)));
                 }
             }
+        }
+        if !self.object_dragging && objects_before_ui != self.project.objects {
+            self.push_object_undo(objects_before_ui);
         }
         map_request
     }
