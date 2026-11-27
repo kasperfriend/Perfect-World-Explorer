@@ -1072,6 +1072,160 @@ impl FarTrees {
             multi_draw: one_call,
         }
     }
+    /// Replace Architect's transient tree placements without rebuilding
+    /// the cached SpeedTree geometry, atlas, or material pipeline.
+    pub fn sync_editor_placements(
+        &mut self,
+        device: &wgpu::Device,
+        placements: &[crate::scene::EditorTreePlacement],
+    ) {
+        if self.editor_placements == placements {
+            return;
+        }
+        self.editor_placements = placements.to_vec();
+        for group in &mut self.groups {
+            group.positions.truncate(group.native_count);
+            group.transforms.truncate(group.native_count);
+        }
+        for placement in placements {
+            if !placement.position.iter().all(|value| value.is_finite())
+                || !placement.yaw.is_finite()
+                || !placement.scale.is_finite()
+                || !(0.05..=20.0).contains(&placement.scale)
+            {
+                continue;
+            }
+            if let Some(group) = self
+                .groups
+                .iter_mut()
+                .find(|group| group.tree_type == placement.tree_type as usize)
+            {
+                group.positions.push(placement.position);
+                group.transforms.push([placement.yaw, placement.scale]);
+            } else {
+                eprintln!(
+                    "Architect tree type {} is unavailable: its SpeedTree cache entry was not loaded",
+                    placement.tree_type
+                );
+            }
+        }
+
+        // Each type owns exactly three adjacent LOD batches. Re-pack their
+        // instance slices so the compute pass can write the updated population.
+        let mut instance_cursor = 0u32;
+        for group in &self.groups {
+            let count = group.positions.len() as u32;
+            for level in 0..3 {
+                if let Some(batch) = self.batches.get_mut(group.first_batch + level) {
+                    batch.instances = instance_cursor..instance_cursor + count;
+                    instance_cursor += count;
+                }
+            }
+        }
+
+        let mut placement_data = Vec::new();
+        for (group_index, group) in self.groups.iter().enumerate() {
+            for (&position, transform) in group.positions.iter().zip(&group.transforms) {
+                placement_data.push(Placement {
+                    pos_height: [position[0], position[1], position[2], 0.0],
+                    group: group_index as u32,
+                    yaw: transform[0],
+                    scale: transform[1],
+                    pad: 0,
+                });
+            }
+        }
+        self.placements = placement_data.len() as u32;
+        if placement_data.is_empty() {
+            placement_data.push(Placement {
+                pos_height: [0.0; 4],
+                group: 0,
+                yaw: 0.0,
+                scale: 1.0,
+                pad: 0,
+            });
+        }
+        let mut group_data = group_table(&self.groups, &self.batches);
+        if group_data.is_empty() {
+            group_data.push(GroupInfo {
+                height: 5.0,
+                args_base: 0,
+                first_instance: 0,
+                capacity: 0,
+            });
+        }
+
+        let seed = vec![Instance::zeroed(); instance_cursor.max(1) as usize];
+        self.capacity = seed.len();
+        self.instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Architect tree instances (LOD compute target)"),
+            contents: bytemuck::cast_slice(&seed),
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+        let placement_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Architect tree placements"),
+            contents: bytemuck::cast_slice(&placement_data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let group_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Architect tree LOD groups"),
+            contents: bytemuck::cast_slice(&group_data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let mut args = Vec::with_capacity(self.batches.len().max(1));
+        for batch in &self.batches {
+            let mut record = record(batch.indices.clone(), batch.instances.clone());
+            record.instance_count = 0;
+            if !self.multi_draw {
+                record.first_instance = 0;
+            }
+            args.push(record);
+        }
+        if args.is_empty() {
+            args.push(record(0..0, 0..0));
+        }
+        self.lod_args_reset = bytemuck::cast_slice::<DrawIndexedArgs, u8>(&args).to_vec();
+        self.lod_args = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Architect tree LOD indirect args"),
+            contents: &self.lod_args_reset,
+            usage: wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+        self.lod_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Architect tree LOD bindings"),
+            layout: &self.lod_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.lod_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: placement_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: group_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.instances.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.lod_args.as_entire_binding(),
+                },
+            ],
+        });
+        self.last_resident_update = None;
+    }
+
     /// Select every placement's LOD on the GPU.
     ///
     /// The CPU used to walk the whole placement table here — distance, LOD
@@ -1139,7 +1293,7 @@ impl FarTrees {
         let mut args = self.lod_args_reset.clone();
         for group in &self.groups {
             let mut counts = [0u32; 3];
-            for &p in &group.positions {
+            for (position_index, &p) in group.positions.iter().enumerate() {
                 let Some(dist) = crate::tree_lod::client_distance(p, camera) else {
                     continue;
                 };
@@ -1164,7 +1318,8 @@ impl FarTrees {
                     }
                     let batch = &self.batches[group.first_batch + level];
                     let index = (batch.instances.start + counts[level]) as usize;
-                    staging[index] = Instance::new(p, info);
+                    let transform = group.transforms[position_index];
+                    staging[index] = Instance::new(p, info, transform[0], transform[1]);
                     counts[level] += 1;
                 }
             }
