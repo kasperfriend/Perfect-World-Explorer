@@ -132,7 +132,10 @@ fn build_point_light_bvh(
         for &index in indices.iter() {
             let light = positions[index as usize];
             let center = Vec3::new(light[0], light[1], light[2]);
-            let radius = Vec3::splat(light[3].max(0.0));
+            // Expand slightly to cover CPU/GPU float-rounding differences at
+            // the strict influence-sphere boundary; this can only add work.
+            let padding = (light[3].abs() * 1e-5).max(1e-4);
+            let radius = Vec3::splat(light[3].max(0.0) + padding);
             minimum = minimum.min(center - radius);
             maximum = maximum.max(center + radius);
         }
