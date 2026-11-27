@@ -362,6 +362,14 @@ impl World {
                 .collect::<Option<Vec<_>>>();
             if let Some(updates) = updates {
                 for (index, (scene_placement, transform)) in updates.into_iter().enumerate() {
+                    let unchanged = self.editor_placements.get(index).is_some_and(|previous| {
+                        previous.position == placements[index].position
+                            && previous.rotation == placements[index].rotation
+                            && previous.scale == placements[index].scale
+                    });
+                    if unchanged {
+                        continue;
+                    }
                     let slot_index = self.native_instance_count + index;
                     self.assets.instances[slot_index].placement = scene_placement;
                     self.slots[slot_index].transform = Ok(transform);
