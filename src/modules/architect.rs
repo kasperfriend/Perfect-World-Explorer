@@ -623,7 +623,17 @@ impl Architect {
             asset
         };
         let normalized = crate::ecmodel::normalize(path);
-        (normalized.starts_with("models/") && normalized.ends_with(".ecm")).then_some(normalized)
+        // PCK entry names are untrusted archive data. Normalize canonicalizes
+        // separators and case, but intentionally does not resolve dot segments;
+        // reject traversal before handing a path to the archive-backed reader.
+        let safe_segments = normalized
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+        (safe_segments
+            && normalized.starts_with("models/")
+            && normalized.ends_with(".ecm")
+            && !normalized.contains(':'))
+        .then_some(normalized)
     }
 
     /// Current project's supported ECM placements, for the native GPU model
@@ -1444,6 +1454,18 @@ mod tests {
         );
         assert_eq!(
             Architect::renderer_asset_path("element/loose/guard.ecm"),
+            None
+        );
+        assert_eq!(
+            Architect::renderer_asset_path("element/models.pck::models/../../outside.ecm"),
+            None
+        );
+        assert_eq!(
+            Architect::renderer_asset_path("element/models.pck::models/./guard.ecm"),
+            None
+        );
+        assert_eq!(
+            Architect::renderer_asset_path("element/models.pck::models/npcs/guard:evil.ecm"),
             None
         );
     }
