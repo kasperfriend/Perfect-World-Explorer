@@ -2495,8 +2495,9 @@ impl GpuPage {
         {
             view.ready = false;
         }
-        // Small lists are cheaper on the CPU. The all-inside opaque fast path
-        // also stays on CPU because only the projected-size check remains there.
+        // GPU compaction needs the native indirect-count feature; otherwise
+        // retain the allocation-free CPU hierarchy and direct/ordinary MDI path.
+        // Small lists and the all-inside opaque fast path are cheaper on CPU.
         if !multi_draw
             || list.cmds.len() < 64
             || list.chunks.is_empty()
@@ -2509,16 +2510,31 @@ impl GpuPage {
         {
             return false;
         }
+        let run_count = 1 + list
+            .cmds
+            .windows(2)
+            .filter(|pair| pair[0].page != pair[1].page)
+            .count();
+        if run_count > u32::MAX as usize {
+            return false;
+        }
+        let workgroups = run_count as u32;
         let limits = device.limits();
         let bounds_bytes = (list.cmds.len() as u64)
             .saturating_mul(std::mem::size_of::<WorldGpuCullBounds>() as u64);
         let args_bytes = (list.cmds.len() as u64).saturating_mul(PAGE_DRAW_ARGS_SIZE);
-        let workgroups = (list.cmds.len() as u32).div_ceil(64);
+        let run_bytes = (run_count as u64)
+            .saturating_mul(std::mem::size_of::<WorldGpuCullRun>() as u64);
+        let count_bytes = (run_count as u64).saturating_mul(std::mem::size_of::<u32>() as u64);
         let binding_limit = u64::from(limits.max_storage_buffer_binding_size);
         if bounds_bytes > binding_limit
             || args_bytes > binding_limit
+            || run_bytes > binding_limit
+            || count_bytes > binding_limit
             || bounds_bytes > limits.max_buffer_size
             || args_bytes > limits.max_buffer_size
+            || run_bytes > limits.max_buffer_size
+            || count_bytes > limits.max_buffer_size
             || workgroups > limits.max_compute_workgroups_per_dimension
         {
             return false;
@@ -2540,7 +2556,7 @@ impl GpuPage {
         let view = culler.views[view_slot]
             .as_mut()
             .expect("world cull view was just created");
-        let params = WorldGpuCullParams::new(cull, list.cmds.len(), sdr_only);
+        let params = WorldGpuCullParams::new(cull, view.runs.len(), sdr_only);
         queue.write_buffer(&view.params, 0, bytemuck::bytes_of(&params));
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2571,9 +2587,9 @@ impl GpuPage {
         if pages.is_empty() || list.chunks.is_empty() {
             return;
         }
-        // A successful compute dispatch writes one valid indexed-indirect
-        // record per stable world command. Keep the original page/run ordering
-        // and bind-group transitions; only the proven-invisible records vanish.
+        // A successful compute dispatch stably compacts visible commands within
+        // each page run. The indirect count buffer prevents invisible records
+        // from reaching the driver, while page and global run order stay intact.
         let gpu_view = scratch
             .gpu_culler
             .as_ref()
@@ -2582,7 +2598,7 @@ impl GpuPage {
             .filter(|view| view.ready && view.commands.as_slice() == list.cmds.as_slice());
         if let Some(view) = gpu_view {
             let mut bound_page: Option<usize> = None;
-            for run in &view.runs {
+            for (run_index, run) in view.runs.iter().enumerate() {
                 if bound_page != Some(run.page) {
                     let page = &pages[run.page];
                     let same_atlas =
@@ -2611,16 +2627,14 @@ impl GpuPage {
                     bound_page = Some(run.page);
                 }
                 let offset = u64::from(run.first_record) * PAGE_DRAW_ARGS_SIZE;
-                if run.record_count > 1 && multi_draw {
-                    pass.multi_draw_indexed_indirect(&view.indirect, offset, run.record_count);
-                } else {
-                    for record in 0..run.record_count {
-                        pass.draw_indexed_indirect(
-                            &view.indirect,
-                            offset + u64::from(record) * PAGE_DRAW_ARGS_SIZE,
-                        );
-                    }
-                }
+                let count_offset = (run_index as u64) * std::mem::size_of::<u32>() as u64;
+                pass.multi_draw_indexed_indirect_count(
+                    &view.indirect,
+                    offset,
+                    &view.counts,
+                    count_offset,
+                    run.record_count,
+                );
             }
             return;
         }
