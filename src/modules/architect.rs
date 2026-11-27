@@ -2881,7 +2881,7 @@ impl Architect {
                                         let t = ((pointer - center).dot(segment)
                                             / segment.length_sq().max(0.001))
                                             .clamp(0.0, 1.0);
-                                        center.distance(center + segment * t - pointer) <= 12.0
+                                        (center + segment * t).distance(pointer) <= 12.0
                                     }) {
                                         axis_pick = Some(axis_index);
                                         break;
@@ -2920,7 +2920,7 @@ impl Architect {
                         // selectable where their visible geometry actually is.
                         let projected_bounds = Self::renderer_asset_path(&object.asset)
                             .and_then(|path| self.preview_bounds.get(&path).copied())
-                            .map(|(min, max)| {
+                            .and_then(|(min, max)| {
                                 let rotation = glam::Quat::from_euler(
                                     glam::EulerRot::XYZ,
                                     object.rotation[0],
