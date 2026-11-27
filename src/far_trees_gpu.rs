@@ -486,6 +486,7 @@ fn sample_tri_alpha_mask49(
     u1: [f32; 2],
     u2: [f32; 2],
     cutoff: f32,
+    inclusive_cutoff: bool,
 ) -> (u64, [f32; 3], u32) {
     let mut mask = 0u64;
     let mut rgb_sum = [0.0f32; 3];
@@ -503,7 +504,7 @@ fn sample_tri_alpha_mask49(
                 u0[1] * bw + u1[1] * bx + u2[1] * by,
             ];
             let (rgb, a) = sample_rgba_uv(img, uv);
-            if a >= cutoff {
+            if if inclusive_cutoff { a >= cutoff } else { a > cutoff } {
                 mask |= 1u64 << (iy * 7 + ix);
                 hits += 1;
                 rgb_sum[0] += rgb[0] * a;
@@ -938,10 +939,18 @@ impl FarTrees {
                             }
                             let norm = cross.normalize();
                             if is_foliage {
+                                let uses_authored_cutoff = authored_mips
+                                    && lod.frond_alpha_ref.is_some_and(|reference| reference >= 0.0);
                                 let frond_cutoff =
                                     raster_alpha_cutoff(authored_mips, lod.frond_alpha_ref);
-                                let (mask, albedo, hits) =
-                                    sample_tri_alpha_mask49(img, v0.uv, v1.uv, v2.uv, frond_cutoff);
+                                let (mask, albedo, hits) = sample_tri_alpha_mask49(
+                                    img,
+                                    v0.uv,
+                                    v1.uv,
+                                    v2.uv,
+                                    frond_cutoff,
+                                    !uses_authored_cutoff,
+                                );
                                 if hits == 0 {
                                     ldiag.frond_skipped += 1;
                                     continue;
@@ -1000,6 +1009,7 @@ impl FarTrees {
                             leaf.uv[1],
                             leaf.uv[2],
                             leaf_cutoff,
+                            !authored_mips,
                         );
                         let (m1, a1, h1) = sample_tri_alpha_mask49(
                             foliage_image,
@@ -1007,6 +1017,7 @@ impl FarTrees {
                             leaf.uv[2],
                             leaf.uv[3],
                             leaf_cutoff,
+                            !authored_mips,
                         );
                         if h0 + h1 == 0 {
                             ldiag.leaves_skipped += 1;
