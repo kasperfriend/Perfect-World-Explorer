@@ -397,18 +397,21 @@ impl Harvester {
         if self.cached.is_none() {
             return true;
         }
-        if let Some(t) = self.last_build_finished {
-            if t.elapsed() < std::time::Duration::from_millis(1500) {
-                return false;
-            }
-        }
         let far_bucket = (view_distance / 128.0).round() as u32;
+        // World/config changes are correctness invalidations, not camera-motion
+        // churn. Never hide newly streamed pages or terrain behind the movement
+        // cooldown; only apply hysteresis after the content keys match.
         if self.last_build_config != Some(config)
             || self.last_build_terrain_gen != terrain_generation
             || self.last_build_content_hash != content_hash
             || self.last_build_far_bucket != far_bucket
         {
             return true;
+        }
+        if let Some(t) = self.last_build_finished {
+            if t.elapsed() < std::time::Duration::from_millis(1500) {
+                return false;
+            }
         }
         match self.last_build_eye {
             Some(last) => {
@@ -2527,6 +2530,42 @@ mod tests {
             ),
             "camera move beyond hysteresis threshold must request a rebuild"
         );
+    }
+
+    #[test]
+    fn content_changes_bypass_camera_rebuild_cooldown() {
+        let mut harvester = Harvester::new();
+        let eye = Vec3::new(0.0, 10.0, 0.0);
+        let forward = Vec3::Z;
+        let vp = Mat4::perspective_infinite_reverse_rh(60.0f32.to_radians(), 16.0 / 9.0, 0.5)
+            * Mat4::look_to_rh(eye, forward, Vec3::Y);
+        let ground = |_x: f32, _z: f32| 0.0;
+        let config = HarvestConfig::default();
+        let _ = harvester.scene_frustum(
+            config,
+            eye,
+            forward,
+            vp,
+            1200.0,
+            2.0,
+            1,
+            42,
+            Some(&ground),
+            &[],
+            &[],
+            &[],
+        );
+        // Simulate a just-completed background build. Camera-only movement is
+        // throttled, but streamed content/terrain changes must rebuild now.
+        harvester.last_build_finished = Some(std::time::Instant::now());
+        assert!(!harvester.needs_frustum_rebuild(config, eye, 1200.0, 1, 42));
+        assert!(harvester.needs_frustum_rebuild(config, eye, 1200.0, 2, 42));
+        assert!(harvester.needs_frustum_rebuild(config, eye, 1200.0, 1, 43));
+        let changed_config = HarvestConfig {
+            radius: config.radius + 1.0,
+            ..config
+        };
+        assert!(harvester.needs_frustum_rebuild(changed_config, eye, 1200.0, 1, 42));
     }
 
     #[test]
