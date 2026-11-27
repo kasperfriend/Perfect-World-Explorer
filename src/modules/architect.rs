@@ -1375,6 +1375,8 @@ impl Architect {
         self.selected_placement = created.last().copied();
         self.selected_scene_object = None;
         self.selected_scene_transform = None;
+        self.multi_selection.clear();
+        self.multi_scene_items.clear();
         self.status = format!(
             "Copied {} supported client scene item(s) into the editable project layer.",
             created.len()
