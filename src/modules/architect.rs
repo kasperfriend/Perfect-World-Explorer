@@ -2529,6 +2529,11 @@ impl Architect {
                                             )
                                             .clicked()
                                         {
+                                            self.selected_asset = self
+                                                .project
+                                                .objects
+                                                .get(*index)
+                                                .map(|object| object.asset.clone());
                                             if self.cursor == CursorMode::MultiSelect {
                                                 if self.selected_placements.insert(*index) {
                                                     self.selected_placement = Some(*index);
@@ -3140,7 +3145,7 @@ impl Architect {
             match self.transform_mode {
                 TransformMode::Move => {
                     if !self.object_drag_group.is_empty() {
-                                    let delta = match self.object_drag_axis {
+                        let delta = match self.object_drag_axis {
                             Some(0) => self
                                 .object_drag_start_hit
                                 .zip(hit)
@@ -3165,7 +3170,8 @@ impl Architect {
                         if let Some(delta) = delta {
                             for (index, position) in &self.object_drag_group {
                                 if let Some(object) = self.project.objects.get_mut(*index) {
-                                    object.position = (Vec3::from_array(*position) + delta).to_array();
+                                    object.position =
+                                        (Vec3::from_array(*position) + delta).to_array();
                                 }
                             }
                         }
@@ -3204,9 +3210,12 @@ impl Architect {
                     }
                 }
                 TransformMode::Rotate => {
-                    if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer) {
+                    if let (Some(start), Some(current)) =
+                        (self.object_drag_start_pointer, pointer)
+                    {
                         let axis = self.object_drag_axis.unwrap_or(1);
-                        let angle = (current.x - start.x - (current.y - start.y) * 0.35) * 0.01;
+                        let angle =
+                            (current.x - start.x - (current.y - start.y) * 0.35) * 0.01;
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
                                 let original = self
@@ -3221,7 +3230,8 @@ impl Architect {
                                         1 => glam::Quat::from_rotation_y(angle),
                                         _ => glam::Quat::from_rotation_z(angle),
                                     };
-                                    object.position = (pivot + rotation * relative).to_array();
+                                    object.position =
+                                        (pivot + rotation * relative).to_array();
                                     object.rotation = original.rotation;
                                     object.rotation[axis] += angle;
                                 }
@@ -3231,7 +3241,9 @@ impl Architect {
                 }
                 TransformMode::Scale => {
                     if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer) {
-                        let factor = (-(current.y - start.y) * 0.01).exp().clamp(0.05, 20.0);
+                        let factor = (-(current.y - start.y) * 0.01)
+                            .exp()
+                            .clamp(0.05, 20.0);
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
                                 if let Some(original) = self
@@ -3241,7 +3253,8 @@ impl Architect {
                                 {
                                     object.scale = (original.scale * factor).clamp(0.01, 100.0);
                                     let relative = Vec3::from_array(original.position) - pivot;
-                                    object.position = (pivot + relative * factor).to_array();
+                                    object.position =
+                                        (pivot + relative * factor).to_array();
                                 }
                             }
                         }
@@ -3409,11 +3422,20 @@ impl Architect {
             .iter()
             .filter_map(|index| self.project.objects.get(*index))
             .filter(|object| object.visible)
-            .map(|object| (object.asset.clone(), object.position, object.scale, object.rotation))
+            .map(|object| {
+                (
+                    object.asset.clone(),
+                    object.position,
+                    object.scale,
+                    object.rotation,
+                )
+            })
             .collect::<Vec<_>>();
         if outline_items.is_empty() {
             if let (Some(asset), Some(position)) = (
-                self.selected_asset.as_ref().filter(|_| self.selected_scene_object.is_some()),
+                self.selected_asset
+                    .as_ref()
+                    .filter(|_| self.selected_scene_object.is_some()),
                 self.selected_scene_transform,
             ) {
                 outline_items.push((asset.clone(), position, 1.0, [0.; 3]));
