@@ -208,8 +208,12 @@ impl Normals {
         if let Data::Resident(grid) = &self.0.data {
             return grid.normals[index];
         }
+        let edits = self.0.edits.read().unwrap();
+        let revision = self.0.revision.load(Ordering::Acquire);
         Reader {
             store: Arc::clone(&self.0),
+            edits: Arc::clone(&edits),
+            revision,
             current: None,
         }
         .normal(index)
@@ -591,7 +595,7 @@ impl Builder {
                 width: self.width,
                 side: self.side,
                 data: Data::Resident(grid),
-                edits: RwLock::new(HashMap::new()),
+                edits: RwLock::new(Arc::new(HashMap::new())),
                 revision: AtomicU64::new(0),
             });
             return Ok((Heights(Arc::clone(&store)), Normals(store)));
@@ -682,7 +686,7 @@ impl Builder {
                     },
                 },
             })),
-            edits: RwLock::new(HashMap::new()),
+            edits: RwLock::new(Arc::new(HashMap::new())),
             revision: AtomicU64::new(0),
         });
         Ok((Heights(Arc::clone(&store)), Normals(store)))
@@ -964,7 +968,7 @@ pub fn restore(
                 },
             },
         })),
-        edits: RwLock::new(HashMap::new()),
+        edits: RwLock::new(Arc::new(HashMap::new())),
         revision: AtomicU64::new(0),
     });
     eprintln!(
