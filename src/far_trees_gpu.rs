@@ -263,7 +263,7 @@ struct In {@builtin(vertex_index) vertex_id:u32,@location(0) pos:vec3<f32>,@loca
 struct Out {@builtin(position) pos:vec4<f32>,@location(0) normal:vec3<f32>,@location(1) uv:vec2<f32>,@location(2) color:vec4<f32>,@location(3) @interpolate(flat) kind:f32,@location(4) world:vec3<f32>,@location(5) @interpolate(flat) tree:vec3<f32>,@location(6) @interpolate(flat) tex_h:f32,@location(7) @interpolate(flat) fade:vec2<f32>,@location(8) @interpolate(flat) alpha_ref:u32};
 fn rotate_y(v:vec3<f32>,yaw:f32)->vec3<f32>{let c=cos(yaw);let s=sin(yaw);return vec3<f32>(c*v.x-s*v.z,v.y,s*v.x+c*v.z);}
 @vertex fn vs(i:In)->Out {var o:Out;var pos=rotate_y(i.pos*i.info.z,i.instance.w)+i.instance.xyz;var norm=rotate_y(i.normal,i.instance.w);
- if i.kind>4.5 {let d=normalize(camera.direction.xyz);let az=atan2(d.z,d.x);let el=asin(clamp(d.y,-1.,1.));let rho=i.color.w;var corner=rotate_y(i.normal,i.instance.w);let rock_index=i.tex_h>>8u;if rock_index>0u {corner=mix(corner,rock_sample(rock_index-1u,camera.tree_bounds.w),clamp(camera.tree_bounds.z,0.,1.));}let q=vec3<f32>(cos(el)*corner.x-sin(el)*corner.z,corner.y,sin(el)*corner.x+cos(el)*corner.z);let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. {v=corner;}pos+=vec3<f32>(v.x,v.z,v.y)*i.info.z;norm=vec3<f32>(0.,1.,0.);if i.vertex_id<arrayLength(&leaf_normals) {let n=leaf_normals[i.vertex_id];if n.w>0.5 {norm=rotate_y(n.xyz,i.instance.w);}}}
+ if i.kind>4.5 {let d=normalize(camera.direction.xyz);let az=atan2(d.z,d.x);let el=asin(clamp(d.y,-1.,1.));let rho=i.color.w;var corner=rotate_y(i.normal,i.instance.w);let rock_index=i.tex_h>>8u;if rock_index>0u {corner=mix(corner,rotate_y(rock_sample(rock_index-1u,camera.tree_bounds.w),i.instance.w),clamp(camera.tree_bounds.z,0.,1.));}let q=vec3<f32>(cos(el)*corner.x-sin(el)*corner.z,corner.y,sin(el)*corner.x+cos(el)*corner.z);let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. {v=corner;}pos+=vec3<f32>(v.x,v.z,v.y)*i.info.z;norm=vec3<f32>(0.,1.,0.);if i.vertex_id<arrayLength(&leaf_normals) {let n=leaf_normals[i.vertex_id];if n.w>0.5 {norm=rotate_y(n.xyz,i.instance.w);}}}
  o.pos=camera.matrix*vec4<f32>(pos,1.);o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.tree=i.instance.xyz;o.tex_h=f32(i.tex_h & 127u)*select(128./8192.,128./2048.,(i.tex_h & 128u)!=0u);o.fade=i.info.xy;o.alpha_ref=i.alpha_ref;return o;}
 @fragment fn fs(i:Out)->@location(0) vec4<f32>{if camera.clip.y!=0. && (i.world.y-camera.clip.x)*camera.clip.y<0. {discard;}
 
@@ -772,8 +772,8 @@ impl FarTrees {
             push_constant_ranges: &[],
         });
         const ATTR: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x2,3=>Float32x4,4=>Float32,7=>Uint32,8=>Uint32];
-        // `Instance` is two `vec4`s (see its doc): position at 0, transition
-        // info at 16. `vertex_attr_array!` would pack them at 0 and 12.
+        // `Instance` is two `vec4`s (see its doc): position/yaw at 0,
+        // fade/scale at 16. `vertex_attr_array!` would pack them at 0 and 12.
         const INST: [wgpu::VertexAttribute; 2] = [
             wgpu::VertexAttribute {
                 format: wgpu::VertexFormat::Float32x4,
