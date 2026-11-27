@@ -2650,6 +2650,7 @@ struct ReprojectResult {
     light_factor: f32,
     moments: vec2<f32>,
     length: f32,
+    source_delta: vec2<f32>,
 };
 
 // Phase 7: Reproject using explicit object motion where written (`mv.z >= 0.5`,
@@ -2662,6 +2663,7 @@ fn reproject(pixel: vec2<i32>, size: vec2<i32>, current_depth: f32) -> Reproject
     empty.light_factor = 1.0;
     empty.moments = vec2<f32>(0.0);
     empty.length = 0.0;
+    empty.source_delta = vec2<f32>(0.0);
 
     if (current_depth <= 0.0) {
         return empty;
@@ -2710,6 +2712,10 @@ fn reproject(pixel: vec2<i32>, size: vec2<i32>, current_depth: f32) -> Reproject
     out.light_factor = prev_c.a;
     out.moments = prev_m.xy;
     out.length = prev_m.w;
+    // Measure motion in render pixels. Water reflections are view-dependent
+    // signals, so surface reprojection becomes less trustworthy as the camera
+    // moves the reflecting surface farther across the screen.
+    out.source_delta = source - (vec2<f32>(pixel) + vec2<f32>(0.5));
     return out;
 }
 
@@ -2739,14 +2745,10 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     // Boost #16: Pass already-loaded depth into reproject (saves 1 full-screen Depth32F fetch).
     let prev = reproject(pixel, size, depth);
-    let n = min(prev.length, params.misc.z);
-    // Opt: Sky pixels (depth <= 1e-6) skip the 3x3 16-fetch SVGF neighborhood loop
-    // (atrous_pass skips sky too), passing volumetric clouds straight to composite.
-    if (depth <= 1e-6) {
-        textureStore(out_colour, pixel, vec4<f32>(current, current_lf));
-        textureStore(out_moments, pixel, vec4<f32>(0.0, 0.0, 0.0, 1.0));
-        return;
-    }
+    // Water's reflected scene moves independently from the water surface.
+    // A short cap prevents stale mirror content from surviving many frames.
+    let history_cap = select(params.misc.z, min(params.misc.z, 6.0), is_glossy);
+    let n = min(prev.length, history_cap);
     let valid = params.misc.w > 0.5 && n > 0.0;
     var blended = current;
     var blended_lf = current_lf;
@@ -2780,24 +2782,30 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         let inv9 = 1.0 / 9.0;
         let mean = sum * inv9;
         let stddev = sqrt(max(sum_sq * inv9 - mean * mean, vec3<f32>(0.0))) * params.weights.w;
-        // Water reflections are stochastic one-sample signals. Clamping their
-        // reprojected history to the current 3x3 sample neighbourhood discards
-        // valid temporal energy whenever a reflected edge crosses that kernel,
-        // which reads as reflection popping. Keep valid water history; land
-        // lighting continues to use the variance clamp.
+        // Water reflections are stochastic one-sample signals, but fully
+        // bypassing the neighbourhood clamp lets stale reflected edges smear
+        // across the moving surface. Use a wider clamp for water while keeping
+        // the tighter variance clamp for diffuse lighting.
         let history = select(
             clamp(prev.colour, mean - stddev, mean + stddev),
-            prev.colour,
+            clamp(prev.colour, mean - stddev * 2.0, mean + stddev * 2.0),
             is_glossy,
         );
         let current_clamped = min(current, mean * 1.75 + vec3<f32>(0.12));
         let mean_lf = sum_lf * inv9;
         let std_lf = sqrt(max(sum_lf_sq * inv9 - mean_lf * mean_lf, 0.0)) * params.weights.w;
         let history_lf = clamp(prev.light_factor, mean_lf - std_lf, mean_lf + std_lf);
-        let alpha = max(1.0 / (n + 1.0), params.extent.w);
+        // Increase water's current-frame contribution with reprojection
+        // distance. This approximates reflected-point motion without tracing
+        // an additional reflected world position through the previous VP.
+        let water_motion_alpha = clamp(length(prev.source_delta) * 0.12, 0.0, 1.0);
+        let alpha = max(
+            max(1.0 / (n + 1.0), params.extent.w),
+            select(0.0, water_motion_alpha, is_glossy),
+        );
         blended = mix(history, current_clamped, alpha);
         blended_lf = clamp(mix(history_lf, current_lf, alpha), 0.0, 1.0);
-        length = min(n + 1.0, params.misc.z);
+        length = min(n + 1.0, history_cap);
         let lum = luminance(blended);
         m1 = mix(prev.moments.x, lum, alpha);
         m2 = mix(prev.moments.y, lum * lum, alpha);
