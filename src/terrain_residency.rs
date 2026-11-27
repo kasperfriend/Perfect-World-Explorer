@@ -538,13 +538,17 @@ mod tests {
         let mut residency = Residency::default();
         let win = window(0, 0, 4, 1);
         residency
-            .update_stitched_parallel(&win, |_, _| (3, [0; 4]), move |x, _, _, _| {
-                Ok((
-                    vec![vertex(x as f32), vertex(x as f32 + 1.)],
-                    std::sync::Arc::clone(&shared),
-                    [x as f32, 0., 0., x as f32 + 1., 0., 1.],
-                ))
-            })
+            .update_stitched_parallel(
+                &win,
+                |_, _| (3, [0; 4]),
+                move |x, _, _, _| {
+                    Ok((
+                        vec![vertex(x as f32), vertex(x as f32 + 1.)],
+                        std::sync::Arc::clone(&shared),
+                        [x as f32, 0., 0., x as f32 + 1., 0., 1.],
+                    ))
+                },
+            )
             .unwrap();
 
         let first = &residency.blocks[&(0, 0)].indices;
