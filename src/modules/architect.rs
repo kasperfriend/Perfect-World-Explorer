@@ -1317,7 +1317,12 @@ impl Architect {
             rotation: [0.; 3],
             scale: 1.,
         });
-        self.selected_placement = Some(self.project.objects.len() - 1);
+        let index = self.project.objects.len() - 1;
+        self.selected_placement = Some(index);
+        self.selected_placements.clear();
+        self.selected_placements.insert(index);
+        self.selected_scene_object = None;
+        self.selected_scene_transform = None;
         self.status = "Game model placed in the live Architect viewport.".into();
     }
 
@@ -1665,6 +1670,25 @@ impl Architect {
                     ui.selectable_value(&mut self.cursor, CursorMode::MultiSelect, "Multi-select");
                     ui.selectable_value(&mut self.cursor, CursorMode::Lasso, "Lasso");
                     ui.selectable_value(&mut self.cursor, CursorMode::Place, "Place");
+                    if self.cursor == CursorMode::Place {
+                        let can_place = self.selected_asset.is_some()
+                            && self.brush_cursor_position.is_some();
+                        if ui.add_enabled(can_place, egui::Button::new("Place here")).clicked() {
+                            if let Some(position) = self.brush_cursor_position {
+                                let mut placement = position;
+                                match self.snap {
+                                    SnapMode::Off | SnapMode::Objects => {}
+                                    SnapMode::Terrain | SnapMode::Smart => {
+                                        if let Some(map) = &self.map {
+                                            placement[1] =
+                                                map.ground(placement[0], placement[2]) + 0.5;
+                                        }
+                                    }
+                                }
+                                self.add_selected_asset_at_position(placement);
+                            }
+                        }
+                    }
                     ui.selectable_value(&mut self.cursor, CursorMode::Sculpt, "Sculpt");
                     ui.separator();
                     ui.label("Gizmo");
