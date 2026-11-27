@@ -1313,32 +1313,63 @@ fn hg_phase(cos_theta: f32, g: f32) -> f32 {
 
 fn trace_effect_light_reflections(origin: vec3<f32>, dir: vec3<f32>, max_t: f32, pl_count: u32) -> vec3<f32> {
     var glow_sum = vec3<f32>(0.0);
-    for (var li = 0u; li < pl_count; li = li + 1u) {
-        let pr = params.point_lights_pos_rad[li];
-        if (pr.w <= 0.1) {
+    let inv_dir = safe_inv_dir(dir);
+    var stack: array<u32, 8>;
+    var stack_len = 0u;
+    if (pl_count > 0u && params.point_light_bvh_meta.x > 0.5) {
+        stack[stack_len] = 0u;
+        stack_len = stack_len + 1u;
+    }
+    loop {
+        if (stack_len == 0u) {
+            break;
+        }
+        stack_len = stack_len - 1u;
+        let node_index = stack[stack_len];
+        let node_min = params.point_light_bvh_min[node_index];
+        let node_max = params.point_light_bvh_max[node_index];
+        if (box_hit(node_min.xyz, node_max.xyz, origin, inv_dir, 0.8, max_t) < 0.0) {
             continue;
         }
-        let d_eye = pr.xyz - params.eye.xyz;
-        if (dot(d_eye, d_eye) < 12.25) {
-            continue;
-        }
-        let to_l = pr.xyz - origin;
-        let t_proj = dot(to_l, dir);
-        if (t_proj <= 0.8 || t_proj >= max_t) {
-            continue;
-        }
-        let d2 = max(dot(to_l, to_l) - t_proj * t_proj, 0.0);
-        let r_core = clamp(pr.w * 0.11, 0.50, 3.2);
-        let r2_out = r_core * r_core * 6.0;
-        if (d2 < r2_out) {
-            let ci = params.point_lights_col_int[li];
-            if (ci.w < 0.05) {
-                continue;
+        if (node_min.w >= 0.0) {
+            let leaf_count = u32(node_min.w);
+            let leaf_first = u32(node_max.w);
+            for (var offset = 0u; offset < leaf_count; offset = offset + 1u) {
+                let li = point_light_order_at(leaf_first + offset);
+                let pr = params.point_lights_pos_rad[li];
+                if (pr.w <= 0.1) {
+                    continue;
+                }
+                let d_eye = pr.xyz - params.eye.xyz;
+                if (dot(d_eye, d_eye) < 12.25) {
+                    continue;
+                }
+                let to_l = pr.xyz - origin;
+                let t_proj = dot(to_l, dir);
+                if (t_proj <= 0.8 || t_proj >= max_t) {
+                    continue;
+                }
+                let d2 = max(dot(to_l, to_l) - t_proj * t_proj, 0.0);
+                let r_core = clamp(pr.w * 0.11, 0.50, 3.2);
+                let r2_out = r_core * r_core * 6.0;
+                if (d2 < r2_out) {
+                    let ci = params.point_lights_col_int[li];
+                    if (ci.w < 0.05) {
+                        continue;
+                    }
+                    let u = clamp(d2 / max(r2_out, 0.1), 0.0, 1.0);
+                    let win = 1.0 - u;
+                    let orb = (win * win * win) * exp(-u * 3.5) / (1.0 + t_proj * 0.014);
+                    glow_sum = glow_sum + ci.rgb * (ci.w * orb * 0.28);
+                }
             }
-            let u = clamp(d2 / max(r2_out, 0.1), 0.0, 1.0);
-            let win = 1.0 - u;
-            let orb = (win * win * win) * exp(-u * 3.5) / (1.0 + t_proj * 0.014);
-            glow_sum = glow_sum + ci.rgb * (ci.w * orb * 0.28);
+        } else {
+            let left = node_index + 1u;
+            let right = u32(node_max.w);
+            stack[stack_len] = right;
+            stack_len = stack_len + 1u;
+            stack[stack_len] = left;
+            stack_len = stack_len + 1u;
         }
     }
     return min(glow_sum, vec3<f32>(2.2));
