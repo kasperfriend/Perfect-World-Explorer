@@ -752,7 +752,6 @@ impl Manager {
         self.index.clear();
         self.index.reserve(self.owners.len());
         self.live_owner_indices.clear();
-        self.live_owner_indices.clear();
         self.active_owner_indices.clear();
         self.player_build_indices.clear();
         self.pending_owner_indices.clear();
@@ -917,6 +916,7 @@ impl Manager {
         }
         self.removed += self.owners.len();
         self.owners.clear();
+        self.live_owner_indices.clear();
         self.active_owner_indices.clear();
         self.player_build_indices.clear();
         self.pending_owner_indices.clear();
