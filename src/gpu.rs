@@ -1812,6 +1812,8 @@ struct Renderer {
     /// the pages whose content did not change instead of re-uploading them.
     local_page_keys: Vec<u64>,
     world_pages: Vec<crate::world_objects::GpuPage>,
+    /// Shared append-only geometry allocations for streamed world pages.
+    world_geometry_arena: crate::world_objects::WorldGeometryArena,
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
     world_draw_cmds: [crate::world_objects::WorldDrawList; crate::world_objects::WORLD_VIEWS],
     /// Separate scratch/buffer lifetimes let the opaque and SDR indirect
@@ -2739,6 +2741,7 @@ impl Renderer {
             local_pages,
             local_page_keys,
             world_pages: Vec::new(),
+            world_geometry_arena: crate::world_objects::WorldGeometryArena::default(),
             world_draw_cmds: std::array::from_fn(|_| {
                 crate::world_objects::WorldDrawList::default()
             }),
@@ -7075,7 +7078,7 @@ pub fn run(
                     if want_world != world_enabled {
                         world_enabled=want_world;
                         if let Some(c)=world_cancel.take(){c.store(true,std::sync::atomic::Ordering::Relaxed);}
-                        world_rx=None;renderer.world_pages.clear();renderer.world_pages.shrink_to_fit();renderer.world_draw_cmds=Default::default();renderer.world_done=false;
+                        world_rx=None;renderer.world_pages.clear();renderer.world_geometry_arena.reset();renderer.world_pages.shrink_to_fit();renderer.world_draw_cmds=Default::default();renderer.world_done=false;
                         if world_enabled {
                          // Each in-flight whole-world Page carries up to ~85 MiB of 4096^2 RGBA + mips;
                          // keeping 4/2 pages buffered saturates GPU upload while cutting peak RAM spikes by ~500-680 MiB.
@@ -7117,6 +7120,7 @@ pub fn run(
                                     &renderer.uniform,
                                     &renderer.reflected_uniform,
                                     &renderer.world_pages,
+                                    &mut renderer.world_geometry_arena,
                                     &mut renderer.world_upload_belt,
                                     &mut upload_encoder,
                                     &page,
@@ -7140,6 +7144,7 @@ pub fn run(
                             }
                             Ok(crate::world_objects::Message::CacheInvalid) => {
                                 renderer.world_pages.clear();
+                                renderer.world_geometry_arena.reset();
                                 renderer.world_pages.shrink_to_fit();
                                 renderer.world_draw_cmds = Default::default();
                                 world_status = String::from("World cache invalid; rebuilding pages...");
@@ -8731,6 +8736,7 @@ pub fn preview(
                 }
                 crate::world_objects::Message::CacheInvalid => {
                     renderer.world_pages.clear();
+                    renderer.world_geometry_arena.reset();
                 }
                 crate::world_objects::Message::Done {
                     processed,
