@@ -2223,7 +2223,26 @@ impl GpuPage {
             pass.draw_indexed(0..self.count, 0, 0..1);
             return;
         }
-        for (start, end) in fold_page_spans(&self.placements, view) {
+        // Fold visible placements directly into draw calls. Building a
+        // temporary Vec here used to allocate once per page and render pass,
+        // even though each span can be emitted as soon as its end is known.
+        let mut span: Option<(u32, u32)> = None;
+        for placement in &self.placements {
+            if !allows_with_context(view, placement.visibility, RenderContext::default()) {
+                continue;
+            }
+            match span.as_mut() {
+                Some((_, end)) if *end == placement.start => {
+                    *end = placement.end;
+                }
+                Some((start, end)) => {
+                    pass.draw_indexed(*start..*end, 0, 0..1);
+                    span = Some((placement.start, placement.end));
+                }
+                None => span = Some((placement.start, placement.end)),
+            }
+        }
+        if let Some((start, end)) = span {
             pass.draw_indexed(start..end, 0, 0..1);
         }
     }
