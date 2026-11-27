@@ -3339,21 +3339,21 @@ impl Architect {
             .iter()
             .filter_map(|index| self.project.objects.get(*index))
             .filter(|object| object.visible)
-            .map(|object| (object.asset.clone(), object.position, object.scale))
+            .map(|object| (object.asset.clone(), object.position, object.scale, object.rotation))
             .collect::<Vec<_>>();
         if outline_items.is_empty() {
             if let (Some(asset), Some(position)) = (
                 self.selected_asset.as_ref().filter(|_| self.selected_scene_object.is_some()),
                 self.selected_scene_transform,
             ) {
-                outline_items.push((asset.clone(), position, 1.0));
+                outline_items.push((asset.clone(), position, 1.0, [0.; 3]));
             }
         }
         let outline_painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("architect_selected_object_bounds"),
         ));
-        for (asset, position, scale) in outline_items {
+        for (asset, position, scale, euler) in outline_items {
             let lower = asset.to_ascii_lowercase();
             let fallback_half = if lower.contains("tree") || lower.contains("forest") {
                 Vec3::new(3.5, 9.0, 3.5)
@@ -3371,18 +3371,12 @@ impl Architect {
                 .map(|(min, max)| (Vec3::from_array(min), Vec3::from_array(max)))
                 .unwrap_or((-fallback_half, fallback_half));
             let center = Vec3::from_array(position);
-            let rotation = self
-                .selected_placements
-                .iter()
-                .find_map(|index| self.project.objects.get(*index))
-                .filter(|object| object.asset == asset)
-                .map(|object| glam::Quat::from_euler(
-                    glam::EulerRot::XYZ,
-                    object.rotation[0],
-                    object.rotation[1],
-                    object.rotation[2],
-                ))
-                .unwrap_or(glam::Quat::IDENTITY);
+            let rotation = glam::Quat::from_euler(
+                glam::EulerRot::XYZ,
+                euler[0],
+                euler[1],
+                euler[2],
+            );
             let mut corners = [egui::Pos2::ZERO; 8];
             let mut valid = [false; 8];
             for bits in 0..8 {
