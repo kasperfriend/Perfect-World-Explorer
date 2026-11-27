@@ -7131,7 +7131,7 @@ pub fn run(
                                 world_status = format!(
                                     "Loading: {processed}/{} objects, {} GPU chunks (latest upload {:.1} ms)",
                                     whole_ornaments.len(),
-                                    renderer.world_pages.len(),
+                                    renderer.world_geometry_arena.chunk_count(),
                                     upload_ms
                                 );
                                 if world_last_log_at.elapsed() >= std::time::Duration::from_secs(1)
