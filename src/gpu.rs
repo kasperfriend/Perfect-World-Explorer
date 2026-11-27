@@ -5881,7 +5881,7 @@ pub fn run(
                     state: ElementState::Pressed,
                     button: MouseButton::Left,
                     ..
-                } if normal_input_allowed(window_focused, menu_page.is_open(), world_loading_active) && !captured => {
+                } if normal_input_allowed(window_focused, menu_page.is_open(), world_loading_active) && !captured && !renderer.modules.architect_active() => {
                     let result = window
                         .set_cursor_grab(CursorGrabMode::Locked)
                         .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
@@ -7645,7 +7645,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     if settings.show_zone_entry {if let Some((name,started))=&zone_banner {let elapsed=started.elapsed().as_secs_f32();if elapsed<4. {let alpha=(elapsed.min(4.-elapsed)*2.).clamp(0.,1.);egui::Area::new(egui::Id::new("zone-entry")).anchor(egui::Align2::CENTER_TOP,egui::vec2(0.,65.)).interactable(false).show(ctx,|ui|{ui.label(egui::RichText::new(format!("Entering {name}")).size(24.).color(egui::Color32::from_white_alpha((alpha*255.) as u8)));});}}}
                                     } else {
                                         menu_page = MenuPage::Closed;
-                                        architect_map_request = renderer.modules.architect_ui(ctx, &catalog, &current_map, &architect_scene, &architect_ornaments, camera.pos);
+                                        architect_map_request = renderer.modules.architect_ui(ctx, &catalog, &current_map, &architect_scene, &architect_ornaments, camera.pos, camera.matrix(config.width, config.height, camera.far));
                                     }
                                 });
                                 if let Some(requested) = architect_map_request {
