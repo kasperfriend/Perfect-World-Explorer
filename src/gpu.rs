@@ -5792,6 +5792,9 @@ pub fn run(
     let mut streaming = false;
     let mut keys = HashSet::new();
     let mut captured = false;
+    // Architect uses a hold-to-look gesture so ordinary left clicks remain
+    // available to egui panels and viewport tools.
+    let mut architect_looking = false;
     // Winit sends Focused(true) when the visible window actually gains focus.
     // Start conservatively so input cannot move the camera before that event.
     let mut window_focused = false;
@@ -5825,6 +5828,7 @@ pub fn run(
                     if event.physical_key == PhysicalKey::Code(KeyCode::Escape) && event.state == ElementState::Pressed && !event.repeat && !world_loading_active {
                         menu_page=menu_page.escape();keys.clear();
                         if captured {let _=window.set_cursor_grab(CursorGrabMode::None);window.set_cursor_visible(true);captured=false;}
+                        architect_looking = false;
                         if input_debug() {eprintln!("Escape menu: {:?}",menu_page);}
                         return;
                     }
@@ -5842,6 +5846,7 @@ pub fn run(
                         menu_page=if menu_page==MenuPage::WorldMap {MenuPage::Closed} else {MenuPage::WorldMap};
                         keys.clear(); map_refresh=Instant::now()-std::time::Duration::from_secs(10);
                         if captured {let _=window.set_cursor_grab(CursorGrabMode::None);window.set_cursor_visible(true);captured=false;}
+                        architect_looking = false;
                         return;
                     }
                 }
@@ -5863,9 +5868,19 @@ pub fn run(
                 }
                 // egui must receive focus changes even while the menu is closed;
                 // otherwise it believes the window is unfocused and ignores clicks.
-                if menu_page.is_open() || matches!(event,WindowEvent::Focused(_)) {
+                if menu_page.is_open() || renderer.modules.architect_active() || matches!(event,WindowEvent::Focused(_)) {
                     let response=egui_state.on_window_event(&window,&event);
-                    if menu_page.is_open() && (response.consumed || matches!(event,WindowEvent::KeyboardInput{..})) && !matches!(event, WindowEvent::RedrawRequested | WindowEvent::Resized(_) | WindowEvent::CloseRequested | WindowEvent::Focused(_)) {return;}
+                    // Always release a hold-to-look capture, even if egui reports
+                    // the release as consumed because it happened over a panel.
+                    if architect_looking && matches!(&event, WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Right, .. }) {
+                        let _ = window.set_cursor_grab(CursorGrabMode::None);
+                        window.set_cursor_visible(true);
+                        captured = false;
+                        architect_looking = false;
+                    }
+                    if (menu_page.is_open() || renderer.modules.architect_active())
+                        && (response.consumed || matches!(event,WindowEvent::KeyboardInput{..}))
+                        && !matches!(event, WindowEvent::RedrawRequested | WindowEvent::Resized(_) | WindowEvent::CloseRequested | WindowEvent::Focused(_)) {return;}
                 }
                 match event {
                 WindowEvent::CloseRequested => { if let Err(e)=settings.save(){eprintln!("Settings save: {e}");} target.exit(); },
@@ -5876,6 +5891,20 @@ pub fn run(
                         MouseScrollDelta::PixelDelta(position) => position.y as f32 / 120.0,
                     };
                     renderer.modules.walker_zoom(steps);
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Right,
+                    ..
+                } if normal_input_allowed(window_focused, menu_page.is_open(), world_loading_active) && renderer.modules.architect_active() && !captured => {
+                    let result = window
+                        .set_cursor_grab(CursorGrabMode::Locked)
+                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+                    if result.is_ok() {
+                        window.set_cursor_visible(false);
+                        captured = true;
+                        architect_looking = true;
+                    }
                 }
                 WindowEvent::MouseInput {
                     state: ElementState::Pressed,
@@ -5904,6 +5933,7 @@ pub fn run(
                         let _ = window.set_cursor_grab(CursorGrabMode::None);
                         window.set_cursor_visible(true);
                         captured = false;
+                        architect_looking = false;
                     }
                     if let Some(files) = &handoff_files {
                         files.set_focused(focused);
@@ -7568,6 +7598,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                                 window.set_cursor_visible(true);
                                                                 captured = false;
                                                             }
+                                                            architect_looking = false;
                                                         }
                                                         Err(error) => {
                                                             settings.selected_world = current_map.id.clone();
@@ -7648,6 +7679,20 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         architect_map_request = renderer.modules.architect_ui(ctx, &catalog, &current_map, &architect_scene, &architect_ornaments, camera.pos, camera.matrix(config.width, config.height, camera.far));
                                     }
                                 });
+                                // Enabling Architect can happen on the same left-click
+                                // that the normal viewer used to capture the mouse. Drop
+                                // that stale capture before the editor takes ownership.
+                                // Also release an Architect look capture if the user
+                                // disables the editor from its own toolbar.
+                                if captured
+                                    && ((renderer.modules.architect_active() && !architect_looking)
+                                        || (!renderer.modules.architect_active() && architect_looking))
+                                {
+                                    let _ = window.set_cursor_grab(CursorGrabMode::None);
+                                    window.set_cursor_visible(true);
+                                    captured = false;
+                                    architect_looking = false;
+                                }
                                 if let Some(requested) = architect_map_request {
                                     selected_world_ui = requested.clone();
                                     if requested.eq_ignore_ascii_case(&current_map.id) {
@@ -7678,6 +7723,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                 }
                                                 renderer.modules.set_architect_active(false);
                                                 keys.clear();
+                                                architect_looking = false;
                                                 if captured {
                                                     let _ = window.set_cursor_grab(CursorGrabMode::None);
                                                     window.set_cursor_visible(true);
