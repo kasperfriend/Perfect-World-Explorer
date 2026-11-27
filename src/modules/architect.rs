@@ -1061,7 +1061,7 @@ impl Architect {
         }
     }
 
-    fn show_tree(&mut self, ui: &mut egui::Ui, path: &Path, depth: usize, camera: Vec3) {
+    fn show_tree(&mut self, ui: &mut egui::Ui, path: &Path, depth: usize, _camera: Vec3) {
         if depth > 12 {
             return;
         }
@@ -1129,9 +1129,6 @@ impl Architect {
                         self.open_archive(child.clone());
                     } else {
                         self.selected_asset = Some(child.to_string_lossy().into_owned());
-                        if self.cursor == CursorMode::Place {
-                            self.add_selected_asset_at_camera(camera);
-                        }
                     }
                 }
                 response.context_menu(|ui| {
@@ -1606,9 +1603,8 @@ impl Architect {
                 self.multi_selection.clear();
                 self.multi_scene_items.clear();
             }
-            if self.cursor == CursorMode::Place {
-                self.add_selected_asset_at_camera(camera);
-            }
+            // Selecting a source-scene row only changes the active asset/target.
+            // Placement is an explicit viewport click or a dedicated Place action.
         }
     }
 
@@ -2109,7 +2105,6 @@ impl Architect {
                                 if response.hovered() { self.hovered_asset = Some(asset.clone()); }
                                 if response.clicked() {
                                     self.selected_asset = Some(asset.clone());
-                                    if self.cursor == CursorMode::Place { self.add_selected_asset_at_camera(camera); }
                                 }
                                 response.context_menu(|ui| {
                                     if ui.button("Pin archive entry to quick bar").clicked() {
