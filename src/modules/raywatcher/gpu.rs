@@ -7205,6 +7205,31 @@ mod reflection_sampling_regression_tests {
     }
 
     #[test]
+    fn canopy_transmission_counts_only_alpha_accepted_foliage_layers() {
+        let detailed = DXR_SHADER
+            .split("uint foliage_layers = 0u;")
+            .nth(1)
+            .and_then(|tail| tail.split("bool occluded_fast(").next())
+            .expect("detailed canopy shadow path");
+        let first_accept = detailed
+            .find("if (accept_opacity(cand_prim")
+            .expect("primary foliage alpha test");
+        let first_count = detailed
+            .find("foliage_layers = min(foliage_layers + 1u, 6u);")
+            .expect("primary accepted foliage count");
+        assert!(first_accept < first_count, "transparent card holes must not deepen the canopy");
+
+        let second_accept = detailed
+            .find("if (accept_opacity(cp2")
+            .expect("terrain-skip foliage alpha test");
+        let second_count = detailed[second_accept..]
+            .find("foliage_layers = min(foliage_layers + 1u, 6u);")
+            .map(|offset| offset + second_accept)
+            .expect("secondary accepted foliage count");
+        assert!(second_accept < second_count);
+    }
+
+    #[test]
     fn layered_rt_radiance_is_attenuated_by_client_fog() {
         assert!(RAY_SHADER.contains("out_rgb = (avg_gi + point_lighting) * (1.0 - fog_t)"));
     }
