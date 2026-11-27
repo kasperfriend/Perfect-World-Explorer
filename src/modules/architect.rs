@@ -1273,7 +1273,14 @@ impl Architect {
     /// BMD scenery placements for the native baked-scenery page builder.
     /// These are transient and remain separate from ECM/SMD placements.
     pub fn renderer_scenery_placements(&self) -> Vec<crate::scene::EditorSceneryPlacement> {
-        if !self.enabled || self.current_map_id.is_empty() {
+        if !self.enabled
+            || self.current_map_id.is_empty()
+            || (!self.project.source_map.is_empty()
+                && !self
+                    .project
+                    .source_map
+                    .eq_ignore_ascii_case(&self.current_map_id))
+        {
             return Vec::new();
         }
         let mut placements = self
@@ -1395,6 +1402,19 @@ impl Architect {
     }
 
     fn add_selected_asset_at_position(&mut self, position: [f32; 3]) {
+        if !self.project.source_map.is_empty()
+            && !self.current_map_id.is_empty()
+            && !self
+                .project
+                .source_map
+                .eq_ignore_ascii_case(&self.current_map_id)
+        {
+            self.status = format!(
+                "This Architect project targets map {}, not {}.",
+                self.project.source_map, self.current_map_id
+            );
+            return;
+        }
         if self.project.source_map.is_empty() && !self.current_map_id.is_empty() {
             self.project.source_map = self.current_map_id.clone();
         }
