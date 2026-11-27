@@ -2053,10 +2053,14 @@ impl Architect {
                         self.selected_scene_transform = None;
                     }
                 } else {
+                    let clicked_inside_group = picked_placement
+                        .is_some_and(|index| self.selected_placements.contains(&index));
                     self.selected_placement = picked_placement;
-                    self.selected_placements.clear();
-                    if let Some(index) = picked_placement {
-                        self.selected_placements.insert(index);
+                    if !clicked_inside_group {
+                        self.selected_placements.clear();
+                        if let Some(index) = picked_placement {
+                            self.selected_placements.insert(index);
+                        }
                     }
                 }
                 if self.selected_placement.is_some() {
