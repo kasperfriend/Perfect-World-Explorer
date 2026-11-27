@@ -1718,7 +1718,8 @@ impl Architect {
                         );
                     }
                     if ui.button("Delete selected").clicked() {
-                        let mut indices = self.selected_placements.iter().copied().collect::<Vec<_>>();
+                        let mut indices =
+                            self.selected_placements.iter().copied().collect::<Vec<_>>();
                         if indices.is_empty() {
                             indices.extend(self.selected_placement);
                         }
