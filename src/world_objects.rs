@@ -1766,7 +1766,7 @@ fn stage_page_atlas_mips(
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("whole-world atlas mip upload"),
         size: total_bytes as u64,
-        usage: wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     belt.write_buffer(encoder, &staging, 0, upload_size, device)
