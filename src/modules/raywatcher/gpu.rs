@@ -2697,21 +2697,50 @@ fn reproject(pixel: vec2<i32>, size: vec2<i32>, current_depth: f32) -> Reproject
     if (source.x < 0.0 || source.y < 0.0 || source.x >= f32(size.x) || source.y >= f32(size.y)) {
         return empty;
     }
-    let index = vec2<i32>(source);
-    let prev_m = textureLoad(history_moments, index, 0);
-    let previous_depth = prev_m.z;
-    if (previous_depth <= 0.0 || expected_prev_depth <= 0.0) {
+    if (expected_prev_depth <= 0.0) {
         return empty;
     }
-    if (abs(previous_depth - expected_prev_depth) / max(expected_prev_depth, 1e-3) > 0.05) {
+
+    // Bilinear history sampling in texel-centre coordinates. Reject each tap
+    // independently against its stored depth so interpolation never pulls
+    // colour across a disocclusion or a foreground/background boundary.
+    let sample_pos = source - vec2<f32>(0.5);
+    let base = vec2<i32>(floor(sample_pos));
+    let fraction = fract(sample_pos);
+    var colour_sum = vec3<f32>(0.0);
+    var light_factor_sum = 0.0;
+    var moments_sum = vec2<f32>(0.0);
+    var length_sum = 0.0;
+    var weight_sum = 0.0;
+    for (var dy = 0; dy <= 1; dy = dy + 1) {
+        for (var dx = 0; dx <= 1; dx = dx + 1) {
+            let offset = vec2<i32>(dx, dy);
+            let tap = clamp(base + offset, vec2<i32>(0), size - vec2<i32>(1));
+            let tap_m = textureLoad(history_moments, tap, 0);
+            let depth_error = abs(tap_m.z - expected_prev_depth) / max(expected_prev_depth, 1e-3);
+            if (tap_m.z <= 0.0 || depth_error > 0.05) {
+                continue;
+            }
+            let wx = select(1.0 - fraction.x, fraction.x, dx == 1);
+            let wy = select(1.0 - fraction.y, fraction.y, dy == 1);
+            let weight = wx * wy;
+            let tap_colour = textureLoad(history_colour, tap, 0);
+            colour_sum += tap_colour.rgb * weight;
+            light_factor_sum += tap_colour.a * weight;
+            moments_sum += tap_m.xy * weight;
+            length_sum += tap_m.w * weight;
+            weight_sum += weight;
+        }
+    }
+    if (weight_sum <= 1e-4) {
         return empty;
     }
-    let prev_c = textureLoad(history_colour, index, 0);
+    let inv_weight = 1.0 / weight_sum;
     var out: ReprojectResult;
-    out.colour = prev_c.rgb;
-    out.light_factor = prev_c.a;
-    out.moments = prev_m.xy;
-    out.length = prev_m.w;
+    out.colour = colour_sum * inv_weight;
+    out.light_factor = light_factor_sum * inv_weight;
+    out.moments = moments_sum * inv_weight;
+    out.length = length_sum * inv_weight;
     // Measure motion in render pixels. Water reflections are view-dependent
     // signals, so surface reprojection becomes less trustworthy as the camera
     // moves the reflecting surface farther across the screen.
