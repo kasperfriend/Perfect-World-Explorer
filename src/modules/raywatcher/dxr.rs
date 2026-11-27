@@ -1968,7 +1968,9 @@ mod imp {
                 }
                 let bsize = align256(info.result_data_max_size_in_bytes);
                 let update_blas = self.dyn_blas_vertex_counts[s] == tri_count
-                    && self.dyn_blas[s].as_ref().is_some_and(|(cap, _)| *cap >= bsize)
+                    && self.dyn_blas[s]
+                        .as_ref()
+                        .is_some_and(|(cap, _)| *cap >= bsize)
                     && self.has_dyn_instance;
                 if self.dyn_blas[s]
                     .as_ref()
@@ -1989,10 +1991,12 @@ mod imp {
                 }
                 let blas_gpu_va = self.dyn_blas[s].as_ref().unwrap().1.gpu_va;
                 if update_blas {
-                    blas_inputs.flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+                    blas_inputs.flags |=
+                        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
                 }
                 let mut scratch_needed = align256(
-                    info.scratch_data_size_in_bytes.max(info.update_scratch_data_size_in_bytes),
+                    info.scratch_data_size_in_bytes
+                        .max(info.update_scratch_data_size_in_bytes),
                 );
 
                 let inst0 = InstanceDesc {
@@ -2038,7 +2042,9 @@ mod imp {
                     return Ok(());
                 }
                 scratch_needed = scratch_needed.max(align256(
-                    tlas_info.scratch_data_size_in_bytes.max(tlas_info.update_scratch_data_size_in_bytes),
+                    tlas_info
+                        .scratch_data_size_in_bytes
+                        .max(tlas_info.update_scratch_data_size_in_bytes),
                 ));
                 if self
                     .reusable_scratch
@@ -2083,7 +2089,8 @@ mod imp {
                 }
                 let tlas_gpu_va = self.dyn_tlas[s].as_ref().unwrap().1.gpu_va;
                 if update_tlas {
-                    tlas_inputs.flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+                    tlas_inputs.flags |=
+                        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
                 }
                 let scratch_va = self.reusable_scratch.as_ref().unwrap().1.gpu_va;
 
