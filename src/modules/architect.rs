@@ -146,6 +146,7 @@ pub struct Architect {
     lasso_points: Vec<egui::Pos2>,
     undo_objects: Vec<Vec<PlacedObject>>,
     redo_objects: Vec<Vec<PlacedObject>>,
+    clipboard_objects: Vec<PlacedObject>,
     object_history_action: bool,
 }
 
@@ -241,6 +242,7 @@ impl Architect {
             lasso_points: Vec::new(),
             undo_objects: Vec::new(),
             redo_objects: Vec::new(),
+            clipboard_objects: Vec::new(),
             object_history_action: false,
         };
         editor.refresh_projects();
@@ -1305,6 +1307,117 @@ impl Architect {
         );
     }
 
+    fn selected_placement_indices(&self) -> Vec<usize> {
+        let mut indices = self.selected_placements.iter().copied().collect::<Vec<_>>();
+        if indices.is_empty() {
+            indices.extend(self.selected_placement);
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices.retain(|index| *index < self.project.objects.len());
+        indices
+    }
+
+    fn copy_selected_objects(&mut self) {
+        let indices = self.selected_placement_indices();
+        let mut copied = indices
+            .iter()
+            .filter_map(|index| self.project.objects.get(*index).cloned())
+            .collect::<Vec<_>>();
+        if copied.is_empty() {
+            let mut scene = self
+                .multi_scene_items
+                .values()
+                .map(|(asset, position)| (asset.clone(), *position))
+                .collect::<Vec<_>>();
+            if scene.is_empty() {
+                if let (Some(asset), Some(position)) = (
+                    self.selected_asset.clone(),
+                    self.selected_scene_transform,
+                ) {
+                    scene.push((asset, position));
+                }
+            }
+            for (asset, position) in scene {
+                if Self::renderer_asset_path(&asset).is_none() {
+                    continue;
+                }
+                let portable_asset = self.portable_asset_path(&asset);
+                copied.push(PlacedObject {
+                    name: Path::new(&portable_asset)
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Object".into()),
+                    asset: portable_asset,
+                    group: "Default".into(),
+                    visible: true,
+                    locked: false,
+                    position,
+                    rotation: [0.; 3],
+                    scale: 1.,
+                });
+            }
+        }
+        if copied.is_empty() {
+            self.status = "Select a placeable game object or project placement before copying.".into();
+            return;
+        }
+        self.clipboard_objects = copied;
+        self.status = format!("Copied {} object(s) to the Architect clipboard.", self.clipboard_objects.len());
+    }
+
+    fn paste_objects(&mut self) {
+        if self.clipboard_objects.is_empty() {
+            self.status = "Architect clipboard is empty. Select an object and press Ctrl+C first.".into();
+            return;
+        }
+        if self.project.source_map.is_empty() && !self.current_map_id.is_empty() {
+            self.project.source_map = self.current_map_id.clone();
+        }
+        let before = self.project.objects.clone();
+        let mut pasted = Vec::with_capacity(self.clipboard_objects.len());
+        for source in &self.clipboard_objects {
+            if Self::renderer_asset_path(&source.asset).is_none() {
+                continue;
+            }
+            let mut object = source.clone();
+            object.position[0] += 2.0;
+            object.position[2] += 2.0;
+            object.locked = false;
+            pasted.push(object);
+        }
+        if pasted.is_empty() {
+            self.status = "Clipboard contains no assets supported by the live game-object renderer.".into();
+            return;
+        }
+        self.push_object_undo(before);
+        self.selected_placements.clear();
+        for object in pasted {
+            let index = self.project.objects.len();
+            self.project.objects.push(object);
+            self.selected_placements.insert(index);
+        }
+        self.selected_placement = self.selected_placements.iter().copied().min();
+        self.status = format!("Pasted {} game object(s); move the selected copies into place.", self.selected_placements.len());
+    }
+
+    fn delete_selected_objects(&mut self) {
+        let indices = self.selected_placement_indices();
+        if indices.is_empty() {
+            self.status = "Select one or more project placements to delete.".into();
+            return;
+        }
+        let before = self.project.objects.clone();
+        let remove = indices.iter().copied().collect::<HashSet<_>>();
+        self.project.objects = self.project.objects.drain(..).enumerate()
+            .filter_map(|(index, object)| (!remove.contains(&index)).then_some(object))
+            .collect();
+        self.push_object_undo(before);
+        self.selected_placements.clear();
+        self.selected_placement = None;
+        self.status = format!("Deleted {} project placement(s).", indices.len());
+    }
+
     /// Screen-space hit radius for source-scene objects. The serialized
     /// placement point is not the mesh centre for many trees, ornaments and
     /// effects, so a small fixed 20 px anchor target was too easy to miss.
@@ -1349,13 +1462,7 @@ impl Architect {
                                 || ((score - *best_score).abs() <= 0.025 && clip.z > *best_depth)
                         })
                 {
-                    nearest_scene = Some((
-                        scene_index,
-                        score,
-                        clip.z,
-                        asset.to_string(),
-                        position,
-                    ));
+                    nearest_scene = Some((scene_index, score, clip.z, asset.to_string(), position));
                 }
             }
             scene_index += 1;
@@ -1679,18 +1786,27 @@ impl Architect {
         // placement snapshot only when the user is working in the viewport or
         // editor chrome, never while typing a name, group or filter.
         if !ctx.wants_keyboard_input() {
-            let (undo, redo) = ctx.input(|input| {
+            let (undo, redo, copy, paste, delete) = ctx.input(|input| {
                 let command = input.modifiers.command;
                 (
                     command && input.key_pressed(egui::Key::Z) && !input.modifiers.shift,
                     (command && input.key_pressed(egui::Key::Y))
                         || (command && input.modifiers.shift && input.key_pressed(egui::Key::Z)),
+                    command && input.key_pressed(egui::Key::C),
+                    command && input.key_pressed(egui::Key::V),
+                    input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace),
                 )
             });
             if undo {
                 self.undo_objects();
             } else if redo {
                 self.redo_objects();
+            } else if copy {
+                self.copy_selected_objects();
+            } else if paste {
+                self.paste_objects();
+            } else if delete {
+                self.delete_selected_objects();
             }
         }
         let screen = ctx.input(|input| input.screen_rect());
@@ -3455,6 +3571,7 @@ mod tests {
             lasso_points: Vec::new(),
             undo_objects: Vec::new(),
             redo_objects: Vec::new(),
+            clipboard_objects: Vec::new(),
             object_history_action: false,
         };
         editor.write_project(&path).unwrap();
