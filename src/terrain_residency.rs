@@ -66,6 +66,10 @@ pub struct Span {
 #[derive(Default)]
 pub struct Residency {
     blocks: std::collections::HashMap<(usize, usize), Block>,
+    // Maintained as blocks enter, change mesh, and leave the window. Computing
+    // this diagnostic by walking the entire resident HashMap after every
+    // crossing added a second O(resident blocks) pass to terrain rebuilds.
+    triangles: u32,
 }
 
 impl Residency {
@@ -77,10 +81,7 @@ impl Residency {
     }
 
     pub fn triangles(&self) -> u32 {
-        self.blocks
-            .values()
-            .map(|b| (b.indices.len() / 3) as u32)
-            .sum()
+        self.triangles
     }
 
     /// Apply one window to the resident set: evict blocks outside it, build the
@@ -114,14 +115,28 @@ impl Residency {
         let mut census = Census::default();
         // Eviction first: the client's loader drops the slots the window left.
         let before = self.blocks.len();
-        self.blocks.retain(|&(x, y), _| window.contains(x, y));
+        let mut evicted_triangles = 0u32;
+        self.blocks.retain(|&(x, y), block| {
+            let keep = window.contains(x, y);
+            if !keep {
+                evicted_triangles = evicted_triangles
+                    .saturating_add((block.indices.len() / 3) as u32);
+            }
+            keep
+        });
+        self.triangles = self.triangles.saturating_sub(evicted_triangles);
         census.evicted = before - self.blocks.len();
         for y in window.y0..window.y1 {
             for x in window.x0..window.x1 {
                 let (level, cases) = state_of(x, y);
                 if level == 0 {
                     // No mesh for this block (`block+0x70 == 0`).
-                    census.evicted += usize::from(self.blocks.remove(&(x, y)).is_some());
+                    if let Some(block) = self.blocks.remove(&(x, y)) {
+                        self.triangles = self
+                            .triangles
+                            .saturating_sub((block.indices.len() / 3) as u32);
+                        census.evicted += 1;
+                    }
                     continue;
                 }
                 let stale = match self.blocks.get(&(x, y)) {
@@ -133,11 +148,15 @@ impl Residency {
                 }
                 let (vertices, indices, bounds) = build(x, y, level)
                     .map_err(|e| format!("terrain block ({x},{y}) level {level}: {e}"))?;
-                if self.blocks.contains_key(&(x, y)) {
+                if let Some(previous) = self.blocks.get(&(x, y)) {
+                    self.triangles = self
+                        .triangles
+                        .saturating_sub((previous.indices.len() / 3) as u32);
                     census.remeshed += 1;
                 } else {
                     census.loaded += 1;
                 }
+                self.triangles = self.triangles.saturating_add((indices.len() / 3) as u32);
                 self.blocks.insert(
                     (x, y),
                     Block {
@@ -151,7 +170,7 @@ impl Residency {
             }
         }
         census.resident = self.blocks.len();
-        census.triangles = self.triangles();
+        census.triangles = self.triangles;
         Ok(census)
     }
 
