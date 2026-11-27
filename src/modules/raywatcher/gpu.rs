@@ -7171,7 +7171,8 @@ mod reflection_sampling_regression_tests {
             .expect("distant shadow branch");
         assert!(distant_shadow.contains("CANDIDATE_NON_OPAQUE_TRIANGLE"));
         assert!(distant_shadow.contains("accept_opacity("));
-        assert!(distant_shadow.contains("transmission = 1.0 - saturate(foliage.surface.w)"));
+        assert!(distant_shadow.contains("float depth_atten = exp(-0.55)"));
+        assert!(distant_shadow.contains("foliage.albedo.rgb * warm_tint"));
         assert!(distant_shadow.contains("has_alpha_mask"));
         assert!(!distant_shadow.contains("RAY_FLAG_FORCE_OPAQUE"));
         let fast_occlusion = DXR_SHADER
