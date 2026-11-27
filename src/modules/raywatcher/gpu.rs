@@ -2908,9 +2908,32 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(out_moments, pixel, textureLoad(history_moments, pixel, 0));
         return;
     }
-    let centre_normal = normal_at_scaled(pixel, grid_scale, gmax);
+    let centre_gp = vec2<i32>(clamp(
+        (vec2<f32>(pixel) + vec2<f32>(0.5)) * grid_scale,
+        vec2<f32>(0.0),
+        gmax,
+    ));
+    let centre_normal_data = textureLoad(src_normals, centre_gp, 0);
+    let centre_normal = centre_normal_data.xyz;
     let centre_moments = textureLoad(history_moments, pixel, 0);
     let centre_variance = variance_of(centre_moments);
+    let step = i32(params.misc.x);
+    let history_cap = select(
+        params.misc.z,
+        min(params.misc.z, 6.0),
+        centre_normal_data.w <= 0.12,
+    );
+    let centre_raw = textureLoad(history_colour, pixel, 0);
+    // Once temporal history has converged and variance is near its floor, the
+    // final (step >= 4) spatial pass cannot materially improve the pixel. Copy
+    // its previous-pass value directly instead of fetching the 3x3 neighbourhood.
+    if (step >= 4
+        && centre_moments.w >= history_cap
+        && centre_variance <= max(params.misc.y * 4.0, 1e-4)) {
+        textureStore(out_colour, pixel, centre_raw);
+        textureStore(out_moments, pixel, centre_moments);
+        return;
+    }
     // History-length adaptive filtering: when camera rotates and pixels are newly
     // disoccluded (`history_len < 4`), relax luminance & light-factor edge weights
     // within strict depth/normal bounds to eliminate rotation noise, then snap
@@ -2920,7 +2943,6 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let lf_edge_k = mix(4.5, 2.5, disocc);
     let inv_centre_depth = 1.0 / max(centre_depth, 1e-3);
     let inv_depth_denom = 1.0 / max(params.weights.z * max(abs(centre_depth), 1e-3), 1e-6);
-    let centre_raw = textureLoad(history_colour, pixel, 0);
     let centre = centre_raw.rgb;
     let centre_lum = luminance(centre);
 
@@ -2932,7 +2954,6 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var weight_sum_lf = w0;
     var moment1 = centre_moments.x * w0;
     var moment2 = centre_moments.y * w0;
-    let step = i32(params.misc.x);
     let filter_lf = step <= 2;
     for (var dy = -1; dy <= 1; dy = dy + 1) {
         let wy = kernel_weight(dy);
