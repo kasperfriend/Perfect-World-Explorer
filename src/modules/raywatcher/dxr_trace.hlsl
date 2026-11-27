@@ -704,38 +704,74 @@ float3 ggx_sample(float3 normal, float roughness, float u1, float u2) {
 // Feature #8: Analytical ray-sphere intersection of active point lights & world effects
 // along reflection rays (so Archosaur ring beams, portals, wandering lights, and torches
 // mirror vividly in water and polished surfaces).
+float light_bvh_box_hit(float3 minimum, float3 maximum, float3 origin, float3 inv_dir, float t_min, float t_max) {
+    float3 t0s = (minimum - origin) * inv_dir;
+    float3 t1s = (maximum - origin) * inv_dir;
+    float3 smaller = min(t0s, t1s);
+    float3 bigger = max(t0s, t1s);
+    float entry = max(t_min, max(smaller.x, max(smaller.y, smaller.z)));
+    float exit = min(t_max, min(bigger.x, min(bigger.y, bigger.z)));
+    return entry <= exit ? entry : -1.0;
+}
+
 float3 trace_effect_light_reflections(float3 origin, float3 dir, float max_t, uint pl_count) {
     float3 glow_sum = float3(0.0, 0.0, 0.0);
-    // Opt #10: Tight squared bounding reject + fast reciprocal falloff (no transcendental exp).
+    // Opt #10: conservative ray/AABB culling keeps every reflected glow tube.
     float max_reach = min(max_t, 360.0);
-    for (uint li = 0u; li < pl_count; li = li + 1u) {
-        float4 pr = params.point_lights_pos_rad[li];
-        if (pr.w <= 0.1) {
+    float3 safe_dir = float3(
+        abs(dir.x) < 1e-12 ? (dir.x < 0.0 ? -1e-12 : 1e-12) : dir.x,
+        abs(dir.y) < 1e-12 ? (dir.y < 0.0 ? -1e-12 : 1e-12) : dir.y,
+        abs(dir.z) < 1e-12 ? (dir.z < 0.0 ? -1e-12 : 1e-12) : dir.z);
+    float3 inv_dir = 1.0 / safe_dir;
+    uint stack[8];
+    uint stack_len = 0u;
+    if (pl_count > 0u && params.point_light_bvh_meta.x > 0.5) {
+        stack[stack_len++] = 0u;
+    }
+    [loop] while (stack_len > 0u) {
+        uint node_index = stack[--stack_len];
+        float4 node_min = params.point_light_bvh_min[node_index];
+        float4 node_max = params.point_light_bvh_max[node_index];
+        if (light_bvh_box_hit(node_min.xyz, node_max.xyz, origin, inv_dir, 0.8, max_reach) < 0.0) {
             continue;
         }
-        float3 d_eye = pr.xyz - params.eye.xyz;
-        if (dot(d_eye, d_eye) < 12.25) {
-            continue;
+        if (node_min.w >= 0.0) {
+            uint leaf_count = (uint)node_min.w;
+            uint leaf_first = (uint)node_max.w;
+            for (uint offset = 0u; offset < leaf_count; ++offset) {
+                uint li = point_light_order_at(leaf_first + offset);
+                float4 pr = params.point_lights_pos_rad[li];
+                if (pr.w <= 0.1) {
+                    continue;
+                }
+                float3 d_eye = pr.xyz - params.eye.xyz;
+                if (dot(d_eye, d_eye) < 12.25) {
+                    continue;
+                }
+                float3 to_l = pr.xyz - origin;
+                float t_proj = dot(to_l, dir);
+                if (t_proj <= 0.8 || t_proj >= max_reach) {
+                    continue;
+                }
+                float r_core = clamp(pr.w * 0.11, 0.50, 3.2);
+                float r2_out = r_core * r_core * 6.0;
+                float d2 = dot(to_l, to_l) - t_proj * t_proj;
+                if (d2 >= r2_out) {
+                    continue;
+                }
+                float4 ci = params.point_lights_col_int[li];
+                if (ci.w < 0.05) {
+                    continue;
+                }
+                float u = saturate(d2 / max(r2_out, 0.1));
+                float win = 1.0 - u;
+                float orb = (win * win * win) / ((1.0 + u * 3.5 + u * u * 6.0) * (1.0 + t_proj * 0.014));
+                glow_sum += ci.rgb * (ci.w * orb * 0.28);
+            }
+        } else {
+            stack[stack_len++] = (uint)node_max.w;
+            stack[stack_len++] = node_index + 1u;
         }
-        float3 to_l = pr.xyz - origin;
-        float t_proj = dot(to_l, dir);
-        if (t_proj <= 0.8 || t_proj >= max_reach) {
-            continue;
-        }
-        float r_core = clamp(pr.w * 0.11, 0.50, 3.2);
-        float r2_out = r_core * r_core * 6.0;
-        float d2 = dot(to_l, to_l) - t_proj * t_proj;
-        if (d2 >= r2_out) {
-            continue;
-        }
-        float4 ci = params.point_lights_col_int[li];
-        if (ci.w < 0.05) {
-            continue;
-        }
-        float u = saturate(d2 / max(r2_out, 0.1));
-        float win = 1.0 - u;
-        float orb = (win * win * win) / ((1.0 + u * 3.5 + u * u * 6.0) * (1.0 + t_proj * 0.014));
-        glow_sum += ci.rgb * (ci.w * orb * 0.28);
     }
     return min(glow_sum, float3(2.2, 2.2, 2.2));
 }
