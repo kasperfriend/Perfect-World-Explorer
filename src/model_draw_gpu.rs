@@ -204,6 +204,10 @@ pub struct Draw {
     /// [`Self::update_posed`] convert vertices without re-running it.
     pose_of: Vec<usize>,
     alpha_meshes: Vec<usize>,
+    // Retained staging memory for animated vertex conversion. Queue writes copy
+    // the bytes before returning, so this scratch can be reused for every mesh
+    // and every frame without keeping a second copy of the whole posed model.
+    scratch_vertices: Vec<raster::Vertex>,
     // Keep authored textures alive and share repeated per-skin texture slots.
     textures: Vec<std::sync::Arc<wgpu::Texture>>,
 }
@@ -478,6 +482,7 @@ impl Draw {
             meshes,
             pose_of,
             alpha_meshes,
+            scratch_vertices: Vec::new(),
             textures,
         })
     }
@@ -531,7 +536,7 @@ impl Draw {
     /// constants. A pose that no longer matches the retained mesh is an explicit
     /// error, never a silently different draw.
     pub fn update_posed(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         asset: &ModelAsset,
         poses: &[PosedMesh],
@@ -587,15 +592,15 @@ impl Draw {
         // Queue writes copy their input immediately, so one scratch allocation
         // can serve every mesh. Reusing it avoids one vertex Vec allocation per
         // submesh and avoids retaining all converted vertices until the end.
-        let mut vertices = Vec::new();
+        let scratch = &mut self.scratch_vertices;
         for (index, gpu) in self.meshes.iter().enumerate() {
             let Some(gpu) = gpu else {
                 continue;
             };
             let pose = &poses[self.pose_of[index]];
             let source = &asset.skins[pose.skin].data.meshes[pose.mesh];
-            vertices.clear();
-            vertices.extend(source.vertices.iter().zip(&pose.vertices).map(|(source, posed)| {
+            scratch.clear();
+            scratch.extend(source.vertices.iter().zip(&pose.vertices).map(|(source, posed)| {
                 raster::Vertex {
                     position: posed.position,
                     normal: posed.normal,
@@ -603,7 +608,7 @@ impl Draw {
                     fog: frame.vertex_fog,
                 }
             }));
-            gpu.mesh.update(queue, &vertices)?;
+            gpu.mesh.update(queue, scratch)?;
             gpu.binding.update(
                 queue,
                 params_by_mesh[index]
