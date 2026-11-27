@@ -348,6 +348,18 @@ pub const MAX_DEPTH: u32 = 40;
 /// any-hit walk two), so twice the depth cap is the hard bound.
 pub const STACK_DEPTH: usize = (MAX_DEPTH as usize) * 2;
 
+/// Reserve for a balanced binary BVH with leaves of at most MAX_LEAF
+/// triangles. The builder can still grow this vector for pathological SAH
+/// partitions, but it no longer eagerly reserves nearly 2 nodes per triangle.
+#[inline]
+fn estimated_node_capacity(triangle_count: usize) -> usize {
+    if triangle_count == 0 {
+        return 1;
+    }
+    let leaves = triangle_count.div_ceil(MAX_LEAF);
+    leaves.saturating_mul(2).saturating_sub(1).clamp(1, 1 << 22)
+}
+
 /// The world, in ray-tracing form.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SceneGeometry {
@@ -444,9 +456,7 @@ impl SceneGeometry {
                         tri_bounds: tb,
                         centroids: ct,
                         cancel,
-                        nodes: Vec::with_capacity(
-                            right_idx.len().saturating_mul(2).clamp(1, 1 << 21),
-                        ),
+                        nodes: Vec::with_capacity(estimated_node_capacity(right_idx.len())),
                         order: Vec::with_capacity(right_idx.len()),
                         depth: 0,
                         widest: 0,
@@ -457,7 +467,7 @@ impl SceneGeometry {
                     tri_bounds: tb,
                     centroids: ct,
                     cancel,
-                    nodes: Vec::with_capacity(left_idx.len().saturating_mul(2).clamp(1, 1 << 21)),
+                    nodes: Vec::with_capacity(estimated_node_capacity(left_idx.len())),
                     order: Vec::with_capacity(left_idx.len()),
                     depth: 0,
                     widest: 0,
@@ -521,7 +531,7 @@ impl SceneGeometry {
             tri_bounds: &tri_bounds,
             centroids: &centroids,
             cancel,
-            nodes: Vec::with_capacity(n.saturating_mul(2).clamp(1, 1 << 22)),
+            nodes: Vec::with_capacity(estimated_node_capacity(n)),
             order: Vec::with_capacity(n),
             depth: 0,
             widest: 0,
@@ -1084,6 +1094,18 @@ mod tests {
             }
         }
         best
+    }
+
+    #[test]
+    fn node_capacity_tracks_leaf_count_instead_of_triangle_count() {
+        assert_eq!(estimated_node_capacity(0), 1);
+        assert_eq!(estimated_node_capacity(1), 1);
+        assert_eq!(estimated_node_capacity(MAX_LEAF), 1);
+        assert_eq!(estimated_node_capacity(MAX_LEAF + 1), 3);
+        assert_eq!(estimated_node_capacity(4096), 2047);
+        // This is a reserve estimate, not a hard cap: pathological trees can
+        // still grow the vector without changing the resulting BVH.
+        assert!(estimated_node_capacity(1_000_000) < 1_000_000);
     }
 
     #[test]
