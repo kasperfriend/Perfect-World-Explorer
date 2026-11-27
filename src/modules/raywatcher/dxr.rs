@@ -137,6 +137,7 @@ impl DxrTracer {
         _src_norm: &wgpu::Texture,
         _src_raster: &wgpu::Texture,
         _src_screen_raster: &wgpu::Texture,
+        _copy_screen_raster: bool,
         _src_sky_env: &wgpu::Texture,
         _copy_sky_env: bool,
         _src_terrain_map: &wgpu::Texture,
