@@ -373,7 +373,7 @@ impl Architect {
                     project.strokes.push(TerrainStroke {
                         mode,
                         position: [n[0], n[1], n[2]],
-                        radius: n[3].clamp(0.1, 10000.),
+                        radius: n[3].clamp(0.1, 250.),
                         strength: n[4].clamp(-10000., 10000.),
                     });
                 }
@@ -418,7 +418,7 @@ impl Architect {
                     .into(),
             );
         }
-        let radius = stroke.radius.clamp(0.1, 10000.);
+        let radius = stroke.radius.clamp(0.1, 250.);
         let cx = stroke.position[0] / map.spacing + map.width as f32 * 0.5;
         let cy = map.height as f32 * 0.5 - stroke.position[2] / map.spacing;
         if !cx.is_finite() || !cy.is_finite() {
@@ -563,7 +563,12 @@ impl Architect {
         }
         map.heights.clear_edits()?;
         for stroke in &self.project.strokes {
-            self.apply_stroke(stroke)?;
+            // Version-1 projects could store Paint strokes before material
+            // painting was implemented. Preserve them in the project, but do
+            // not let an unsupported record block terrain replay.
+            if stroke.mode != BrushMode::Paint {
+                self.apply_stroke(stroke)?;
+            }
         }
         Ok(())
     }
@@ -1507,7 +1512,13 @@ impl Architect {
                 if ui.button("Apply brush at camera").clicked() {
                     let stroke = TerrainStroke {
                         mode: self.brush,
-                        position: self.placement_position(camera),
+                        position: {
+                            let mut position = camera.to_array();
+                            if let Some(map) = &self.map {
+                                position[1] = map.ground(position[0], position[2]) + 0.5;
+                            }
+                            position
+                        },
                         radius: self.brush_radius,
                         strength: if self.brush == BrushMode::Flatten {
                             self.flatten_height
