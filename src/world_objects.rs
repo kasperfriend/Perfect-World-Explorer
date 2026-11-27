@@ -1405,6 +1405,11 @@ fn run(
         height: 1,
         rgba: vec![160, 160, 160, 255],
     };
+    // Resolve the worker budget once per preload, not once per mesh.
+    let transform_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4);
     let batch_size = if crate::objects::unbounded_textures() {
         256
     } else {
@@ -1535,11 +1540,7 @@ fn run(
                 page.vertices
                     .resize(vertex_start + vertex_count, Vertex::zeroed());
                 let workers = if vertex_count >= 32_768 {
-                    std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(1)
-                        .min(4)
-                        .min(vertex_count.div_ceil(8_192))
+                    transform_workers.min(vertex_count.div_ceil(8_192))
                 } else {
                     1
                 };
@@ -1581,8 +1582,10 @@ fn run(
                             + scaled_x * v.position[0]
                             + scaled_y * v.position[1]
                             + scaled_z * v.position[2];
-                        let normal =
-                            (x * v.normal[0] + y * v.normal[1] + z * v.normal[2]).normalize_or_zero();
+                        let normal = (x * v.normal[0]
+                            + y * v.normal[1]
+                            + z * v.normal[2])
+                            .normalize_or_zero();
                         *out = Vertex {
                             pos: pos.to_array(),
                             normal: normal.to_array(),
