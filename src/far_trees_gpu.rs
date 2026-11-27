@@ -443,14 +443,11 @@ impl FarTrees {
                 let rocking_base = rocking_samples.len() / 64;
                 rocking_samples.extend(lod.rocking.iter().map(|v| [v[0], v[1], v[2], 0.]));
                 let start_inst = instances.len() as u32;
-                instances.extend(
-                    positions
-                        .iter()
-                        .zip(&transforms)
-                        .map(|(&position, transform)| {
-                            Instance::new(position, [0., 0.], transform[0], transform[1])
-                        }),
-                );
+                instances.extend(positions.iter().zip(&transforms).map(
+                    |(&position, transform)| {
+                        Instance::new(position, [0., 0.], transform[0], transform[1])
+                    },
+                ));
                 let end_inst = instances.len() as u32;
                 let start_idx = indices.len() as u32;
                 for (part, slot_id, kind, native_alpha) in [
