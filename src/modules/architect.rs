@@ -709,8 +709,8 @@ impl Architect {
             return false;
         }
         self.project.name = name.to_string();
-        if self.project.source_map.is_empty() && self.selected_map != "__empty__" {
-            self.project.source_map = self.selected_map.clone();
+        if self.project.source_map.is_empty() && !self.current_map_id.is_empty() {
+            self.project.source_map = self.current_map_id.clone();
         }
         let path = self
             .project_root
@@ -1022,6 +1022,9 @@ impl Architect {
     }
 
     fn add_selected_asset_at_position(&mut self, position: [f32; 3]) {
+        if self.project.source_map.is_empty() && !self.current_map_id.is_empty() {
+            self.project.source_map = self.current_map_id.clone();
+        }
         let Some(asset) = self.selected_asset.clone() else {
             self.status = "Choose an ECM asset before placing it.".into();
             return;
@@ -2057,6 +2060,9 @@ impl Architect {
             self.object_drag_start_pointer = None;
         }
         if pressed && self.cursor == CursorMode::Sculpt && !over_ui && hit.is_some() {
+            if self.project.source_map.is_empty() && !self.current_map_id.is_empty() {
+                self.project.source_map = self.current_map_id.clone();
+            }
             self.brush_dragging = true;
             self.last_brush_position = None;
         }
