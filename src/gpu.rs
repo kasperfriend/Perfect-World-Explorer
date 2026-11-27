@@ -3042,13 +3042,6 @@ impl Renderer {
                 .update(&self.queue, direction, w, h, frame, reflected_sets, true);
         }
         let resident_bounds = self.resident_bounds();
-        self.far_trees.update_resident_lods(
-            &self.device,
-            &self.queue,
-            camera.pos.to_array(),
-            self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
-            resident_bounds,
-        );
         // Use the actual uploaded window. The native window shifts at map
         // edges; recomputing a clamped camera square discarded the wrong area.
         let win = self.lod.window;
@@ -5232,6 +5225,16 @@ impl Renderer {
         // with the ones the reprojection pass writes.
         let unjittered_vp = camera.matrix(w, h, camera.far);
         let mut e = self.device.create_command_encoder(&Default::default());
+        // Tree LOD is a compute pass whose indirect arguments are consumed by
+        // the main scene draw below. Record it into this frame encoder rather
+        // than submitting a separate command buffer before rendering.
+        self.far_trees.update_resident_lods(
+            &self.queue,
+            &mut e,
+            camera.pos.to_array(),
+            self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
+            resident_bounds,
+        );
         // The object-motion attachment is cleared here, before any pass that may
         // write it, so a frame with no producer still hands the motion-vector
         // pass a zeroed surface instead of the previous frame's vectors.
