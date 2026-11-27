@@ -400,6 +400,17 @@ impl Scene {
     }
 }
 
+/// A non-destructive SpeedTree placement authored by Architect. Tree geometry
+/// remains owned by the existing SpeedTree cache and GPU instancer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EditorTreePlacement {
+    pub tree_type: u32,
+    pub position: [f32; 3],
+    /// Rotation around the world's up axis, in radians.
+    pub yaw: f32,
+    pub scale: f32,
+}
+
 /// A non-destructive BMD scenery instance authored by Architect. It is
 /// submitted through the same baked-scenery path as EC-BSD ornaments.
 #[derive(Clone, Debug, PartialEq)]
