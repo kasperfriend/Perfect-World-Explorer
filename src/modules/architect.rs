@@ -4052,6 +4052,7 @@ mod tests {
                 "/client",
             )),
             preview: None,
+            preview_bounds: HashMap::new(),
             preview_message: String::new(),
             selected_archive: None,
             archive_entries: Vec::new(),
