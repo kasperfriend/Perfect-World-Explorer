@@ -338,6 +338,14 @@ fn transform_tree_lod_for_view(
     view_direction: glam::Vec3,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<Vec<RtTreeTriangle>> {
+    // Direction normalization, azimuth and elevation are constant for every
+    // leaf in this scene. The previous per-vertex helper recalculated all three
+    // (including atan2/asin) for each of a triangle's three corners.
+    let direction = view_direction.normalize_or_zero();
+    let azimuth = direction.z.atan2(direction.x);
+    let elevation = direction.y.clamp(-1.0, 1.0).asin();
+    let (sin_elevation, cos_elevation) = elevation.sin_cos();
+
     let mut transformed = Vec::with_capacity(source.len());
     for (index, triangle) in source.iter().enumerate() {
         if index & 0x3ff == 0
@@ -349,10 +357,24 @@ fn transform_tree_lod_for_view(
         if moved.leaf_rho >= 0.0 {
             let pivot = moved.leaf_center;
             let rho = moved.leaf_rho;
+            // Rho is shared by all three vertices, so evaluate its azimuth
+            // rotation once per triangle rather than once per vertex.
+            let (sin_angle, cos_angle) = if rho > 1000.0 {
+                (0.0, 1.0)
+            } else {
+                (azimuth + rho).sin_cos()
+            };
             let transform = |vertex: glam::Vec3| {
                 let relative = vertex - pivot;
                 let corner = [relative.x, relative.z, relative.y];
-                pivot + speedtree_leaf_corner(corner, view_direction, rho)
+                if rho > 1000.0 {
+                    return pivot + glam::Vec3::new(corner[0], corner[2], corner[1]);
+                }
+                let qx = cos_elevation * corner[0] - sin_elevation * corner[2];
+                let qz = sin_elevation * corner[0] + cos_elevation * corner[2];
+                let x = cos_angle * qx - sin_angle * corner[1];
+                let y = sin_angle * qx + cos_angle * corner[1];
+                pivot + glam::Vec3::new(x, qz, y)
             };
             moved.a = transform(moved.a);
             moved.b = transform(moved.b);
@@ -2269,6 +2291,55 @@ mod raywatcher_tree_tests {
             out.is_empty(),
             "no synthetic geometry may be emitted when a LOD cannot fit"
         );
+    }
+
+    #[test]
+    fn cached_leaf_transform_matches_the_original_per_vertex_reference() {
+        let pivot = glam::Vec3::new(1.25, -2.0, 0.75);
+        let vertices = [
+            pivot + glam::Vec3::new(-1.0, 4.0, 0.25),
+            pivot + glam::Vec3::new(1.5, 4.5, -0.5),
+            pivot + glam::Vec3::new(0.0, 6.0, 0.75),
+        ];
+        for view in [
+            glam::Vec3::X,
+            glam::Vec3::new(0.3, 0.8, -0.4),
+            glam::Vec3::new(-0.2, -0.1, 0.9),
+        ] {
+            for rho in [0.0, 0.37, 2.1, 1000.0, 1001.0] {
+                let source = [RtTreeTriangle {
+                    a: vertices[0],
+                    b: vertices[1],
+                    c: vertices[2],
+                    normal: glam::Vec3::Z,
+                    albedo: [0.2, 0.4, 0.1],
+                    roughness: 0.8,
+                    opacity: 0.7,
+                    alpha_mask: 0,
+                    leaf_center: pivot,
+                    leaf_rho: rho,
+                }];
+                let actual = transform_tree_lod_for_view(&source, view, None).unwrap()[0];
+                let reference = |vertex: glam::Vec3| {
+                    let relative = vertex - pivot;
+                    pivot + speedtree_leaf_corner(
+                        [relative.x, relative.z, relative.y],
+                        view,
+                        rho,
+                    )
+                };
+                for (got, expected) in [
+                    (actual.a, reference(source[0].a)),
+                    (actual.b, reference(source[0].b)),
+                    (actual.c, reference(source[0].c)),
+                ] {
+                    assert!(
+                        (got - expected).length() < 2e-5,
+                        "cached transform diverged for rho={rho}: {got:?} vs {expected:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
