@@ -514,6 +514,59 @@ fn sample_tri_alpha_mask49(
     (mask, albedo, hits)
 }
 
+/// Build the same isolated, coverage-preserving composite mip chain used by
+/// the raster atlas. RT triangles cannot evaluate fragment derivatives, so the
+/// tree's discrete geometry LOD selects the matching alpha mip as a stable
+/// approximation instead of every LOD sampling high-frequency mip 0.
+fn rt_foliage_mip_images(
+    base: &image::RgbaImage,
+    authored_mips: &[image::RgbaImage],
+    width: u32,
+    height: u32,
+    use_authored: bool,
+) -> Vec<image::RgbaImage> {
+    let mut level_zero = image::RgbaImage::new(width.max(1), height.max(1));
+    for y in 0..height.max(1) {
+        let sy = (y as u64 * base.height().max(1) as u64 / height.max(1) as u64)
+            .min(base.height().saturating_sub(1) as u64) as u32;
+        for x in 0..width.max(1) {
+            let sx = (x as u64 * base.width().max(1) as u64 / width.max(1) as u64)
+                .min(base.width().saturating_sub(1) as u64) as u32;
+            level_zero.put_pixel(x, y, *base.get_pixel(sx, sy));
+        }
+    }
+    let mut images = vec![level_zero];
+    if use_authored
+        && crate::vegetation_textures::chain_fits(authored_mips, width.max(1), height.max(1), 7)
+    {
+        images.extend(authored_mips.iter().take(7).cloned());
+        return images;
+    }
+
+    let source_coverage = crate::foliage_mips::coverage(images[0].as_raw());
+    let mut raw = images[0].as_raw().clone();
+    let (mut mip_width, mut mip_height) = (width.max(1) as usize, height.max(1) as usize);
+    for _ in 1..8 {
+        if mip_width < 2 || mip_height < 2 {
+            break;
+        }
+        raw = crate::foliage_mips::downsample(&raw, mip_width, mip_height, true);
+        mip_width /= 2;
+        mip_height /= 2;
+        let corrected = crate::foliage_mips::preserve_coverage(&raw, source_coverage);
+        if let Some(image) = image::RgbaImage::from_raw(
+            mip_width as u32,
+            mip_height as u32,
+            corrected,
+        ) {
+            images.push(image);
+        } else {
+            break;
+        }
+    }
+    images
+}
+
 pub struct FarTrees {
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
@@ -751,7 +804,18 @@ impl FarTrees {
             }
             let mut species_rt_lods: Vec<Vec<RtTreeTriangle>> = Vec::with_capacity(tree.lods.len());
             let mut species_lod_diags: Vec<RtTreeLodDiag> = Vec::with_capacity(tree.lods.len());
-            for lod in &tree.lods {
+            let composite_slot = slots[1];
+            let rt_composite_mips = rt_foliage_mip_images(
+                &tree.composite,
+                &tree.composite_mips,
+                composite_slot.2 as u32,
+                composite_slot.3 as u32,
+                authored_mips,
+            );
+            for (lod_index, lod) in tree.lods.iter().enumerate() {
+                // LOD 0 uses the atlas base; LOD 1/2 use progressively coarser
+                // alpha mips. The ray scene has no raster derivatives, so this
+                // keeps the foliage cutout frequency aligned with geometry LOD.
                 let rocking_base = rocking_samples.len() / 64;
                 rocking_samples.extend(lod.rocking.iter().map(|v| [v[0], v[1], v[2], 0.]));
                 let start_inst = instances.len() as u32;
@@ -839,9 +903,11 @@ impl FarTrees {
                 {
                     let mut lod_tris = Vec::new();
                     let mut ldiag = RtTreeLodDiag::default();
+                    let foliage_image = &rt_composite_mips
+                        [lod_index.min(rt_composite_mips.len().saturating_sub(1))];
                     for (part, img, is_foliage) in [
                         (&lod.branch, &tree.bark, false),
-                        (&lod.frond, &tree.composite, true),
+                        (&lod.frond, foliage_image, true),
                     ] {
                         for tri in part.indices.chunks_exact(3) {
                             let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
@@ -920,14 +986,14 @@ impl FarTrees {
                         // reproduce real individual leaves instead of flat boxy quads/diamonds.
                         let leaf_cutoff = leaf_alpha_cutoff(authored_mips);
                         let (m0, a0, h0) = sample_tri_alpha_mask49(
-                            &tree.composite,
+                            foliage_image,
                             leaf.uv[0],
                             leaf.uv[1],
                             leaf.uv[2],
                             leaf_cutoff,
                         );
                         let (m1, a1, h1) = sample_tri_alpha_mask49(
-                            &tree.composite,
+                            foliage_image,
                             leaf.uv[0],
                             leaf.uv[2],
                             leaf.uv[3],
@@ -2188,6 +2254,35 @@ pub fn harvest_rt_tree_species_cancellable(
 #[cfg(test)]
 mod raywatcher_tree_tests {
     use super::*;
+
+    #[test]
+    fn rt_foliage_mips_follow_the_raster_atlas_chain_and_geometry_lod() {
+        let mut base = image::RgbaImage::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                let alpha = if (x + y) % 2 == 0 { 255 } else { 0 };
+                base.put_pixel(x, y, image::Rgba([40, 120, 30, alpha]));
+            }
+        }
+        let mips = rt_foliage_mip_images(&base, &[], 8, 8, false);
+        assert_eq!(mips.len(), 4);
+        assert_eq!(mips[0].dimensions(), (8, 8));
+        assert_eq!(mips[1].dimensions(), (4, 4));
+        assert_eq!(mips[2].dimensions(), (2, 2));
+        assert_eq!(mips[3].dimensions(), (1, 1));
+        let authored = vec![
+            image::RgbaImage::new(4, 4),
+            image::RgbaImage::new(2, 2),
+            image::RgbaImage::new(1, 1),
+            image::RgbaImage::new(1, 1),
+            image::RgbaImage::new(1, 1),
+            image::RgbaImage::new(1, 1),
+            image::RgbaImage::new(1, 1),
+        ];
+        let authored_chain = rt_foliage_mip_images(&base, &authored, 8, 8, true);
+        assert_eq!(authored_chain[1].dimensions(), (4, 4));
+        assert_eq!(authored_chain[2].dimensions(), (2, 2));
+    }
 
     #[test]
     fn rt_foliage_alpha_sampling_matches_linear_repeat_texture_filtering() {
