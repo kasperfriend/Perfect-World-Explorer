@@ -2144,21 +2144,19 @@ impl GpuPage {
         let index_bytes = index_data.len() as u64;
         let page_bytes = index_offset + index_bytes;
         let (geometry, vertex_offset) = arena.allocate(device, page_bytes);
-        if !vertex_data.is_empty() {
-            let size = std::num::NonZeroU64::new(vertex_bytes).expect("non-empty vertex upload");
-            belt.write_buffer(encoder, &geometry, vertex_offset, size, device)
-                .copy_from_slice(vertex_data);
-        }
-        if !index_data.is_empty() {
-            let size = std::num::NonZeroU64::new(index_bytes).expect("non-empty index upload");
-            belt.write_buffer(
-                encoder,
-                &geometry,
-                vertex_offset + index_offset,
-                size,
-                device,
-            )
-            .copy_from_slice(index_data);
+        if page_bytes != 0 {
+            // One staging allocation and one GPU copy per page. The former
+            // path staged vertices and indices separately, doubling belt
+            // bookkeeping and copy commands for every geometry page.
+            let size = std::num::NonZeroU64::new(page_bytes).expect("non-empty page upload");
+            let staged = belt.write_buffer(encoder, &geometry, vertex_offset, size, device);
+            let vertex_end = vertex_data.len();
+            staged[..vertex_end].copy_from_slice(vertex_data);
+            if index_offset > vertex_bytes {
+                staged[vertex_bytes as usize..index_offset as usize].fill(0);
+            }
+            let index_start = index_offset as usize;
+            staged[index_start..index_start + index_data.len()].copy_from_slice(index_data);
         }
         Self {
             geometry,
