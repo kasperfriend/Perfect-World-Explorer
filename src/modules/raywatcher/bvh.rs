@@ -1208,6 +1208,44 @@ mod tests {
     }
 
     #[test]
+    fn four_way_parallel_build_preserves_exact_nearest_hit_results() {
+        // Cross the large-scene threshold so this exercises the four-worker
+        // build and the rebasing of all four subtree node/order ranges.
+        let tris = scattered(4_200);
+        let scene = SceneGeometry::build(tris.clone(), vec![]);
+        assert_eq!(scene.triangles.len(), tris.len());
+        assert_eq!(scene.order.len(), tris.len());
+        assert!(scene.nodes.len() > 4);
+
+        let mut seed = 0x6d2b_79f5u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let mut hits = 0;
+        for _ in 0..256 {
+            let origin = Vec3::new(next() * 45.0, next() * 10.0 + 4.0, next() * 45.0);
+            let dir = Vec3::new(next(), next(), next()).normalize();
+            let traced = scene.closest_hit(origin, dir, 0.0, 1e4);
+            let reference = brute_force(&tris, origin, dir, 0.0, 1e4);
+            match (traced, reference) {
+                (None, None) => {}
+                (Some(hit), Some((t, triangle))) => {
+                    hits += 1;
+                    assert_eq!(hit.triangle, triangle, "parallel BVH nearest triangle");
+                    assert!((hit.t - t).abs() < 1e-3, "parallel BVH distance {} vs {}", hit.t, t);
+                }
+                (actual, expected) => {
+                    panic!("parallel BVH and brute force disagree: {actual:?} vs {expected:?}")
+                }
+            }
+        }
+        assert!(hits > 20, "the test rays must exercise actual hits ({hits})");
+    }
+
+    #[test]
     fn occlusion_matches_the_closest_hit_query() {
         let tris = scattered(200);
         let scene = SceneGeometry::build(tris.clone(), vec![]);
