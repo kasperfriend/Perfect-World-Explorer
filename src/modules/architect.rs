@@ -1540,6 +1540,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sculpt_brush_updates_shared_heights_and_replays_reversibly() {
+        let mut builder = crate::terrain_store::Builder::new_resident(8, 8, 4).unwrap();
+        for by in 0..2 {
+            for bx in 0..2 {
+                builder
+                    .block(bx, by, &[0.; 16], &[[0, 127, 0]; 16])
+                    .unwrap();
+            }
+        }
+        let (heights, _normals) = builder.finish(0).unwrap();
+        let map = crate::navigation::MapSpace {
+            width: 8,
+            height: 8,
+            spacing: 1.,
+            heights,
+        };
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element/element.data"),
+            Some(map.clone()),
+            "a01".into(),
+        );
+        editor.project.source_map = "a01".into();
+        let stroke = TerrainStroke {
+            mode: BrushMode::Raise,
+            position: [0., 0., 0.],
+            radius: 2.,
+            strength: 10.,
+        };
+        let changed = editor.apply_stroke(&stroke).unwrap();
+        assert!(changed > 0);
+        assert_eq!(map.heights.at(4 * 8 + 4), 10.);
+
+        editor.project.strokes.push(stroke);
+        editor.rebuild_terrain().unwrap();
+        assert_eq!(map.heights.at(4 * 8 + 4), 10.);
+        editor.project.strokes.clear();
+        editor.rebuild_terrain().unwrap();
+        assert_eq!(map.heights.at(4 * 8 + 4), 0.);
+    }
+
+    #[test]
     fn project_codec_round_trips_unicode_paths_and_editor_operations() {
         let project = Project {
             name: "我的世界".into(),
