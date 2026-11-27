@@ -777,8 +777,7 @@ impl Page {
                         first_vertex = first_vertex.min(index);
                         last_vertex = last_vertex.max(index);
                         let kind = self.vertices[index].kind;
-                        has_sdr |= (kind > 2.01 && kind < 2.03)
-                            || (kind > 2.11 && kind < 2.13);
+                        has_sdr |= (kind > 2.01 && kind < 2.03) || (kind > 2.11 && kind < 2.13);
                     }
                 }
                 if first_vertex != usize::MAX {
@@ -1559,10 +1558,9 @@ fn run(
                                         + scaled_x * v.position[0]
                                         + scaled_y * v.position[1]
                                         + scaled_z * v.position[2];
-                                    let normal = (x * v.normal[0]
-                                        + y * v.normal[1]
-                                        + z * v.normal[2])
-                                        .normalize_or_zero();
+                                    let normal =
+                                        (x * v.normal[0] + y * v.normal[1] + z * v.normal[2])
+                                            .normalize_or_zero();
                                     *out = Vertex {
                                         pos: pos.to_array(),
                                         normal: normal.to_array(),
@@ -1582,9 +1580,7 @@ fn run(
                             + scaled_x * v.position[0]
                             + scaled_y * v.position[1]
                             + scaled_z * v.position[2];
-                        let normal = (x * v.normal[0]
-                            + y * v.normal[1]
-                            + z * v.normal[2])
+                        let normal = (x * v.normal[0] + y * v.normal[1] + z * v.normal[2])
                             .normalize_or_zero();
                         *out = Vertex {
                             pos: pos.to_array(),
