@@ -578,14 +578,31 @@ impl Reader {
             .min(32)
             .min(raw_pages.len().max(1));
         if workers > 1 && raw_pages.len() >= 2 {
-            std::thread::scope(|s| {
+            // A cache batch is intentionally small (normally 2–8 pages). Spawn
+            // one worker per contiguous chunk, not one OS thread per page: the
+            // latter repeatedly pays thread creation/join costs on every batch.
+            // Contiguous chunks also keep each worker's page allocations and
+            // checksum/decode work local while preserving file order on return.
+            let chunk_len = raw_pages.len().div_ceil(workers);
+            std::thread::scope(|scope| {
                 let handles: Vec<_> = raw_pages
-                    .into_iter()
-                    .map(|slab_res| {
-                        s.spawn(move || slab_res.and_then(|slab| decode_page_slab(&slab)))
+                    .chunks(chunk_len)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|slab_res| match slab_res {
+                                    Ok(slab) => decode_page_slab(slab),
+                                    Err(error) => Err(error.clone()),
+                                })
+                                .collect::<Vec<_>>()
+                        })
                     })
                     .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
+                handles
+                    .into_iter()
+                    .flat_map(|handle| handle.join().unwrap())
+                    .collect()
             })
         } else {
             raw_pages
