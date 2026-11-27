@@ -6578,6 +6578,40 @@ mod phase_r1_tests {
     }
 
     #[test]
+    fn point_light_bvh_is_conservative_and_covers_each_packed_light_once() {
+        let mut positions = [[0.0f32; 4]; MAX_RAY_LIGHTS];
+        for (i, light) in positions.iter_mut().enumerate() {
+            let x = (i as f32 * 17.0).sin() * 90.0;
+            let y = (i as f32 * 7.0).cos() * 35.0;
+            let z = (i as f32 * 13.0).sin() * 75.0;
+            let radius = 2.0 + (i % 11) as f32 * 1.75;
+            *light = [x, y, z, radius];
+        }
+        let (nodes, order) = build_point_light_bvh(&positions, MAX_RAY_LIGHTS);
+        assert_eq!(order.len(), MAX_RAY_LIGHTS);
+        assert!(nodes.len() <= 63);
+        let mut seen = [false; MAX_RAY_LIGHTS];
+        for node in &nodes {
+            if node.min[3] < 0.0 {
+                continue;
+            }
+            let first = node.max[3] as usize;
+            let count = node.min[3] as usize;
+            for &index in &order[first..first + count] {
+                let index = index as usize;
+                assert!(!seen[index], "light {index} appears in more than one leaf");
+                seen[index] = true;
+                let light = positions[index];
+                for axis in 0..3 {
+                    assert!(node.min[axis] <= light[axis] - light[3]);
+                    assert!(node.max[axis] >= light[axis] + light[3]);
+                }
+            }
+        }
+        assert!(seen.into_iter().all(|covered| covered));
+    }
+
+    #[test]
     fn point_light_pack_culls_only_lights_outside_the_far_influence_sphere() {
         let lighting = super::super::frame::LightingRecord::default();
         let params = super::super::frame::FrameParams {
