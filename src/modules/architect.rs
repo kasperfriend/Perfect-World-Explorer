@@ -2911,7 +2911,10 @@ impl Architect {
                     && !source_is_frontmost;
                 let begin_lasso = self.cursor == CursorMode::Lasso;
                 if self.cursor == CursorMode::MultiSelect {
-                    if let Some(index) = picked_placement {
+                    if source_is_frontmost {
+                        self.selected_placement = None;
+                        self.selected_placements.clear();
+                    } else if let Some(index) = picked_placement {
                         self.selected_placements.insert(index);
                         self.selected_placement = Some(index);
                         self.selected_scene_object = None;
