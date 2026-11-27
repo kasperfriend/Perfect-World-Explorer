@@ -344,9 +344,10 @@ pub const MAX_LEAF: usize = 4;
 /// Maximum tree depth. A pathological input (all centroids coincident) stops
 /// splitting here and keeps a large leaf rather than recursing forever.
 pub const MAX_DEPTH: u32 = 40;
-/// Traversal stack depth. Both walks push at most one node per level (the
-/// any-hit walk two), so twice the depth cap is the hard bound.
-pub const STACK_DEPTH: usize = (MAX_DEPTH as usize) * 2;
+/// Traversal stack depth. Near-first depth-first traversal keeps at most
+/// one deferred sibling per level; MAX_DEPTH therefore needs at most 41
+/// entries. Two extra slots keep the root and deepest split safely bounded.
+pub const STACK_DEPTH: usize = MAX_DEPTH as usize + 2;
 
 /// Reserve for a balanced binary BVH with leaves of at most MAX_LEAF
 /// triangles. The builder can still grow this vector for pathological SAH
@@ -1094,6 +1095,12 @@ mod tests {
             }
         }
         best
+    }
+
+    #[test]
+    fn traversal_stack_covers_maximum_depth_with_one_deferred_sibling_per_level() {
+        assert_eq!(STACK_DEPTH, MAX_DEPTH as usize + 2);
+        assert_eq!(STACK_DEPTH, 42);
     }
 
     #[test]
