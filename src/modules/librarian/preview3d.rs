@@ -645,6 +645,20 @@ impl Preview {
         }
         queue.submit(Some(encoder.finish()));
     }
+    /// Draw the offscreen model target inside an egui panel.
+    pub fn show(&self, ui: &mut egui::Ui, size: egui::Vec2) {
+        if let Some(error) = &self.error {
+            ui.colored_label(egui::Color32::LIGHT_RED, error);
+        } else {
+            ui.add(egui::Image::new((self.target.texture_id, size)));
+        }
+        for warning in &self.warnings {
+            ui.label(egui::RichText::new(warning).small().weak());
+        }
+        if let Some(error) = &self.animation_error {
+            ui.label(egui::RichText::new(error).small().color(egui::Color32::YELLOW));
+        }
+    }
     pub fn select_action(&mut self, action: usize) {
         if self.action != action {
             self.action = action;
