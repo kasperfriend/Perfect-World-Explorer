@@ -3010,7 +3010,8 @@ impl Architect {
                 .is_some_and(|object| !object.locked);
             self.object_dragging = self.cursor == CursorMode::Select
                 && selected_is_unlocked
-                && ((self.selected_placements.len() > 1 && (hit.is_some() || self.object_drag_axis.is_some()))
+                && ((self.selected_placements.len() > 1
+                    && (hit.is_some() || self.object_drag_axis.is_some()))
                     || (self.selected_placements.len() <= 1
                         && (hit.is_some() || self.object_drag_axis.is_some())));
             if self.object_dragging && self.selected_placements.len() > 1 {
@@ -3393,15 +3394,29 @@ impl Architect {
                         }
                     },
                     TransformMode::Rotate => {
-                        let radius = center.distance(project_point(origin + Vec3::X * 24.).unwrap_or(center)).max(12.);
-                        for (scale, color) in [(1.28, axes[0].1), (1.0, axes[1].1), (0.72, axes[2].1)] {
-                            painter.circle_stroke(center, radius * scale, egui::Stroke::new(2.5, color));
+                        let radius = center
+                            .distance(project_point(origin + Vec3::X * 24.).unwrap_or(center))
+                            .max(12.);
+                        for (scale, color) in [
+                            (1.28, axes[0].1),
+                            (1.0, axes[1].1),
+                            (0.72, axes[2].1),
+                        ] {
+                            painter.circle_stroke(
+                                center,
+                                radius * scale,
+                                egui::Stroke::new(2.5, color),
+                            );
                         }
                     },
                     TransformMode::Scale => for (axis, color) in axes {
                         if let Some(end) = project_point(origin + axis * 24.) {
                             painter.line_segment([center, end], egui::Stroke::new(3., color));
-                            painter.rect_filled(egui::Rect::from_center_size(end, egui::vec2(9., 9.)), 1., color);
+                            painter.rect_filled(
+                                egui::Rect::from_center_size(end, egui::vec2(9., 9.)),
+                                1.,
+                                color,
+                            );
                         }
                     },
                 }
@@ -3546,7 +3561,13 @@ mod tests {
 
     #[test]
     fn multiselect_mode_keeps_source_scene_picks_out_of_marquee_fallback() {
-        let source_pick = Some((4usize, 0.2f32, 0.8f32, "models/tree.ecm".to_string(), [1., 2., 3.]));
+        let source_pick = Some((
+            4usize,
+            0.2f32,
+            0.8f32,
+            "models/tree.ecm".to_string(),
+            [1., 2., 3.],
+        ));
         let source_is_frontmost = source_pick.is_some();
         let picked_placement: Option<usize> = None;
         let begin_marquee = CursorMode::MultiSelect == CursorMode::MultiSelect
