@@ -5703,8 +5703,8 @@ impl RaywatcherGpu {
             pass.set_pipeline(&self.pipelines.atrous);
             pass.set_bind_group(0, &self.atrous_bind_groups[iteration as usize], &[]);
             pass.dispatch_workgroups(rw.div_ceil(8), rh.div_ceil(8), 1);
-        }
-        if iteration == 0 {
+            drop(pass);
+            if iteration == 0 {
             encoder.copy_texture_to_texture(
                 wgpu::ImageCopyTexture {
                     texture: &self.filter_colour_tex[0],
@@ -5743,6 +5743,7 @@ impl RaywatcherGpu {
                     depth_or_array_layers: 1,
                 },
             );
+            }
         }
         let final_plane = ((iterations - 1) % 2) as usize;
         self.last_output_plane = final_plane;
