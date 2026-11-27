@@ -4348,6 +4348,7 @@ mod tests {
             )),
             preview: None,
             preview_bounds: HashMap::new(),
+            tree_types: Vec::new(),
             preview_message: String::new(),
             selected_archive: None,
             archive_entries: Vec::new(),
