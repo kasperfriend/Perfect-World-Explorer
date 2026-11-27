@@ -1752,13 +1752,35 @@ impl Architect {
             if let Some(position) = hit {
                 let spacing = self.map.as_ref().map_or(1., |m| m.spacing);
                 let step = (self.brush_radius * 0.18).max(spacing).max(0.25);
-                if self.last_brush_position.is_none_or(|last| (position - Vec3::from_array(last)).length() >= step) {
-                    let stroke = TerrainStroke { mode: self.brush, position: position.to_array(), radius: self.brush_radius, strength: if self.brush == BrushMode::Flatten { self.flatten_height } else { self.brush_strength } };
-                    match self.apply_stroke(&stroke) {
-                        Ok(cells) if cells > 0 => { self.project.strokes.push(stroke); self.redo_strokes.clear(); self.last_brush_position = Some(position.to_array()); self.status = format!("Sculpted {cells} terrain cells · {} dabs", self.project.strokes.len()); }
-                        Ok(_) => { self.last_brush_position = Some(position.to_array()); }
-                        Err(error) => self.status = error,
+                let previous = self.last_brush_position.map(Vec3::from_array).unwrap_or(position);
+                let distance = (position - previous).length();
+                if distance >= step || self.last_brush_position.is_none() {
+                    // Interpolate along fast pointer movement so a high-speed drag
+                    // cannot leave holes between individual brush dabs.
+                    let count = ((distance / step).ceil() as usize).clamp(1, 128);
+                    let mut total_cells = 0usize;
+                    for dab in 1..=count {
+                        let point = previous.lerp(position, dab as f32 / count as f32);
+                        let stroke = TerrainStroke {
+                            mode: self.brush,
+                            position: point.to_array(),
+                            radius: self.brush_radius,
+                            strength: if self.brush == BrushMode::Flatten { self.flatten_height } else { self.brush_strength },
+                        };
+                        match self.apply_stroke(&stroke) {
+                            Ok(cells) if cells > 0 => {
+                                total_cells = total_cells.saturating_add(cells);
+                                self.project.strokes.push(stroke);
+                            }
+                            Ok(_) => {}
+                            Err(error) => { self.status = error; break; }
+                        }
                     }
+                    if total_cells > 0 {
+                        self.redo_strokes.clear();
+                        self.status = format!("Sculpted {total_cells} terrain cells · {} dabs", self.project.strokes.len());
+                    }
+                    self.last_brush_position = Some(position.to_array());
                 }
             }
         }
