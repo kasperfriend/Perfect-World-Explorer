@@ -2148,7 +2148,7 @@ impl GpuPage {
             // path staged vertices and indices separately, doubling belt
             // bookkeeping and copy commands for every geometry page.
             let size = std::num::NonZeroU64::new(page_bytes).expect("non-empty page upload");
-            let staged = belt.write_buffer(encoder, &geometry, vertex_offset, size, device);
+            let mut staged = belt.write_buffer(encoder, &geometry, vertex_offset, size, device);
             let vertex_end = vertex_data.len();
             staged[..vertex_end].copy_from_slice(vertex_data);
             if index_offset > vertex_bytes {
