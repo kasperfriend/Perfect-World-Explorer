@@ -1377,7 +1377,7 @@ impl World {
             if !slot.visible {
                 continue;
             }
-            if let Some(draw) = &slot.draw {
+            if let Some(draw) = &mut slot.draw {
                 draw.draw_opaque(pass);
             }
         }
