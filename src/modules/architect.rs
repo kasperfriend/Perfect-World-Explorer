@@ -6,7 +6,7 @@
 //! exporter exists.
 use glam::Vec3;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -1797,56 +1797,72 @@ impl Architect {
                 });
                 let mut delete_placement = None;
                 let mut duplicate_placement = None;
-                let placement_rows = self
-                    .project
-                    .objects
-                    .iter()
-                    .enumerate()
-                    .map(|(index, object)| {
-                        let label = format!(
-                            "{} · ({:.1}, {:.1}, {:.1})",
-                            Path::new(&object.asset)
-                                .file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| object.asset.clone()),
-                            object.position[0],
-                            object.position[1],
-                            object.position[2]
-                        );
-                        (index, label)
-                    })
-                    .collect::<Vec<_>>();
+                let mut hierarchy = BTreeMap::<String, Vec<(usize, String)>>::new();
+                for (index, object) in self.project.objects.iter().enumerate() {
+                    let label = format!(
+                        "{}{}",
+                        if object.visible { "" } else { "◌ " },
+                        if object.locked { format!("🔒 {}", object.name) } else { object.name.clone() }
+                    );
+                    hierarchy
+                        .entry(if object.group.trim().is_empty() {
+                            "Ungrouped".into()
+                        } else {
+                            object.group.clone()
+                        })
+                        .or_default()
+                        .push((index, label));
+                }
                 egui::ScrollArea::vertical()
-                    .max_height(100.)
+                    .max_height(180.)
                     .show(ui, |ui| {
-                        for (index, label) in &placement_rows {
-                            if ui
-                                .selectable_label(
-                                    self.selected_placements.contains(index)
-                                        || self.selected_placement == Some(*index),
-                                    label,
-                                )
-                                .clicked()
-                            {
-                                if self.cursor == CursorMode::MultiSelect {
-                                    if self.selected_placements.insert(*index) {
-                                        self.selected_placement = Some(*index);
-                                    } else {
-                                        self.selected_placements.remove(index);
-                                        self.selected_placement =
-                                            self.selected_placements.iter().copied().min();
+                        for (group, rows) in &hierarchy {
+                            egui::CollapsingHeader::new(format!("📁 {group}"))
+                                .id_source(("architect_group", group))
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    for (index, label) in rows {
+                                        if ui
+                                            .selectable_label(
+                                                self.selected_placements.contains(index)
+                                                    || self.selected_placement == Some(*index),
+                                                label,
+                                            )
+                                            .clicked()
+                                        {
+                                            if self.cursor == CursorMode::MultiSelect {
+                                                if self.selected_placements.insert(*index) {
+                                                    self.selected_placement = Some(*index);
+                                                } else {
+                                                    self.selected_placements.remove(index);
+                                                    self.selected_placement =
+                                                        self.selected_placements.iter().copied().min();
+                                                }
+                                            } else {
+                                                self.selected_placements.clear();
+                                                self.selected_placements.insert(*index);
+                                                self.selected_placement = Some(*index);
+                                            }
+                                        }
                                     }
-                                } else {
-                                    self.selected_placements.clear();
-                                    self.selected_placements.insert(*index);
-                                    self.selected_placement = Some(*index);
-                                }
-                            }
+                                });
                         }
                     });
                 if let Some(index) = self.selected_placement {
                     if let Some(object) = self.project.objects.get_mut(index) {
                         ui.label(egui::RichText::new(&object.asset).small().weak());
+                        ui.horizontal(|ui| {
+                            ui.label("Name");
+                            ui.text_edit_singleline(&mut object.name);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Group");
+                            ui.text_edit_singleline(&mut object.group);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut object.visible, "Visible");
+                            ui.checkbox(&mut object.locked, "Locked");
+                        });
                         ui.horizontal(|ui| {
                             ui.label("Position");
                             for axis in 0..3 {
@@ -2097,7 +2113,7 @@ impl Architect {
                     for (index, object) in self.project.objects.iter().enumerate() {
                         let clip =
                             view_projection.project_point3(Vec3::from_array(object.position));
-                        if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
+                        if !object.visible || !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
                             continue;
                         }
                         let point = egui::pos2(
@@ -2188,8 +2204,12 @@ impl Architect {
             self.object_drag_axis = axis_pick;
             self.object_drag_group.clear();
             self.object_drag_start_hit = hit.map(|position| position.to_array());
+            let selected_is_unlocked = self
+                .selected_placement
+                .and_then(|index| self.project.objects.get(index))
+                .is_some_and(|object| !object.locked);
             self.object_dragging = self.cursor == CursorMode::Select
-                && self.selected_placement.is_some()
+                && selected_is_unlocked
                 && ((self.selected_placements.len() > 1 && hit.is_some())
                     || (self.selected_placements.len() <= 1
                         && (hit.is_some() || self.object_drag_axis == Some(1))));
@@ -2202,6 +2222,7 @@ impl Architect {
                         self.project
                             .objects
                             .get(index)
+                            .filter(|object| !object.locked)
                             .map(|object| (index, object.position))
                     })
                     .collect();
@@ -2218,7 +2239,7 @@ impl Architect {
             }
         }
         if self.object_dragging && down && self.cursor == CursorMode::Select && !over_ui {
-            if self.object_drag_group.len() > 1 {
+            if !self.object_drag_group.is_empty() {
                 if let (Some(start), Some(current)) = (self.object_drag_start_hit, hit) {
                     let delta = Vec3::from_array(current.to_array()) - Vec3::from_array(start);
                     for (index, position) in &self.object_drag_group {
