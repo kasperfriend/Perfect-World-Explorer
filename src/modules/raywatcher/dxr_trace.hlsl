@@ -242,40 +242,9 @@ Hit closest_hit(float3 origin, float3 dir, float t_min, float t_max, uint opaque
 }
 
 Hit closest_hit_fast(float3 origin, float3 dir, float t_min, float t_max, uint opaque_offset, uint tri_count) {
-    Hit hit;
-    hit.index = 0xffffffffu;
-    hit.t = t_max;
-    hit.normal = float3(0.0, 1.0, 0.0);
-
-    RayDesc ray;
-    ray.Origin = origin;
-    ray.Direction = dir;
-    ray.TMin = t_min;
-    ray.TMax = t_max;
-
-    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-    q.TraceRayInline(scene_tlas, RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
-    q.Proceed();
-
-    if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-        if (q.CommittedInstanceID() == 1u) {
-            hit.index = 0xfffffffeu;
-            hit.t = q.CommittedRayT();
-            hit.normal = normalize(-dir * 0.55 + float3(0.0, 0.83, 0.0));
-        } else {
-            uint prim = q.CommittedPrimitiveIndex() + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
-            if (prim < tri_count) {
-                float3 n = tris[prim].n.xyz; // Opt #3: pre-normalized in harvest.rs
-                if (dot(n, dir) > 0.0) {
-                    n = -n;
-                }
-                hit.index = prim;
-                hit.t = q.CommittedRayT();
-                hit.normal = n;
-            }
-        }
-    }
-    return hit;
+    // Kept as a compatibility helper for callers that only need a closest hit.
+    // The opaque shortcut is invalid for alpha-tested tree and grass geometry.
+    return closest_hit(origin, dir, t_min, t_max, opaque_offset, tri_count);
 }
 
 // Feature #4 & #7: Shadow ray returning blocker distance (for PCSS contact-hardening)
@@ -293,10 +262,25 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
     ray.TMax = t_max;
 
     if (fast_mode) {
-        // Opt #5: Accept first hit & end search immediately on RT cores (2-3x faster distant shadows).
-        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-        q.TraceRayInline(scene_tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
-        q.Proceed();
+        // Distant rays still terminate at the first accepted blocker, but retain
+        // non-opaque candidate handling so the foliage alpha mask is respected.
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+        q.TraceRayInline(
+            scene_tlas,
+            RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
+            0xffu,
+            ray);
+        while (q.Proceed()) {
+            if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+                break; // Opaque geometry is auto-committed.
+            }
+            if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
+                uint prim = q.CandidatePrimitiveIndex() + (q.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
+                if (accept_opacity(prim, q.CandidateTriangleBarycentrics(), seed, tri_count)) {
+                    q.CommitNonOpaqueTriangleHit();
+                }
+            }
+        }
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
             res.occluded = true;
             res.t_blocker = q.CommittedRayT();
@@ -386,16 +370,34 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
     return res;
 }
 
-bool occluded_fast(float3 origin, float3 dir, float t_min, float t_max) {
+bool occluded_fast(float3 origin, float3 dir, float t_min, float t_max, uint opaque_offset, uint tri_count) {
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = dir;
     ray.TMin = t_min;
     ray.TMax = t_max;
 
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-    q.TraceRayInline(scene_tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xffu, ray);
-    q.Proceed();
+    // Keep first-hit termination, but never FORCE_OPAQUE: foliage lives in the
+    // non-opaque BLAS geometry and must pass the same barycentric alpha test as
+    // the near shadow path. FORCE_OPAQUE turns every leaf card into a solid quad.
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+    q.TraceRayInline(
+        scene_tlas,
+        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
+        0xffu,
+        ray);
+    while (q.Proceed()) {
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            return true;
+        }
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
+            uint prim = q.CandidatePrimitiveIndex() + (q.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
+            if (accept_opacity(prim, q.CandidateTriangleBarycentrics(), 0u, tri_count)) {
+                q.CommitNonOpaqueTriangleHit();
+                return true;
+            }
+        }
+    }
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
@@ -1215,7 +1217,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             // Enhancement #17: Distant terrain self-shadowing beyond near BLAS bubble (480..1400u).
             if (shadow > 0.5 && dist > 260.0 && params.lens.y > 500.0) {
                 float far_max_t = min(params.lens.y, 1400.0);
-                if (occluded_fast(ray_origin, params.sun_dir.xyz, 460.0, far_max_t)) {
+                if (occluded_fast(ray_origin, params.sun_dir.xyz, 460.0, far_max_t, opaque_offset, tri_count)) {
                     shadow = 0.0;
                 }
             }
