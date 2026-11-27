@@ -792,10 +792,7 @@ mod tests {
         assert_eq!(fallback.air_day.end, 400.);
         assert_eq!(fallback.air_night.start, 60.);
         assert_eq!(fallback.air_night.end, 400.);
-        assert_eq!(
-            fallback.air_day.color,
-            [70. / 255., 77. / 255., 91. / 255.]
-        );
+        assert_eq!(fallback.air_day.color, [70. / 255., 77. / 255., 91. / 255.]);
         assert_eq!(fallback.air_night.color, fallback.air_day.color);
     }
 
