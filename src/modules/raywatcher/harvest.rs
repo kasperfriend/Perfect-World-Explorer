@@ -2297,7 +2297,7 @@ mod tests {
     }
 
     #[test]
-    fn rotating_camera_reuses_cached_bvh_without_rebuilding() {
+    fn camera_rotation_refreshes_camera_facing_tree_billboards_by_view_sector() {
         let mut harvester = Harvester::new();
         let config = HarvestConfig::default();
         let eye = Vec3::new(10.0, 20.0, 10.0);
@@ -2318,12 +2318,19 @@ mod tests {
             &[],
             &[],
         );
-        // Rotating 180 degrees at the same position must be a cache hit so
-        // looking around never triggers a CPU BVH or DXR BLAS rebuild stall.
+        // A small mouse delta inside the same 11.25-degree view sector is a
+        // cache hit, but a 180-degree turn must refresh billboard geometry.
+        let nearby = Vec3::new(0.01, 0.0, -1.0).normalize();
         let cached = harvester
-            .cached_if_unchanged_frustum(config, eye, Vec3::Z, 1000.0, 1, 42)
-            .expect("rotating the camera must hit the 360-degree BVH cache");
+            .cached_if_unchanged_frustum(config, eye, nearby, 1000.0, 1, 42)
+            .expect("sub-sector camera motion must reuse the cached scene");
         assert!(std::sync::Arc::ptr_eq(&first, &cached));
+        assert!(
+            harvester
+                .cached_if_unchanged_frustum(config, eye, Vec3::Z, 1000.0, 1, 42)
+                .is_none(),
+            "a new view sector must rebuild camera-facing leaf geometry"
+        );
     }
 
     #[test]
