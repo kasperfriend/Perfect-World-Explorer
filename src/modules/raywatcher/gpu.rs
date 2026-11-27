@@ -7217,7 +7217,10 @@ mod reflection_sampling_regression_tests {
         let first_count = detailed
             .find("foliage_layers = min(foliage_layers + 1u, 6u);")
             .expect("primary accepted foliage count");
-        assert!(first_accept < first_count, "transparent card holes must not deepen the canopy");
+        assert!(
+            first_accept < first_count,
+            "transparent card holes must not deepen the canopy"
+        );
 
         let second_accept = detailed
             .find("if (accept_opacity(cp2")
