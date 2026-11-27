@@ -496,8 +496,6 @@ struct WorldGpuCullBounds {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
 struct WorldGpuCullRun {
     first_cmd: u32,
     command_count: u32,
@@ -505,6 +503,8 @@ struct WorldGpuCullRun {
     pad: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct WorldGpuCullParams {
     frustum: [[f32; 4]; 6],
     eye_proj: [f32; 4],
