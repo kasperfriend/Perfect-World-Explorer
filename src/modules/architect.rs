@@ -3291,7 +3291,7 @@ mod tests {
     }
 
     #[test]
-    fn renderer_asset_paths_only_accept_models_pck_ecm_entries() {
+    fn renderer_asset_paths_accept_ecm_and_static_gfx_smd_entries_only() {
         assert_eq!(
             Architect::renderer_asset_path("element/models.pck::Models/NPCs/Guard/guard.ecm"),
             Some("models/npcs/guard/guard.ecm".into())
@@ -3303,6 +3303,14 @@ mod tests {
         assert_eq!(
             Architect::renderer_asset_path("element/gfx.pck::gfx/models/fire.ecm"),
             None
+        );
+        assert_eq!(
+            Architect::renderer_asset_path("element/gfx.pck::models/fire.smd"),
+            Some("gfx/models/fire.smd".into())
+        );
+        assert_eq!(
+            Architect::renderer_asset_path("gfx/models/stone.smd"),
+            Some("gfx/models/stone.smd".into())
         );
         assert_eq!(
             Architect::renderer_asset_path("element/models.pck::textures/tree.dds"),
@@ -3322,6 +3330,10 @@ mod tests {
         );
         assert_eq!(
             Architect::renderer_asset_path("element/models.pck::models/npcs/guard:evil.ecm"),
+            None
+        );
+        assert_eq!(
+            Architect::renderer_asset_path("element/other.pck::models/npcs/guard.ecm"),
             None
         );
     }
