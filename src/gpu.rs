@@ -2896,6 +2896,9 @@ impl Renderer {
             self.sky
                 .update(&self.queue, direction, w, h, frame, reflected_sets, true);
         }
+        let editor_tree_placements = self.modules.architect_tree_placements();
+        self.far_trees
+            .sync_editor_placements(&self.device, &editor_tree_placements);
         let resident_bounds = self.resident_bounds();
         self.far_trees.update_resident_lods(
             &self.device,
