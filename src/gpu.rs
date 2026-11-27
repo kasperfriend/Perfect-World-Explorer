@@ -4007,7 +4007,7 @@ impl Renderer {
         // foliage triangles. Include them in the scene key so an asynchronous
         // tree load or live setting change cannot leave stale leaves in RT.
         let tree_species = self.far_trees.rt_species_snapshot();
-        let tree_species_key = (tree_species.as_ptr() as usize as u64)
+        let tree_species_key = (tree_species.as_ref().as_ptr() as usize as u64)
             ^ (tree_species.len() as u64).rotate_left(37);
         let tree_lod_scale =
             self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees);
