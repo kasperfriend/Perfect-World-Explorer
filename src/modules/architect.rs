@@ -117,6 +117,7 @@ pub struct Architect {
     /// Exact local-space bounds cached per loaded client mesh. Never substitute
     /// guessed class dimensions for an object's actual geometry.
     preview_bounds: HashMap<String, ([f32; 3], [f32; 3])>,
+    tree_types: Vec<crate::scene::TreeType>,
     preview_message: String,
     selected_archive: Option<PathBuf>,
     archive_entries: Vec<String>,
@@ -215,6 +216,7 @@ impl Architect {
             preview_assets,
             preview: None,
             preview_bounds: HashMap::new(),
+            tree_types: Vec::new(),
             preview_message: "Hover or select an ECM/SMD model to preview it.".into(),
             selected_archive: None,
             archive_entries: Vec::new(),
@@ -1281,6 +1283,54 @@ impl Architect {
         Some(path)
     }
 
+    fn renderer_tree_type(&self, asset: &str) -> Option<usize> {
+        let candidate = asset
+            .split_once("::")
+            .map_or(asset, |(_, entry)| entry);
+        let candidate = crate::ecmodel::normalize(candidate);
+        self.tree_types.iter().position(|tree| {
+            let path = crate::ecmodel::normalize(&tree.tree);
+            candidate == path
+                || candidate.ends_with(&format!("/{path}"))
+                || path.ends_with(&format!("/{candidate}"))
+        })
+    }
+
+    /// Project SpeedTree instances for the native GPU instancer.
+    pub fn renderer_tree_placements(&self) -> Vec<crate::scene::EditorTreePlacement> {
+        if !self.enabled
+            || (!self.project.source_map.is_empty()
+                && !self.current_map_id.is_empty()
+                && !self
+                    .project
+                    .source_map
+                    .eq_ignore_ascii_case(&self.current_map_id))
+        {
+            return Vec::new();
+        }
+        self.project
+            .objects
+            .iter()
+            .filter(|object| object.visible)
+            .filter_map(|object| {
+                let tree_type = self.renderer_tree_type(&object.asset)?;
+                if !object.position.iter().all(|value| value.is_finite())
+                    || !object.rotation.iter().all(|value| value.is_finite())
+                    || !object.scale.is_finite()
+                    || !(0.05..=20.0).contains(&object.scale)
+                {
+                    return None;
+                }
+                Some(crate::scene::EditorTreePlacement {
+                    tree_type: tree_type as u32,
+                    position: object.position,
+                    yaw: object.rotation[1],
+                    scale: object.scale,
+                })
+            })
+            .collect()
+    }
+
     /// BMD scenery placements for the native baked-scenery page builder.
     /// These are transient and remain separate from ECM/SMD placements.
     pub fn renderer_scenery_placements(&self) -> Vec<crate::scene::EditorSceneryPlacement> {
@@ -1436,8 +1486,9 @@ impl Architect {
         };
         if Self::renderer_asset_path(&asset).is_none()
             && Self::renderer_bmd_path(&asset, &self.current_map_id).is_none()
+            && self.renderer_tree_type(&asset).is_none()
         {
-            self.status = "This file is indexed but not yet placeable. The live render paths currently support ECM, static SMD, and litmodels.pck BMD scenery.".into();
+            self.status = "This file is indexed but not yet placeable. Live placement supports ECM, static SMD, BMD scenery, and loaded SpeedTree types.".into();
             return;
         }
         let before = self.project.objects.clone();
@@ -1489,6 +1540,7 @@ impl Architect {
         for (_, asset, position) in items {
             if Self::renderer_asset_path(&asset).is_none()
                 && Self::renderer_bmd_path(&asset, &self.current_map_id).is_none()
+                && self.renderer_tree_type(&asset).is_none()
             {
                 continue;
             }
@@ -2041,6 +2093,7 @@ impl Architect {
         if !self.enabled {
             return None;
         }
+        self.tree_types.clone_from(&scene.tree_types);
         self.object_history_action = false;
         let objects_before_ui = self.project.objects.clone();
         if self.selected_map.is_empty() || self.selected_map == "__empty__" {
