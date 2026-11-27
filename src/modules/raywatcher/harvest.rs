@@ -1245,15 +1245,10 @@ fn frustum_view_key(view_forward: Vec3, view_distance: f32) -> u64 {
     // 32 yaw sectors (11.25 degrees) and 16 pitch sectors (11.25 degrees).
     // This tracks the camera-facing foliage transform without reacting to
     // every tiny mouse delta.
-    let yaw_bin = (((yaw + std::f32::consts::PI)
-        / std::f32::consts::TAU
-        * 32.0)
-        .floor() as u32)
-        .min(31);
-    let pitch_bin = (((pitch + std::f32::consts::FRAC_PI_2)
-        / std::f32::consts::PI
-        * 16.0)
-        .floor() as u32)
+    let yaw_bin =
+        (((yaw + std::f32::consts::PI) / std::f32::consts::TAU * 32.0).floor() as u32).min(31);
+    let pitch_bin = (((pitch + std::f32::consts::FRAC_PI_2) / std::f32::consts::PI * 16.0).floor()
+        as u32)
         .min(15);
     let far_bucket = ((view_distance / 128.0).round() as u32) as u64;
     (far_bucket & 0xffff) | ((yaw_bin as u64) << 16) | ((pitch_bin as u64) << 21) | (1u64 << 63)
