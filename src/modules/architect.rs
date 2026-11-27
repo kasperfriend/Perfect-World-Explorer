@@ -1694,12 +1694,14 @@ impl Architect {
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Duplicate selected").clicked() {
-                        let mut indices = self.selected_placements.iter().copied().collect::<Vec<_>>();
+                        let mut indices =
+                            self.selected_placements.iter().copied().collect::<Vec<_>>();
                         if indices.is_empty() {
                             indices.extend(self.selected_placement);
                         }
                         indices.sort_unstable();
-                        let originals = indices.iter()
+                        let originals = indices
+                            .iter()
                             .filter_map(|index| self.project.objects.get(*index).cloned())
                             .collect::<Vec<_>>();
                         self.selected_placements.clear();
@@ -1710,7 +1712,10 @@ impl Architect {
                             self.selected_placements.insert(index);
                         }
                         self.selected_placement = self.selected_placements.iter().copied().min();
-                        self.status = format!("Duplicated {} custom placement(s).", self.selected_placements.len());
+                        self.status = format!(
+                            "Duplicated {} custom placement(s).",
+                            self.selected_placements.len()
+                        );
                     }
                     if ui.button("Delete selected").clicked() {
                         let mut indices = self.selected_placements.iter().copied().collect::<Vec<_>>();
@@ -1759,10 +1764,10 @@ impl Architect {
                         for (index, label) in &placement_rows {
                             if ui
                                 .selectable_label(
-                                self.selected_placements.contains(index)
-                                    || self.selected_placement == Some(*index),
-                                label,
-                            )
+                                    self.selected_placements.contains(index)
+                                        || self.selected_placement == Some(*index),
+                                    label,
+                                )
                                 .clicked()
                             {
                                 if self.cursor == CursorMode::MultiSelect {
@@ -1997,7 +2002,10 @@ impl Architect {
         }
         // Pick staged project objects directly in the viewport. Their editor
         // transform is independent from the immutable source-scene instances.
-        if pressed && matches!(self.cursor, CursorMode::Select | CursorMode::MultiSelect) && !over_ui {
+        if pressed
+            && matches!(self.cursor, CursorMode::Select | CursorMode::MultiSelect)
+            && !over_ui
+        {
             let mut axis_pick = None;
             if let (Some(index), Some(pointer)) = (self.selected_placement, pointer) {
                 if let Some(object) = self.project.objects.get(index) {
@@ -2128,9 +2136,16 @@ impl Architect {
                     || (self.selected_placements.len() <= 1
                         && (hit.is_some() || self.object_drag_axis == Some(1))));
             if self.object_dragging && self.selected_placements.len() > 1 {
-                self.object_drag_group = self.selected_placements.iter().copied()
-                    .filter_map(|index| self.project.objects.get(index)
-                        .map(|object| (index, object.position)))
+                self.object_drag_group = self
+                    .selected_placements
+                    .iter()
+                    .copied()
+                    .filter_map(|index| {
+                        self.project
+                            .objects
+                            .get(index)
+                            .map(|object| (index, object.position))
+                    })
                     .collect();
             }
             self.object_drag_snapshot = self.object_dragging.then(|| self.project.objects.clone());
