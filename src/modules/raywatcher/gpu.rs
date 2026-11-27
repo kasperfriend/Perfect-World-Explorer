@@ -3806,10 +3806,10 @@ impl RaywatcherGpu {
         // pays pipeline compilation on its first visible frame.
         let blit_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("raywatcher blit"),
-            bind_group_layouts: &[&pipelines.blit_layout],
-            push_constant_ranges: &[],
-        });
+                label: Some("raywatcher blit"),
+                bind_group_layouts: &[&pipelines.blit_layout],
+                push_constant_ranges: &[],
+            });
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("raywatcher blit"),
             layout: Some(&blit_pipeline_layout),
