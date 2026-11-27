@@ -2557,7 +2557,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         }
 
-        if (roughness <= params.effects.x) {
+        if (is_water && roughness <= params.effects.x) {
             let rdir = reflect(view_dir, normal);
             let rh = closest_hit(ray_origin, rdir, bias, params.lens.y);
             if (rh.index != 0xffffffffu) {
