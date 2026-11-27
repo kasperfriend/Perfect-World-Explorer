@@ -33,8 +33,9 @@ pub const KIND_WATER: f32 = 1.0;
 pub const KIND_TERRAIN_LOD: f32 = 2.0;
 pub const KIND_REAL_MESH: f32 = 3.0;
 pub const KIND_PROXY: f32 = 4.0;
-/// Hard cap on total BVH/BLAS triangles (~38 MB) so extreme `ray_length` values
-/// can never exceed `wgpu::Limits::max_buffer_size` or `max_storage_buffer_binding_size`.
+/// Hard cap on total BVH/BLAS triangles (about 77 MB for the 64-byte
+/// `RayTriangle` records alone, before nodes/materials) so extreme `ray_length`
+/// values cannot exceed the GPU storage-buffer budget.
 pub const MAX_SCENE_TRIANGLES: usize = 1_200_000;
 /// Maximum horizontal terrain harvest radius (world units).
 const MAX_TERRAIN_HARVEST_FAR: f32 = 2048.0;
