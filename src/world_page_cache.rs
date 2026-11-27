@@ -390,6 +390,12 @@ impl Reader {
                 if vertex_start > vertex_end || vertex_end as usize > vertex_count {
                     return Err("invalid cached placement vertex range".into());
                 }
+                if indices[start as usize..end as usize]
+                    .iter()
+                    .any(|&index| index < vertex_start || index >= vertex_end)
+                {
+                    return Err("cached placement indices escape their vertex range".into());
+                }
                 placements.push(PlacementRange {
                     start,
                     end,
@@ -722,6 +728,12 @@ fn decode_page_slab(slab: &[u8]) -> Result<Page, String> {
             }
             if vertex_start > vertex_end || vertex_end as usize > vertex_count {
                 return Err("invalid cached placement vertex range".into());
+            }
+            if indices[start as usize..end as usize]
+                .iter()
+                .any(|&index| index < vertex_start || index >= vertex_end)
+            {
+                return Err("cached placement indices escape their vertex range".into());
             }
             placements.push(PlacementRange {
                 start,
