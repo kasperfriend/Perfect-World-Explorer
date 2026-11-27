@@ -396,6 +396,9 @@ fn swap_remove_sorted_owner_index(indices: &mut Vec<usize>, removed: usize, last
 
 pub struct Manager {
     owners: Vec<Owner>,
+    /// All live owners, including inactive ones whose clocks/lights still tick.
+    /// Avoids scanning pending and failed entries on every frame.
+    live_owner_indices: Vec<usize>,
     /// Live, active owner indices; geometry stepping never scans the full owner list.
     active_owner_indices: Vec<usize>,
     /// Eligible active roots whose animated Player has not been built yet.
@@ -606,6 +609,11 @@ impl Manager {
     pub fn new() -> Self {
         Self {
             owners: Vec::new(),
+            // Every live owner must advance its clock, but pending and failed
+            // owners have no work in the per-frame tick. Keep the live subset
+            // indexed so a map with a large pending queue is not rescanned in
+            // full on every frame while roots are being admitted.
+            live_owner_indices: Vec::new(),
             active_owner_indices: Vec::new(),
             player_build_indices: Vec::new(),
             pending_owner_indices: Vec::new(),
@@ -743,6 +751,8 @@ impl Manager {
     fn reindex(&mut self) {
         self.index.clear();
         self.index.reserve(self.owners.len());
+        self.live_owner_indices.clear();
+        self.live_owner_indices.clear();
         self.active_owner_indices.clear();
         self.player_build_indices.clear();
         self.pending_owner_indices.clear();
@@ -757,6 +767,7 @@ impl Manager {
                     }
                 }
                 State::Live { .. } if owner.request.active => {
+                    self.live_owner_indices.push(index);
                     self.active_owner_indices.push(index);
                     if self.effects
                         && owner.player.is_none()
@@ -766,7 +777,8 @@ impl Manager {
                         self.player_build_indices.push(index);
                     }
                 }
-                State::Live { .. } | State::Failed => {}
+                State::Live { .. } => self.live_owner_indices.push(index),
+                State::Failed => {}
             }
         }
     }
@@ -885,6 +897,7 @@ impl Manager {
         self.unregister(&self.owners[index], publications);
         let last_index = self.owners.len() - 1;
         let removed_id = self.owners.swap_remove(index).request.identity;
+        swap_remove_sorted_owner_index(&mut self.live_owner_indices, index, last_index);
         swap_remove_sorted_owner_index(&mut self.active_owner_indices, index, last_index);
         swap_remove_sorted_owner_index(&mut self.player_build_indices, index, last_index);
         swap_remove_sorted_owner_index(&mut self.pending_owner_indices, index, last_index);
@@ -932,10 +945,8 @@ impl Manager {
         let mut finished = Vec::new();
         let mut failed = Vec::new();
         let mut newly_buildable = Vec::new();
-        for (owner_index, owner) in self.owners.iter_mut().enumerate() {
-            if !matches!(owner.state, State::Live { .. }) {
-                continue;
-            }
+        for &owner_index in &self.live_owner_indices {
+            let owner = &mut self.owners[owner_index];
             let was_buildable = owner.request.active
                 && owner.player.is_none()
                 && !owner.player_failed
@@ -962,6 +973,7 @@ impl Manager {
                 self.unregister(&self.owners[index], publications);
                 let last_index = self.owners.len() - 1;
                 let removed_id = self.owners.swap_remove(index).request.identity;
+                swap_remove_sorted_owner_index(&mut self.live_owner_indices, index, last_index);
                 swap_remove_sorted_owner_index(&mut self.active_owner_indices, index, last_index);
                 swap_remove_sorted_owner_index(&mut self.player_build_indices, index, last_index);
                 swap_remove_sorted_owner_index(&mut self.pending_owner_indices, index, last_index);
@@ -978,6 +990,7 @@ impl Manager {
                 self.unregister(&self.owners[index], publications);
                 let origin = self.owners[index].request.origin.clone();
                 self.owners[index].state = State::Failed;
+                set_sorted_owner_index(&mut self.live_owner_indices, index, false);
                 set_sorted_owner_index(&mut self.active_owner_indices, index, false);
                 set_sorted_owner_index(&mut self.player_build_indices, index, false);
                 set_sorted_owner_index(&mut self.pending_owner_indices, index, false);
@@ -1578,6 +1591,7 @@ impl Manager {
             lights,
             light_error,
         };
+        set_sorted_owner_index(&mut self.live_owner_indices, index, true);
         if self.owners[index].request.active {
             set_sorted_owner_index(&mut self.active_owner_indices, index, true);
             let owner = &self.owners[index];
