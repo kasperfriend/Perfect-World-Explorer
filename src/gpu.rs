@@ -2544,42 +2544,56 @@ impl Renderer {
                         .unwrap_or(1)
                         .min(4)
                         .min(initial_local_pages.len());
-                    let batch_size = initial_local_pages.len().div_ceil(worker_count);
-                    let mut pages = initial_local_pages.into_iter();
-                    let mut batches = Vec::with_capacity(worker_count);
-                    loop {
-                        let batch: Vec<_> = pages.by_ref().take(batch_size).collect();
-                        if batch.is_empty() {
-                            break;
+                    if worker_count <= 1 {
+                        for page in initial_local_pages {
+                            uploaded.push(crate::world_objects::GpuPage::upload(
+                                device_ref,
+                                queue_ref,
+                                layout_ref,
+                                sampler_ref,
+                                uniform_ref,
+                                reflected_ref,
+                                page,
+                            ));
                         }
-                        batches.push(batch);
-                    }
-                    std::thread::scope(|ps| {
-                        let handles: Vec<_> = batches
-                            .into_iter()
-                            .map(|batch| {
-                                ps.spawn(move || {
-                                    batch
-                                        .into_iter()
-                                        .map(|page| {
-                                            crate::world_objects::GpuPage::upload(
-                                                device_ref,
-                                                queue_ref,
-                                                layout_ref,
-                                                sampler_ref,
-                                                uniform_ref,
-                                                reflected_ref,
-                                                page,
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
+                    } else {
+                        let batch_size = initial_local_pages.len().div_ceil(worker_count);
+                        let mut pages = initial_local_pages.into_iter();
+                        let mut batches = Vec::with_capacity(worker_count);
+                        loop {
+                            let batch: Vec<_> = pages.by_ref().take(batch_size).collect();
+                            if batch.is_empty() {
+                                break;
+                            }
+                            batches.push(batch);
+                        }
+                        std::thread::scope(|ps| {
+                            let handles: Vec<_> = batches
+                                .into_iter()
+                                .map(|batch| {
+                                    ps.spawn(move || {
+                                        batch
+                                            .into_iter()
+                                            .map(|page| {
+                                                crate::world_objects::GpuPage::upload(
+                                                    device_ref,
+                                                    queue_ref,
+                                                    layout_ref,
+                                                    sampler_ref,
+                                                    uniform_ref,
+                                                    reflected_ref,
+                                                    page,
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
                                 })
-                            })
-                            .collect();
-                        for handle in handles {
-                            uploaded.extend(handle.join().unwrap());
-                        }
-                    });
+                                .collect();
+                            for handle in handles {
+                                uploaded.extend(handle.join().unwrap());
+                            }
+                        });
+                    }
                 }
                 uploaded
             });
