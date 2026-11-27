@@ -5239,8 +5239,9 @@ impl RaywatcherGpu {
         // Keep the temporal reprojection state across scene swaps. The depth
         // validation rejects disoccluded pixels; camera cuts still reset history
         // through the explicit camera_jumped path.
-        // Keep the current tracer alive while a replacement is built in the
-        // background. Its output is not composited during the rebuild.
+        // Keep the current tracer live while a replacement is built in the
+        // background; it continues tracing the current camera against its last
+        // complete scene snapshot until the new acceleration structure is ready.
         if self.dxr.is_some() && self.dxr_init.is_none() {
             self.begin_dxr_scene_rebuild(None, scene);
         }
