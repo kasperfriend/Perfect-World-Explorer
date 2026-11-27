@@ -94,6 +94,12 @@ impl Modules {
         self.architect.renderer_placements()
     }
 
+    pub fn prepare_architect_preview(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut egui_wgpu::Renderer, format: wgpu::TextureFormat) {
+        if self.architect.active() {
+            self.architect.prepare_preview(device, queue, renderer, format);
+        }
+    }
+
     pub fn architect_active(&self) -> bool {
         self.architect.active()
     }
