@@ -134,6 +134,8 @@ pub struct Architect {
     object_drag_start_hit: Option<[f32; 3]>,
     object_drag_group: Vec<(usize, [f32; 3])>,
     object_drag_snapshot: Option<Vec<PlacedObject>>,
+    marquee_start: Option<egui::Pos2>,
+    marquee_current: Option<egui::Pos2>,
     undo_objects: Vec<Vec<PlacedObject>>,
     redo_objects: Vec<Vec<PlacedObject>>,
     object_history_action: bool,
@@ -218,6 +220,8 @@ impl Architect {
             object_drag_start_hit: None,
             object_drag_group: Vec::new(),
             object_drag_snapshot: None,
+            marquee_start: None,
+            marquee_current: None,
             undo_objects: Vec::new(),
             redo_objects: Vec::new(),
             object_history_action: false,
@@ -732,6 +736,14 @@ impl Architect {
     fn clear_object_selection(&mut self) {
         self.selected_placement = None;
         self.selected_placements.clear();
+    }
+
+    fn marquee_rect(start: egui::Pos2, current: egui::Pos2) -> egui::Rect {
+        egui::Rect::from_two_pos(start, current)
+    }
+
+    fn marquee_contains(start: egui::Pos2, current: egui::Pos2, point: egui::Pos2) -> bool {
+        Self::marquee_rect(start, current).contains(point)
     }
 
     fn cancel_object_drag(&mut self) {
@@ -2304,10 +2316,17 @@ impl Architect {
                     }
                 }
                 let picked_placement = nearest.map(|(index, _)| index);
+                let begin_marquee =
+                    self.cursor == CursorMode::MultiSelect && picked_placement.is_none();
                 if self.cursor == CursorMode::MultiSelect {
                     if let Some(index) = picked_placement {
                         self.selected_placements.insert(index);
                         self.selected_placement = Some(index);
+                        self.selected_scene_object = None;
+                        self.selected_scene_transform = None;
+                    } else {
+                        self.marquee_start = pointer;
+                        self.marquee_current = pointer;
                         self.selected_scene_object = None;
                         self.selected_scene_transform = None;
                     }
@@ -2322,7 +2341,10 @@ impl Architect {
                         }
                     }
                 }
-                if self.selected_placement.is_some() {
+                if begin_marquee {
+                    // Multi-select empty-space drags are reserved for marquee
+                    // selection; do not fall through to source-scene picking.
+                } else if self.selected_placement.is_some() {
                     self.selected_scene_object = None;
                     self.selected_scene_transform = None;
                 } else if let Some(pointer) = pointer {
@@ -2404,6 +2426,7 @@ impl Architect {
                     })
                     .collect();
             }
+            self.object_dragging = self.object_dragging && self.marquee_start.is_none();
             self.object_drag_snapshot = self.object_dragging.then(|| self.project.objects.clone());
             self.object_drag_start_pointer = pointer;
             if let Some(index) = self.selected_placement {
@@ -2414,6 +2437,39 @@ impl Architect {
                     self.object_drag_xz_offset = [position[0] - hit.x, position[2] - hit.z];
                 }
             }
+        }
+        if self.marquee_start.is_some() && down && self.cursor == CursorMode::MultiSelect {
+            self.marquee_current = pointer;
+        }
+        if self.marquee_start.is_some() && released {
+            if let (Some(start), Some(current)) = (self.marquee_start, pointer.or(self.marquee_current)) {
+                let rect = Self::marquee_rect(start, current);
+                if rect.width() >= 4.0 || rect.height() >= 4.0 {
+                    for (index, object) in self.project.objects.iter().enumerate() {
+                        if !object.visible {
+                            continue;
+                        }
+                        let clip = view_projection.project_point3(Vec3::from_array(object.position));
+                        if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
+                            continue;
+                        }
+                        let projected = egui::pos2(
+                            screen.left() + (clip.x + 1.0) * 0.5 * screen.width(),
+                            screen.top() + (1.0 - clip.y) * 0.5 * screen.height(),
+                        );
+                        if rect.contains(projected) {
+                            self.selected_placements.insert(index);
+                        }
+                    }
+                    self.selected_placement = self
+                        .selected_placement
+                        .filter(|index| self.selected_placements.contains(index))
+                        .or_else(|| self.selected_placements.iter().copied().min());
+                    self.status = format!("Selected {} placements.", self.selected_placements.len());
+                }
+            }
+            self.marquee_start = None;
+            self.marquee_current = None;
         }
         if self.object_dragging && down && self.cursor == CursorMode::Select && !over_ui {
             if !self.object_drag_group.is_empty() {
@@ -2531,6 +2587,19 @@ impl Architect {
             self.brush_dragging = false;
             self.last_brush_position = None;
         }
+        if let (Some(start), Some(current)) = (self.marquee_start, self.marquee_current) {
+            let rect = Self::marquee_rect(start, current);
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("architect_marquee_selection"),
+            ))
+            .rect(
+                rect,
+                2.0,
+                egui::Color32::from_rgba_unmultiplied(70, 145, 235, 28),
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 175, 255)),
+            );
+        }
         if let Some(index) = self
             .selected_placement
             .filter(|index| *index < self.project.objects.len())
@@ -2644,6 +2713,15 @@ mod tests {
         assert!(hit.x.abs() < 0.05);
         assert!(hit.z.abs() < 0.05);
         assert!(hit.y.abs() < 0.1);
+    }
+
+    #[test]
+    fn marquee_selection_rect_is_direction_independent_and_inclusive() {
+        let start = egui::pos2(100.0, 80.0);
+        let end = egui::pos2(20.0, 160.0);
+        assert!(Architect::marquee_contains(start, end, egui::pos2(20.0, 80.0)));
+        assert!(Architect::marquee_contains(start, end, egui::pos2(60.0, 120.0)));
+        assert!(!Architect::marquee_contains(start, end, egui::pos2(101.0, 120.0)));
     }
 
     #[test]
@@ -2873,6 +2951,8 @@ mod tests {
             object_drag_start_hit: None,
             object_drag_group: Vec::new(),
             object_drag_snapshot: None,
+            marquee_start: None,
+            marquee_current: None,
             undo_objects: Vec::new(),
             redo_objects: Vec::new(),
             object_history_action: false,
