@@ -5,7 +5,7 @@ mod cutoff_residency;
 use crate::indirect_args::{base_instance, multi_draw, record, DrawIndexedArgs, DRAW_ARGS};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
-/// One instance record: `[position.xyz, 0]`, then `[fraction, mode, 0, 0]`.
+/// One instance record: `[position.xyz, yaw]`, then `[fraction, mode, scale, 0]`.
 ///
 /// Two `vec4`s rather than a `vec3` + `vec2`: WGSL pads a storage-array element
 /// to a 16-byte boundary, so `info` would land at offset 16 there but at 12 in a
@@ -18,16 +18,16 @@ struct Instance {
     data: [f32; 8],
 }
 impl Instance {
-    fn new(position: [f32; 3], info: [f32; 2]) -> Self {
+    fn new(position: [f32; 3], info: [f32; 2], yaw: f32, scale: f32) -> Self {
         Self {
             data: [
                 position[0],
                 position[1],
                 position[2],
-                0.,
+                yaw,
                 info[0],
                 info[1],
-                0.,
+                scale,
                 0.,
             ],
         }
@@ -40,7 +40,9 @@ impl Instance {
 pub(crate) struct Placement {
     pub(crate) pos_height: [f32; 4],
     pub(crate) group: u32,
-    pub(crate) pad: [u32; 3],
+    pub(crate) yaw: f32,
+    pub(crate) scale: f32,
+    pub(crate) pad: u32,
 }
 /// Per-group constants the LOD pass needs, plus where its instances live.
 #[repr(C)]
@@ -80,7 +82,7 @@ pub(crate) struct LodParams {
 /// changes the fade fraction, never whether the tree is drawn.
 pub(crate) const LOD_COMPUTE: &str = r#"
 struct LodParamsGpu {camera:vec4<f32>,bounds:vec4<f32>,counts:vec4<u32>};
-struct Placement {pos_height:vec4<f32>,group:u32,pad0:u32,pad1:u32,pad2:u32};
+struct Placement {pos_height:vec4<f32>,group:u32,yaw:f32,scale:f32,pad:u32};
 struct GroupInfo {height:f32,args_base:u32,first_instance:u32,capacity:u32};
 struct Args {index_count:u32,instance_count:atomic<u32>,first_index:u32,base_vertex:i32,first_instance:u32};
 struct Instance {data0:vec4<f32>,data1:vec4<f32>};
@@ -117,7 +119,7 @@ fn select_level(distance:f32,height:f32,scale:f32)->vec4<f32> {
  if distance<a {primary=0.;} else if distance<b {primary=1.;}
  return vec4<f32>(primary,3.,0.,0.);
 }
-fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>) {
+fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>,yaw:f32,scale:f32) {
  let g=groups[group_index];
  if level>2u {return;}
  // A group whose cache carries fewer than three levels has no records of its
@@ -126,7 +128,7 @@ fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>) {
  if g.capacity==0u {return;}
  let slot=atomicAdd(&args[g.args_base+level].instance_count,1u);
  if slot>=g.capacity {return;}
- instances[g.first_instance+level*g.capacity+slot]=Instance(vec4<f32>(position,0.),vec4<f32>(info,0.,1.));
+ instances[g.first_instance+level*g.capacity+slot]=Instance(vec4<f32>(position,yaw),vec4<f32>(info,scale,0.));
 }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id:vec3<u32>) {
@@ -145,9 +147,9 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {
  let selection=select_level(distance,constants.height,p.camera.w);
  let fraction=selection.z;
  let secondary=selection.w>0.5;
- append(placement.group,u32(selection.x),position,vec2<f32>(fraction,select(0.,1.,secondary)));
+ append(placement.group,u32(selection.x),position,vec2<f32>(fraction,select(0.,1.,secondary)),placement.yaw,placement.scale);
  if secondary {
-  append(placement.group,u32(selection.y),position,vec2<f32>(fraction,2.));
+  append(placement.group,u32(selection.y),position,vec2<f32>(fraction,2.),placement.yaw,placement.scale);
  }
 }
 "#;
@@ -156,7 +158,10 @@ struct Batch {
     instances: std::ops::Range<u32>,
 }
 struct Group {
+    tree_type: usize,
     positions: Vec<[f32; 3]>,
+    transforms: Vec<[f32; 2]>,
+    native_count: usize,
     height: f32,
     first_batch: usize,
 }
@@ -221,6 +226,7 @@ pub struct FarTrees {
     /// The LOD selection pass: a camera move dispatches this instead of walking
     /// every placement on the CPU and re-uploading the instance buffer.
     lod_pipeline: wgpu::ComputePipeline,
+    lod_layout: wgpu::BindGroupLayout,
     lod_bind: wgpu::BindGroup,
     lod_params: wgpu::Buffer,
     placements: u32,
@@ -228,6 +234,7 @@ pub struct FarTrees {
     /// static part of each record with `instance_count` zeroed.
     lod_args: wgpu::Buffer,
     lod_args_reset: Vec<u8>,
+    editor_placements: Vec<crate::scene::EditorTreePlacement>,
     /// `multi_draw_indexed_indirect` + `first_instance` are optional device
     /// features; when they are present the whole batch list is one call.
     multi_draw: bool,
@@ -252,11 +259,12 @@ fn fogged(linear:vec3<f32>, reciprocal_w:f32)->vec3<f32> {
  let v=mix(encoded,camera.fog_color.rgb,f);
  return select(v/12.92,pow((max(v,vec3<f32>(0.))+0.055)/1.055,vec3<f32>(2.4)),v>vec3<f32>(0.04045));
 }
-struct In {@builtin(vertex_index) vertex_id:u32,@location(0) pos:vec3<f32>,@location(1) normal:vec3<f32>,@location(2) uv:vec2<f32>,@location(3) color:vec4<f32>,@location(4) kind:f32,@location(5) instance:vec3<f32>,@location(6) info:vec2<f32>,@location(7) tex_h:u32,@location(8) alpha_ref:u32};
+struct In {@builtin(vertex_index) vertex_id:u32,@location(0) pos:vec3<f32>,@location(1) normal:vec3<f32>,@location(2) uv:vec2<f32>,@location(3) color:vec4<f32>,@location(4) kind:f32,@location(5) instance:vec4<f32>,@location(6) info:vec4<f32>,@location(7) tex_h:u32,@location(8) alpha_ref:u32};
 struct Out {@builtin(position) pos:vec4<f32>,@location(0) normal:vec3<f32>,@location(1) uv:vec2<f32>,@location(2) color:vec4<f32>,@location(3) @interpolate(flat) kind:f32,@location(4) world:vec3<f32>,@location(5) @interpolate(flat) tree:vec3<f32>,@location(6) @interpolate(flat) tex_h:f32,@location(7) @interpolate(flat) fade:vec2<f32>,@location(8) @interpolate(flat) alpha_ref:u32};
-@vertex fn vs(i:In)->Out {var o:Out;var pos=i.pos+i.instance;var norm=i.normal;
- if i.kind>4.5 {let d=normalize(camera.direction.xyz);let az=atan2(d.z,d.x);let el=asin(clamp(d.y,-1.,1.));let rho=i.color.w;var corner=i.normal;let rock_index=i.tex_h>>8u;if rock_index>0u {corner=mix(corner,rock_sample(rock_index-1u,camera.tree_bounds.w),clamp(camera.tree_bounds.z,0.,1.));}let q=vec3<f32>(cos(el)*corner.x-sin(el)*corner.z,corner.y,sin(el)*corner.x+cos(el)*corner.z);let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. {v=corner;}pos+=vec3<f32>(v.x,v.z,v.y);norm=vec3<f32>(0.,1.,0.);if i.vertex_id<arrayLength(&leaf_normals) {let n=leaf_normals[i.vertex_id];if n.w>0.5 {norm=n.xyz;}}}
- o.pos=camera.matrix*vec4<f32>(pos,1.);o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.tree=i.instance;o.tex_h=f32(i.tex_h & 127u)*select(128./8192.,128./2048.,(i.tex_h & 128u)!=0u);o.fade=i.info;o.alpha_ref=i.alpha_ref;return o;}
+fn rotate_y(v:vec3<f32>,yaw:f32)->vec3<f32>{let c=cos(yaw);let s=sin(yaw);return vec3<f32>(c*v.x-s*v.z,v.y,s*v.x+c*v.z);}
+@vertex fn vs(i:In)->Out {var o:Out;var pos=rotate_y(i.pos*i.info.z,i.instance.w)+i.instance.xyz;var norm=rotate_y(i.normal,i.instance.w);
+ if i.kind>4.5 {let d=normalize(camera.direction.xyz);let az=atan2(d.z,d.x);let el=asin(clamp(d.y,-1.,1.));let rho=i.color.w;var corner=rotate_y(i.normal,i.instance.w);let rock_index=i.tex_h>>8u;if rock_index>0u {corner=mix(corner,rock_sample(rock_index-1u,camera.tree_bounds.w),clamp(camera.tree_bounds.z,0.,1.));}let q=vec3<f32>(cos(el)*corner.x-sin(el)*corner.z,corner.y,sin(el)*corner.x+cos(el)*corner.z);let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. {v=corner;}pos+=vec3<f32>(v.x,v.z,v.y)*i.info.z;norm=vec3<f32>(0.,1.,0.);if i.vertex_id<arrayLength(&leaf_normals) {let n=leaf_normals[i.vertex_id];if n.w>0.5 {norm=rotate_y(n.xyz,i.instance.w);}}}
+ o.pos=camera.matrix*vec4<f32>(pos,1.);o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.tree=i.instance.xyz;o.tex_h=f32(i.tex_h & 127u)*select(128./8192.,128./2048.,(i.tex_h & 128u)!=0u);o.fade=i.info;o.alpha_ref=i.alpha_ref;return o;}
 @fragment fn fs(i:Out)->@location(0) vec4<f32>{if camera.clip.y!=0. && (i.world.y-camera.clip.x)*camera.clip.y<0. {discard;}
 
  let scale=vec2<f32>(i.color.z,i.tex_h);var dx=dpdx(i.uv);var dy=dpdy(i.uv);let lod_bias=exp2(camera.lod.x);dx*=lod_bias;dy*=lod_bias;let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(dx*dims),length(dy*dims)),1.)),0.,7.);let halfpixel=min(vec2<f32>(0.5*exp2(mip))/dims,scale*0.499);let uv=i.color.xy+clamp(fract((i.uv-i.color.xy)/scale)*scale,halfpixel,scale-halfpixel);let tex=textureSampleGrad(atlas,atlas_sampler,uv,dx,dy);if i.alpha_ref!=0xffffffffu {let threshold=bitcast<f32>(i.alpha_ref);if tex.a<=threshold {discard;}}else if i.kind>3.5 && tex.a<0.5 {discard;}
@@ -767,12 +775,12 @@ impl FarTrees {
         // info at 16. `vertex_attr_array!` would pack them at 0 and 12.
         const INST: [wgpu::VertexAttribute; 2] = [
             wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Float32x3,
+                format: wgpu::VertexFormat::Float32x4,
                 offset: 0,
                 shader_location: 5,
             },
             wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Float32x2,
+                format: wgpu::VertexFormat::Float32x4,
                 offset: 16,
                 shader_location: 6,
             },
