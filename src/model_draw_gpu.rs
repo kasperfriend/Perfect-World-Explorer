@@ -600,14 +600,18 @@ impl Draw {
             let pose = &poses[self.pose_of[index]];
             let source = &asset.skins[pose.skin].data.meshes[pose.mesh];
             scratch.clear();
-            scratch.extend(source.vertices.iter().zip(&pose.vertices).map(|(source, posed)| {
-                raster::Vertex {
-                    position: posed.position,
-                    normal: posed.normal,
-                    uv: source.uv,
-                    fog: frame.vertex_fog,
-                }
-            }));
+            scratch.extend(
+                source
+                    .vertices
+                    .iter()
+                    .zip(&pose.vertices)
+                    .map(|(source, posed)| raster::Vertex {
+                        position: posed.position,
+                        normal: posed.normal,
+                        uv: source.uv,
+                        fog: frame.vertex_fog,
+                    }),
+            );
             gpu.mesh.update(queue, scratch)?;
             gpu.binding.update(
                 queue,
