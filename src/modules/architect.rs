@@ -2622,10 +2622,26 @@ mod tests {
         editor.project.objects[0].position = [4., 5., 6.];
         editor.push_object_undo(before);
         assert_eq!(editor.project.objects[0].position, [4., 5., 6.]);
+
+        // History restores whole vectors, so a surviving numeric index must not
+        // be mistaken for the same logical object after insertions/deletions.
+        editor.selected_placement = Some(0);
+        editor.selected_placements.insert(0);
+        editor.object_dragging = true;
+        editor.object_drag_group.push((0, original.position));
         editor.undo_objects();
         assert_eq!(editor.project.objects[0].position, original.position);
+        assert_eq!(editor.selected_placement, None);
+        assert!(editor.selected_placements.is_empty());
+        assert!(!editor.object_dragging);
+        assert!(editor.object_drag_group.is_empty());
+
+        editor.selected_placement = Some(0);
+        editor.selected_placements.insert(0);
         editor.redo_objects();
         assert_eq!(editor.project.objects[0].position, [4., 5., 6.]);
+        assert_eq!(editor.selected_placement, None);
+        assert!(editor.selected_placements.is_empty());
     }
 
     #[test]
