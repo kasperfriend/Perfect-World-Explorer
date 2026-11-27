@@ -1238,7 +1238,10 @@ fn build(
     // are what the local draw reads; nothing else consumes them, and the
     // whole-world pages were selected from the map's own records.
     let nearby = if skip_local_scenery {
-        Vec::new()
+        // Whole-world pages own native map scenery, but transient Architect
+        // BMDs are not part of that immutable preload. Build only the editor
+        // tail locally so it remains visible without duplicating native props.
+        (t.objects.native_ornament_count()..t.objects.ornaments.len()).collect()
     } else {
         // Built once for the map and kept: the list covers the whole scene, and
         // the camera cannot change any entry in it. Cloning the `Arc` out of the
@@ -1396,6 +1399,7 @@ fn build(
         let z = basis(model.direction);
         let y = basis(model.up);
         let x = y.cross(z).normalize_or_zero();
+        let instance_scale = t.objects.placement_scale(id);
         for mesh in &model.meshes {
             let key = mesh.texture.to_lowercase();
             let Some((page_id, slot)) = texture_slots.get(&key).copied() else {
@@ -1429,9 +1433,9 @@ fn build(
             let sy = slot.h as f32 / ATLAS as f32;
             for vert in &mesh.vertices {
                 let p = Vec3::from_array(model.position)
-                    + x * (vert.position[0] * model.scale[0])
-                    + y * (vert.position[1] * model.scale[1])
-                    + z * (vert.position[2] * model.scale[2]);
+                    + x * (vert.position[0] * model.scale[0] * instance_scale)
+                    + y * (vert.position[1] * model.scale[1] * instance_scale)
+                    + z * (vert.position[2] * model.scale[2] * instance_scale);
                 let n = (x * vert.normal[0] + y * vert.normal[1] + z * vert.normal[2])
                     .normalize_or_zero();
                 page.vertices.push(Vertex {
@@ -3278,10 +3282,11 @@ impl Renderer {
         p.set_vertex_buffer(0, self.vertex.slice(..));
         p.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
         p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
-        if !self.world_done {
-            for page in &self.local_pages {
-                page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, true);
-            }
+        // Local pages are normally the streamed map scenery. When the
+        // whole-world preload is active they contain only Architect's transient
+        // BMD placements, so they must still be drawn alongside world pages.
+        for page in &self.local_pages {
+            page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, true);
         }
         if self.world_done {
             let slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
@@ -5635,6 +5640,7 @@ pub fn run(
     let mut world_status = String::from("Off");
     let mut world_last_log_at = std::time::Instant::now();
     let mut world_last_logged_pages = 0usize;
+    let mut last_architect_scenery = Vec::<crate::scene::EditorSceneryPlacement>::new();
     let world_upload_budget_ms = std::env::var("PW_WORLD_UPLOAD_BUDGET_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -5652,15 +5658,25 @@ pub fn run(
     // the worker can leave the local half of the mesh out (see `build`).
     let architect_scene = t.scene.clone();
     let architect_ornaments = t.objects.ornaments.clone();
-    let (request_tx, request_rx) =
-        std::sync::mpsc::channel::<(f32, f32, DetailSettings, u64, bool)>();
+    let (request_tx, request_rx) = std::sync::mpsc::channel::<(
+        f32,
+        f32,
+        DetailSettings,
+        u64,
+        bool,
+        Vec<crate::scene::EditorSceneryPlacement>,
+    )>();
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<MeshData, String>>(1);
     std::thread::Builder::new()
         .name("world-streaming".into())
         .spawn(move || {
             let mut residency = crate::terrain_residency::Residency::default();
-            while let Ok((x, z, detail, grass_atlas_key, skip_local_scenery)) = request_rx.recv() {
+            while let Ok((x, z, detail, grass_atlas_key, skip_local_scenery, editor_scenery)) = request_rx.recv() {
                 let started = Instant::now();
+                if t.objects.set_editor_ornaments(&editor_scenery) {
+                    t.scenery_placements = None;
+                    t.scenery_residency.reset();
+                }
                 let result = build(
                     &mut t,
                     x,
@@ -6597,12 +6613,14 @@ pub fn run(
                     // state changes what the mesh should contain, so it is part
                     // of the staleness test and not just of the request.
                     let skip_local_scenery = renderer.world_done;
+                    let architect_scenery = renderer.modules.architect_scenery_placements();
                     let stale = match &aim {
                         Some(aim) => {
                             aim != &renderer.lod
                                 || renderer.detail != settings.detail
                                 || renderer.local_scenery_skipped != skip_local_scenery
                                 || renderer.terrain_revision != map_space.heights.revision()
+                                || architect_scenery != last_architect_scenery
                         }
                         None => false,
                     };
@@ -6613,12 +6631,14 @@ pub fn run(
                             settings.detail,
                             renderer.grass_atlas_key,
                             skip_local_scenery,
+                            architect_scenery.clone(),
                         );
                         if request_tx.send(request).is_err() {
                             eprintln!("World streaming worker exited");
                             target.exit();
                             return;
                         }
+                        last_architect_scenery = architect_scenery;
                         streaming = true;
                     }
                     music.update(settings.music_enabled,settings.music_volume,camera.pos.x,camera.pos.z);
