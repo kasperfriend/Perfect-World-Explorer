@@ -8,6 +8,8 @@ Open the main menu and choose ARCHITECT | WORLD EDITOR. The original HUD and vie
 
 ## Workspace
 
+- Camera: use WASD to fly, Space/E to rise, Q/Ctrl to descend and Shift to boost. Hold the right mouse button and move the mouse to look around; release it to restore the normal editor cursor. Left-click remains reserved for panels and viewport tools. Escape opens the viewer menu.
+
 - World (left by default): choose an empty project, any readable client map, or a saved Architect project. Client map changes use the viewer's existing world-handoff path and reopen Architect in the destination map.
 - Client assets (right by default): browse the client folder tree lazily, expand PCK archive indexes on demand, and right-click folders/files/archive entries to pin them to the quick bar.
 - Scene objects: inspect and viewport-pick loaded models, trees, scenery and effects; duplicate eligible ECM models into the editable project layer. Non-ECM source objects remain read-only.
