@@ -1370,8 +1370,14 @@ fn restir_reuse_one(
     if (cosine <= 0.01) { return; }
     if (!is_sky) {
         let tolerance = max(0.35, sample_distance * 0.02);
-        let visible = closest_hit(ray_origin, direction, max(0.05, bias * 0.25), sample_distance + tolerance);
-        if (visible.index == 0xffffffffu || abs(visible.t - sample_distance) > tolerance) { return; }
+        let min_t = max(0.05, bias * 0.25);
+        // The reservoir sample position is an existing surface hit. Only a
+        // blocker strictly before its tolerance interval can invalidate reuse;
+        // an any-hit query avoids finding the nearest triangle at/behind it.
+        if (sample_distance > min_t + tolerance
+            && occluded(ray_origin, direction, min_t, sample_distance - tolerance, 0u)) {
+            return;
+        }
     }
     let target_density = max(luminance(source.radiance_m.xyz) * cosine, 1e-5);
     let target_over_pdf = target_density / max(cosine, 1e-5);
@@ -6114,6 +6120,24 @@ impl RaywatcherGpu {
 #[cfg(test)]
 mod software_bvh_stack_tests {
     use super::*;
+
+    #[test]
+    fn restir_spatial_visibility_uses_early_exit_occlusion_on_both_backends() {
+        let software = RAY_SHADER;
+        let hardware = include_str!("dxr_trace.hlsl");
+        assert!(software.contains(
+            "occluded(ray_origin, direction, min_t, sample_distance - tolerance, 0u)"
+        ));
+        assert!(!software.contains(
+            "closest_hit(ray_origin, direction, max(0.05, bias * 0.25), sample_distance + tolerance)"
+        ));
+        assert!(hardware.contains(
+            "occluded_opacity(ray_origin, direction, min_t, sample_distance - tolerance"
+        ));
+        assert!(!hardware.contains(
+            "Hit visible = closest_hit(ray_origin, direction, max(0.05, bias * 0.25)"
+        ));
+    }
 
     #[test]
     fn software_shader_stack_covers_the_maximum_bvh_depth() {
