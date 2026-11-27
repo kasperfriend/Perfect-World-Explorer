@@ -2285,7 +2285,10 @@ mod raywatcher_tree_tests {
         );
         assert_eq!(result, (1, 12, 0));
         assert_eq!(out.len(), 12);
-        assert_eq!(out[0].leaf_rho, -1.0, "fallback LOD billboard must be transformed");
+        assert_eq!(
+            out[0].leaf_rho, -1.0,
+            "fallback LOD billboard must be transformed"
+        );
         assert_eq!(out[0].normal, glam::Vec3::Y);
     }
 
@@ -2369,11 +2372,7 @@ mod raywatcher_tree_tests {
                 let actual = transform_tree_lod_for_view(&source, view, None).unwrap()[0];
                 let reference = |vertex: glam::Vec3| {
                     let relative = vertex - pivot;
-                    pivot + speedtree_leaf_corner(
-                        [relative.x, relative.z, relative.y],
-                        view,
-                        rho,
-                    )
+                    pivot + speedtree_leaf_corner([relative.x, relative.z, relative.y], view, rho)
                 };
                 for (got, expected) in [
                     (actual.a, reference(source[0].a)),
