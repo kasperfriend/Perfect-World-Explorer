@@ -1220,7 +1220,8 @@ impl Architect {
         {
             return Vec::new();
         }
-        self.project
+        let mut placements = self
+            .project
             .objects
             .iter()
             .filter_map(|object| {
@@ -1234,7 +1235,44 @@ impl Architect {
                     scale: object.scale,
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+
+        // A live, native-mesh placement ghost in the world viewport. It uses
+        // the exact same ECM/SMD renderer as committed objects, and is never
+        // serialized into the project until the user clicks to place it.
+        if self.cursor == CursorMode::Place {
+            if let (Some(asset), Some(mut position)) = (
+                self.selected_asset.as_deref().and_then(Self::renderer_asset_path),
+                self.brush_cursor_position,
+            ) {
+                if matches!(self.snap, SnapMode::Off | SnapMode::Terrain) {
+                    if let Some(map) = &self.map {
+                        position[1] = map.ground(position[0], position[2]) + 0.5;
+                    }
+                } else if matches!(self.snap, SnapMode::Objects | SnapMode::Smart) {
+                    if let Some(target) = self.selected_scene_transform {
+                        position = target;
+                    } else if self.snap == SnapMode::Smart {
+                        if let Some(map) = &self.map {
+                            position[1] = map.ground(position[0], position[2]) + 0.5;
+                        }
+                    }
+                }
+                let already_committed = self.project.objects.iter().any(|object| {
+                    Self::renderer_asset_path(&object.asset).as_deref() == Some(asset.as_str())
+                        && object.position.iter().zip(position).all(|(a, b)| (*a - b).abs() < 0.01)
+                });
+                if !already_committed {
+                    placements.push(crate::world_models_gpu::EditorPlacement {
+                        path: asset,
+                        position,
+                        rotation: [0.; 3],
+                        scale: 1.,
+                    });
+                }
+            }
+        }
+        placements
     }
 
     fn add_selected_asset_at_camera(&mut self, camera: Vec3) {
@@ -3604,6 +3642,25 @@ mod tests {
         editor.undo_objects();
         assert_eq!(editor.project.objects.len(), 1);
         assert_eq!(editor.project.objects[0].position, [10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn place_mode_adds_a_live_preview_mesh_without_serializing_it() {
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element/element.data"),
+            None,
+            "a01".into(),
+        );
+        editor.enabled = true;
+        editor.project.source_map = "a01".into();
+        editor.cursor = CursorMode::Place;
+        editor.selected_asset = Some("element/models.pck::models/buildings/gate.ecm".into());
+        editor.brush_cursor_position = Some([12., 3., 18.]);
+        let preview = editor.renderer_placements();
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0].path, "models/buildings/gate.ecm");
+        assert_eq!(preview[0].position, [12., 3.5, 18.]);
+        assert!(editor.project.objects.is_empty());
     }
 
     #[test]
