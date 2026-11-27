@@ -643,30 +643,22 @@ impl SceneGeometry {
                 match (lh, rh) {
                     (None, None) => continue,
                     (Some(lt), None) => {
-                        if sp < STACK_DEPTH {
-                            stack[sp] = (left, lt);
-                            sp += 1;
-                        }
+                        stack[sp] = (left, lt);
+                        sp += 1;
                     }
                     (None, Some(rt)) => {
-                        if sp < STACK_DEPTH {
-                            stack[sp] = (right, rt);
-                            sp += 1;
-                        }
+                        stack[sp] = (right, rt);
+                        sp += 1;
                     }
                     (Some(lt), Some(rt)) if lt <= rt => {
-                        if sp + 2 <= STACK_DEPTH {
-                            stack[sp] = (right, rt);
-                            stack[sp + 1] = (left, lt);
-                            sp += 2;
-                        }
+                        stack[sp] = (right, rt);
+                        stack[sp + 1] = (left, lt);
+                        sp += 2;
                     }
                     (Some(lt), Some(rt)) => {
-                        if sp + 2 <= STACK_DEPTH {
-                            stack[sp] = (left, lt);
-                            stack[sp + 1] = (right, rt);
-                            sp += 2;
-                        }
+                        stack[sp] = (left, lt);
+                        stack[sp + 1] = (right, rt);
+                        sp += 2;
                     }
                 }
             }
@@ -719,30 +711,22 @@ impl SceneGeometry {
                 match (lh, rh) {
                     (None, None) => {}
                     (Some(lt), None) => {
-                        if sp < STACK_DEPTH {
-                            stack[sp] = (left, lt);
-                            sp += 1;
-                        }
+                        stack[sp] = (left, lt);
+                        sp += 1;
                     }
                     (None, Some(rt)) => {
-                        if sp < STACK_DEPTH {
-                            stack[sp] = (right, rt);
-                            sp += 1;
-                        }
+                        stack[sp] = (right, rt);
+                        sp += 1;
                     }
                     (Some(lt), Some(rt)) if lt <= rt => {
-                        if sp + 2 <= STACK_DEPTH {
-                            stack[sp] = (right, rt);
-                            stack[sp + 1] = (left, lt);
-                            sp += 2;
-                        }
+                        stack[sp] = (right, rt);
+                        stack[sp + 1] = (left, lt);
+                        sp += 2;
                     }
                     (Some(lt), Some(rt)) => {
-                        if sp + 2 <= STACK_DEPTH {
-                            stack[sp] = (left, lt);
-                            stack[sp + 1] = (right, rt);
-                            sp += 2;
-                        }
+                        stack[sp] = (left, lt);
+                        stack[sp + 1] = (right, rt);
+                        sp += 2;
                     }
                 }
             }
