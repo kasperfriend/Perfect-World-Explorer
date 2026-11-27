@@ -1210,6 +1210,94 @@ impl Architect {
         (safe_segments && (valid_model || valid_static_gfx)).then_some(normalized)
     }
 
+    /// Resolve a BMD from litmodels.pck into the map-partitioned path used by
+    /// the native baked-scenery loader. This is deliberately separate from the
+    /// ECM/SMD model queue: BMDs need the scenery material/lighting pipeline.
+    fn renderer_bmd_path(asset: &str, map_id: &str) -> Option<String> {
+        let (archive, inner) = asset.split_once("::")?;
+        let archive_name = Path::new(archive)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())?;
+        if archive_name != "litmodels.pck" {
+            return None;
+        }
+        let mut path = crate::ecmodel::normalize(inner);
+        if !path.ends_with(".bmd") {
+            return None;
+        }
+        let safe = |value: &str| {
+            value
+                .split('/')
+                .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+        };
+        if !safe(&path) || path.contains(':') {
+            return None;
+        }
+        let namespace = format!("litmodels/{}/", map_id.to_ascii_lowercase());
+        if path.starts_with("litmodels/") {
+            if path.starts_with(&namespace) {
+                // Already namespaced for the current map.
+            } else if let Some(relative) = path.strip_prefix("litmodels/world/") {
+                path = format!("{namespace}{relative}");
+            } else if let Some(relative) = path.strip_prefix("litmodels/") {
+                // Archive entries may omit the map component. Do not silently
+                // accept a path explicitly partitioned for another map.
+                let first = relative.split('/').next().unwrap_or_default();
+                if first.eq_ignore_ascii_case(map_id) {
+                    path = format!("litmodels/{relative}");
+                } else if first == "world" {
+                    return None;
+                } else {
+                    path = format!("{namespace}{relative}");
+                }
+            } else {
+                return None;
+            }
+        } else if let Some(relative) = path.strip_prefix("world/") {
+            path = format!("{namespace}{relative}");
+        } else {
+            path = format!("{namespace}{path}");
+        }
+        Some(path)
+    }
+
+    /// BMD scenery placements for the native baked-scenery page builder.
+    /// These are transient and remain separate from ECM/SMD placements.
+    pub fn renderer_scenery_placements(&self) -> Vec<crate::scene::EditorSceneryPlacement> {
+        if !self.enabled || self.current_map_id.is_empty() {
+            return Vec::new();
+        }
+        self.project
+            .objects
+            .iter()
+            .filter(|object| object.visible)
+            .filter_map(|object| {
+                let path = Self::renderer_bmd_path(&object.asset, &self.current_map_id)?;
+                if !object.position.iter().all(|value| value.is_finite())
+                    || !object.rotation.iter().all(|value| value.is_finite())
+                    || !object.scale.is_finite()
+                    || !(0.001..=1000.0).contains(&object.scale)
+                {
+                    return None;
+                }
+                let rotation = glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    object.rotation[0],
+                    object.rotation[1],
+                    object.rotation[2],
+                );
+                Some(crate::scene::EditorSceneryPlacement {
+                    path,
+                    position: object.position,
+                    direction: (rotation * Vec3::Z).to_array(),
+                    up: (rotation * Vec3::Y).to_array(),
+                    scale: object.scale,
+                    map_id: self.current_map_id.to_ascii_lowercase(),
+                })
+            })
+            .collect()
+    }
+
     /// Current project's supported ECM placements, for the native GPU model
     /// queue. Other archive types remain browsable/pinnable but are not guessed
     /// into a renderer format they do not implement.
@@ -1299,12 +1387,10 @@ impl Architect {
                 "Choose a placeable game model from the client assets before placing it.".into();
             return;
         };
-        if Self::renderer_asset_path(&asset).is_none() {
-            self.status = if asset.to_ascii_lowercase().ends_with(".bmd") {
-                "BMD scenery is a real client asset, but the editor still needs a dedicated movable BMD renderer before it can be placed safely.".into()
-            } else {
-                "This file is indexed but not yet placeable. Supported live assets are ECM models from models.pck and static SMD models from gfx.pck.".into()
-            };
+        if Self::renderer_asset_path(&asset).is_none()
+            && Self::renderer_bmd_path(&asset, &self.current_map_id).is_none()
+        {
+            self.status = "This file is indexed but not yet placeable. The live render paths currently support ECM, static SMD, and litmodels.pck BMD scenery.".into();
             return;
         }
         let portable_asset = self.portable_asset_path(&asset);
@@ -1351,7 +1437,9 @@ impl Architect {
         let before = self.project.objects.clone();
         let mut created = Vec::new();
         for (_, asset, position) in items {
-            if Self::renderer_asset_path(&asset).is_none() {
+            if Self::renderer_asset_path(&asset).is_none()
+                && Self::renderer_bmd_path(&asset, &self.current_map_id).is_none()
+            {
                 continue;
             }
             let portable_asset = self.portable_asset_path(&asset);
@@ -4246,6 +4334,36 @@ mod tests {
         assert!(loaded.objects[0].visible);
         assert!(!loaded.objects[0].locked);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn renderer_bmd_paths_keep_map_namespace_and_reject_other_archives() {
+        assert_eq!(
+            Architect::renderer_bmd_path(
+                "element/litmodels.pck::litmodels/a01/1/litmodel_42.bmd",
+                "a01"
+            )
+            .as_deref(),
+            Some("litmodels/a01/1/litmodel_42.bmd")
+        );
+        assert_eq!(
+            Architect::renderer_bmd_path(
+                "element/litmodels.pck::litmodels/world/1/litmodel_42.bmd",
+                "a01"
+            )
+            .as_deref(),
+            Some("litmodels/a01/1/litmodel_42.bmd")
+        );
+        assert!(Architect::renderer_bmd_path(
+            "element/models.pck::litmodels/a01/1/litmodel_42.bmd",
+            "a01"
+        )
+        .is_none());
+        assert!(Architect::renderer_bmd_path(
+            "element/litmodels.pck::litmodels/a01/../other.bmd",
+            "a01"
+        )
+        .is_none());
     }
 
     #[test]
