@@ -1,6 +1,6 @@
 //! Optional item browser. Its archives, textures and database are owned by the
 //! module and are released when it is disabled.
-mod archive;
+pub(super) mod archive;
 mod compare;
 mod database;
 mod descriptions;
@@ -9,7 +9,7 @@ mod effects;
 mod elements;
 mod icons;
 mod npcs;
-mod preview3d;
+pub(super) mod preview3d;
 
 use crate::modules::designer::catalog::{Class, Gender};
 use archive::LibrarianAssets;
