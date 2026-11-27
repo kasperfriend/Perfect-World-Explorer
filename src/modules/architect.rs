@@ -2842,7 +2842,7 @@ impl Architect {
                                 }
                             }
                             TransformMode::Rotate => {
-                                let radius = center.distance(
+                                            let radius = center.distance(
                                     project_point(origin + Vec3::X * 24.).unwrap_or(center),
                                 );
                                 let distance = center.distance(pointer);
@@ -3240,7 +3240,9 @@ impl Architect {
                     }
                 }
                 TransformMode::Scale => {
-                    if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer) {
+                    if let (Some(start), Some(current)) =
+                        (self.object_drag_start_pointer, pointer)
+                    {
                         let factor = (-(current.y - start.y) * 0.01)
                             .exp()
                             .clamp(0.05, 20.0);
