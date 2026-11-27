@@ -1331,18 +1331,19 @@ impl Architect {
         if copied.is_empty() {
             let mut scene = self
                 .multi_scene_items
-                .values()
-                .map(|(asset, position)| (asset.clone(), *position))
+                .iter()
+                .map(|(index, (asset, position))| (*index, asset.clone(), *position))
                 .collect::<Vec<_>>();
+            scene.sort_by_key(|(index, _, _)| *index);
             if scene.is_empty() {
                 if let (Some(asset), Some(position)) = (
                     self.selected_asset.clone(),
                     self.selected_scene_transform,
                 ) {
-                    scene.push((asset, position));
+                    scene.push((0, asset, position));
                 }
             }
-            for (asset, position) in scene {
+            for (_, asset, position) in scene {
                 if Self::renderer_asset_path(&asset).is_none() {
                     continue;
                 }
