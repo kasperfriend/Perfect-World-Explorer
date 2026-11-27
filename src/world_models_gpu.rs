@@ -1065,9 +1065,9 @@ impl World {
         self.owners.effect_warnings().to_vec()
     }
 
-    /// Tick every playback clock once and evaluate each model's pose once.
-    /// 0x7b2520 resolves hooks from this pose, and every pass of the frame
-    /// (main, reflection, refraction) reuses it.
+    /// Tick every resident playback clock once and evaluate poses needed by
+    /// the current view. Main-only frames can defer off-frustum skinning; hook
+    /// parents and secondary-view frames retain full pose evaluation.
     fn advance_poses(&mut self, delta_ms: u32) {
         let bounds = self.resident_bounds;
         let frustum = self.frustum;
