@@ -2447,7 +2447,7 @@ impl Architect {
         {
             self.marquee_current = pointer;
         }
-        if self.marquee_start.is_some() && released {
+        if self.marquee_start.is_some() && (released || !down) {
             let release_position = if over_ui {
                 self.marquee_current
             } else {
