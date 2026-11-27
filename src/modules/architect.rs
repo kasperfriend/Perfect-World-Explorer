@@ -1864,6 +1864,14 @@ impl Architect {
                         self.add_selected_asset_at_camera(camera);
                     }
                 });
+            preview_window_hovered = preview_response
+                .as_ref()
+                .is_some_and(|response| response.response.hovered());
+        }
+        if self.hovered_asset.is_none() && (asset_panel_hovered || preview_window_hovered) {
+            self.hovered_asset = previous_hovered_asset;
+        } else if !asset_panel_hovered && !preview_window_hovered {
+            self.hovered_asset = None;
         }
 
         egui::Window::new("Scene objects")
