@@ -1102,15 +1102,11 @@ pub(crate) struct NativeCommandSlot {
     retired: u64,
 }
 
-/// Three (allocator, list) pairs rotated per submission, guarded by a single
-/// fence. The previous single-allocator design forced a full CPU/GPU
-/// rendezvous every frame: the CPU blocked until the GPU retired the
-/// previous list before it could even start recording the next one. With a
-/// 3-slot ring the GPU typically runs one frame behind, so the slot being
-/// re-acquired has retired long ago and the fence check never waits; only
-/// real back-pressure (or 5 s of pathological latency) blocks.
+/// Six allocator/list pairs are rotated per submission behind one fence.
+/// The larger ring absorbs the DXR scene build + dynamic-AS + trace bursts
+/// without forcing unrelated FSR/DLSS submissions to reuse a busy slot.
 pub(crate) struct NativeCommandRing {
-    slots: [NativeCommandSlot; 3],
+    slots: Vec<NativeCommandSlot>,
     next: usize,
     fence: d3d12::Fence,
     fence_event: d3d12::Event,
@@ -1124,8 +1120,8 @@ impl NativeCommandRing {
             return Err(format!("{tag}: create_fence failed (HRESULT 0x{hr:08x})"));
         }
         let fence_event = d3d12::Event::create(false, false);
-        let mut slots = Vec::with_capacity(3);
-        for _ in 0..3 {
+        let mut slots = Vec::with_capacity(6);
+        for _ in 0..6 {
             let (allocator, hr) = raw_device.create_command_allocator(d3d12::CmdListType::Direct);
             if hr < 0 {
                 return Err(format!(
@@ -1157,9 +1153,6 @@ impl NativeCommandRing {
                 retired: 0,
             });
         }
-        let slots: [NativeCommandSlot; 3] = slots
-            .try_into()
-            .map_err(|_| format!("{tag}: internal ring size mismatch"))?;
         Ok(Self {
             slots,
             next: 0,
@@ -1191,6 +1184,29 @@ impl NativeCommandRing {
             ));
         }
         Ok(index)
+    }
+
+    /// Try to acquire a command slot without waiting for the GPU. Used by
+    /// per-frame dynamic acceleration-structure updates: if every slot is busy,
+    /// the caller can keep the previous valid AS for this frame instead of
+    /// stalling the render thread.
+    pub(crate) fn try_acquire(&mut self, tag: &str) -> Result<Option<usize>, String> {
+        let index = self.next;
+        self.next = (self.next + 1) % self.slots.len();
+        let slot = &mut self.slots[index];
+        if slot.retired != 0 && self.fence.get_value() < slot.retired {
+            return Ok(None);
+        }
+        slot.allocator.reset();
+        let hr = slot
+            .list
+            .reset(&slot.allocator, d3d12::PipelineState::null());
+        if hr < 0 {
+            return Err(format!(
+                "{tag}: ID3D12GraphicsCommandList::Reset failed (HRESULT 0x{hr:08x})"
+            ));
+        }
+        Ok(Some(index))
     }
 
     pub(crate) fn slot_mut(&mut self, index: usize) -> &mut NativeCommandSlot {
