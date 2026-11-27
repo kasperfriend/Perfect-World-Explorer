@@ -1244,9 +1244,11 @@ impl Architect {
             }
             Some(point.y - map.ground(point.x, point.z))
         };
+        let step_distance = (map.spacing * 4.).clamp(0.5, 64.);
+        let max_steps = ((far - near).length() / step_distance).ceil() as usize;
         let mut previous: Option<(f32, f32)> = None;
-        for step in 0..=512 {
-            let t = step as f32 * 64.;
+        for step in 0..=max_steps {
+            let t = step as f32 * step_distance;
             let point = near + direction * t;
             let Some(current_delta) = delta(point) else {
                 continue;
