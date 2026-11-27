@@ -1799,6 +1799,51 @@ impl Architect {
                         }
                     }
                 });
+                if self.selected_placements.len() > 1 {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Hide selected").clicked() {
+                            for index in &self.selected_placements {
+                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                    object.visible = false;
+                                }
+                            }
+                        }
+                        if ui.button("Show selected").clicked() {
+                            for index in &self.selected_placements {
+                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                    object.visible = true;
+                                }
+                            }
+                        }
+                        if ui.button("Lock selected").clicked() {
+                            for index in &self.selected_placements {
+                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                    object.locked = true;
+                                }
+                            }
+                        }
+                        if ui.button("Unlock selected").clicked() {
+                            for index in &self.selected_placements {
+                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                    object.locked = false;
+                                }
+                            }
+                        }
+                        if ui.button("Group with active object").clicked() {
+                            if let Some(group) = self
+                                .selected_placement
+                                .and_then(|index| self.project.objects.get(index))
+                                .map(|object| object.group.clone())
+                            {
+                                for index in &self.selected_placements {
+                                    if let Some(object) = self.project.objects.get_mut(*index) {
+                                        object.group = group.clone();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
                 let mut delete_placement = None;
                 let mut duplicate_placement = None;
                 let mut hierarchy = BTreeMap::<String, Vec<(usize, String)>>::new();
