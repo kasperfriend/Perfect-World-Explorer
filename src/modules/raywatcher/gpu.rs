@@ -673,29 +673,10 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Feature #3: Ultra-conservative calibrated glossy reflection mask.
-    // Matte stone, terrain, plaster, wood, and foliage ALWAYS stay matte (0.92).
-    // Only crisp close-range specular/metallic/glazed architectural trims qualify
-    // for a subtle satin sheen (roughness 0.26..=0.34).
+    // Reflections are deliberately water-only. Do not infer reflectivity from
+    // bright pixels, local contrast, material colour, or surface orientation:
+    // those heuristics misclassify sunlit terrain and hill faces as white mirrors.
     let is_water = roughness <= 0.12;
-    if (!is_water && dist < 95.0) {
-        let max_c = max(raster_rgb.r, max(raster_rgb.g, raster_rgb.b));
-        let is_green_foliage = raster_rgb.g > raster_rgb.r * 1.12 && raster_rgb.g > raster_rgb.b * 1.12;
-        if (max_c > 0.68 && !is_green_foliage && (abs(n.y) < 0.94 || max_c > 0.82)) {
-            let lum_w = vec3<f32>(0.2126, 0.7152, 0.0722);
-            let l_c = dot(raster_rgb, lum_w);
-            let l_nb = 0.25 * (
-                dot(textureLoad(src_raster, px_l, 0).rgb, lum_w)
-                + dot(textureLoad(src_raster, px_r, 0).rgb, lum_w)
-                + dot(textureLoad(src_raster, px_u, 0).rgb, lum_w)
-                + dot(textureLoad(src_raster, px_d, 0).rgb, lum_w)
-            );
-            let spec_contrast = l_c - l_nb;
-            if (spec_contrast > 0.14) {
-                roughness = clamp(0.34 - (spec_contrast - 0.14) * 0.35, 0.26, 0.34);
-            }
-        }
-    }
 
     textureStore(out_pos, vec2<i32>(id.xy), vec4<f32>(p, dist));
     textureStore(out_norm, vec2<i32>(id.xy), vec4<f32>(n, roughness));
@@ -1807,16 +1788,12 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         accum_open = accum_open + open;
 
         var refl_dist = params.lens.y;
-        if (bits_reflections && roughness <= params.effects.x && (!is_water || s == 0u)) {
+        if (bits_reflections && is_water && roughness <= params.effects.x && s == 0u) {
             // Native game water is a flat glossy dielectric: no animated wave
             // normals. Use the raster normal for both water and non-water surfaces.
             let refl_base_n = normal;
-            // Keep non-water glossy trims on GGX, but use the exact
-            // planar normal for native water so the reflected scene is stable.
-            var h = refl_base_n;
-            if (!is_water) {
-                h = ggx_sample(refl_base_n, roughness, next_f32(&state), next_f32(&state));
-            }
+            // Water uses the exact planar normal so the reflected scene is stable.
+            let h = refl_base_n;
             var reflect_dir = reflect(view_dir, h);
             if (dot(reflect_dir, refl_base_n) <= 0.0) {
                 reflect_dir = reflect(view_dir, refl_base_n);
@@ -1826,7 +1803,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             let m = 1.0 - clamp(dot(-view_dir, h), 0.0, 1.0);
             let m2 = m * m;
             let fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
-            let trim_scale = select(0.28 * (1.0 - smoothstep(0.24, 0.37, roughness)), 1.0, is_water);
+            let trim_scale = 1.0;
             let refl_max_t = select(min(params.lens.y, 180.0), min(params.lens.y, 900.0), is_water);
             let rhit = closest_hit(ray_origin, reflect_dir, bias, refl_max_t);
             let eff_max_t = select(refl_max_t, rhit.t, rhit.index != 0xffffffffu);
@@ -2525,7 +2502,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         store_refl = vec3<f32>(0.0);
     } else if (debug_mode == 8u) {
         var rkind = 0.0;
-        if (roughness <= params.effects.x) {
+        if (is_water && roughness <= params.effects.x) {
             let rdir = reflect(view_dir, normal);
             let rh = closest_hit(ray_origin, rdir, bias, params.lens.y);
             if (rh.index != 0xffffffffu) {
