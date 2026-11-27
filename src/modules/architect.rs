@@ -1739,6 +1739,15 @@ impl Architect {
                                 .logarithmic(true)
                                 .text("Scale"),
                         );
+                        if ui.button("Duplicate custom placement").clicked() {
+                            let before = self.project.objects.clone();
+                            let mut duplicate = object.clone();
+                            duplicate.position[0] += 1.0;
+                            self.project.objects.push(duplicate);
+                            self.push_object_undo(before);
+                            self.selected_placement = Some(self.project.objects.len() - 1);
+                            self.status = "Duplicated custom placement.".into();
+                        }
                         if ui.button("Delete custom placement").clicked() {
                             delete_placement = Some(index);
                         }
