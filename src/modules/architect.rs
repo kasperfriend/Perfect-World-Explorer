@@ -648,19 +648,14 @@ impl Architect {
         match fs::remove_file(&path) {
             Ok(()) => {
                 let erased_source_map = self.project.source_map.clone();
-                self.project = Project::default();
-                self.redo_strokes.clear();
-                if let Some(map) = &self.map {
+                let reset_error = self.map.as_ref().and_then(|map| {
                     let belongs_here = erased_source_map.is_empty()
                         || self.current_map_id.is_empty()
                         || erased_source_map.eq_ignore_ascii_case(&self.current_map_id);
-                    if belongs_here {
-                        if let Err(error) = map.heights.clear_edits() {
-                            self.status =
-                                format!("Project erased, but terrain reset failed: {error}");
-                        }
-                    }
-                }
+                    belongs_here.then(|| map.heights.clear_edits()).and_then(Result::err)
+                });
+                self.project = Project::default();
+                self.redo_strokes.clear();
                 self.project_name = "Untitled World".into();
                 self.selected_project = None;
                 self.selected_placement = None;
@@ -670,6 +665,9 @@ impl Architect {
                 self.confirm_erase = false;
                 self.refresh_projects();
                 self.status = "Custom project erased. Client map files were not touched.".into();
+                if let Some(error) = reset_error {
+                    self.status = format!("Project erased, but terrain reset failed: {error}");
+                }
             }
             Err(error) => self.status = format!("Could not erase project: {error}"),
         }
