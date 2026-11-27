@@ -1242,7 +1242,11 @@ impl Architect {
             return;
         };
         if Self::renderer_asset_path(&asset).is_none() {
-            self.status = "This file is indexed but not yet placeable. Placeable assets: ECM models from models.pck and static SMD models from gfx.pck; other files remain browseable.".into();
+            self.status = if asset.to_ascii_lowercase().ends_with(".bmd") {
+                "BMD scenery is a real client asset, but the editor still needs a dedicated movable BMD renderer before it can be placed safely.".into()
+            } else {
+                "This file is indexed but not yet placeable. Supported live assets are ECM models from models.pck and static SMD models from gfx.pck.".into()
+            };
             return;
         }
         let portable_asset = self.portable_asset_path(&asset);
@@ -2009,6 +2013,17 @@ impl Architect {
                                 response.context_menu(|ui| {
                                     if ui.button("Pin archive entry to quick bar").clicked() {
                                         self.pin(asset.clone());
+                                        ui.close_menu();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            Self::renderer_asset_path(&asset).is_some(),
+                                            egui::Button::new("Place at camera"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.selected_asset = Some(asset.clone());
+                                        self.add_selected_asset_at_camera(camera);
                                         ui.close_menu();
                                     }
                                 });
