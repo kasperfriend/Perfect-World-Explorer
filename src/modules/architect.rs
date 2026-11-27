@@ -2873,9 +2873,22 @@ impl Architect {
                             )
                         })
                     };
+                    // The handle direction is a screen-space aid, not a second
+                    // world-space point that must pass the camera depth clip.
+                    // Requiring the full 24-unit endpoint to be in range made
+                    // gizmo axes vanish near the far plane and at steep angles.
+                    let project_direction_point = |point: Vec3| {
+                        let clip = view_projection.project_point3(point);
+                        clip.is_finite().then(|| {
+                            egui::pos2(
+                                screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
+                                screen.top() + (1. - clip.y) * 0.5 * screen.height(),
+                            )
+                        })
+                    };
                     if let Some(center) = project_point(origin) {
                         let axis_end = |axis: Vec3| {
-                            project_point(origin + axis * 24.).map(|projected| {
+                            project_direction_point(origin + axis).map(|projected| {
                                 let direction = projected - center;
                                 let direction = if direction.length_sq() > 0.0001 {
                                     direction.normalized()
@@ -3484,6 +3497,15 @@ impl Architect {
                     )
                 })
             };
+            let project_direction_point = |point: Vec3| -> Option<egui::Pos2> {
+                let clip = view_projection.project_point3(point);
+                clip.is_finite().then(|| {
+                    egui::pos2(
+                        screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
+                        screen.top() + (1. - clip.y) * 0.5 * screen.height(),
+                    )
+                })
+            };
             if let Some(center) = project_point(origin) {
                 let painter = ctx.layer_painter(egui::LayerId::new(
                     egui::Order::Foreground,
@@ -3496,7 +3518,7 @@ impl Architect {
                 ];
                 painter.circle_stroke(center, 5., egui::Stroke::new(2., egui::Color32::WHITE));
                 let axis_end = |axis: Vec3| {
-                    project_point(origin + axis * 24.).map(|projected| {
+                    project_direction_point(origin + axis).map(|projected| {
                         let direction = projected - center;
                         let direction = if direction.length_sq() > 0.0001 {
                             direction.normalized()
