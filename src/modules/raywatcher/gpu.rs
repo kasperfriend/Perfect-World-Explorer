@@ -3920,17 +3920,16 @@ fn software_fallback_ready(triangle_count: u32, node_count: u32) -> bool {
     triangle_count == 0 || node_count > 0
 }
 
-/// Whether this frame can actually dispatch through DXR. A Hardware mode
-/// request alone is insufficient while the acceleration structure is being
-/// rebuilt on a worker; the last RT output is held (or raster remains visible)
-/// until the matching hardware scene is ready.
+/// Whether this frame can actually dispatch through DXR. During a scene
+/// rebuild the previous tracer remains active and keeps producing fresh frames;
+/// only first-use initialization has no tracer to dispatch.
 fn hardware_trace_ready(
     hardware_mode: bool,
     dxr_failed: bool,
     dxr_ready: bool,
-    dxr_initializing: bool,
+    _dxr_initializing: bool,
 ) -> bool {
-    hardware_mode && !dxr_failed && dxr_ready && !dxr_initializing
+    hardware_mode && !dxr_failed && dxr_ready
 }
 
 /// Everything Raywatcher owns on the GPU.
@@ -5220,7 +5219,6 @@ impl RaywatcherGpu {
     /// DXR failure: it has no CPU BVH to provide occlusion or shadows.
     pub fn can_replace_raster_effects(&self) -> bool {
         self.traced_last_frame
-            && self.dxr_init.is_none()
             && (!self.dxr_failed
                 || software_fallback_ready(self.scene.counts.triangles, self.scene.counts.nodes))
     }
@@ -5304,13 +5302,14 @@ impl RaywatcherGpu {
         // load with a Software trace on every frame.
         if hardware_mode && !self.dxr_failed {
             if self.dxr_init.is_some() {
-                if !self.poll_dxr_initialization(device) {
-                    // The previous output belongs to the previous scene snapshot.
-                    // It has not been reprojected against this frame's G-buffer, so
-                    // leave raster effects enabled instead of compositing stale RT.
+                if !self.poll_dxr_initialization(device) && self.dxr.is_none() {
+                    // First-use initialization has no active tracer yet. Keep
+                    // the raster path intact until the first DXR scene is ready.
                     self.traced_last_frame = false;
                     return;
                 }
+                // On a scene swap the old tracer remains live. Continue tracing
+                // it every frame while the replacement AS builds in parallel.
             } else if self.dxr.is_none() {
                 self.begin_dxr_initialization();
                 if !self.poll_dxr_initialization(device) {
@@ -5474,8 +5473,8 @@ impl RaywatcherGpu {
         let mut traced_hw = false;
 
         // Track the backend actually used for this frame, not the requested
-        // mode. Hardware frames are paused while its scene/AS worker runs, so
-        // the backend transition resets temporal history only after it is ready.
+        // mode. A scene rebuild keeps the previous tracer active, so the
+        // backend does not change and valid temporal history is preserved.
         let requested_hardware = hardware_trace_ready(
             hardware_mode,
             self.dxr_failed,
@@ -7268,12 +7267,12 @@ mod dxr_backend_selection_tests {
     }
 
     #[test]
-    fn hardware_scene_rebuild_does_not_report_hardware_ready_until_dxr_is_ready() {
+    fn hardware_scene_rebuild_keeps_the_previous_tracer_active() {
         assert!(!hardware_trace_ready(true, false, false, true));
-        assert!(!hardware_trace_ready(true, false, false, false));
+        assert!(hardware_trace_ready(true, false, true, true));
         assert!(hardware_trace_ready(true, false, true, false));
-        assert!(!hardware_trace_ready(true, true, true, false));
-        assert!(!hardware_trace_ready(false, false, true, false));
+        assert!(!hardware_trace_ready(true, true, true, true));
+        assert!(!hardware_trace_ready(false, false, true, true));
     }
 }
 
