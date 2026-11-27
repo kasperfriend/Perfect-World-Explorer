@@ -511,6 +511,15 @@ impl Architect {
     /// its ordered strokes. This makes undo/redo deterministic and reversible.
     fn rebuild_terrain(&self) -> Result<(), String> {
         let map = self.map.as_ref().ok_or("No terrain is loaded for sculpting")?;
+        if !self.project.source_map.is_empty()
+            && !self.current_map_id.is_empty()
+            && !self.project.source_map.eq_ignore_ascii_case(&self.current_map_id)
+        {
+            return Err(format!(
+                "Project belongs to map {}, but the loaded terrain is {}.",
+                self.project.source_map, self.current_map_id
+            ));
+        }
         map.heights.clear_edits()?;
         for stroke in &self.project.strokes {
             self.apply_stroke(stroke)?;
@@ -563,9 +572,7 @@ impl Architect {
                 };
                 self.project = project;
                 self.redo_strokes.clear();
-                if let Err(error) = self.rebuild_terrain() {
-                    self.status = format!("Loaded project, but terrain replay failed: {error}");
-                }
+                let replay_error = self.rebuild_terrain().err();
                 self.selected_placement = None;
                 self.selected_scene_object = None;
                 self.multi_selection.clear();
@@ -576,6 +583,9 @@ impl Architect {
                     self.project.objects.len(),
                     self.project.strokes.len()
                 );
+                if let Some(error) = replay_error {
+                    self.status = format!("{} Terrain replay failed: {error}", self.status);
+                }
             }
             Err(error) => self.status = format!("Could not load project: {error}"),
         }
@@ -594,8 +604,13 @@ impl Architect {
                 self.project = Project::default();
                 self.redo_strokes.clear();
                 if let Some(map) = &self.map {
-                    if let Err(error) = map.heights.clear_edits() {
-                        self.status = format!("Project erased, but terrain reset failed: {error}");
+                    let belongs_here = self.project.source_map.is_empty()
+                        || self.current_map_id.is_empty()
+                        || self.project.source_map.eq_ignore_ascii_case(&self.current_map_id);
+                    if belongs_here {
+                        if let Err(error) = map.heights.clear_edits() {
+                            self.status = format!("Project erased, but terrain reset failed: {error}");
+                        }
                     }
                 }
                 self.project_name = "Untitled World".into();
