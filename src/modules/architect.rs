@@ -725,6 +725,20 @@ impl Architect {
         Ok(())
     }
 
+    fn clear_object_selection(&mut self) {
+        self.selected_placement = None;
+        self.selected_placements.clear();
+    }
+
+    fn cancel_object_drag(&mut self) {
+        self.object_dragging = false;
+        self.object_drag_axis = None;
+        self.object_drag_start_pointer = None;
+        self.object_drag_start_hit = None;
+        self.object_drag_group.clear();
+        self.object_drag_snapshot = None;
+    }
+
     fn push_object_undo(&mut self, snapshot: Vec<PlacedObject>) {
         if snapshot == self.project.objects {
             return;
@@ -741,12 +755,13 @@ impl Architect {
         if let Some(previous) = self.undo_objects.pop() {
             self.redo_objects
                 .push(std::mem::replace(&mut self.project.objects, previous));
-            self.selected_placement = self
-                .selected_placement
-                .filter(|index| *index < self.project.objects.len());
-            self.selected_placements
-                .retain(|index| *index < self.project.objects.len());
-            self.status = "Undid object edit.".into();
+            // Placement indices are not stable across snapshot restoration: a
+            // deletion or insertion before a selected row can make the same index
+            // refer to a completely different object. Never preserve stale indices
+            // across history navigation; require an explicit re-selection instead.
+            self.clear_object_selection();
+            self.cancel_object_drag();
+            self.status = "Undid object edit. Select a placement to continue editing.".into();
         }
     }
 
@@ -755,12 +770,9 @@ impl Architect {
         if let Some(next) = self.redo_objects.pop() {
             self.undo_objects
                 .push(std::mem::replace(&mut self.project.objects, next));
-            self.selected_placement = self
-                .selected_placement
-                .filter(|index| *index < self.project.objects.len());
-            self.selected_placements
-                .retain(|index| *index < self.project.objects.len());
-            self.status = "Redid object edit.".into();
+            self.clear_object_selection();
+            self.cancel_object_drag();
+            self.status = "Redid object edit. Select a placement to continue editing.".into();
         }
     }
 
