@@ -5706,7 +5706,7 @@ impl RaywatcherGpu {
                         depth_or_array_layers: 1,
                     },
                 );
-                }
+            }
         }
         let final_plane = ((iterations - 1) % 2) as usize;
         // Opt #16: Replace full-screen compose_pass compute shader (4 loads + 2 stores + barrier)
