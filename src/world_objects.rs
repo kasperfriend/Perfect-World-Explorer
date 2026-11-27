@@ -2231,12 +2231,12 @@ impl GpuPage {
             if !allows_with_context(view, placement.visibility, RenderContext::default()) {
                 continue;
             }
-            match span.as_mut() {
-                Some((_, end)) if *end == placement.start => {
-                    *end = placement.end;
+            match span {
+                Some((start, end)) if end == placement.start => {
+                    span = Some((start, placement.end));
                 }
                 Some((start, end)) => {
-                    pass.draw_indexed(*start..*end, 0, 0..1);
+                    pass.draw_indexed(start..end, 0, 0..1);
                     span = Some((placement.start, placement.end));
                 }
                 None => span = Some((placement.start, placement.end)),
