@@ -1365,6 +1365,10 @@ fn run(
     let mut page = Builder::new();
     let mut shared_slots: HashMap<TextureKey, SharedSlot> = HashMap::new();
     let mut shared_geometry = HashMap::<usize, Builder>::new();
+    // O(1) aggregate for the shared builders; rescanning every builder after
+    // each object batch made world construction scale with the number of
+    // distinct shared atlas sources.
+    let mut shared_geometry_vertices = 0usize;
     let mut skipped = 0usize;
     let mut pages = 0usize;
     let mut atlas_pages = 0usize;
@@ -1447,7 +1451,7 @@ fn run(
                         return Ok(());
                     }
                 }
-                let (page, slot) = if let Some(shared) = shared_slots.get(&key).copied() {
+                let (page, slot, is_shared_builder) = if let Some(shared) = shared_slots.get(&key).copied() {
                     let target = shared_geometry
                         .entry(shared.source)
                         .or_insert_with(|| Builder::shared(shared.source, shared.height));
@@ -1458,12 +1462,14 @@ fn run(
                             target,
                             Builder::shared(shared.source, shared.height),
                         );
+                        shared_geometry_vertices =
+                            shared_geometry_vertices.saturating_sub(ready.vertices.len());
                         pages += 1;
                         if !finisher.submit(ready, id) {
                             return Ok(());
                         }
                     }
-                    (target, shared.slot)
+                    (target, shared.slot, true)
                 } else {
                     let (slot, turned) = allocate_slot(&mut page, key, tex)?;
                     if let Some(finished) = turned {
@@ -1475,7 +1481,7 @@ fn run(
                             return Ok(());
                         }
                     }
-                    (&mut page, slot)
+                    (&mut page, slot, false)
                 };
                 let base = page.vertices.len() as u32;
                 let range_start = page.indices.len() as u32;
@@ -1483,6 +1489,10 @@ fn run(
                 let oy = slot.y as f32 / SIDE as f32;
                 let sx = slot.w as f32 / SIDE as f32;
                 let sy = slot.h as f32 / SIDE as f32;
+                if is_shared_builder {
+                    shared_geometry_vertices =
+                        shared_geometry_vertices.saturating_add(mesh.vertices.len());
+                }
                 for v in &mesh.vertices {
                     let pos = Vec3::from_array(model.position)
                         + x * (v.position[0] * model.scale[0])
@@ -1518,14 +1528,13 @@ fn run(
         // Accumulate across batches until a builder reaches `max_vertices` (or
         // total buffered shared vertices exceeds 2x `max_vertices`) instead of
         // emitting tiny fragmented pages after every batch.
-        let total_shared_verts: usize = shared_geometry.values().map(|b| b.vertices.len()).sum();
-        if total_shared_verts >= max_vertices.saturating_mul(2)
+        if shared_geometry_vertices >= max_vertices.saturating_mul(2)
             || shared_geometry
                 .values()
                 .any(|b| b.vertices.len() >= max_vertices)
         {
             let mut flush_sources: Vec<usize> =
-                if total_shared_verts >= max_vertices.saturating_mul(2) {
+                if shared_geometry_vertices >= max_vertices.saturating_mul(2) {
                     shared_geometry.keys().copied().collect()
                 } else {
                     shared_geometry
@@ -1537,6 +1546,8 @@ fn run(
             flush_sources.sort_unstable();
             for source in flush_sources {
                 if let Some(builder) = shared_geometry.remove(&source) {
+                    shared_geometry_vertices =
+                        shared_geometry_vertices.saturating_sub(builder.vertices.len());
                     if !builder.indices.is_empty() {
                         pages += 1;
                         if !finisher.submit(builder, end) {
