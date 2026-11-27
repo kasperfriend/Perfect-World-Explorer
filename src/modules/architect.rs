@@ -825,6 +825,7 @@ impl Architect {
                 self.project_name = "Untitled World".into();
                 self.selected_project = None;
                 self.selected_placement = None;
+                self.selected_placements.clear();
                 self.selected_scene_object = None;
                 self.multi_selection.clear();
                 self.multi_scene_items.clear();
@@ -1404,6 +1405,7 @@ impl Architect {
                     self.selected_map = "__empty__".into();
                     self.selected_project = None;
                     self.selected_placement = None;
+                    self.selected_placements.clear();
                     self.selected_scene_object = None;
                     self.selected_scene_transform = None;
                     self.multi_selection.clear();
