@@ -1364,6 +1364,7 @@ impl Architect {
     fn open_archive(&mut self, path: PathBuf) {
         self.selected_archive = Some(path.clone());
         self.archive_entries.clear();
+        self.archive_details.clear();
         self.archive_error = None;
         if let Some(entries) = self.archive_cache.get(&path) {
             self.archive_entries = entries.clone();
@@ -2572,7 +2573,7 @@ impl Architect {
                     }
                 }
             }
-            let mut nearest: Option<(usize, f32)> = None;
+            let mut nearest: Option<(usize, f32, f32)> = None;
             if axis_pick.is_none() {
                 if let Some(pointer) = pointer {
                     for (index, object) in self.project.objects.iter().enumerate() {
@@ -2585,13 +2586,19 @@ impl Architect {
                             screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
                             screen.top() + (1. - clip.y) * 0.5 * screen.height(),
                         );
-                        let distance = point.distance(pointer);
-                        if distance <= 20. && nearest.is_none_or(|(_, best)| distance < best) {
-                            nearest = Some((index, distance));
+                        let score = point.distance(pointer) / Self::source_pick_radius(&object.asset);
+                        if score <= 1.0
+                            && nearest.is_none_or(|(_, best_score, best_depth)| {
+                                score < best_score - 0.025
+                                    || ((score - best_score).abs() <= 0.025
+                                        && clip.z > best_depth)
+                            })
+                        {
+                            nearest = Some((index, score, clip.z));
                         }
                     }
                 }
-                let picked_placement = nearest.map(|(index, _)| index);
+                let picked_placement = nearest.map(|(index, _, _)| index);
                 let begin_marquee =
                     self.cursor == CursorMode::MultiSelect && picked_placement.is_none();
                 let begin_lasso = self.cursor == CursorMode::Lasso;
