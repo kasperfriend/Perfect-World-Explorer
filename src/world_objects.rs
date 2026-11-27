@@ -1741,6 +1741,35 @@ impl WorldGeometryArena {
     }
 }
 
+/// Build a page's combined vertex/index buffer directly in its initial mapped
+/// allocation. This avoids a second page-sized CPU Vec and its extra copy.
+fn create_page_geometry_buffer(
+    device: &wgpu::Device,
+    vertex_data: &[u8],
+    index_data: &[u8],
+) -> wgpu::Buffer {
+    let vertex_bytes = vertex_data.len() as u64;
+    let index_offset = (vertex_bytes + 3) & !3;
+    let size = (index_offset + index_data.len() as u64).max(4);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("whole-world object geometry (vertices + indices)"),
+        size,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
+        mapped_at_creation: true,
+    });
+    {
+        let mut mapped = buffer.slice(..).get_mapped_range_mut();
+        mapped[..vertex_data.len()].copy_from_slice(vertex_data);
+        if index_offset > vertex_bytes {
+            mapped[vertex_bytes as usize..index_offset as usize].fill(0);
+        }
+        let index_start = index_offset as usize;
+        mapped[index_start..index_start + index_data.len()].copy_from_slice(index_data);
+    }
+    buffer.unmap();
+    buffer
+}
+
 /// A GPU page can reference a subrange of a shared arena chunk.
 pub struct GpuPage {
     geometry: Arc<wgpu::Buffer>,
@@ -1994,20 +2023,11 @@ impl GpuPage {
             };
             (Arc::new(make(normal)), Arc::new(make(reflected)))
         };
-        use wgpu::util::DeviceExt;
         let vertex_data = bytemuck::cast_slice(&page.vertices);
         let index_data = bytemuck::cast_slice(&page.indices);
         let vertex_bytes = vertex_data.len() as u64;
         let index_offset = (vertex_bytes + 3) & !3;
-        let mut geometry_data = Vec::with_capacity(index_offset as usize + index_data.len());
-        geometry_data.extend_from_slice(vertex_data);
-        geometry_data.resize(index_offset as usize, 0);
-        geometry_data.extend_from_slice(index_data);
-        let geometry = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("whole-world object geometry (vertices + indices)"),
-            contents: &geometry_data,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
-        });
+        let geometry = create_page_geometry_buffer(device, vertex_data, index_data);
         Self {
             geometry: Arc::new(geometry),
             vertex_offset: 0,
@@ -2160,20 +2180,11 @@ impl GpuPage {
         normal: Arc<wgpu::BindGroup>,
         reflected: Arc<wgpu::BindGroup>,
     ) -> Self {
-        use wgpu::util::DeviceExt;
         let vertex_data = bytemuck::cast_slice(&page.vertices);
         let index_data = bytemuck::cast_slice(&page.indices);
         let vertex_bytes = vertex_data.len() as u64;
         let index_offset = (vertex_bytes + 3) & !3;
-        let mut geometry_data = Vec::with_capacity(index_offset as usize + index_data.len());
-        geometry_data.extend_from_slice(vertex_data);
-        geometry_data.resize(index_offset as usize, 0);
-        geometry_data.extend_from_slice(index_data);
-        let geometry = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("whole-world object geometry (vertices + indices)"),
-            contents: &geometry_data,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
-        });
+        let geometry = create_page_geometry_buffer(device, vertex_data, index_data);
         Self {
             geometry: Arc::new(geometry),
             vertex_offset: 0,
