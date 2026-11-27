@@ -1633,7 +1633,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             }
             if (best_h_score > 1e-4) {
                 float vis_h = 1.0;
-                if (bits_shadows && occluded_fast(params.eye.xyz, view_dir, 0.5, max(length(best_h_pos - params.eye.xyz) - 0.5, 0.6))) {
+                if (bits_shadows && occluded_fast(params.eye.xyz, view_dir, 0.5, max(length(best_h_pos - params.eye.xyz) - 0.5, 0.6), opaque_offset, tri_count)) {
                     vis_h = 0.0;
                 }
                 halo_sum += best_h_col * vis_h;
