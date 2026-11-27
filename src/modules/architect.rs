@@ -1518,6 +1518,19 @@ impl Architect {
     }
 
     fn duplicate_selected_scene_item(&mut self) {
+        if !self.project.source_map.is_empty()
+            && !self.current_map_id.is_empty()
+            && !self
+                .project
+                .source_map
+                .eq_ignore_ascii_case(&self.current_map_id)
+        {
+            self.status = format!(
+                "This Architect project targets map {}, not {}.",
+                self.project.source_map, self.current_map_id
+            );
+            return;
+        }
         let mut items = self
             .multi_scene_items
             .iter()
@@ -1647,6 +1660,19 @@ impl Architect {
     }
 
     fn paste_objects(&mut self) {
+        if !self.project.source_map.is_empty()
+            && !self.current_map_id.is_empty()
+            && !self
+                .project
+                .source_map
+                .eq_ignore_ascii_case(&self.current_map_id)
+        {
+            self.status = format!(
+                "This Architect project targets map {}, not {}.",
+                self.project.source_map, self.current_map_id
+            );
+            return;
+        }
         if self.clipboard_objects.is_empty() {
             self.status =
                 "Architect clipboard is empty. Select an object and press Ctrl+C first.".into();
