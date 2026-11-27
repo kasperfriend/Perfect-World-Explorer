@@ -90,7 +90,7 @@ struct Store {
     side: usize,
     data: Data,
     /// Sparse, non-destructive editor overlay shared by all readers.
-    edits: RwLock<HashMap<usize, (f32, [i8; 3])>>,
+    edits: RwLock<Arc<HashMap<usize, (f32, [i8; 3])>>>,
     revision: AtomicU64,
 }
 #[derive(Clone)]
@@ -98,6 +98,8 @@ pub struct Heights(Arc<Store>);
 pub struct Normals(Arc<Store>);
 pub struct Reader {
     store: Arc<Store>,
+    edits: Arc<HashMap<usize, (f32, [i8; 3])>>,
+    revision: u64,
     current: Option<(usize, Arc<Page>)>,
 }
 impl From<Vec<f32>> for Heights {
@@ -107,15 +109,19 @@ impl From<Vec<f32>> for Heights {
             width: values.len(),
             side: 1,
             data: Data::Memory(values),
-            edits: RwLock::new(HashMap::new()),
+            edits: RwLock::new(Arc::new(HashMap::new())),
             revision: AtomicU64::new(0),
         }))
     }
 }
 impl Heights {
     pub fn reader(&self) -> Reader {
+        let edits = self.0.edits.read().unwrap();
+        let revision = self.0.revision.load(Ordering::Acquire);
         Reader {
             store: Arc::clone(&self.0),
+            edits: Arc::clone(&edits),
+            revision,
             current: None,
         }
     }
@@ -142,9 +148,11 @@ impl Heights {
             return Ok(());
         }
         let mut edits = self.0.edits.write().map_err(|_| "terrain edit lock poisoned")?;
+        let mut next = (**edits).clone();
         for (index, height, normal) in cells {
-            edits.insert(*index, (*height, *normal));
+            next.insert(*index, (*height, *normal));
         }
+        *edits = Arc::new(next);
         self.0.revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
@@ -283,7 +291,7 @@ impl Reader {
         if index >= self.store.len {
             return Err(format!("terrain cell {index} out of bounds"));
         }
-        if let Some(cell) = self.store.edits.read().unwrap().get(&index).copied() {
+        if let Some(cell) = self.edits.get(&index).copied() {
             return Ok(cell);
         }
         match &self.store.data {
@@ -309,7 +317,7 @@ impl Reader {
         Ok((page.heights[local], page.normals[local]))
     }
     pub fn height(&mut self, index: usize) -> f32 {
-        if let Some((height, _)) = self.store.edits.read().unwrap().get(&index) {
+        if let Some((height, _)) = self.edits.get(&index) {
             return *height;
         }
         match &self.store.data {
@@ -323,7 +331,7 @@ impl Reader {
         self.current.as_ref().unwrap().1.heights[local]
     }
     pub fn normal(&mut self, index: usize) -> [i8; 3] {
-        if let Some((_, normal)) = self.store.edits.read().unwrap().get(&index) {
+        if let Some((_, normal)) = self.edits.get(&index) {
             return *normal;
         }
         match &self.store.data {
