@@ -3355,7 +3355,7 @@ impl Architect {
         ));
         for (asset, position, scale) in outline_items {
             let lower = asset.to_ascii_lowercase();
-            let half = if lower.contains("tree") || lower.contains("forest") {
+            let fallback_half = if lower.contains("tree") || lower.contains("forest") {
                 Vec3::new(3.5, 9.0, 3.5)
             } else if lower.ends_with(".bmd") || lower.contains("building") {
                 Vec3::new(5.0, 5.0, 5.0)
@@ -3363,16 +3363,35 @@ impl Architect {
                 Vec3::new(2.5, 3.5, 2.5)
             } else {
                 Vec3::new(2.0, 2.5, 2.0)
-            } * scale.max(0.01);
+            };
+            let actual_bounds = (self.selected_asset.as_deref() == Some(asset.as_str()))
+                .then(|| self.preview.as_ref().and_then(|preview| preview.model_bounds()))
+                .flatten();
+            let (local_min, local_max) = actual_bounds
+                .map(|(min, max)| (Vec3::from_array(min), Vec3::from_array(max)))
+                .unwrap_or((-fallback_half, fallback_half));
             let center = Vec3::from_array(position);
+            let rotation = self
+                .selected_placements
+                .iter()
+                .find_map(|index| self.project.objects.get(*index))
+                .filter(|object| object.asset == asset)
+                .map(|object| glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    object.rotation[0],
+                    object.rotation[1],
+                    object.rotation[2],
+                ))
+                .unwrap_or(glam::Quat::IDENTITY);
             let mut corners = [egui::Pos2::ZERO; 8];
             let mut valid = [false; 8];
             for bits in 0..8 {
-                let point = center + Vec3::new(
-                    if bits & 1 == 0 { -half.x } else { half.x },
-                    if bits & 2 == 0 { -half.y } else { half.y },
-                    if bits & 4 == 0 { -half.z } else { half.z },
-                );
+                let local = Vec3::new(
+                    if bits & 1 == 0 { local_min.x } else { local_max.x },
+                    if bits & 2 == 0 { local_min.y } else { local_max.y },
+                    if bits & 4 == 0 { local_min.z } else { local_max.z },
+                ) * scale.max(0.01);
+                let point = center + rotation * local;
                 if let Some(projected) = project_outline_point(point) {
                     corners[bits] = projected;
                     valid[bits] = true;
