@@ -2460,7 +2460,8 @@ impl Architect {
                         if !object.visible {
                             continue;
                         }
-                        let clip = view_projection.project_point3(Vec3::from_array(object.position));
+                        let clip =
+                            view_projection.project_point3(Vec3::from_array(object.position));
                         if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
                             continue;
                         }
@@ -2476,7 +2477,8 @@ impl Architect {
                         .selected_placement
                         .filter(|index| self.selected_placements.contains(index))
                         .or_else(|| self.selected_placements.iter().copied().min());
-                    self.status = format!("Selected {} placements.", self.selected_placements.len());
+                    self.status =
+                        format!("Selected {} placements.", self.selected_placements.len());
                 }
             }
             self.marquee_start = None;
