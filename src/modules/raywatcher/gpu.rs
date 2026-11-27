@@ -6860,7 +6860,8 @@ mod shader_optimization_regression_tests {
         let dxr = include_str!("dxr_trace.hlsl");
         assert!(RAY_SHADER.contains("maximum <= base || is_water"));
         assert!(RAY_SHADER.contains("let h = refl_base_n;"));
-        assert!(RAY_SHADER.contains("if (bits_reflections && is_water && roughness <= params.effects.x"));
+        assert!(RAY_SHADER
+            .contains("if (bits_reflections && is_water && roughness <= params.effects.x"));
         assert!(RAY_SHADER.contains("is_water && dot(base_normal, view_dir) > 0.0"));
         assert!(RAY_SHADER.contains("select(0.04, 0.0204, is_water)"));
         assert!(!RAY_SHADER.contains("complexity = max(complexity, 0.42)"));
@@ -7150,10 +7151,16 @@ mod reflection_sampling_regression_tests {
     fn reflections_are_water_only_and_distant_dxr_keeps_alpha_tested_foliage() {
         assert!(!GBUF_PREP_SHADER.contains("spec_contrast > 0.14"));
         assert!(!GBUF_PREP_SHADER.contains("roughness = clamp(0.34"));
-        assert!(RAY_SHADER.contains("bits_reflections && is_water && roughness <= params.effects.x"));
-        assert!(DXR_SHADER.contains("bits_reflections && is_water && roughness <= params.effects.x"));
+        assert!(
+            RAY_SHADER.contains("bits_reflections && is_water && roughness <= params.effects.x")
+        );
+        assert!(
+            DXR_SHADER.contains("bits_reflections && is_water && roughness <= params.effects.x")
+        );
         assert!(!DXR_SHADER.contains("if (is_water && dist > 560.0)"));
-        assert!(DXR_SHADER.contains("Hit rhit = closest_hit(ray_origin, reflect_dir, bias, refl_max_t"));
+        assert!(
+            DXR_SHADER.contains("Hit rhit = closest_hit(ray_origin, reflect_dir, bias, refl_max_t")
+        );
     }
 
     #[test]
