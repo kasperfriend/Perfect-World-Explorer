@@ -3659,7 +3659,7 @@ mod tests {
         let preview = editor.renderer_placements();
         assert_eq!(preview.len(), 1);
         assert_eq!(preview[0].path, "models/buildings/gate.ecm");
-        assert_eq!(preview[0].position, [12., 3.5, 18.]);
+        assert_eq!(preview[0].position, [12., 3., 18.]);
         assert!(editor.project.objects.is_empty());
     }
 
