@@ -444,88 +444,110 @@ impl SceneGeometry {
             centroids.push((a + b + c) * (1.0 / 3.0));
         }
         let mut index: Vec<u32> = (0..n as u32).collect();
-        // Opt #26: Parallel multi-threaded BVH build via std::thread::scope for scenes > 4096 tris.
+        // Opt #26: Parallel four-way top-level BVH build for large scenes.
+        //
+        // The previous implementation exposed only the root's two children to
+        // separate workers; each worker then recursively built half the world
+        // on one thread. Split each half once more before launching workers so
+        // four independent, spatially coherent subtrees can be built at once.
+        // The resulting node layout is still the same binary BVH used by WGSL.
         if n > 4096 {
             let root_bounds = geometry.bounds;
-            let mid = partition_sah(&tri_bounds, &centroids, &mut index, root_bounds, cancel)?;
-            let (left_idx, right_idx) = index.split_at_mut(mid);
-            let (left_state, right_state) = std::thread::scope(|scope| {
+            let root_mid = partition_sah(&tri_bounds, &centroids, &mut index, root_bounds, cancel)?;
+            let (left_half, right_half) = index.split_at_mut(root_mid);
+
+            let left_half_bounds = bounds_for_partition(&tri_bounds, left_half, cancel)?;
+            let right_half_bounds = bounds_for_partition(&tri_bounds, right_half, cancel)?;
+            let left_mid = partition_sah(&tri_bounds, &centroids, left_half, left_half_bounds, cancel)?;
+            let right_mid = partition_sah(&tri_bounds, &centroids, right_half, right_half_bounds, cancel)?;
+            let (a_idx, b_idx) = left_half.split_at_mut(left_mid);
+            let (c_idx, d_idx) = right_half.split_at_mut(right_mid);
+
+            let a_bounds = bounds_for_partition(&tri_bounds, a_idx, cancel)?;
+            let b_bounds = bounds_for_partition(&tri_bounds, b_idx, cancel)?;
+            let c_bounds = bounds_for_partition(&tri_bounds, c_idx, cancel)?;
+            let d_bounds = bounds_for_partition(&tri_bounds, d_idx, cancel)?;
+
+            let (a_state, b_state, c_state, d_state) = std::thread::scope(|scope| {
                 let tb = &tri_bounds;
                 let ct = &centroids;
-                let handle = scope.spawn(move || {
-                    let mut st = BuildState {
+                let build = |partition: &mut [u32]| {
+                    let mut state = BuildState {
                         tri_bounds: tb,
                         centroids: ct,
                         cancel,
-                        nodes: Vec::with_capacity(estimated_node_capacity(right_idx.len())),
-                        order: Vec::with_capacity(right_idx.len()),
+                        nodes: Vec::with_capacity(estimated_node_capacity(partition.len())),
+                        order: Vec::with_capacity(partition.len()),
                         depth: 0,
                         widest: 0,
                     };
-                    st.build_node(right_idx, 1).map(|_| st)
-                });
-                let mut left_st = BuildState {
-                    tri_bounds: tb,
-                    centroids: ct,
-                    cancel,
-                    nodes: Vec::with_capacity(estimated_node_capacity(left_idx.len())),
-                    order: Vec::with_capacity(left_idx.len()),
-                    depth: 0,
-                    widest: 0,
+                    state.build_node(partition, 2).map(|_| state)
                 };
-                let left_ok = left_st.build_node(left_idx, 1).is_some();
-                let right_st = handle.join().expect("BVH worker thread panicked");
-                if !left_ok {
-                    return None;
-                }
-                Some((left_st, right_st?))
-            })?;
-            let left_nodes = left_state.nodes.len() as u32;
-            let left_order = left_state.order.len() as u32;
-            let right_root = 1 + left_nodes;
-            let mut nodes =
-                Vec::with_capacity(1 + left_state.nodes.len() + right_state.nodes.len());
-            nodes.push(BvhNode {
-                min: [
-                    root_bounds.min.x,
-                    root_bounds.min.y,
-                    root_bounds.min.z,
-                    -1.0,
-                ],
-                max: [
-                    root_bounds.max.x,
-                    root_bounds.max.y,
-                    root_bounds.max.z,
-                    right_root as f32,
-                ],
+                let a_handle = scope.spawn(|| build(a_idx));
+                let b_handle = scope.spawn(|| build(b_idx));
+                let c_handle = scope.spawn(|| build(c_idx));
+                let d_state = build(d_idx);
+                (
+                    a_handle.join().expect("BVH worker A panicked"),
+                    b_handle.join().expect("BVH worker B panicked"),
+                    c_handle.join().expect("BVH worker C panicked"),
+                    d_state,
+                )
             });
-            for (i, mut node) in left_state.nodes.into_iter().enumerate() {
-                if i & 0x3ff == 0 && is_cancelled(cancel) {
-                    return None;
-                }
-                if node.min[3] < 0.0 {
-                    node.max[3] += 1.0;
-                }
-                nodes.push(node);
+            let a_state = a_state?;
+            let b_state = b_state?;
+            let c_state = c_state?;
+            let d_state = d_state?;
+
+            if is_cancelled(cancel) {
+                return None;
             }
-            for (i, mut node) in right_state.nodes.into_iter().enumerate() {
-                if i & 0x3ff == 0 && is_cancelled(cancel) {
-                    return None;
-                }
-                if node.min[3] < 0.0 {
-                    node.max[3] += right_root as f32;
-                } else {
-                    node.max[3] += left_order as f32;
-                }
-                nodes.push(node);
-            }
+
+            let max_depth = a_state.depth.max(b_state.depth).max(c_state.depth).max(d_state.depth);
+            let widest_leaf = a_state.widest.max(b_state.widest).max(c_state.widest).max(d_state.widest);
+            let left_group_root = 1u32;
+            let a_root = left_group_root + 1;
+            let b_root = a_root + a_state.nodes.len() as u32;
+            let right_group_root = b_root + b_state.nodes.len() as u32;
+            let c_root = right_group_root + 1;
+            let d_root = c_root + c_state.nodes.len() as u32;
+
+            let mut left_bounds = a_bounds;
+            left_bounds.union(&b_bounds);
+            let mut right_bounds = c_bounds;
+            right_bounds.union(&d_bounds);
+
+            let mut nodes = Vec::with_capacity(
+                1 + 1 + a_state.nodes.len() + b_state.nodes.len()
+                    + 1 + c_state.nodes.len() + d_state.nodes.len(),
+            );
+            nodes.push(BvhNode {
+                min: [root_bounds.min.x, root_bounds.min.y, root_bounds.min.z, -1.0],
+                max: [root_bounds.max.x, root_bounds.max.y, root_bounds.max.z, right_group_root as f32],
+            });
+            nodes.push(BvhNode {
+                min: [left_bounds.min.x, left_bounds.min.y, left_bounds.min.z, -1.0],
+                max: [left_bounds.max.x, left_bounds.max.y, left_bounds.max.z, b_root as f32],
+            });
+
             let mut order = Vec::with_capacity(n);
-            order.extend_from_slice(&left_state.order);
-            order.extend_from_slice(&right_state.order);
+            append_parallel_subtree(&mut nodes, &mut order, a_state, a_root, 0, cancel)?;
+            let b_order_offset = order.len() as u32;
+            append_parallel_subtree(&mut nodes, &mut order, b_state, b_root, b_order_offset, cancel)?;
+
+            nodes.push(BvhNode {
+                min: [right_bounds.min.x, right_bounds.min.y, right_bounds.min.z, -1.0],
+                max: [right_bounds.max.x, right_bounds.max.y, right_bounds.max.z, d_root as f32],
+            });
+            let c_order_offset = order.len() as u32;
+            append_parallel_subtree(&mut nodes, &mut order, c_state, c_root, c_order_offset, cancel)?;
+            let d_order_offset = order.len() as u32;
+            append_parallel_subtree(&mut nodes, &mut order, d_state, d_root, d_order_offset, cancel)?;
+
             geometry.nodes = nodes;
             geometry.order = order;
-            geometry.depth = left_state.depth.max(right_state.depth);
-            geometry.widest_leaf = left_state.widest.max(right_state.widest);
+            geometry.depth = max_depth;
+            geometry.widest_leaf = widest_leaf;
             return Some(geometry);
         }
         let mut state = BuildState {
@@ -841,6 +863,54 @@ impl<'a> BuildState<'a> {
         };
         Some(node_index)
     }
+}
+
+
+/// Compute the exact bounds of an indexed triangle partition while preserving
+/// cancellation responsiveness during large parallel BVH builds.
+fn bounds_for_partition(
+    tri_bounds: &[(Vec3, Vec3)],
+    partition: &[u32],
+    cancel: Option<&AtomicBool>,
+) -> Option<Bounds> {
+    let mut bounds = Bounds::EMPTY;
+    for (i, &triangle) in partition.iter().enumerate() {
+        if i & 0x3ff == 0 && is_cancelled(cancel) {
+            return None;
+        }
+        let (min, max) = tri_bounds[triangle as usize];
+        bounds.extend(min);
+        bounds.extend(max);
+    }
+    Some(bounds)
+}
+
+/// Append an independently-built subtree and rebase its node and leaf-order
+/// indices into the shared flat arrays. The leaf/interior encoding is unchanged.
+fn append_parallel_subtree(
+    nodes: &mut Vec<BvhNode>,
+    order: &mut Vec<u32>,
+    state: BuildState<'_>,
+    node_base: u32,
+    order_base: u32,
+    cancel: Option<&AtomicBool>,
+) -> Option<()> {
+    for (i, mut node) in state.nodes.into_iter().enumerate() {
+        if i & 0x3ff == 0 && is_cancelled(cancel) {
+            return None;
+        }
+        if node.min[3] >= 0.0 {
+            node.max[3] += order_base as f32;
+        } else {
+            node.max[3] += node_base as f32;
+        }
+        nodes.push(node);
+    }
+    if is_cancelled(cancel) {
+        return None;
+    }
+    order.extend(state.order);
+    Some(())
 }
 
 fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
