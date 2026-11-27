@@ -572,11 +572,14 @@ impl Reader {
             self.next_page += 1;
             raw_pages.push(Ok(slab));
         }
+        // Cache batches are at most a handful of pages. Cap parallelism
+        // at four and require at least two pages per worker so a machine with
+        // many cores does not recreate the old one-thread-per-page behaviour.
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .min(32)
-            .min(raw_pages.len().max(1));
+            .min(4)
+            .min(raw_pages.len().div_ceil(2).max(1));
         if workers > 1 && raw_pages.len() >= 2 {
             // A cache batch is intentionally small (normally 2–8 pages). Spawn
             // one worker per contiguous chunk, not one OS thread per page: the
