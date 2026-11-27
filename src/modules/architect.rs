@@ -601,12 +601,13 @@ impl Architect {
         };
         match fs::remove_file(&path) {
             Ok(()) => {
+                let erased_source_map = self.project.source_map.clone();
                 self.project = Project::default();
                 self.redo_strokes.clear();
                 if let Some(map) = &self.map {
-                    let belongs_here = self.project.source_map.is_empty()
+                    let belongs_here = erased_source_map.is_empty()
                         || self.current_map_id.is_empty()
-                        || self.project.source_map.eq_ignore_ascii_case(&self.current_map_id);
+                        || erased_source_map.eq_ignore_ascii_case(&self.current_map_id);
                     if belongs_here {
                         if let Err(error) = map.heights.clear_edits() {
                             self.status = format!("Project erased, but terrain reset failed: {error}");
