@@ -269,7 +269,8 @@ fn sample_rgba_uv(img: &image::RgbaImage, uv: [f32; 2]) -> ([f32; 3], f32) {
     let fx = x - x0 as f32;
     let fy = y - y0 as f32;
     let sample = |px: i64, py: i64| {
-        img.get_pixel(px.rem_euclid(w) as u32, py.rem_euclid(h) as u32).0
+        img.get_pixel(px.rem_euclid(w) as u32, py.rem_euclid(h) as u32)
+            .0
     };
     let p00 = sample(x0, y0);
     let p10 = sample(x0 + 1, y0);
@@ -282,7 +283,11 @@ fn sample_rgba_uv(img: &image::RgbaImage, uv: [f32; 2]) -> ([f32; 3], f32) {
     };
     let to_lin = |c: f32| c.powf(2.2);
     (
-        [to_lin(bilinear(0)), to_lin(bilinear(1)), to_lin(bilinear(2))],
+        [
+            to_lin(bilinear(0)),
+            to_lin(bilinear(1)),
+            to_lin(bilinear(2)),
+        ],
         bilinear(3),
     )
 }
@@ -554,11 +559,9 @@ fn rt_foliage_mip_images(
         mip_width /= 2;
         mip_height /= 2;
         let corrected = crate::foliage_mips::preserve_coverage(&raw, source_coverage);
-        if let Some(image) = image::RgbaImage::from_raw(
-            mip_width as u32,
-            mip_height as u32,
-            corrected,
-        ) {
+        if let Some(image) =
+            image::RgbaImage::from_raw(mip_width as u32, mip_height as u32, corrected)
+        {
             images.push(image);
         } else {
             break;
