@@ -2448,7 +2448,12 @@ impl Architect {
             self.marquee_current = pointer;
         }
         if self.marquee_start.is_some() && released {
-            if let (Some(start), Some(current)) = (self.marquee_start, pointer.or(self.marquee_current)) {
+            let release_position = if over_ui {
+                self.marquee_current
+            } else {
+                pointer.or(self.marquee_current)
+            };
+            if let (Some(start), Some(current)) = (self.marquee_start, release_position) {
                 let rect = Self::marquee_rect(start, current);
                 if rect.width() >= 4.0 || rect.height() >= 4.0 {
                     for (index, object) in self.project.objects.iter().enumerate() {
