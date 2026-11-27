@@ -6860,7 +6860,7 @@ mod shader_optimization_regression_tests {
         let dxr = include_str!("dxr_trace.hlsl");
         assert!(RAY_SHADER.contains("maximum <= base || is_water"));
         assert!(RAY_SHADER.contains("let h = refl_base_n;"));
-        assert!(RAY_SHADER.contains("if (!is_water)"));
+        assert!(RAY_SHADER.contains("if (bits_reflections && is_water && roughness <= params.effects.x"));
         assert!(RAY_SHADER.contains("is_water && dot(base_normal, view_dir) > 0.0"));
         assert!(RAY_SHADER.contains("select(0.04, 0.0204, is_water)"));
         assert!(!RAY_SHADER.contains("complexity = max(complexity, 0.42)"));
