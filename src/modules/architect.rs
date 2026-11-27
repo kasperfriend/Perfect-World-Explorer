@@ -447,7 +447,7 @@ impl Architect {
                     BrushMode::Flatten => old + (stroke.strength - old) * falloff,
                     BrushMode::Smooth => {
                         let mut total = 0.;
-                        let mut count = 0.;
+                        let mut count: f32 = 0.;
                         for ny in y.saturating_sub(1)..=(y + 1).min(map.height - 1) {
                             for nx in x.saturating_sub(1)..=(x + 1).min(map.width - 1) {
                                 total += source.height(ny * map.width + nx);
