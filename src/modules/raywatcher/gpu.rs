@@ -115,8 +115,9 @@ pub fn compute_scene_albedo_gain(
 }
 
 /// Build a conservative world-space BVH over active point-light influence
-/// spheres. Each node bounds the full radius cube of every descendant light,
-/// so point queries can prune whole subtrees without dropping any contribution.
+/// spheres and reflected-glow tubes. Each node bounds the largest required
+/// direct or reflected influence cube of every descendant light, so point and
+/// ray queries can prune subtrees without dropping any contribution.
 fn build_point_light_bvh(
     positions: &[[f32; 4]; MAX_RAY_LIGHTS],
     count: usize,
