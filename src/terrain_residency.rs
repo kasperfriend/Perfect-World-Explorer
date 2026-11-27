@@ -111,7 +111,7 @@ impl Residency {
         &mut self,
         window: &crate::terrain_lod::Window,
         level_of: L,
-        mut build: B,
+        build: B,
     ) -> Result<Census, String>
     where
         L: Fn(usize, usize) -> u8,
@@ -248,7 +248,7 @@ impl Residency {
                     [u8; 4],
                     bool,
                     Vec<Vertex>,
-                    Vec<u32>,
+                    I,
                     [f32; 6],
                 )> = std::thread::scope(|s| -> Result<_, String> {
                     let build_ref = &build;
@@ -295,7 +295,7 @@ impl Residency {
                             level,
                             cases,
                             vertices,
-                            indices,
+                            indices: indices.into(),
                             bounds,
                         },
                     );
@@ -315,7 +315,7 @@ impl Residency {
                             level,
                             cases,
                             vertices,
-                            indices,
+                            indices: indices.into(),
                             bounds,
                         },
                     );
