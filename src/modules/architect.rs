@@ -753,6 +753,8 @@ impl Architect {
         self.object_drag_start_hit = None;
         self.object_drag_group.clear();
         self.object_drag_snapshot = None;
+        self.marquee_start = None;
+        self.marquee_current = None;
     }
 
     fn push_object_undo(&mut self, snapshot: Vec<PlacedObject>) {
@@ -2438,7 +2440,11 @@ impl Architect {
                 }
             }
         }
-        if self.marquee_start.is_some() && down && self.cursor == CursorMode::MultiSelect {
+        if self.marquee_start.is_some()
+            && down
+            && self.cursor == CursorMode::MultiSelect
+            && !over_ui
+        {
             self.marquee_current = pointer;
         }
         if self.marquee_start.is_some() && released {
