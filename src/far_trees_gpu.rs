@@ -2170,9 +2170,12 @@ mod raywatcher_tree_tests {
     use super::*;
 
     #[test]
-    fn rt_leaf_alpha_cutoff_matches_the_raster_shader_reference() {
+    fn rt_leaf_and_frond_cutoffs_match_the_raster_shader_references() {
         assert!((leaf_alpha_cutoff(false) - 0.5).abs() < f32::EPSILON);
         assert!((leaf_alpha_cutoff(true) - 84.0 / 255.0).abs() < f32::EPSILON);
+        assert!((raster_alpha_cutoff(false, Some(120.0)) - 0.5).abs() < f32::EPSILON);
+        assert!((raster_alpha_cutoff(true, Some(120.0)) - 120.0 / 255.0).abs() < f32::EPSILON);
+        assert!((raster_alpha_cutoff(true, None) - 0.5).abs() < f32::EPSILON);
     }
 
     #[test]
