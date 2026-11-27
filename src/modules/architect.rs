@@ -2837,7 +2837,9 @@ impl Architect {
                                 }
                             }
                             TransformMode::Rotate => {
-                                let radius = center.distance(project_point(origin + Vec3::X * 24.).unwrap_or(center));
+                                let radius = center.distance(
+                                    project_point(origin + Vec3::X * 24.).unwrap_or(center),
+                                );
                                 let distance = center.distance(pointer);
                                 if (distance - radius).abs() <= 9. {
                                     axis_pick = Some(1);
@@ -2876,7 +2878,11 @@ impl Architect {
                         }
                     }
                 }
-                let source_pick = if matches!(self.cursor, CursorMode::Select | CursorMode::MultiSelect) && axis_pick.is_none() {
+                let source_pick = if matches!(
+                    self.cursor,
+                    CursorMode::Select | CursorMode::MultiSelect
+                ) && axis_pick.is_none()
+                {
                     pointer.and_then(|pointer| {
                         Self::pick_source_scene(pointer, screen, view_projection, scene, ornaments)
                     })
@@ -2917,7 +2923,11 @@ impl Architect {
                     } else if let Some(index) = picked_placement {
                         self.selected_placements.insert(index);
                         self.selected_placement = Some(index);
-                        self.selected_asset = self.project.objects.get(index).map(|object| object.asset.clone());
+                        self.selected_asset = self
+                            .project
+                            .objects
+                            .get(index)
+                            .map(|object| object.asset.clone());
                         self.selected_scene_object = None;
                         self.selected_scene_transform = None;
                     } else {
@@ -2938,7 +2948,11 @@ impl Architect {
                         .is_some_and(|index| self.selected_placements.contains(&index));
                     self.selected_placement = picked_placement;
                     if let Some(index) = picked_placement {
-                        self.selected_asset = self.project.objects.get(index).map(|object| object.asset.clone());
+                        self.selected_asset = self
+                        .project
+                        .objects
+                        .get(index)
+                        .map(|object| object.asset.clone());
                     }
                     if !clicked_inside_group {
                         self.selected_placements.clear();
@@ -3126,11 +3140,27 @@ impl Architect {
             match self.transform_mode {
                 TransformMode::Move => {
                     if !self.object_drag_group.is_empty() {
-                        let delta = match self.object_drag_axis {
-                            Some(0) => self.object_drag_start_hit.zip(hit).map(|(start, current)| Vec3::X * (current[0] - start[0])),
-                            Some(1) => self.object_drag_start_pointer.zip(pointer).map(|(start, current)| Vec3::Y * (-(current.y - start.y) * 0.1)),
-                            Some(2) => self.object_drag_start_hit.zip(hit).map(|(start, current)| Vec3::Z * (current[2] - start[2])),
-                            _ => self.object_drag_start_hit.zip(hit).map(|(start, current)| Vec3::from_array(current) - Vec3::from_array(start)),
+                                    let delta = match self.object_drag_axis {
+                            Some(0) => self
+                                .object_drag_start_hit
+                                .zip(hit)
+                                .map(|(start, current)| Vec3::X * (current[0] - start[0])),
+                            Some(1) => self
+                                .object_drag_start_pointer
+                                .zip(pointer)
+                                .map(|(start, current)| {
+                                    Vec3::Y * (-(current.y - start.y) * 0.1)
+                                }),
+                            Some(2) => self
+                                .object_drag_start_hit
+                                .zip(hit)
+                                .map(|(start, current)| Vec3::Z * (current[2] - start[2])),
+                            _ => self
+                                .object_drag_start_hit
+                                .zip(hit)
+                                .map(|(start, current)| {
+                                    Vec3::from_array(current) - Vec3::from_array(start)
+                                }),
                         };
                         if let Some(delta) = delta {
                             for (index, position) in &self.object_drag_group {
@@ -3142,10 +3172,33 @@ impl Architect {
                     } else if let Some(index) = self.selected_placement {
                         if let Some(object) = self.project.objects.get_mut(index) {
                             match self.object_drag_axis {
-                                Some(0) => if let Some(hit) = hit { object.position[0] = hit.x + self.object_drag_xz_offset[0]; },
-                                Some(1) => if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer) { object.position[1] = self.object_drag_start_position[1] - (current.y - start.y) * 0.1; },
-                                Some(2) => if let Some(hit) = hit { object.position[2] = hit.z + self.object_drag_xz_offset[1]; },
-                                _ => if let Some(hit) = hit { object.position = [hit.x + self.object_drag_xz_offset[0], hit.y + self.object_drag_y_offset, hit.z + self.object_drag_xz_offset[1]]; },
+                                Some(0) => {
+                                    if let Some(hit) = hit {
+                                        object.position[0] = hit.x + self.object_drag_xz_offset[0];
+                                    }
+                                }
+                                Some(1) => {
+                                    if let (Some(start), Some(current)) =
+                                        (self.object_drag_start_pointer, pointer)
+                                    {
+                                        object.position[1] = self.object_drag_start_position[1]
+                                            - (current.y - start.y) * 0.1;
+                                    }
+                                }
+                                Some(2) => {
+                                    if let Some(hit) = hit {
+                                        object.position[2] = hit.z + self.object_drag_xz_offset[1];
+                                    }
+                                }
+                                _ => {
+                                    if let Some(hit) = hit {
+                                        object.position = [
+                                            hit.x + self.object_drag_xz_offset[0],
+                                            hit.y + self.object_drag_y_offset,
+                                            hit.z + self.object_drag_xz_offset[1],
+                                        ];
+                                    }
+                                }
                             }
                         }
                     }
@@ -3156,10 +3209,18 @@ impl Architect {
                         let angle = (current.x - start.x - (current.y - start.y) * 0.35) * 0.01;
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
-                                let original = self.object_drag_snapshot.as_ref().and_then(|items| items.get(index)).cloned();
+                                let original = self
+                                    .object_drag_snapshot
+                                    .as_ref()
+                                    .and_then(|items| items.get(index))
+                                    .cloned();
                                 if let Some(original) = original {
                                     let relative = Vec3::from_array(original.position) - pivot;
-                                    let rotation = match axis { 0 => glam::Quat::from_rotation_x(angle), 1 => glam::Quat::from_rotation_y(angle), _ => glam::Quat::from_rotation_z(angle) };
+                                    let rotation = match axis {
+                                        0 => glam::Quat::from_rotation_x(angle),
+                                        1 => glam::Quat::from_rotation_y(angle),
+                                        _ => glam::Quat::from_rotation_z(angle),
+                                    };
                                     object.position = (pivot + rotation * relative).to_array();
                                     object.rotation = original.rotation;
                                     object.rotation[axis] += angle;
@@ -3173,7 +3234,11 @@ impl Architect {
                         let factor = (-(current.y - start.y) * 0.01).exp().clamp(0.05, 20.0);
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
-                                if let Some(original) = self.object_drag_snapshot.as_ref().and_then(|items| items.get(index)) {
+                                if let Some(original) = self
+                                    .object_drag_snapshot
+                                    .as_ref()
+                                    .and_then(|items| items.get(index))
+                                {
                                     object.scale = (original.scale * factor).clamp(0.01, 100.0);
                                     let relative = Vec3::from_array(original.position) - pivot;
                                     object.position = (pivot + relative * factor).to_array();
