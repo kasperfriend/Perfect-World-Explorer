@@ -11,8 +11,8 @@ Open the main menu and choose ARCHITECT | WORLD EDITOR. The original HUD and vie
 - World (left by default): choose an empty project, any readable client map, or a saved Architect project. Client map changes use the viewer's existing world-handoff path and reopen Architect in the destination map.
 - Client assets (right by default): browse the client folder tree lazily, expand PCK archive indexes on demand, and right-click folders/files/archive entries to pin them to the quick bar.
 - Scene objects: inspect loaded models, trees, scenery and effects; multi-select and duplicate eligible ECM models into the editable project layer.
-- Transform: edit custom placements' position, Euler rotation (degree-based controls) and scale. Supported ECM placements update in the live viewport through the same native model, material, animation and GPU queue used by map models.
-- Terrain tools: apply raise/lower/flatten/smooth brushes at the camera position with a configurable radius and strength. Height and normal overrides are shared with navigation and the renderer; the near terrain blocks and distant LOD rebuild when the edit revision changes. Brush strokes are stored in the project and support undo/redo. Paint is shown as an unavailable mode until terrain material painting is implemented.
+- Transform: click staged custom ECM placements in the viewport to select them; the selected placement receives a three-axis transform guide and can be dragged across the terrain plane. Position, Euler rotation (degree-based controls) and scale remain editable numerically. Object edits have bounded undo/redo history. Supported ECM placements update in the live viewport through the same native model, material, animation and GPU queue used by map models.
+- Terrain tools: choose Sculpt in the viewport toolbar, then click-drag directly over terrain. A projected, terrain-conforming brush ring shows the active radius; raise/lower/flatten/smooth dabs follow the cursor and are saved as ordered brush operations. The camera-position brush remains available as a fallback. Height and normal overrides are shared with navigation and the renderer; the near terrain blocks and distant LOD rebuild when the edit revision changes. Brush strokes are stored in the project and support undo/redo. Paint is shown as an unavailable mode until terrain material painting is implemented.
 - Quick bar (bottom): select pinned assets quickly.
 
 Panels are movable and can be repositioned to the left, right, bottom or floating placement. Directory and PCK indexes are cached until Refresh files is used.
@@ -24,7 +24,7 @@ Projects are saved as portable UTF-8 .pwa files under the user's application dat
 - Windows: %LOCALAPPDATA%/PerfectWorldExplorer/Architect/Worlds
 - Linux: $XDG_DATA_HOME/PerfectWorldExplorer/Architect/Worlds, or ~/.local/share/PerfectWorldExplorer/Architect/Worlds
 
-The project format stores a source map ID, asset references, object transforms and ordered terrain-brush operations. It is versioned and validates numeric values and file size on load. Loading a project replays its strokes over the immutable source terrain; undo/redo rebuilds that overlay from the stroke history.
+The project format stores a source map ID, asset references, object transforms and ordered terrain-brush operations. Saves validate object/brush values and stage a temporary file while preserving the previous project as a rollback backup during replacement. Placements are not rendered when the active map does not match the project's source map. It is versioned and validates numeric values and file size on load. Loading a project replays its strokes over the immutable source terrain; undo/redo rebuilds that overlay from the stroke history.
 
 ## Current implementation boundary
 
