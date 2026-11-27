@@ -1042,7 +1042,7 @@ impl Architect {
         if !self.enabled {
             return None;
         }
-        if self.selected_map.is_empty() {
+        if self.selected_map.is_empty() || self.selected_map == "__empty__" {
             self.selected_map = current_map.id.clone();
         }
         self.toolbar(ctx);
