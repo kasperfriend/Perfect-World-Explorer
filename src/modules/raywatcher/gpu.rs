@@ -5233,7 +5233,6 @@ impl RaywatcherGpu {
         walker_pos: Option<(glam::Vec3, bool)>,
         walker_rt_verts: &[[f32; 3]],
     ) {
-        let output_was_ready = self.traced_last_frame;
         self.traced_last_frame = false;
         if !plan.trace {
             return;
