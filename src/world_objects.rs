@@ -1617,8 +1617,11 @@ fn run(
     Ok(())
 }
 pub struct GpuPage {
-    vertex: wgpu::Buffer,
-    index: wgpu::Buffer,
+    /// Vertex and index data share one allocation; indices remain page-local.
+    geometry: wgpu::Buffer,
+    vertex_bytes: u64,
+    index_offset: u64,
+    index_bytes: u64,
     count: u32,
     normal: Arc<wgpu::BindGroup>,
     reflected: Arc<wgpu::BindGroup>,
@@ -1865,19 +1868,24 @@ impl GpuPage {
             (Arc::new(make(normal)), Arc::new(make(reflected)))
         };
         use wgpu::util::DeviceExt;
-        let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("whole-world object vertices"),
-            contents: bytemuck::cast_slice(&page.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("whole-world object indices"),
-            contents: bytemuck::cast_slice(&page.indices),
-            usage: wgpu::BufferUsages::INDEX,
+        let vertex_data = bytemuck::cast_slice(&page.vertices);
+        let index_data = bytemuck::cast_slice(&page.indices);
+        let vertex_bytes = vertex_data.len() as u64;
+        let index_offset = (vertex_bytes + 3) & !3;
+        let mut geometry_data = Vec::with_capacity(index_offset as usize + index_data.len());
+        geometry_data.extend_from_slice(vertex_data);
+        geometry_data.resize(index_offset as usize, 0);
+        geometry_data.extend_from_slice(index_data);
+        let geometry = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("whole-world object geometry (vertices + indices)"),
+            contents: &geometry_data,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
         });
         Self {
-            vertex,
-            index,
+            geometry,
+            vertex_bytes,
+            index_offset,
+            index_bytes: index_data.len() as u64,
             count: page.indices.len() as u32,
             normal: normal_bg,
             reflected: reflected_bg,
@@ -1978,35 +1986,34 @@ impl GpuPage {
             (Arc::new(make(normal)), Arc::new(make(reflected)))
         };
 
-        let vertex_bytes = bytemuck::cast_slice(&page.vertices);
-        let index_bytes = bytemuck::cast_slice(&page.indices);
-        let vertex = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("whole-world object vertices"),
-            size: vertex_bytes.len().max(4) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        let vertex_data = bytemuck::cast_slice(&page.vertices);
+        let index_data = bytemuck::cast_slice(&page.indices);
+        let vertex_bytes = vertex_data.len() as u64;
+        let index_offset = (vertex_bytes + 3) & !3;
+        let index_bytes = index_data.len() as u64;
+        let geometry = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("whole-world object geometry (vertices + indices)"),
+            size: (index_offset + index_bytes).max(4),
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::INDEX
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let index = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("whole-world object indices"),
-            size: index_bytes.len().max(4) as u64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        if !vertex_bytes.is_empty() {
-            let size = std::num::NonZeroU64::new(vertex_bytes.len() as u64)
-                .expect("non-empty vertex upload");
-            belt.write_buffer(encoder, &vertex, 0, size, device)
-                .copy_from_slice(vertex_bytes);
+        if !vertex_data.is_empty() {
+            let size = std::num::NonZeroU64::new(vertex_bytes).expect("non-empty vertex upload");
+            belt.write_buffer(encoder, &geometry, 0, size, device)
+                .copy_from_slice(vertex_data);
         }
-        if !index_bytes.is_empty() {
-            let size = std::num::NonZeroU64::new(index_bytes.len() as u64)
-                .expect("non-empty index upload");
-            belt.write_buffer(encoder, &index, 0, size, device)
-                .copy_from_slice(index_bytes);
+        if !index_data.is_empty() {
+            let size = std::num::NonZeroU64::new(index_bytes).expect("non-empty index upload");
+            belt.write_buffer(encoder, &geometry, index_offset, size, device)
+                .copy_from_slice(index_data);
         }
         Self {
-            vertex,
-            index,
+            geometry,
+            vertex_bytes,
+            index_offset,
+            index_bytes,
             count: page.indices.len() as u32,
             normal: normal_bg,
             reflected: reflected_bg,
@@ -2025,19 +2032,24 @@ impl GpuPage {
         reflected: Arc<wgpu::BindGroup>,
     ) -> Self {
         use wgpu::util::DeviceExt;
-        let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("whole-world object vertices"),
-            contents: bytemuck::cast_slice(&page.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("whole-world object indices"),
-            contents: bytemuck::cast_slice(&page.indices),
-            usage: wgpu::BufferUsages::INDEX,
+        let vertex_data = bytemuck::cast_slice(&page.vertices);
+        let index_data = bytemuck::cast_slice(&page.indices);
+        let vertex_bytes = vertex_data.len() as u64;
+        let index_offset = (vertex_bytes + 3) & !3;
+        let mut geometry_data = Vec::with_capacity(index_offset as usize + index_data.len());
+        geometry_data.extend_from_slice(vertex_data);
+        geometry_data.resize(index_offset as usize, 0);
+        geometry_data.extend_from_slice(index_data);
+        let geometry = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("whole-world object geometry (vertices + indices)"),
+            contents: &geometry_data,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
         });
         Self {
-            vertex,
-            index,
+            geometry,
+            vertex_bytes,
+            index_offset,
+            index_bytes: index_data.len() as u64,
             count: page.indices.len() as u32,
             normal,
             reflected,
@@ -2066,8 +2078,8 @@ impl GpuPage {
             },
             &[],
         );
-        pass.set_vertex_buffer(0, self.vertex.slice(..));
-        pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
+        pass.set_vertex_buffer(0, self.geometry.slice(0..self.vertex_bytes));
+        pass.set_index_buffer(self.geometry.slice(self.index_offset..self.index_offset + self.index_bytes), wgpu::IndexFormat::Uint32);
         if self.placements.is_empty() {
             eprintln!("scenery page has no placement visibility ranges; drawing all indices");
             pass.draw_indexed(0..self.count, 0, 0..1);
@@ -2139,8 +2151,8 @@ impl GpuPage {
             let p = &pages[cmd.page];
             if bound != Some(cmd.page) {
                 pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
-                pass.set_vertex_buffer(0, p.vertex.slice(..));
-                pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
+                pass.set_vertex_buffer(0, p.geometry.slice(0..p.vertex_bytes));
+                pass.set_index_buffer(p.geometry.slice(p.index_offset..p.index_offset + p.index_bytes), wgpu::IndexFormat::Uint32);
                 bound = Some(cmd.page);
             }
             pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
@@ -2283,8 +2295,8 @@ impl GpuPage {
                             &[],
                         );
                     }
-                    pass.set_vertex_buffer(0, page.vertex.slice(..));
-                    pass.set_index_buffer(page.index.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_vertex_buffer(0, page.geometry.slice(0..page.vertex_bytes));
+                    pass.set_index_buffer(page.geometry.slice(page.index_offset..page.index_offset + page.index_bytes), wgpu::IndexFormat::Uint32);
                     bound_page = Some(run.page);
                 }
                 let offset = u64::from(run.first_record) * PAGE_DRAW_ARGS_SIZE;
@@ -2501,8 +2513,8 @@ impl GpuPage {
                             &[],
                         );
                     }
-                    pass.set_vertex_buffer(0, page.vertex.slice(..));
-                    pass.set_index_buffer(page.index.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_vertex_buffer(0, page.geometry.slice(0..page.vertex_bytes));
+                    pass.set_index_buffer(page.geometry.slice(page.index_offset..page.index_offset + page.index_bytes), wgpu::IndexFormat::Uint32);
                     bound_page = Some(run.page);
                 }
                 if run.record_count > 1 {
@@ -2533,8 +2545,8 @@ impl GpuPage {
                             &[],
                         );
                     }
-                    pass.set_vertex_buffer(0, page.vertex.slice(..));
-                    pass.set_index_buffer(page.index.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_vertex_buffer(0, page.geometry.slice(0..page.vertex_bytes));
+                    pass.set_index_buffer(page.geometry.slice(page.index_offset..page.index_offset + page.index_bytes), wgpu::IndexFormat::Uint32);
                     bound_page = Some(cmd.page);
                 }
                 pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
@@ -2577,8 +2589,8 @@ impl GpuPage {
             },
             &[],
         );
-        pass.set_vertex_buffer(0, self.vertex.slice(..));
-        pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
+        pass.set_vertex_buffer(0, self.geometry.slice(0..self.vertex_bytes));
+        pass.set_index_buffer(self.geometry.slice(self.index_offset..self.index_offset + self.index_bytes), wgpu::IndexFormat::Uint32);
         if self.placements.is_empty() {
             pass.draw_indexed(0..self.count, 0, 0..1);
             return;
