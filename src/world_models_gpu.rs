@@ -89,6 +89,9 @@ struct Slot {
     /// Last evaluated pose, reused by every pass of the same frame.
     posed: Option<Result<SlotPose, String>>,
     geometry_dirty: bool,
+    /// Playback may advance while an off-frustum model defers skinning. The
+    /// next visible frame must rebuild its pose even if its sampled time repeats.
+    pose_stale: bool,
     vertex_fog: Option<f32>,
     visible: bool,
 }
@@ -217,6 +220,7 @@ impl World {
                 transform: crate::world_models::transform(&i.placement),
                 posed: None,
                 geometry_dirty: true,
+                pose_stale: false,
                 vertex_fog: None,
                 visible: true,
             })
@@ -1056,6 +1060,12 @@ impl World {
     /// (main, reflection, refraction) reuses it.
     fn advance_poses(&mut self, delta_ms: u32) {
         let bounds = self.resident_bounds;
+        let frustum = self.frustum;
+        // Hook-attached effects need their parent bone matrices even when the
+        // parent is outside the camera view. In worlds without such attachments,
+        // defer expensive skinning/mesh generation for off-frustum models while
+        // still advancing their playback clocks.
+        let defer_offscreen_poses = !self.producers.iter().any(|producer| producer.hook.is_some());
         let len = self.slots.len();
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -1095,9 +1105,19 @@ impl World {
                                     continue;
                                 }
                             };
-                            if let Some(Ok(previous)) = &slot.posed {
-                                if previous.sample == sample {
-                                    continue;
+                            if defer_offscreen_poses
+                                && frustum.is_some_and(|planes| {
+                                    !sphere_in_frustum(&planes, instance.placement.position, 128.0)
+                                })
+                            {
+                                slot.pose_stale = true;
+                                continue;
+                            }
+                            if !slot.pose_stale {
+                                if let Some(Ok(previous)) = &slot.posed {
+                                    if previous.sample == sample {
+                                        continue;
+                                    }
                                 }
                             }
                             let result = (|| -> Result<SlotPose, String> {
@@ -1116,6 +1136,7 @@ impl World {
                                 })
                             })();
                             slot.geometry_dirty = true;
+                            slot.pose_stale = false;
                             slot.posed = Some(result);
                         }
                     });
@@ -1147,7 +1168,17 @@ impl World {
                     continue;
                 }
             };
-            if matches!(&slot.posed, Some(Ok(previous)) if previous.sample == sample) {
+            if defer_offscreen_poses
+                && frustum.is_some_and(|planes| {
+                    !sphere_in_frustum(&planes, instance.placement.position, 128.0)
+                })
+            {
+                slot.pose_stale = true;
+                continue;
+            }
+            if !slot.pose_stale
+                && matches!(&slot.posed, Some(Ok(previous)) if previous.sample == sample)
+            {
                 continue;
             }
             let result = (|| -> Result<SlotPose, String> {
@@ -1164,6 +1195,7 @@ impl World {
                 })
             })();
             slot.geometry_dirty = true;
+            slot.pose_stale = false;
             slot.posed = Some(result);
         }
     }
