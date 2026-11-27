@@ -3831,6 +3831,37 @@ impl RaywatcherGpu {
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
+        // The normal RT composite target uses COLOUR_FORMAT too. Compile its
+        // PSO alongside the other first-use pipelines on the initialization
+        // worker, rather than stalling the render thread on the first frame.
+        let composite_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("raywatcher composite"),
+                bind_group_layouts: &[&pipelines.composite_layout],
+                push_constant_ranges: &[],
+            });
+        let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("raywatcher composite"),
+            layout: Some(&composite_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &pipelines.composite_module,
+                entry_point: "vs",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &pipelines.composite_module,
+                entry_point: "fs",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: COLOUR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
         let gbuf_prep_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("raywatcher gbuf prep params"),
             size: std::mem::size_of::<GbufPrepParams>() as u64,
@@ -4041,7 +4072,7 @@ impl RaywatcherGpu {
             dlss_rr_error: None,
             blit_pipeline: vec![(COLOUR_FORMAT, blit_pipeline)],
             blit_bind_group,
-            composite_pipeline: Vec::new(),
+            composite_pipeline: vec![(COLOUR_FORMAT, composite_pipeline)],
             raster_copy: None,
             screen_raster_tex,
             screen_raster_view,
