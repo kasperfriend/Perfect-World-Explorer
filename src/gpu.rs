@@ -3104,14 +3104,16 @@ impl Renderer {
                 1.
             });
         let mut active_fog = camera.active_fog();
+        // PR #44's client fallback for outdoor air fog is 60..400 with the
+        // neutral blue-grey colour. The viewer's later residency cap could
+        // squeeze that interval against the resident-window boundary, making
+        // fog appear only at the edge instead of around the camera. Keep the
+        // fallback range in view space; do not couple atmospheric fog to the
+        // terrain streaming/cutoff window.
         if active_fog.enabled && camera.underwater_depth <= 0. {
-            if let Some(cap) = self.resident_bounds().and_then(|b| {
-                crate::terrain_cutoff::fog_cap(b, camera.pos.to_array(), w as f32 / h.max(1) as f32)
-            }) {
-                let range = crate::terrain_cutoff::fit_fog(active_fog.start, active_fog.end, cap);
-                active_fog.start = range[0];
-                active_fog.end = range[1];
-            }
+            active_fog.start = 60.;
+            active_fog.end = 400.;
+            active_fog.color = [70. / 255., 77. / 255., 91. / 255.];
         }
         let (mut fog_range, fog_color) = (active_fog.range(), active_fog.color4());
         // Uniform fog_range.w is the terrain day/night factor; the shader reads
