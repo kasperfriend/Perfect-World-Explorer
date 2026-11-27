@@ -139,8 +139,8 @@ impl Residency {
         self.blocks.retain(|&(x, y), block| {
             let keep = window.contains(x, y);
             if !keep {
-                evicted_triangles = evicted_triangles
-                    .saturating_add((block.indices.len() / 3) as u32);
+                evicted_triangles =
+                    evicted_triangles.saturating_add((block.indices.len() / 3) as u32);
             }
             keep
         });
@@ -206,8 +206,8 @@ impl Residency {
         self.blocks.retain(|&(x, y), block| {
             let keep = window.contains(x, y);
             if !keep {
-                evicted_triangles = evicted_triangles
-                    .saturating_add((block.indices.len() / 3) as u32);
+                evicted_triangles =
+                    evicted_triangles.saturating_add((block.indices.len() / 3) as u32);
             }
             keep
         });
@@ -540,11 +540,7 @@ mod tests {
         let mut residency = Residency::default();
         let first = window(0, 0, 3, 2);
         let census = residency
-            .update_stitched_parallel(
-                &first,
-                |_, _| (3, [0; 4]),
-                |x, _, _, _| Ok(block(x as f32)),
-            )
+            .update_stitched_parallel(&first, |_, _| (3, [0; 4]), |x, _, _, _| Ok(block(x as f32)))
             .unwrap();
         assert_eq!(census.loaded, 6);
         assert_eq!(census.triangles, 6);
