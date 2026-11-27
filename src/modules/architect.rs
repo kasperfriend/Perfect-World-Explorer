@@ -44,7 +44,7 @@ enum BrushMode {
     Paint,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct PlacedObject {
     asset: String,
     position: [f32; 3],
@@ -1868,7 +1868,7 @@ impl Architect {
         } else {
             None
         };
-        self.brush_cursor_position = hit.map(Vec3::to_array);
+        self.brush_cursor_position = hit.map(|position| position.to_array());
         if pressed && self.cursor == CursorMode::Place && !over_ui {
             if let Some(position) = hit {
                 let mut placement = position.to_array();
