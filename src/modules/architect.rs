@@ -127,6 +127,8 @@ pub struct Architect {
     object_drag_axis: Option<usize>,
     object_drag_start_pointer: Option<egui::Pos2>,
     object_drag_start_position: [f32; 3],
+    object_drag_start_hit: Option<[f32; 3]>,
+    object_drag_group: Vec<(usize, [f32; 3])>,
     object_drag_snapshot: Option<Vec<PlacedObject>>,
     undo_objects: Vec<Vec<PlacedObject>>,
     redo_objects: Vec<Vec<PlacedObject>>,
@@ -209,6 +211,8 @@ impl Architect {
             object_drag_axis: None,
             object_drag_start_pointer: None,
             object_drag_start_position: [0.; 3],
+            object_drag_start_hit: None,
+            object_drag_group: Vec::new(),
             object_drag_snapshot: None,
             undo_objects: Vec::new(),
             redo_objects: Vec::new(),
@@ -2033,9 +2037,7 @@ impl Architect {
                 let picked_placement = nearest.map(|(index, _)| index);
                 if self.cursor == CursorMode::MultiSelect {
                     if let Some(index) = picked_placement {
-                        if !self.selected_placements.insert(index) {
-                            self.selected_placements.remove(&index);
-                        }
+                        self.selected_placements.insert(index);
                         self.selected_placement = Some(index);
                         self.selected_scene_object = None;
                         self.selected_scene_transform = None;
@@ -2104,10 +2106,19 @@ impl Architect {
                 }
             }
             self.object_drag_axis = axis_pick;
+            self.object_drag_group.clear();
+            self.object_drag_start_hit = hit.map(Vec3::to_array);
             self.object_dragging = self.cursor == CursorMode::Select
-                && self.selected_placements.len() <= 1
                 && self.selected_placement.is_some()
-                && (hit.is_some() || self.object_drag_axis == Some(1));
+                && ((self.selected_placements.len() > 1 && hit.is_some())
+                    || (self.selected_placements.len() <= 1
+                        && (hit.is_some() || self.object_drag_axis == Some(1))));
+            if self.object_dragging && self.selected_placements.len() > 1 {
+                self.object_drag_group = self.selected_placements.iter().copied()
+                    .filter_map(|index| self.project.objects.get(index)
+                        .map(|object| (index, object.position)))
+                    .collect();
+            }
             self.object_drag_snapshot = self.object_dragging.then(|| self.project.objects.clone());
             self.object_drag_start_pointer = pointer;
             if let Some(index) = self.selected_placement {
@@ -2120,7 +2131,16 @@ impl Architect {
             }
         }
         if self.object_dragging && down && self.cursor == CursorMode::Select && !over_ui {
-            if let Some(index) = self.selected_placement {
+            if self.object_drag_group.len() > 1 {
+                if let (Some(start), Some(current)) = (self.object_drag_start_hit, hit) {
+                    let delta = Vec3::from_array(current.to_array()) - Vec3::from_array(start);
+                    for (index, position) in &self.object_drag_group {
+                        if let Some(object) = self.project.objects.get_mut(*index) {
+                            object.position = (Vec3::from_array(*position) + delta).to_array();
+                        }
+                    }
+                }
+            } else if let Some(index) = self.selected_placement {
                 if let Some(object) = self.project.objects.get_mut(index) {
                     match self.object_drag_axis {
                         Some(0) => {
@@ -2160,6 +2180,8 @@ impl Architect {
                     self.push_object_undo(snapshot);
                 }
             }
+            self.object_drag_group.clear();
+            self.object_drag_start_hit = None;
             self.object_dragging = false;
             self.object_drag_axis = None;
             self.object_drag_start_pointer = None;
@@ -2531,6 +2553,8 @@ mod tests {
             object_drag_axis: None,
             object_drag_start_pointer: None,
             object_drag_start_position: [0.; 3],
+            object_drag_start_hit: None,
+            object_drag_group: Vec::new(),
             object_drag_snapshot: None,
             undo_objects: Vec::new(),
             redo_objects: Vec::new(),
