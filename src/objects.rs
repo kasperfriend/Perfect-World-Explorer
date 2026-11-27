@@ -1149,6 +1149,37 @@ mod tests {
         }
     }
     #[test]
+    fn editor_bmd_ornaments_are_transient_and_keep_native_placements() {
+        let root = fixture_root("editor-bmd-tail");
+        write_pck(&root.join("litmodels.pck"), &[]);
+        write_pck(&root.join("building.pck"), &[]);
+        let mut objects = Objects::open(&root, vec![ornament("a01")]).unwrap();
+        let placement = crate::scene::EditorSceneryPlacement {
+            path: "litmodels/a01/1/editor.bmd".into(),
+            position: [4.0, 5.0, 6.0],
+            direction: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            scale: 2.5,
+            map_id: "a01".into(),
+        };
+
+        assert!(objects.set_editor_ornaments(std::slice::from_ref(&placement)));
+        assert_eq!(objects.native_ornament_count(), 1);
+        assert_eq!(objects.ornaments.len(), 2);
+        assert_eq!(objects.ornaments[0].path, "1/litmodel_1399.bmd");
+        assert_eq!(objects.ornaments[1].path, "litmodels/a01/1/editor.bmd");
+        assert_eq!(objects.placement_scale(0), 1.0);
+        assert_eq!(objects.placement_scale(1), 2.5);
+        assert!(!objects.set_editor_ornaments(std::slice::from_ref(&placement)));
+
+        assert!(objects.set_editor_ornaments(&[]));
+        assert_eq!(objects.ornaments.len(), 1);
+        assert_eq!(objects.ornaments[0].path, "1/litmodel_1399.bmd");
+        assert_eq!(objects.placement_scale(1), 1.0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn map_partitioned_litmodels_load_from_the_selected_instance_namespace() {
         let root = fixture_root("map-scoped-litmodels");
         let bmd = empty_bmd();
