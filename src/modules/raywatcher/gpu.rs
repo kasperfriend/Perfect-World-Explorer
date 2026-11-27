@@ -7147,6 +7147,16 @@ mod reflection_sampling_regression_tests {
     }
 
     #[test]
+    fn reflections_are_water_only_and_distant_dxr_keeps_alpha_tested_foliage() {
+        assert!(!GBUF_PREP_SHADER.contains("spec_contrast > 0.14"));
+        assert!(!GBUF_PREP_SHADER.contains("roughness = clamp(0.34"));
+        assert!(RAY_SHADER.contains("bits_reflections && is_water && roughness <= params.effects.x"));
+        assert!(DXR_SHADER.contains("bits_reflections && is_water && roughness <= params.effects.x"));
+        assert!(!DXR_SHADER.contains("if (is_water && dist > 560.0)"));
+        assert!(DXR_SHADER.contains("Hit rhit = closest_hit(ray_origin, reflect_dir, bias, refl_max_t"));
+    }
+
+    #[test]
     fn sky_and_cloud_reflection_atlas_uses_four_times_the_previous_edge_resolution() {
         assert_eq!(SKY_ENV_FACE, 512);
         assert!(DXR_SHADER.contains("SKY_ENV_FACE_F = 512.0"));
