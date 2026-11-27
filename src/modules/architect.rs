@@ -1391,6 +1391,7 @@ impl Architect {
             return;
         }
         self.push_object_undo(before);
+        self.object_history_action = true;
         self.selected_placements.clear();
         for object in pasted {
             let index = self.project.objects.len();
@@ -1413,6 +1414,7 @@ impl Architect {
             .filter_map(|(index, object)| (!remove.contains(&index)).then_some(object))
             .collect();
         self.push_object_undo(before);
+        self.object_history_action = true;
         self.selected_placements.clear();
         self.selected_placement = None;
         self.status = format!("Deleted {} project placement(s).", indices.len());
