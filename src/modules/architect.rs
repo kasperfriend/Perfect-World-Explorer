@@ -1633,7 +1633,7 @@ impl Architect {
             });
         let (pointer, down, pressed, released) = ctx.input(|i| (i.pointer.hover_pos(), i.pointer.primary_down(), i.pointer.button_pressed(egui::PointerButton::Primary), i.pointer.button_released(egui::PointerButton::Primary)));
         let over_ui = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
-        let hit = if self.cursor == CursorMode::Sculpt && !over_ui { pointer.and_then(|p| self.map.as_ref().and_then(|m| Self::terrain_hit(p, screen, view_projection, m))) } else { None };
+        let hit = if matches!(self.cursor, CursorMode::Sculpt | CursorMode::Select) && !over_ui { pointer.and_then(|p| self.map.as_ref().and_then(|m| Self::terrain_hit(p, screen, view_projection, m))) } else { None };
         self.brush_cursor_position = hit.map(Vec3::to_array);
         // Pick staged project objects directly in the viewport. Their editor
         // transform is independent from the immutable source-scene instances.
