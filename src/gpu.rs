@@ -4003,10 +4003,16 @@ impl Renderer {
             .as_ref()
             .is_some_and(|gpu| gpu.hardware_failed());
         let skip_cpu_bvh = hardware_mode && !hardware_failed;
+        // Tree LOD scale changes which leaf/frond mesh the RT scene harvests.
+        // Include the effective value in the scene key so the live settings
+        // slider cannot leave stale foliage geometry in the BVH/BLAS.
+        let tree_lod_scale =
+            self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees);
         let content_hash = (active_pages_len << 16)
             ^ (self.water_batches.len() as u64)
             ^ (u64::from(skip_cpu_bvh) << 61)
-            ^ (u64::from(self.world_done) << 62);
+            ^ (u64::from(self.world_done) << 62)
+            ^ u64::from(tree_lod_scale.to_bits()).rotate_left(23);
         let t_rw_frame = std::time::Instant::now();
         // Poll any completed background BVH build without blocking the frame.
         let _ = self.raywatcher_harvest.poll_background_build();
@@ -4194,8 +4200,7 @@ impl Renderer {
                 eye: camera.pos,
                 view_direction: camera.direction(),
                 max_distance: detail_radius.min(640.0),
-                lod_scale: self.detail.tree_lod_scale
-                    * lod_scale(self.detail.scenery_quality, Class::Trees),
+                lod_scale: tree_lod_scale,
                 triangle_budget: 420_000,
             };
             // Diagnostics log is written immediately on toggle-on and every 4s above.
