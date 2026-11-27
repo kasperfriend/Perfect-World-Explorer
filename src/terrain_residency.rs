@@ -576,7 +576,7 @@ mod tests {
         let disabled = residency
             .update_stitched_parallel(
                 &shifted,
-                |x, _| (if x == 1 { 0 } else { 3 }, [0; 4]),
+                |x, y| (if x == 1 && y == 0 { 0 } else { 3 }, [0; 4]),
                 |_, _, _, _| panic!("level-zero blocks must not be built"),
             )
             .unwrap();
