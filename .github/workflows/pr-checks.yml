@@ -539,19 +539,14 @@ jobs:
           path: artifact/
           if-no-files-found: error
           retention-days: 14
-      # This artifact was uploaded in this same workflow run. Leave github-token
-      # unset so download-artifact uses the run-scoped artifact service; setting
-      # it switches to the cross-run REST path, which can return 404 before the
-      # current workflow run has finalized.
-      - name: Download the uploaded portable artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: Perfect-World-Explorer-Windows-x64
-          path: ${{ runner.temp }}/uploaded-viewer
-      - name: Audit the uploaded artifact layout
+      # The upload action already validates that the staged files are
+      # publishable. Audit the exact staged directory locally instead of
+      # downloading the same-run artifact again (the artifact service can
+      # transiently return 404 immediately after finalization).
+      - name: Audit the portable package layout
         shell: pwsh
         run: |
-          $uploaded = Join-Path $env:RUNNER_TEMP 'uploaded-viewer'
+          $uploaded = Join-Path $PWD 'artifact'
           $topLevel = @(Get-ChildItem -LiteralPath $uploaded -Force)
           if ($topLevel.Count -ne 1 -or $topLevel[0].Name -cne 'Perfect World Explorer') {
             throw 'The artifact must contain only the Perfect World Explorer top-level folder.'
