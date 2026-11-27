@@ -3197,7 +3197,7 @@ impl Populator {
                         Err(error) => live.failure = Some(error),
                     }
                 }
-                (Some(draw), Some(meshes)) => {
+                (Some(mut draw), Some(meshes)) => {
                     // Topology is fixed for a retained rig, so this skips
                     // `model_draw::prepare`'s per-frame re-validation and
                     // converts the pose straight into the vertex buffer.
