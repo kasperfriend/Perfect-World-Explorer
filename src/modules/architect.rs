@@ -1638,6 +1638,40 @@ mod tests {
     }
 
     #[test]
+    fn sculpt_brush_rejects_a_project_from_another_map() {
+        let mut builder = crate::terrain_store::Builder::new_resident(8, 8, 4).unwrap();
+        for by in 0..2 {
+            for bx in 0..2 {
+                builder
+                    .block(bx, by, &[0.; 16], &[[0, 127, 0]; 16])
+                    .unwrap();
+            }
+        }
+        let (heights, _) = builder.finish(0).unwrap();
+        let map = crate::navigation::MapSpace {
+            width: 8,
+            height: 8,
+            spacing: 1.,
+            heights,
+        };
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element/element.data"),
+            Some(map.clone()),
+            "a01".into(),
+        );
+        editor.project.source_map = "b03".into();
+        let stroke = TerrainStroke {
+            mode: BrushMode::Raise,
+            position: [0., 0., 0.],
+            radius: 2.,
+            strength: 10.,
+        };
+        assert!(editor.apply_stroke(&stroke).is_err());
+        assert_eq!(map.heights.revision(), 0);
+        assert_eq!(map.heights.at(4 * 8 + 4), 0.);
+    }
+
+    #[test]
     fn project_codec_round_trips_unicode_paths_and_editor_operations() {
         let project = Project {
             name: "我的世界".into(),
