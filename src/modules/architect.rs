@@ -102,6 +102,7 @@ pub struct Architect {
     selected_scene_object: Option<usize>,
     selected_scene_transform: Option<[f32; 3]>,
     selected_placement: Option<usize>,
+    selected_placements: HashSet<usize>,
     multi_selection: HashSet<usize>,
     multi_scene_items: HashMap<usize, (String, [f32; 3])>,
     quick_bar: Vec<String>,
@@ -183,6 +184,7 @@ impl Architect {
             selected_scene_object: None,
             selected_scene_transform: None,
             selected_placement: None,
+            selected_placements: HashSet::new(),
             multi_selection: HashSet::new(),
             multi_scene_items: HashMap::new(),
             quick_bar: Vec::new(),
@@ -773,6 +775,7 @@ impl Architect {
                 self.redo_objects.clear();
                 let replay_error = self.rebuild_terrain().err().or(previous_reset_error);
                 self.selected_placement = None;
+                self.selected_placements.clear();
                 self.selected_scene_object = None;
                 self.multi_selection.clear();
                 self.multi_scene_items.clear();
@@ -1444,6 +1447,7 @@ impl Architect {
                             self.project.objects.clear();
                             self.project.strokes.clear();
                             self.selected_placement = None;
+                            self.selected_placements.clear();
                             self.multi_selection.clear();
                             self.multi_scene_items.clear();
                             self.confirm_clear = false;
@@ -1671,6 +1675,57 @@ impl Architect {
                 }
                 ui.separator();
                 ui.heading("Custom placements");
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} selected", self.selected_placements.len()));
+                    if ui.button("Select all").clicked() {
+                        self.selected_placements = (0..self.project.objects.len()).collect();
+                        self.selected_placement = self.selected_placements.iter().copied().min();
+                    }
+                    if ui.button("Clear selection").clicked() {
+                        self.selected_placements.clear();
+                        self.selected_placement = None;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Duplicate selected").clicked() {
+                        let mut indices = self.selected_placements.iter().copied().collect::<Vec<_>>();
+                        if indices.is_empty() {
+                            indices.extend(self.selected_placement);
+                        }
+                        indices.sort_unstable();
+                        let originals = indices.iter()
+                            .filter_map(|index| self.project.objects.get(*index).cloned())
+                            .collect::<Vec<_>>();
+                        self.selected_placements.clear();
+                        for mut object in originals {
+                            object.position[0] += 1.0;
+                            let index = self.project.objects.len();
+                            self.project.objects.push(object);
+                            self.selected_placements.insert(index);
+                        }
+                        self.selected_placement = self.selected_placements.iter().copied().min();
+                        self.status = format!("Duplicated {} custom placement(s).", self.selected_placements.len());
+                    }
+                    if ui.button("Delete selected").clicked() {
+                        let mut indices = self.selected_placements.iter().copied().collect::<Vec<_>>();
+                        if indices.is_empty() {
+                            indices.extend(self.selected_placement);
+                        }
+                        if !indices.is_empty() {
+                            let removed = indices.len();
+                            let remove = indices.into_iter().collect::<HashSet<_>>();
+                            let mut next_index = 0usize;
+                            self.project.objects.retain(|_| {
+                                let keep = !remove.contains(&next_index);
+                                next_index += 1;
+                                keep
+                            });
+                            self.selected_placements.clear();
+                            self.selected_placement = None;
+                            self.status = format!("Deleted {removed} custom placement(s).");
+                        }
+                    }
+                });
                 let mut delete_placement = None;
                 let mut duplicate_placement = None;
                 let placement_rows = self
@@ -1697,9 +1752,21 @@ impl Architect {
                     .show(ui, |ui| {
                         for (index, label) in &placement_rows {
                             if ui
-                                .selectable_label(self.selected_placement == Some(*index), label)
+                                .selectable_label(
+                                self.selected_placements.contains(index)
+                                    || self.selected_placement == Some(*index),
+                                label,
+                            )
                                 .clicked()
                             {
+                                if self.cursor == CursorMode::MultiSelect {
+                                    if !self.selected_placements.insert(*index) {
+                                        self.selected_placements.remove(index);
+                                    }
+                                } else {
+                                    self.selected_placements.clear();
+                                    self.selected_placements.insert(*index);
+                                }
                                 self.selected_placement = Some(*index);
                             }
                         }
@@ -1877,7 +1944,7 @@ impl Architect {
         let over_ui = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
         let hit = if matches!(
             self.cursor,
-            CursorMode::Sculpt | CursorMode::Select | CursorMode::Place
+            CursorMode::Sculpt | CursorMode::Select | CursorMode::MultiSelect | CursorMode::Place
         ) && !over_ui
         {
             pointer.and_then(|position| {
@@ -1916,7 +1983,7 @@ impl Architect {
         }
         // Pick staged project objects directly in the viewport. Their editor
         // transform is independent from the immutable source-scene instances.
-        if pressed && self.cursor == CursorMode::Select && !over_ui {
+        if pressed && matches!(self.cursor, CursorMode::Select | CursorMode::MultiSelect) && !over_ui {
             let mut axis_pick = None;
             if let (Some(index), Some(pointer)) = (self.selected_placement, pointer) {
                 if let Some(object) = self.project.objects.get(index) {
@@ -1963,7 +2030,23 @@ impl Architect {
                         }
                     }
                 }
-                self.selected_placement = nearest.map(|(index, _)| index);
+                let picked_placement = nearest.map(|(index, _)| index);
+                if self.cursor == CursorMode::MultiSelect {
+                    if let Some(index) = picked_placement {
+                        if !self.selected_placements.insert(index) {
+                            self.selected_placements.remove(&index);
+                        }
+                        self.selected_placement = Some(index);
+                        self.selected_scene_object = None;
+                        self.selected_scene_transform = None;
+                    }
+                } else {
+                    self.selected_placement = picked_placement;
+                    self.selected_placements.clear();
+                    if let Some(index) = picked_placement {
+                        self.selected_placements.insert(index);
+                    }
+                }
                 if self.selected_placement.is_some() {
                     self.selected_scene_object = None;
                     self.selected_scene_transform = None;
@@ -2021,7 +2104,9 @@ impl Architect {
                 }
             }
             self.object_drag_axis = axis_pick;
-            self.object_dragging = self.selected_placement.is_some()
+            self.object_dragging = self.cursor == CursorMode::Select
+                && self.selected_placements.len() <= 1
+                && self.selected_placement.is_some()
                 && (hit.is_some() || self.object_drag_axis == Some(1));
             self.object_drag_snapshot = self.object_dragging.then(|| self.project.objects.clone());
             self.object_drag_start_pointer = pointer;
@@ -2421,6 +2506,7 @@ mod tests {
             selected_scene_object: None,
             selected_scene_transform: None,
             selected_placement: None,
+            selected_placements: HashSet::new(),
             multi_selection: HashSet::new(),
             multi_scene_items: HashMap::new(),
             quick_bar: Vec::new(),
