@@ -288,7 +288,6 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
             // for alpha-masked foliage; non-masked alpha geometry has already
             // used stochastic opacity in accept_opacity and must not be faded
             // a second time here.
-            float transmission = 0.0;
             if (q.CommittedInstanceID() != 1u) {
                 uint prim = q.CommittedPrimitiveIndex()
                     + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
