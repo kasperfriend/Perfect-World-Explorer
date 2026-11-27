@@ -715,6 +715,10 @@ struct Params {
     point_light_meta: vec4<f32>,
     point_lights_pos_rad: array<vec4<f32>, 128>,
     point_lights_col_int: array<vec4<f32>, 128>,
+    point_light_bvh_meta: vec4<f32>,
+    point_light_bvh_min: array<vec4<f32>, 63>,
+    point_light_bvh_max: array<vec4<f32>, 63>,
+    point_light_order: array<vec4<u32>, 32>,
     terrain_map_bounds: vec4<f32>,
     prev_vp: mat4x4<f32>,
     restir: vec4<f32>,
@@ -1082,6 +1086,17 @@ fn occluded_point_light(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f3
         }
     }
     return true;
+}
+
+fn point_light_order_at(index: u32) -> u32 {
+    let packed = params.point_light_order[index >> 2u];
+    return packed[index & 3u];
+}
+
+fn point_light_node_contains(node_index: u32, point: vec3<f32>) -> bool {
+    let minimum = params.point_light_bvh_min[node_index].xyz;
+    let maximum = params.point_light_bvh_max[node_index].xyz;
+    return all(point >= minimum) && all(point <= maximum);
 }
 
 fn point_light_falloff(dist: f32, radius: f32) -> f32 {
@@ -2054,12 +2069,42 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var pl_w_lit = 0.0;
     if (bits_lighting && pl_count > 0u) {
         var any_pl_near = false;
-        for (var pre_i = 0u; pre_i < pl_count; pre_i = pre_i + 1u) {
-            let pr = params.point_lights_pos_rad[pre_i];
-            let d_pre = pr.xyz - point;
-            if (abs(d_pre.x) < pr.w && abs(d_pre.z) < pr.w && abs(d_pre.y) < pr.w && dot(d_pre, d_pre) < pr.w * pr.w) {
-                any_pl_near = true;
+        var near_stack: array<u32, 16>;
+        var near_sp = 0u;
+        if (params.point_light_bvh_meta.x > 0.5) {
+            near_stack[near_sp] = 0u;
+            near_sp = near_sp + 1u;
+        }
+        loop {
+            if (near_sp == 0u || any_pl_near) {
                 break;
+            }
+            near_sp = near_sp - 1u;
+            let node_index = near_stack[near_sp];
+            let node_min = params.point_light_bvh_min[node_index];
+            let node_max = params.point_light_bvh_max[node_index];
+            if (any(point < node_min.xyz) || any(point > node_max.xyz)) {
+                continue;
+            }
+            if (node_min.w >= 0.0) {
+                let leaf_count = u32(node_min.w);
+                let leaf_first = u32(node_max.w);
+                for (var offset = 0u; offset < leaf_count; offset = offset + 1u) {
+                    let pre_i = point_light_order_at(leaf_first + offset);
+                    let pr = params.point_lights_pos_rad[pre_i];
+                    let d_pre = pr.xyz - point;
+                    if (abs(d_pre.x) < pr.w && abs(d_pre.z) < pr.w && abs(d_pre.y) < pr.w && dot(d_pre, d_pre) < pr.w * pr.w) {
+                        any_pl_near = true;
+                        break;
+                    }
+                }
+            } else {
+                let left = node_index + 1u;
+                let right = u32(node_max.w);
+                near_stack[near_sp] = right;
+                near_sp = near_sp + 1u;
+                near_stack[near_sp] = left;
+                near_sp = near_sp + 1u;
             }
         }
         var pl_normal = normal;
