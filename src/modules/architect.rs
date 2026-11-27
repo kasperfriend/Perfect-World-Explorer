@@ -1600,7 +1600,7 @@ mod tests {
                     .unwrap();
             }
         }
-        let (heights, _normals) = builder.finish(0).unwrap();
+        let (heights, normals) = builder.finish(0).unwrap();
         let map = crate::navigation::MapSpace {
             width: 8,
             height: 8,
@@ -1622,6 +1622,7 @@ mod tests {
         let changed = editor.apply_stroke(&stroke).unwrap();
         assert!(changed > 0);
         assert_eq!(map.heights.at(4 * 8 + 4), 10.);
+        assert_ne!(normals.at(4 * 8 + 5), [0, 127, 0]);
 
         editor.project.strokes.push(stroke);
         editor.rebuild_terrain().unwrap();
@@ -1629,6 +1630,7 @@ mod tests {
         editor.project.strokes.clear();
         editor.rebuild_terrain().unwrap();
         assert_eq!(map.heights.at(4 * 8 + 4), 0.);
+        assert_eq!(normals.at(4 * 8 + 5), [0, 127, 0]);
     }
 
     #[test]
