@@ -1548,8 +1548,16 @@ fn push_instances_chunked_cancellable(
         }
         candidates.extend(list);
     }
-    candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    candidates.truncate(instance_budget);
+    let by_distance = |a: &(f32, usize), b: &(f32, usize)| {
+        a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1))
+    };
+    if candidates.len() > instance_budget {
+        // Partition in linear expected time rather than sorting every
+        // candidate when the global budget is much smaller than the world.
+        candidates.select_nth_unstable_by(instance_budget, by_distance);
+        candidates.truncate(instance_budget);
+    }
+    candidates.sort_unstable_by(by_distance);
 
     let mut palette: std::collections::HashMap<(u8, u8, u8), u32> =
         std::collections::HashMap::new();
