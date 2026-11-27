@@ -353,9 +353,9 @@ pub struct Settings {
     /// `false` so textured terrain, buildings, trees, water, effects, sky and
     /// fog stay intact.
     pub replace_raster: bool,
-    /// Opt-in shadow visibility modulation for the game's own `SceneLights`
-    /// point lights (never adds light on top of raster). Off by default until
-    /// per-light visibility is verified.
+    /// Shadow visibility modulation for the game's own `SceneLights` point
+    /// lights (never adds light on top of raster). Enabled by default to retain
+    /// the current effect; the setting can disable its per-light shadow work.
     pub point_light_shadows: bool,
     /// Single-term debug view (Phase 0); `DebugView::None` in normal play.
     pub debug_view: DebugView,
@@ -494,9 +494,9 @@ pub struct Plan {
     /// Explicit opt-in to replace raster lighting terms. `false` (default)
     /// keeps the full raster world render untouched and composites RT on top.
     pub replace_raster: bool,
-    /// Opt-in shadow visibility modulation for the game's own `SceneLights`
-    /// point lights (never adds light on top of raster). Off by default until
-    /// per-light visibility is verified.
+    /// Shadow visibility modulation for the game's own `SceneLights` point
+    /// lights (never adds light on top of raster). Enabled by default to retain
+    /// the current effect; the setting can disable its per-light shadow work.
     pub point_light_shadows: bool,
     /// Single-term debug view (Phase 0); `DebugView::None` in normal play.
     pub debug_view: DebugView,
