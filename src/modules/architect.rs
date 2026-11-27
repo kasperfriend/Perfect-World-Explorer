@@ -345,7 +345,7 @@ impl Architect {
         let backup = path.with_extension("pwa.bak");
         let _ = fs::remove_file(&temp);
         fs::write(&temp, out).map_err(|e| format!("{}: {e}", temp.display()))?;
-        if let Ok(file) = fs::OpenOptions::new().read(true).open(&temp) {
+        if let Ok(file) = fs::OpenOptions::new().write(true).open(&temp) {
             file.sync_all().map_err(|e| format!("{}: {e}", temp.display()))?;
         }
         let had_previous = path.exists();
