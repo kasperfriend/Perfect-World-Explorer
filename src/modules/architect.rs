@@ -715,11 +715,21 @@ impl Architect {
                 } else {
                     project.source_map.clone()
                 };
+                let previous_source = self.project.source_map.clone();
+                let previous_belongs_here = previous_source.is_empty()
+                    || previous_source.eq_ignore_ascii_case(&self.current_map_id);
+                let previous_reset_error = if previous_belongs_here {
+                    self.map
+                        .as_ref()
+                        .and_then(|map| map.heights.clear_edits().err())
+                } else {
+                    None
+                };
                 self.project = project;
                 self.redo_strokes.clear();
                 self.undo_objects.clear();
                 self.redo_objects.clear();
-                let replay_error = self.rebuild_terrain().err();
+                let replay_error = self.rebuild_terrain().err().or(previous_reset_error);
                 self.selected_placement = None;
                 self.selected_scene_object = None;
                 self.multi_selection.clear();
