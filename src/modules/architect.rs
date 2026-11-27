@@ -80,6 +80,7 @@ pub struct Architect {
     map: Option<crate::navigation::MapSpace>,
     project_root: PathBuf,
     project: Project,
+    redo_strokes: Vec<TerrainStroke>,
     project_files: Vec<PathBuf>,
     directory_cache: HashMap<PathBuf, Vec<ExplorerEntry>>,
     archive_cache: HashMap<PathBuf, Vec<String>>,
@@ -142,6 +143,7 @@ impl Architect {
             map,
             project_root,
             project: Project::default(),
+            redo_strokes: Vec::new(),
             project_files: Vec::new(),
             directory_cache: HashMap::new(),
             archive_cache: HashMap::new(),
@@ -381,6 +383,126 @@ impl Architect {
         Ok(project)
     }
 
+    /// Apply one brush stroke to the shared terrain overlay. The source client
+    /// pages remain immutable; the renderer and navigation readers see the
+    /// same sparse height/normal overrides through MapSpace.
+    fn apply_stroke(&self, stroke: &TerrainStroke) -> Result<usize, String> {
+        let map = self.map.as_ref().ok_or("No terrain is loaded for sculpting")?;
+        if map.width < 2 || map.height < 2 || !map.spacing.is_finite() || map.spacing <= 0. {
+            return Err("Terrain dimensions or spacing are invalid".into());
+        }
+        if stroke.mode == BrushMode::Paint {
+            return Err("Terrain paint is not implemented yet; choose Raise, Lower, Flatten or Smooth.".into());
+        }
+        let radius = stroke.radius.clamp(0.1, 10000.);
+        let cx = stroke.position[0] / map.spacing + map.width as f32 * 0.5;
+        let cy = map.height as f32 * 0.5 - stroke.position[2] / map.spacing;
+        if !cx.is_finite() || !cy.is_finite() {
+            return Err("Brush position is not finite".into());
+        }
+        let cells_radius = radius / map.spacing;
+        let x0 = (cx - cells_radius).floor().max(0.) as usize;
+        let y0 = (cy - cells_radius).floor().max(0.) as usize;
+        let x1 = (cx + cells_radius).ceil().min((map.width - 1) as f32) as usize;
+        let y1 = (cy + cells_radius).ceil().min((map.height - 1) as f32) as usize;
+        if x0 > x1 || y0 > y1 {
+            return Ok(0);
+        }
+        let area = (x1 - x0 + 1).saturating_mul(y1 - y0 + 1);
+        if area > 2_000_000 {
+            return Err("Brush footprint is too large for one edit operation".into());
+        }
+        let mut source = map.heights.reader();
+        let mut changed = HashMap::<usize, f32>::new();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let dx = (x as f32 - cx) * map.spacing;
+                let dz = (cy - y as f32) * map.spacing;
+                let distance = (dx * dx + dz * dz).sqrt();
+                if distance > radius {
+                    continue;
+                }
+                let t = (1. - distance / radius).clamp(0., 1.);
+                let falloff = t * t * (3. - 2. * t);
+                let index = y * map.width + x;
+                let old = source.height(index);
+                let next = match stroke.mode {
+                    BrushMode::Raise => old + stroke.strength * falloff,
+                    BrushMode::Lower => old - stroke.strength * falloff,
+                    BrushMode::Flatten => old + (stroke.strength - old) * falloff,
+                    BrushMode::Smooth => {
+                        let mut total = 0.;
+                        let mut count = 0.;
+                        for ny in y.saturating_sub(1)..=(y + 1).min(map.height - 1) {
+                            for nx in x.saturating_sub(1)..=(x + 1).min(map.width - 1) {
+                                total += source.height(ny * map.width + nx);
+                                count += 1.;
+                            }
+                        }
+                        let average = total / count.max(1.);
+                        let blend = (stroke.strength / 20.).clamp(0., 1.) * falloff;
+                        old + (average - old) * blend
+                    }
+                    BrushMode::Paint => unreachable!(),
+                };
+                if !next.is_finite() {
+                    return Err("Brush produced a non-finite terrain height".into());
+                }
+                if (next - old).abs() > 0.00001 {
+                    changed.insert(index, next);
+                }
+            }
+        }
+        if changed.is_empty() {
+            return Ok(0);
+        }
+
+        // Recompute normals over the changed cells plus a one-cell border. This
+        // avoids visible lighting seams at the edge of a sculpted patch.
+        let nx0 = x0.saturating_sub(1);
+        let ny0 = y0.saturating_sub(1);
+        let nx1 = (x1 + 1).min(map.width - 1);
+        let ny1 = (y1 + 1).min(map.height - 1);
+        let height_at = |x: usize, y: usize, source: &mut crate::terrain_store::Reader| {
+            changed
+                .get(&(y * map.width + x))
+                .copied()
+                .unwrap_or_else(|| source.height(y * map.width + x))
+        };
+        let mut edits = Vec::with_capacity((nx1 - nx0 + 1) * (ny1 - ny0 + 1));
+        for y in ny0..=ny1 {
+            for x in nx0..=nx1 {
+                let center = height_at(x, y, &mut source);
+                let left = if x > 0 { height_at(x - 1, y, &mut source) } else { center };
+                let right = if x + 1 < map.width { height_at(x + 1, y, &mut source) } else { center };
+                let north = if y > 0 { height_at(x, y - 1, &mut source) } else { center };
+                let south = if y + 1 < map.height { height_at(x, y + 1, &mut source) } else { center };
+                let dx = (right - left) / (if x == 0 || x + 1 == map.width { map.spacing } else { 2. * map.spacing });
+                let dz = (north - south) / (if y == 0 || y + 1 == map.height { map.spacing } else { 2. * map.spacing });
+                let normal = Vec3::new(-dx, 1., -dz).normalize_or_zero();
+                let encoded = [
+                    (normal.x * 127.).round().clamp(-127., 127.) as i8,
+                    (normal.y * 127.).round().clamp(-127., 127.) as i8,
+                    (normal.z * 127.).round().clamp(-127., 127.) as i8,
+                ];
+                edits.push((y * map.width + x, center, encoded));
+            }
+        }
+        map.heights.apply_cells(&edits)?;
+        Ok(changed.len())
+    }
+
+    /// Recreate the current project's terrain from the immutable source plus
+    /// its ordered strokes. This makes undo/redo deterministic and reversible.
+    fn rebuild_terrain(&self) -> Result<(), String> {
+        let map = self.map.as_ref().ok_or("No terrain is loaded for sculpting")?;
+        map.heights.clear_edits()?;
+        for stroke in &self.project.strokes {
+            self.apply_stroke(stroke)?;
+        }
+        Ok(())
+    }
+
     fn save_named(&mut self) -> bool {
         let name = self.project_name.trim();
         if name.is_empty() {
@@ -425,6 +547,10 @@ impl Architect {
                     project.source_map.clone()
                 };
                 self.project = project;
+                self.redo_strokes.clear();
+                if let Err(error) = self.rebuild_terrain() {
+                    self.status = format!("Loaded project, but terrain replay failed: {error}");
+                }
                 self.selected_placement = None;
                 self.selected_scene_object = None;
                 self.multi_selection.clear();
@@ -451,6 +577,12 @@ impl Architect {
         match fs::remove_file(&path) {
             Ok(()) => {
                 self.project = Project::default();
+                self.redo_strokes.clear();
+                if let Some(map) = &self.map {
+                    if let Err(error) = map.heights.clear_edits() {
+                        self.status = format!("Project erased, but terrain reset failed: {error}");
+                    }
+                }
                 self.project_name = "Untitled World".into();
                 self.selected_project = None;
                 self.selected_placement = None;
@@ -1299,23 +1431,44 @@ impl Architect {
         terrain_panel.show(ctx, |ui| {
                 ui.horizontal(|ui| { ui.heading("Terrain sculpt"); Self::dock_picker(ui, &mut self.bottom_dock); });
                 ui.add(egui::Slider::new(&mut self.flatten_height, -500.0..=500.0).text("Flatten target"));
-                if ui.button("Record brush operation at camera").clicked() {
-                    let position = self.placement_position(camera);
-                    self.project.strokes.push(TerrainStroke {
+                if ui.button("Apply brush at camera").clicked() {
+                    let stroke = TerrainStroke {
                         mode: self.brush,
-                        position,
+                        position: self.placement_position(camera),
                         radius: self.brush_radius,
                         strength: if self.brush == BrushMode::Flatten {
                             self.flatten_height
                         } else {
                             self.brush_strength
                         },
-                    });
-                    self.status = "Brush operation saved to the project. Native terrain deformation is still pending.".into();
+                    };
+                    match self.apply_stroke(&stroke) {
+                        Ok(cells) => {
+                            self.project.strokes.push(stroke);
+                            self.redo_strokes.clear();
+                            self.status = format!("Applied terrain brush to {cells} cells.");
+                        }
+                        Err(error) => self.status = error,
+                    }
                 }
                 ui.horizontal(|ui| {
                     if ui.button("Undo last brush").clicked() {
-                        self.project.strokes.pop();
+                        if let Some(stroke) = self.project.strokes.pop() {
+                            self.redo_strokes.push(stroke);
+                            match self.rebuild_terrain() {
+                                Ok(()) => self.status = "Undid last terrain brush.".into(),
+                                Err(error) => self.status = format!("Terrain undo failed: {error}"),
+                            }
+                        }
+                    }
+                    if ui.button("Redo brush").clicked() {
+                        if let Some(stroke) = self.redo_strokes.pop() {
+                            self.project.strokes.push(stroke);
+                            match self.rebuild_terrain() {
+                                Ok(()) => self.status = "Redid terrain brush.".into(),
+                                Err(error) => self.status = format!("Terrain redo failed: {error}"),
+                            }
+                        }
                     }
                     if ui.button("Undo last placement").clicked() {
                         self.project.objects.pop();
@@ -1323,7 +1476,7 @@ impl Architect {
                     }
                 });
                 ui.label(format!("{} stored brush operations · {} stored placements", self.project.strokes.len(), self.project.objects.len()));
-                ui.label(egui::RichText::new("Brush modes and snapping are project metadata at this stage; they do not alter the live terrain mesh.").small().weak());
+                ui.label(egui::RichText::new("Brush edits update the shared terrain, navigation and rendered mesh. Paint remains unavailable.").small().weak());
             });
 
         egui::TopBottomPanel::bottom("architect_quick_bar")
@@ -1380,6 +1533,7 @@ mod tests {
             map: None,
             project_root: path.parent().unwrap().to_path_buf(),
             project: project.clone(),
+            redo_strokes: Vec::new(),
             project_files: Vec::new(),
             directory_cache: HashMap::new(),
             archive_cache: HashMap::new(),
