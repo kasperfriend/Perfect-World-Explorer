@@ -2132,7 +2132,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
 
         // Reflection-hit foliage: check if the reflection ray hits a leaf.
-        if (roughness <= params.effects.x) {
+        if (is_water && roughness <= params.effects.x) {
             float3 rdir = reflect(view_dir, normal);
             Hit rh = closest_hit(ray_origin, rdir, bias, params.lens.y, opaque_offset, tri_count);
             if (rh.index < tri_count) {
