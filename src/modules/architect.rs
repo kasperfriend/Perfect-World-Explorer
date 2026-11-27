@@ -1454,7 +1454,6 @@ impl Architect {
             self.status = "Clipboard contains no assets supported by the live game-object renderer.".into();
             return;
         }
-        self.push_object_undo(before);
         self.object_history_action = true;
         self.selected_placements.clear();
         for object in pasted {
@@ -1462,6 +1461,10 @@ impl Architect {
             self.project.objects.push(object);
             self.selected_placements.insert(index);
         }
+        // History snapshots are pushed after the mutation and compared with
+        // the current project. Keep the pre-paste vector until all copies have
+        // been appended, otherwise the equality guard drops the undo record.
+        self.push_object_undo(before);
         self.selected_placement = self.selected_placements.iter().copied().min();
         self.status = format!("Pasted {} game object(s); move the selected copies into place.", self.selected_placements.len());
     }
