@@ -1658,6 +1658,10 @@ impl WorldGeometryArena {
     pub fn reset(&mut self) {
         self.chunks.clear();
     }
+
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
 }
 
 /// A GPU page can reference a subrange of a shared arena chunk.
