@@ -1246,7 +1246,9 @@ impl Architect {
         // serialized into the project until the user clicks to place it.
         if self.cursor == CursorMode::Place {
             if let (Some(asset), Some(mut position)) = (
-                self.selected_asset.as_deref().and_then(Self::renderer_asset_path),
+                self.selected_asset
+                    .as_deref()
+                    .and_then(Self::renderer_asset_path),
                 self.brush_cursor_position,
             ) {
                 if self.snap == SnapMode::Terrain {
@@ -1264,7 +1266,11 @@ impl Architect {
                 }
                 let already_committed = self.project.objects.iter().any(|object| {
                     Self::renderer_asset_path(&object.asset).as_deref() == Some(asset.as_str())
-                        && object.position.iter().zip(position).all(|(a, b)| (*a - b).abs() < 0.01)
+                        && object
+                            .position
+                            .iter()
+                            .zip(position)
+                            .all(|(a, b)| (*a - b).abs() < 0.01)
                 });
                 if !already_committed {
                     placements.push(crate::world_models_gpu::EditorPlacement {
@@ -1289,7 +1295,8 @@ impl Architect {
             self.project.source_map = self.current_map_id.clone();
         }
         let Some(asset) = self.selected_asset.clone() else {
-            self.status = "Choose a placeable game model from the client assets before placing it.".into();
+            self.status =
+                "Choose a placeable game model from the client assets before placing it.".into();
             return;
         };
         if Self::renderer_asset_path(&asset).is_none() {
@@ -1408,10 +1415,9 @@ impl Architect {
                 .collect::<Vec<_>>();
             scene.sort_by_key(|(index, _, _)| *index);
             if scene.is_empty() {
-                if let (Some(asset), Some(position)) = (
-                    self.selected_asset.clone(),
-                    self.selected_scene_transform,
-                ) {
+                if let (Some(asset), Some(position)) =
+                    (self.selected_asset.clone(), self.selected_scene_transform)
+                {
                     scene.push((0, asset, position));
                 }
             }
@@ -1436,16 +1442,21 @@ impl Architect {
             }
         }
         if copied.is_empty() {
-            self.status = "Select a placeable game object or project placement before copying.".into();
+            self.status =
+                "Select a placeable game object or project placement before copying.".into();
             return;
         }
         self.clipboard_objects = copied;
-        self.status = format!("Copied {} object(s) to the Architect clipboard.", self.clipboard_objects.len());
+        self.status = format!(
+            "Copied {} object(s) to the Architect clipboard.",
+            self.clipboard_objects.len()
+        );
     }
 
     fn paste_objects(&mut self) {
         if self.clipboard_objects.is_empty() {
-            self.status = "Architect clipboard is empty. Select an object and press Ctrl+C first.".into();
+            self.status =
+                "Architect clipboard is empty. Select an object and press Ctrl+C first.".into();
             return;
         }
         if self.project.source_map.is_empty() && !self.current_map_id.is_empty() {
@@ -1464,7 +1475,8 @@ impl Architect {
             pasted.push(object);
         }
         if pasted.is_empty() {
-            self.status = "Clipboard contains no assets supported by the live game-object renderer.".into();
+            self.status =
+                "Clipboard contains no assets supported by the live game-object renderer.".into();
             return;
         }
         self.object_history_action = true;
@@ -1479,7 +1491,10 @@ impl Architect {
         // been appended, otherwise the equality guard drops the undo record.
         self.push_object_undo(before);
         self.selected_placement = self.selected_placements.iter().copied().min();
-        self.status = format!("Pasted {} game object(s); move the selected copies into place.", self.selected_placements.len());
+        self.status = format!(
+            "Pasted {} game object(s); move the selected copies into place.",
+            self.selected_placements.len()
+        );
     }
 
     fn delete_selected_objects(&mut self) {
@@ -1490,7 +1505,11 @@ impl Architect {
         }
         let before = self.project.objects.clone();
         let remove = indices.iter().copied().collect::<HashSet<_>>();
-        self.project.objects = self.project.objects.drain(..).enumerate()
+        self.project.objects = self
+            .project
+            .objects
+            .drain(..)
+            .enumerate()
             .filter_map(|(index, object)| (!remove.contains(&index)).then_some(object))
             .collect();
         self.push_object_undo(before);
@@ -1686,9 +1705,12 @@ impl Architect {
                     ui.selectable_value(&mut self.cursor, CursorMode::Lasso, "Lasso");
                     ui.selectable_value(&mut self.cursor, CursorMode::Place, "Place");
                     if self.cursor == CursorMode::Place {
-                        let can_place = self.selected_asset.is_some()
-                            && self.brush_cursor_position.is_some();
-                        if ui.add_enabled(can_place, egui::Button::new("Place here")).clicked() {
+                        let can_place =
+                            self.selected_asset.is_some() && self.brush_cursor_position.is_some();
+                        if ui
+                            .add_enabled(can_place, egui::Button::new("Place here"))
+                            .clicked()
+                        {
                             if let Some(position) = self.brush_cursor_position {
                                 let mut placement = position;
                                 match self.snap {
@@ -2907,7 +2929,7 @@ impl Architect {
                                         let segment = end - center;
                                         let t = ((pointer - center).dot(segment)
                                             / segment.length_sq().max(0.001))
-                                            .clamp(0.0, 1.0);
+                                        .clamp(0.0, 1.0);
                                         (center + segment * t).distance(pointer) <= 12.0
                                     }) {
                                         axis_pick = Some(axis_index);
@@ -2967,8 +2989,10 @@ impl Architect {
                                     let projected = view_projection.project_point3(world);
                                     if projected.is_finite() && (0.0..=1.0).contains(&projected.z) {
                                         let screen_point = egui::pos2(
-                                            screen.left() + (projected.x + 1.) * 0.5 * screen.width(),
-                                            screen.top() + (1. - projected.y) * 0.5 * screen.height(),
+                                            screen.left()
+                                                + (projected.x + 1.) * 0.5 * screen.width(),
+                                            screen.top()
+                                                + (1. - projected.y) * 0.5 * screen.height(),
                                         );
                                         rect.extend_with(screen_point);
                                         count += 1;
@@ -3005,17 +3029,22 @@ impl Architect {
                         }
                     }
                 }
-                let source_pick = if matches!(
-                    self.cursor,
-                    CursorMode::Select | CursorMode::MultiSelect
-                ) && axis_pick.is_none()
-                {
-                    pointer.and_then(|pointer| {
-                        Self::pick_source_scene(pointer, screen, view_projection, scene, ornaments)
-                    })
-                } else {
-                    None
-                };
+                let source_pick =
+                    if matches!(self.cursor, CursorMode::Select | CursorMode::MultiSelect)
+                        && axis_pick.is_none()
+                    {
+                        pointer.and_then(|pointer| {
+                            Self::pick_source_scene(
+                                pointer,
+                                screen,
+                                view_projection,
+                                scene,
+                                ornaments,
+                            )
+                        })
+                    } else {
+                        None
+                    };
                 // Resolve both editor and source-scene candidates together. A
                 // source model in front of a staged placement must be selectable,
                 // while a nearer staged object still wins when their hit targets
@@ -3076,10 +3105,10 @@ impl Architect {
                     self.selected_placement = picked_placement;
                     if let Some(index) = picked_placement {
                         self.selected_asset = self
-                        .project
-                        .objects
-                        .get(index)
-                        .map(|object| object.asset.clone());
+                            .project
+                            .objects
+                            .get(index)
+                            .map(|object| object.asset.clone());
                     }
                     if !clicked_inside_group {
                         self.selected_placements.clear();
@@ -3258,7 +3287,10 @@ impl Architect {
             let indices = if self.object_drag_group.is_empty() {
                 self.selected_placement.into_iter().collect::<Vec<_>>()
             } else {
-                self.object_drag_group.iter().map(|(index, _)| *index).collect()
+                self.object_drag_group
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .collect()
             };
             let pivot = self
                 .selected_placement
@@ -3276,9 +3308,7 @@ impl Architect {
                             Some(1) => self
                                 .object_drag_start_pointer
                                 .zip(pointer)
-                                .map(|(start, current)| {
-                                    Vec3::Y * (-(current.y - start.y) * 0.1)
-                                }),
+                                .map(|(start, current)| Vec3::Y * (-(current.y - start.y) * 0.1)),
                             Some(2) => self
                                 .object_drag_start_hit
                                 .zip(hit)
@@ -3286,9 +3316,7 @@ impl Architect {
                             _ => self
                                 .object_drag_start_hit
                                 .zip(hit)
-                                .map(|(start, current)| {
-                                    current - Vec3::from_array(start)
-                                }),
+                                .map(|(start, current)| current - Vec3::from_array(start)),
                         };
                         if let Some(delta) = delta {
                             for (index, position) in &self.object_drag_group {
@@ -3333,12 +3361,10 @@ impl Architect {
                     }
                 }
                 TransformMode::Rotate => {
-                    if let (Some(start), Some(current)) =
-                        (self.object_drag_start_pointer, pointer)
+                    if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer)
                     {
                         let axis = self.object_drag_axis.unwrap_or(1);
-                        let angle =
-                            (current.x - start.x - (current.y - start.y) * 0.35) * 0.01;
+                        let angle = (current.x - start.x - (current.y - start.y) * 0.35) * 0.01;
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
                                 let original = self
@@ -3353,8 +3379,7 @@ impl Architect {
                                         1 => glam::Quat::from_rotation_y(angle),
                                         _ => glam::Quat::from_rotation_z(angle),
                                     };
-                                    object.position =
-                                        (pivot + rotation * relative).to_array();
+                                    object.position = (pivot + rotation * relative).to_array();
                                     object.rotation = original.rotation;
                                     object.rotation[axis] += angle;
                                 }
@@ -3366,9 +3391,7 @@ impl Architect {
                     if let (Some(start), Some(current)) =
                         (self.object_drag_start_pointer, pointer)
                     {
-                        let factor = (-(current.y - start.y) * 0.01)
-                            .exp()
-                            .clamp(0.05, 20.0);
+                        let factor = (-(current.y - start.y) * 0.01).exp().clamp(0.05, 20.0);
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
                                 if let Some(original) = self
@@ -3378,8 +3401,7 @@ impl Architect {
                                 {
                                     object.scale = (original.scale * factor).clamp(0.01, 100.0);
                                     let relative = Vec3::from_array(original.position) - pivot;
-                                    object.position =
-                                        (pivot + relative * factor).to_array();
+                                    object.position = (pivot + relative * factor).to_array();
                                 }
                             }
                         }
@@ -3529,35 +3551,33 @@ impl Architect {
                     })
                 };
                 match self.transform_mode {
-                    TransformMode::Move => for (axis, color) in axes {
-                        if let Some(end) = axis_end(axis) {
-                            painter.line_segment([center, end], egui::Stroke::new(4., color));
-                            painter.circle_filled(end, 6., color);
+                    TransformMode::Move => {
+                        for (axis, color) in axes {
+                            if let Some(end) = axis_end(axis) {
+                                painter.line_segment([center, end], egui::Stroke::new(4., color));
+                                painter.circle_filled(end, 6., color);
+                            }
                         }
-                    },
+                    }
                     TransformMode::Rotate => {
-                        for (radius, color) in [
-                            (69.0, axes[0].1),
-                            (54.0, axes[1].1),
-                            (39.0, axes[2].1),
-                        ] {
-                            painter.circle_stroke(
-                                center,
-                                radius,
-                                egui::Stroke::new(3.0, color),
-                            );
+                        for (radius, color) in
+                            [(69.0, axes[0].1), (54.0, axes[1].1), (39.0, axes[2].1)]
+                        {
+                            painter.circle_stroke(center, radius, egui::Stroke::new(3.0, color));
                         }
                     },
-                    TransformMode::Scale => for (axis, color) in axes {
-                        if let Some(end) = axis_end(axis) {
-                            painter.line_segment([center, end], egui::Stroke::new(4., color));
-                            painter.rect_filled(
-                                egui::Rect::from_center_size(end, egui::vec2(12., 12.)),
-                                2.,
-                                color,
-                            );
+                    TransformMode::Scale => {
+                        for (axis, color) in axes {
+                            if let Some(end) = axis_end(axis) {
+                                painter.line_segment([center, end], egui::Stroke::new(4., color));
+                                painter.rect_filled(
+                                    egui::Rect::from_center_size(end, egui::vec2(12., 12.)),
+                                    2.,
+                                    color,
+                                );
+                            }
                         }
-                    },
+                    }
                 }
             }
         }
@@ -3612,19 +3632,27 @@ impl Architect {
             };
             let (local_min, local_max) = (Vec3::from_array(min), Vec3::from_array(max));
             let center = Vec3::from_array(position);
-            let rotation = glam::Quat::from_euler(
-                glam::EulerRot::XYZ,
-                euler[0],
-                euler[1],
-                euler[2],
-            );
+            let rotation =
+                glam::Quat::from_euler(glam::EulerRot::XYZ, euler[0], euler[1], euler[2]);
             let mut corners = [egui::Pos2::ZERO; 8];
             let mut valid = [false; 8];
             for bits in 0..8 {
                 let local = Vec3::new(
-                    if bits & 1 == 0 { local_min.x } else { local_max.x },
-                    if bits & 2 == 0 { local_min.y } else { local_max.y },
-                    if bits & 4 == 0 { local_min.z } else { local_max.z },
+                    if bits & 1 == 0 {
+                        local_min.x
+                    } else {
+                        local_max.x
+                    },
+                    if bits & 2 == 0 {
+                        local_min.y
+                    } else {
+                        local_max.y
+                    },
+                    if bits & 4 == 0 {
+                        local_min.z
+                    } else {
+                        local_max.z
+                    },
                 ) * scale.max(0.01);
                 let point = center + rotation * local;
                 if let Some(projected) = project_outline_point(point) {
@@ -3899,7 +3927,10 @@ mod tests {
 
         assert_eq!(editor.project.objects.len(), 2);
         let pasted = &editor.project.objects[1];
-        assert_eq!(pasted.asset, "element/models.pck::Models/Buildings/gate.ecm");
+        assert_eq!(
+            pasted.asset,
+            "element/models.pck::Models/Buildings/gate.ecm"
+        );
         assert_eq!(pasted.name, "Gate");
         assert_eq!(pasted.group, "Buildings");
         assert!(pasted.visible);
@@ -3925,11 +3956,17 @@ mod tests {
         editor.project.source_map = "a01".into();
         editor.multi_scene_items.insert(
             3,
-            ("element/models.pck::models/buildings/gate.ecm".into(), [1., 2., 3.]),
+            (
+                "element/models.pck::models/buildings/gate.ecm".into(),
+                [1., 2., 3.],
+            ),
         );
         editor.multi_scene_items.insert(
             8,
-            ("element/models.pck::models/buildings/tower.ecm".into(), [4., 5., 6.]),
+            (
+                "element/models.pck::models/buildings/tower.ecm".into(),
+                [4., 5., 6.],
+            ),
         );
 
         editor.duplicate_selected_scene_item();
