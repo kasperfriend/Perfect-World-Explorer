@@ -4038,6 +4038,14 @@ pub struct RaywatcherGpu {
 // remains exclusively owned and is never sent back to another thread.
 unsafe impl Send for RaywatcherGpu {}
 
+fn retire_dxr_async(tracer: super::dxr::DxrTracer) {
+    // DxrTracer::drop waits for its native command queue. Keep that wait off
+    // the render thread when a scene rebuild, resize or trace failure retires it.
+    let _ = std::thread::Builder::new()
+        .name("pwe-raywatcher-dxr-retire".to_string())
+        .spawn(move || drop(tracer));
+}
+
 impl RaywatcherGpu {
     pub fn new(
         device: std::sync::Arc<wgpu::Device>,
@@ -4776,7 +4784,9 @@ impl RaywatcherGpu {
         if let Some(dxr) = self.dxr.as_mut() {
             if let Err(err) = dxr.resize(device, self.grid_extent, (w, h)) {
                 eprintln!("[Raywatcher] DXR resize failed ({err}); falling back to Software");
-                self.dxr = None;
+                if let Some(old) = self.dxr.take() {
+                    retire_dxr_async(old);
+                }
                 self.dxr_failed = true;
             }
         }
@@ -5160,9 +5170,7 @@ impl RaywatcherGpu {
                     // DxrTracer::drop waits for its native queue, so retire the
                     // previous instance on a worker rather than stalling render.
                     if let Some(old) = self.dxr.replace(tracer) {
-                        let _ = std::thread::Builder::new()
-                            .name("pwe-raywatcher-dxr-retire".to_string())
-                            .spawn(move || drop(old));
+                        retire_dxr_async(old);
                     }
                 }
                 true
