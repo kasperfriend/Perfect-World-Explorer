@@ -5238,6 +5238,7 @@ impl RaywatcherGpu {
     /// DXR failure: it has no CPU BVH to provide occlusion or shadows.
     pub fn can_replace_raster_effects(&self) -> bool {
         self.traced_last_frame
+            && self.dxr_init.is_none()
             && (!self.dxr_failed
                 || software_fallback_ready(self.scene.counts.triangles, self.scene.counts.nodes))
     }
