@@ -247,8 +247,7 @@ pub fn block_surface_cached(level: u8, cases: [u8; 4]) -> &'static BlockSurface 
         + cases[1] as usize * 9
         + cases[2] as usize * 3
         + cases[3] as usize;
-    SURFACES
-        .get_or_init(|| (0..243).map(|_| std::sync::OnceLock::new()).collect())[slot]
+    SURFACES.get_or_init(|| (0..243).map(|_| std::sync::OnceLock::new()).collect())[slot]
         .get_or_init(|| build_block_surface(level, cases))
 }
 
