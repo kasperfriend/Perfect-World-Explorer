@@ -806,12 +806,6 @@ impl Page {
                     self.page_max[axis] = self.page_max[axis].max(max[axis]);
                 }
             }
-            if min[0] <= max[0] {
-                for axis in 0..3 {
-                    self.page_min[axis] = self.page_min[axis].min(min[axis]);
-                    self.page_max[axis] = self.page_max[axis].max(max[axis]);
-                }
-            }
         }
         if self.shared_atlas.is_some() {
             assert!(self.atlas.is_empty() && self.mips.is_empty());
