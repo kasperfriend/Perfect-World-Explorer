@@ -2268,7 +2268,9 @@ mod raywatcher_tree_tests {
             composite_alpha_min: 0,
             composite_alpha_max: 255,
             positions: vec![[1.0, 0.0, 1.0]],
-            lods: vec![vec![branch, branch], vec![leaf]],
+            // The outer LOD must be a real, non-sparse LOD (12+ triangles)
+            // or the raster-compatible selector deliberately rejects it.
+            lods: vec![vec![branch; 13], vec![leaf; 12]],
             lod_diags: vec![RtTreeLodDiag::default(); 2],
         };
         let mut out = Vec::new();
@@ -2278,11 +2280,11 @@ mod raywatcher_tree_tests {
             glam::Vec3::X,
             100.0,
             1.0,
-            1,
+            12,
             &mut out,
         );
-        assert_eq!(result, (1, 1, 0));
-        assert_eq!(out.len(), 1);
+        assert_eq!(result, (1, 12, 0));
+        assert_eq!(out.len(), 12);
         assert_eq!(out[0].leaf_rho, -1.0, "fallback LOD billboard must be transformed");
         assert_eq!(out[0].normal, glam::Vec3::Y);
     }
