@@ -2956,9 +2956,12 @@ impl Architect {
                         if self.cursor == CursorMode::MultiSelect {
                             if self.multi_selection.insert(index) {
                                 self.multi_scene_items.insert(index, (asset, position));
+                                self.selected_scene_object = Some(index);
                             } else {
                                 self.multi_selection.remove(&index);
                                 self.multi_scene_items.remove(&index);
+                                self.selected_scene_object =
+                                    self.multi_selection.iter().copied().min();
                             }
                         } else {
                             self.multi_selection.clear();
