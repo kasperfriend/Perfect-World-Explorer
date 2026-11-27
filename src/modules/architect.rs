@@ -1025,7 +1025,6 @@ impl Architect {
             };
             let mut entries = directory
                 .flatten()
-                .take(500)
                 .filter_map(|entry| {
                     let kind = entry.file_type().ok()?;
                     if kind.is_symlink() {
@@ -1711,23 +1710,23 @@ impl Architect {
                     } else {
                         ui.label(format!("{} indexed entries", self.archive_entries.len()));
                         let archive_entries = self.archive_entries.clone();
-                        egui::ScrollArea::vertical().max_height(180.).show(ui, |ui| {
-                            for entry in archive_entries.iter().take(2000) {
-                                if !self.tree_filter.is_empty()
-                                    && !entry.to_lowercase().contains(&self.tree_filter.to_lowercase())
-                                {
-                                    continue;
-                                }
+                        let filter = self.tree_filter.to_lowercase();
+                        let filtered = archive_entries.iter().filter(|entry| filter.is_empty() || entry.to_lowercase().contains(&filter)).collect::<Vec<_>>();
+                        let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                        egui::ScrollArea::vertical().max_height(180.).show_rows(ui, row_height, filtered.len(), |ui, rows| {
+                            for row in rows {
+                                let entry = filtered[row];
+                                let asset = format!("{}::{}", archive.display(), entry);
                                 let label = Path::new(entry).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| entry.clone());
-                                let response = ui.selectable_label(self.selected_asset.as_deref() == Some(format!("{}::{}", archive.display(), entry).as_str()), format!("📦 {label}"));
-                                if response.hovered() { self.hovered_asset = Some(format!("{}::{}", archive.display(), entry)); }
+                                let response = ui.selectable_label(self.selected_asset.as_deref() == Some(asset.as_str()), format!("📦 {label}"));
+                                if response.hovered() { self.hovered_asset = Some(asset.clone()); }
                                 if response.clicked() {
-                                    self.selected_asset = Some(format!("{}::{}", archive.display(), entry));
+                                    self.selected_asset = Some(asset.clone());
                                     if self.cursor == CursorMode::Place { self.add_selected_asset_at_camera(camera); }
                                 }
                                 response.context_menu(|ui| {
                                     if ui.button("Pin archive entry to quick bar").clicked() {
-                                        self.pin(format!("{}::{}", archive.display(), entry));
+                                        self.pin(asset.clone());
                                         ui.close_menu();
                                     }
                                 });
