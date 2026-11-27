@@ -4884,10 +4884,20 @@ impl RaywatcherGpu {
             let (b, bv) = plane(device, "raywatcher filter moments b", w, h, GUIDE_FORMAT);
             ([a, b], [av, bv])
         };
-        let (history_colour_tex, history_colour) =
-            plane(device, "raywatcher temporal history colour", w, h, COLOUR_FORMAT);
-        let (history_moments_tex, history_moments) =
-            plane(device, "raywatcher temporal history moments", w, h, GUIDE_FORMAT);
+        let (history_colour_tex, history_colour) = plane(
+            device,
+            "raywatcher temporal history colour",
+            w,
+            h,
+            COLOUR_FORMAT,
+        );
+        let (history_moments_tex, history_moments) = plane(
+            device,
+            "raywatcher temporal history moments",
+            w,
+            h,
+            GUIDE_FORMAT,
+        );
         let (temporal_colour_tex, temporal_colour) =
             plane(device, "raywatcher temporal colour", w, h, COLOUR_FORMAT);
         let (temporal_moments_tex, temporal_moments) =
