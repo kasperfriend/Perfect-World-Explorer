@@ -3165,7 +3165,7 @@ impl Architect {
                                 .object_drag_start_hit
                                 .zip(hit)
                                 .map(|(start, current)| {
-                                    Vec3::from_array(current) - Vec3::from_array(start)
+                                    current - Vec3::from_array(start)
                                 }),
                         };
                         if let Some(delta) = delta {
