@@ -252,18 +252,38 @@ pub struct RtTreeSpecies {
 }
 
 /// Sample linear RGB + alpha coverage from an RGBA8 texture at normalized UV.
+///
+/// Match the far-tree raster sampler's Repeat + Linear filtering at mip 0.
+/// Nearest-texel sampling made the RT cutout mask depend on arbitrary source
+/// texel boundaries, exaggerating small transparent gaps into jagged card edges.
 fn sample_rgba_uv(img: &image::RgbaImage, uv: [f32; 2]) -> ([f32; 3], f32) {
-    let w = img.width().max(1);
-    let h = img.height().max(1);
+    let w = img.width().max(1) as i64;
+    let h = img.height().max(1) as i64;
     let u = uv[0].rem_euclid(1.0);
     let v = uv[1].rem_euclid(1.0);
-    let px = ((u * w as f32) as u32).min(w - 1);
-    let py = ((v * h as f32) as u32).min(h - 1);
-    let p = img.get_pixel(px, py).0;
-    let to_lin = |c: u8| (c as f32 / 255.0).powf(2.2);
+    // GPU normalized linear sampling addresses texel centres at (n + 0.5)/size.
+    let x = u * w as f32 - 0.5;
+    let y = v * h as f32 - 0.5;
+    let x0 = x.floor() as i64;
+    let y0 = y.floor() as i64;
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let sample = |px: i64, py: i64| {
+        img.get_pixel(px.rem_euclid(w) as u32, py.rem_euclid(h) as u32).0
+    };
+    let p00 = sample(x0, y0);
+    let p10 = sample(x0 + 1, y0);
+    let p01 = sample(x0, y0 + 1);
+    let p11 = sample(x0 + 1, y0 + 1);
+    let bilinear = |channel: usize| {
+        let top = (p00[channel] as f32 * (1.0 - fx) + p10[channel] as f32 * fx) / 255.0;
+        let bottom = (p01[channel] as f32 * (1.0 - fx) + p11[channel] as f32 * fx) / 255.0;
+        top * (1.0 - fy) + bottom * fy
+    };
+    let to_lin = |c: f32| c.powf(2.2);
     (
-        [to_lin(p[0]), to_lin(p[1]), to_lin(p[2])],
-        p[3] as f32 / 255.0,
+        [to_lin(bilinear(0)), to_lin(bilinear(1)), to_lin(bilinear(2))],
+        bilinear(3),
     )
 }
 
@@ -2168,6 +2188,20 @@ pub fn harvest_rt_tree_species_cancellable(
 #[cfg(test)]
 mod raywatcher_tree_tests {
     use super::*;
+
+    #[test]
+    fn rt_foliage_alpha_sampling_matches_linear_repeat_texture_filtering() {
+        let mut image = image::RgbaImage::new(2, 1);
+        image.put_pixel(0, 0, image::Rgba([255, 0, 0, 0]));
+        image.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
+        // At the midpoint between texel centres, linear filtering returns
+        // half coverage rather than snapping to one side of the leaf edge.
+        let (_, alpha) = sample_rgba_uv(&image, [0.5, 0.5]);
+        assert!((alpha - 0.5).abs() < 1e-6, "alpha={alpha}");
+        // Repeat addressing must interpolate across the texture seam too.
+        let (_, seam_alpha) = sample_rgba_uv(&image, [0.0, 0.5]);
+        assert!((seam_alpha - 0.5).abs() < 1e-6, "alpha={seam_alpha}");
+    }
 
     #[test]
     fn rt_leaf_and_frond_cutoffs_match_the_raster_shader_references() {
