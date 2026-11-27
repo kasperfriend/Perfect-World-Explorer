@@ -532,6 +532,31 @@ mod tests {
     }
 
     #[test]
+    fn parallel_residency_shares_immutable_index_topology() {
+        let topology: std::sync::Arc<[u32]> = vec![0, 1, 0].into();
+        let shared = std::sync::Arc::clone(&topology);
+        let mut residency = Residency::default();
+        let win = window(0, 0, 4, 1);
+        residency
+            .update_stitched_parallel(&win, |_, _| (3, [0; 4]), move |x, _, _, _| {
+                Ok((
+                    vec![vertex(x as f32), vertex(x as f32 + 1.)],
+                    std::sync::Arc::clone(&shared),
+                    [x as f32, 0., 0., x as f32 + 1., 0., 1.],
+                ))
+            })
+            .unwrap();
+
+        let first = &residency.blocks[&(0, 0)].indices;
+        for x in 1..4 {
+            assert!(
+                std::sync::Arc::ptr_eq(first, &residency.blocks[&(x, 0)].indices),
+                "resident block {x} duplicated an immutable terrain index topology"
+            );
+        }
+    }
+
+    #[test]
     fn parallel_updates_keep_the_triangle_census_incremental() {
         let mut residency = Residency::default();
         let first = window(0, 0, 3, 2);
