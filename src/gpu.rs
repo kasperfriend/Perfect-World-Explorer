@@ -3169,7 +3169,7 @@ impl Renderer {
         } else {
             None
         };
-        let (raster_fog, mut rt_fog) = split_raster_and_rt_fog(active_fog, rt_fog_cap);
+        let (raster_fog, rt_fog) = split_raster_and_rt_fog(active_fog, rt_fog_cap);
         let (mut fog_range, fog_color) = (raster_fog.range(), raster_fog.color4());
         // Uniform fog_range.w is the terrain day/night factor; the shader reads
         // it instead of overloading sun.w (the lightmap-availability flag).
