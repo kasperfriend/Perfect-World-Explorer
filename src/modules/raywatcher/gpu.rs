@@ -2703,7 +2703,7 @@ fn reproject(pixel: vec2<i32>, size: vec2<i32>, current_depth: f32) -> Reproject
     if (previous_depth <= 0.0 || expected_prev_depth <= 0.0) {
         return empty;
     }
-    if (abs(previous_depth - expected_prev_depth) / max(expected_prev_depth, 1e-3) > 0.038) {
+    if (abs(previous_depth - expected_prev_depth) / max(expected_prev_depth, 1e-3) > 0.05) {
         return empty;
     }
     let prev_c = textureLoad(history_colour, index, 0);
@@ -5188,11 +5188,10 @@ impl RaywatcherGpu {
         let old_dxr = self.dxr.take();
         self.scene_geom = scene.clone();
         self.scene = SceneBuffers::upload(device, scene.clone());
-        self.prev_view_projection = None;
-        self.frames = 0;
-        // Keep the last complete output available while a replacement AS builds.
-        // record() freezes it and returns to the raster pass instead of running
-        // a full Software trace in parallel with an expensive Hardware build.
+        // Keep the temporal reprojection state across scene swaps. The depth
+        // validation rejects disoccluded pixels; camera cuts still reset history
+        // through the explicit camera_jumped path.
+        // A held RT image is never treated as fresh while its AS is rebuilding.
         if let Some(dxr) = old_dxr {
             self.begin_dxr_scene_rebuild(dxr, scene);
         }
@@ -5256,8 +5255,10 @@ impl RaywatcherGpu {
         if hardware_mode && !self.dxr_failed && self.dxr.is_none() {
             self.begin_dxr_initialization();
             if !self.poll_dxr_initialization(device) {
-                self.traced_last_frame =
-                    output_was_ready && !resized && depth_ext == self.render_extent;
+                // The previous output belongs to the previous scene snapshot.
+                // It has not been reprojected against this frame's G-buffer, so
+                // leave raster effects enabled instead of compositing stale RT.
+                self.traced_last_frame = false;
                 return;
             }
         }
