@@ -3804,12 +3804,11 @@ impl RaywatcherGpu {
         // The terrain-map and sky-environment blits both target COLOUR_FORMAT.
         // Build this shared PSO during renderer construction so neither path
         // pays pipeline compilation on its first visible frame.
-        let blit_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("raywatcher blit"),
-                bind_group_layouts: &[&pipelines.blit_layout],
-                push_constant_ranges: &[],
-            });
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("raywatcher blit"),
+            bind_group_layouts: &[&pipelines.blit_layout],
+            push_constant_ranges: &[],
+        });
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("raywatcher blit"),
             layout: Some(&blit_pipeline_layout),
@@ -5679,14 +5678,8 @@ impl RaywatcherGpu {
                 None => encoder,
             };
 
-            let Some((
-                _,
-                _,
-                ref scratch_view,
-                _,
-                ref scratch_depth_view,
-                ref blit_bg,
-            )) = self.sky_env_scratch
+            let Some((_, _, ref scratch_view, _, ref scratch_depth_view, ref blit_bg)) =
+                self.sky_env_scratch
             else {
                 return;
             };
