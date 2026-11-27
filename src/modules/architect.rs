@@ -2412,6 +2412,19 @@ mod tests {
             tree_filter: String::new(),
             object_filter: String::new(),
             show_scene_objects: true,
+            brush_cursor_position: None,
+            brush_dragging: false,
+            last_brush_position: None,
+            object_dragging: false,
+            object_drag_y_offset: 0.,
+            object_drag_xz_offset: [0.; 2],
+            object_drag_axis: None,
+            object_drag_start_pointer: None,
+            object_drag_start_position: [0.; 3],
+            object_drag_snapshot: None,
+            undo_objects: Vec::new(),
+            redo_objects: Vec::new(),
+            object_history_action: false,
         };
         editor.write_project(&path).unwrap();
         let loaded = Architect::read_project(&path).unwrap();
