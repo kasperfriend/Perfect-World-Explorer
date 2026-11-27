@@ -714,6 +714,16 @@ mod tests {
         DenoiseConfig::default()
     }
 
+    #[test]
+    fn non_finite_history_settings_fall_back_to_the_declared_defaults() {
+        let mut config = DenoiseConfig::default();
+        config.temporal_floor = f32::NAN;
+        config.max_history = f32::NAN;
+        config.sanitise();
+        assert_eq!(config.temporal_floor, 0.10);
+        assert_eq!(config.max_history, 16.0);
+    }
+
     /// A flat, fully converged frame: every guide identical, no motion.
     fn flat(w: u32, h: u32, colour: Vec3) -> Frame {
         let mut frame = Frame::new(w, h);
