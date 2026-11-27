@@ -561,7 +561,7 @@ impl WorldGpuCullView {
             });
             args.push(PageDrawIndexedArgs {
                 index_count: cmd.end.saturating_sub(cmd.start),
-                instance_count: 1,
+                instance_count: 0,
                 first_index: cmd.start,
                 base_vertex: 0,
                 first_instance: 0,
@@ -577,6 +577,15 @@ impl WorldGpuCullView {
                 }),
             }
         }
+        let gpu_runs: Vec<WorldGpuCullRun> = runs
+            .iter()
+            .map(|run| WorldGpuCullRun {
+                first_cmd: run.first_cmd as u32,
+                command_count: run.record_count,
+                first_output: run.first_record,
+                pad: 0,
+            })
+            .collect();
         let bounds = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("whole-world GPU culling bounds"),
             contents: bytemuck::cast_slice(&bounds),
@@ -588,6 +597,19 @@ impl WorldGpuCullView {
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::COPY_SRC,
+        });
+        let runs_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("whole-world GPU culling page runs"),
+            contents: bytemuck::cast_slice(&gpu_runs),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let counts = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("whole-world GPU compacted draw counts"),
+            size: (runs.len() * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
         });
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("whole-world GPU culling parameters"),
@@ -611,6 +633,14 @@ impl WorldGpuCullView {
                     binding: 2,
                     resource: params.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: runs_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: counts.as_entire_binding(),
+                },
             ],
         });
         Some(Self {
@@ -618,6 +648,8 @@ impl WorldGpuCullView {
             _bounds: bounds,
             indirect,
             params,
+            _runs: runs_buffer,
+            counts,
             bind_group,
             runs,
             ready: false,
@@ -661,6 +693,26 @@ impl WorldGpuCuller {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
