@@ -5222,6 +5222,7 @@ impl Renderer {
         let refraction = self.water.refraction();
         let scene_color = self.water.scene();
         let scene_depth = self.depth.create_view(&Default::default());
+        let resident_bounds = self.resident_bounds();
         // The main view's unjittered view-projection. `matrix` carries the
         // upscaler's sub-pixel jitter, and a motion vector must not: it describes
         // where the surface was, not where this frame sampled it. Same expression
