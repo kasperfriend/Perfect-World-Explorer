@@ -2112,19 +2112,19 @@ pub fn harvest_rt_tree_species_cancellable(
             let sparse_outer_lod =
                 candidate > 0 && tris.len() < 12 && !sp.lods[candidate - 1].is_empty();
             if !tris.is_empty() && !sparse_outer_lod && tris.len() <= remaining {
-                chosen = Some(tris);
+                chosen = Some((candidate, tris));
                 break;
             }
         }
-        let Some(src_tris) = chosen else {
+        let Some((chosen_lod_idx, src_tris)) = chosen else {
             budget_skips += 1;
             continue;
         };
         let offset = glam::Vec3::from_array(pos);
-        let has_billboards = *billboard_lods[si][lod_idx]
+        let has_billboards = *billboard_lods[si][chosen_lod_idx]
             .get_or_insert_with(|| src_tris.iter().any(|triangle| triangle.leaf_rho >= 0.0));
         let local_triangles = if has_billboards {
-            let cache = &mut transformed_lods[si][lod_idx];
+            let cache = &mut transformed_lods[si][chosen_lod_idx];
             if cache.is_none() {
                 *cache = transform_tree_lod_for_view(src_tris, view_direction, cancel);
             }
