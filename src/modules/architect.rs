@@ -1808,6 +1808,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn viewport_ray_hits_flat_terrain_at_view_center() {
+        let mut builder = crate::terrain_store::Builder::new_resident(8, 8, 4).unwrap();
+        for by in 0..2 {
+            for bx in 0..2 {
+                builder.block(bx, by, &[0.; 16], &[[0, 127, 0]; 16]).unwrap();
+            }
+        }
+        let (heights, _) = builder.finish(0).unwrap();
+        let map = crate::navigation::MapSpace { width: 8, height: 8, spacing: 1., heights };
+        let eye = Vec3::new(0., 10., 10.);
+        let direction = Vec3::new(0., -1., -1.).normalize();
+        let view = glam::Mat4::look_to_rh(eye, direction, Vec3::Y);
+        let projection = glam::Mat4::from_scale(Vec3::new(-1., 1., 1.))
+            * glam::Mat4::perspective_rh(70f32.to_radians(), 1., 1000., 0.1);
+        let vp = projection * view;
+        let hit = Architect::terrain_hit(
+            egui::pos2(50., 50.),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100., 100.)),
+            vp,
+            &map,
+        ).expect("center ray should hit flat terrain");
+        assert!(hit.x.abs() < 0.05);
+        assert!(hit.z.abs() < 0.05);
+        assert!(hit.y.abs() < 0.1);
+    }
+
+    #[test]
     fn sculpt_brush_updates_shared_heights_and_replays_reversibly() {
         let mut builder = crate::terrain_store::Builder::new_resident(8, 8, 4).unwrap();
         for by in 0..2 {
