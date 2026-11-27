@@ -7179,12 +7179,18 @@ mod reflection_sampling_regression_tests {
             .expect("fast occlusion helper");
         assert!(fast_occlusion.contains("accept_opacity("));
         assert!(!fast_occlusion.contains("RAY_FLAG_FORCE_OPAQUE"));
-        assert!(!DXR_SHADER.contains("RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES>"));
+        assert!(!DXR_SHADER
+            .contains("RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES>"));
         let point_shadow = DXR_SHADER
             .split("bool occluded_point_light(")
             .nth(1)
             .and_then(|tail| tail.split("uint point_light_order_at").next())
-            .unwrap_or_else(|| DXR_SHADER.split("bool occluded_point_light(").nth(1).unwrap());
+            .unwrap_or_else(|| {
+                DXR_SHADER
+                    .split("bool occluded_point_light(")
+                    .nth(1)
+                    .unwrap()
+            });
         assert!(point_shadow.contains("accept_opacity("));
         assert!(!point_shadow.contains("RAY_FLAG_FORCE_OPAQUE"));
     }
