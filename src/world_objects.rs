@@ -2428,9 +2428,7 @@ impl GpuPage {
             // 1. Hierarchical page-level rejection: test each GpuPage AABB once
             // against clip plane, frustum, and sub-pixel size into a reused buffer.
             scratch.page_visible.clear();
-            scratch
-                .page_visible
-                .reserve(pages.len().saturating_sub(scratch.page_visible.capacity()));
+            scratch.page_visible.reserve(pages.len());
             let mut any_page_visible = false;
             for page in pages {
                 let vis = page.count > 0
