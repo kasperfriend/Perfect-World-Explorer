@@ -2660,7 +2660,7 @@ impl Architect {
                         }
                     }
                 }
-                let source_pick = if self.cursor == CursorMode::Select {
+                let source_pick = if self.cursor == CursorMode::Select && axis_pick.is_none() {
                     pointer.and_then(|pointer| {
                         Self::pick_source_scene(pointer, screen, view_projection, scene, ornaments)
                     })
@@ -2674,13 +2674,18 @@ impl Architect {
                 let source_is_frontmost = match (nearest.as_ref(), source_pick.as_ref()) {
                     (None, Some(_)) => true,
                     (Some(_), None) | (None, None) => false,
-                    (Some((_, project_score, project_depth)), Some((_, scene_score, scene_depth, _, _))) => {
-                        scene_score < project_score - 0.025
-                            || ((scene_score - project_score).abs() <= 0.025
-                                && scene_depth > project_depth)
+                    (
+                        Some((_, project_score, project_depth)),
+                        Some((_, scene_score, scene_depth, _, _)),
+                    ) => {
+                        *scene_score < *project_score - 0.025
+                            || ((*scene_score - *project_score).abs() <= 0.025
+                                && *scene_depth > *project_depth)
                     }
                 };
-                let picked_placement = if source_is_frontmost {
+                let picked_placement = if axis_pick.is_some() {
+                    self.selected_placement
+                } else if source_is_frontmost {
                     None
                 } else {
                     nearest.map(|(index, _, _)| index)
