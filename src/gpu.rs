@@ -4003,22 +4003,10 @@ impl Renderer {
             .as_ref()
             .is_some_and(|gpu| gpu.hardware_failed());
         let skip_cpu_bvh = hardware_mode && !hardware_failed;
-        // Tree placement data and both LOD controls affect the harvested
-        // foliage triangles. Include them in the scene key so an asynchronous
-        // tree load or live setting change cannot leave stale leaves in RT.
-        let tree_species = self.far_trees.rt_species_snapshot();
-        let tree_species_key = (tree_species.as_ref().as_ptr() as usize as u64)
-            ^ (tree_species.len() as u64).rotate_left(37);
-        let tree_lod_scale =
-            self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees);
-        let tree_max_distance = view_distance.clamp(512.0, 1024.0).min(640.0);
         let content_hash = (active_pages_len << 16)
             ^ (self.water_batches.len() as u64)
             ^ (u64::from(skip_cpu_bvh) << 61)
-            ^ (u64::from(self.world_done) << 62)
-            ^ u64::from(tree_lod_scale.to_bits()).rotate_left(23)
-            ^ u64::from(tree_max_distance.to_bits()).rotate_left(41)
-            ^ tree_species_key.rotate_left(7);
+            ^ (u64::from(self.world_done) << 62);
         let t_rw_frame = std::time::Instant::now();
         // Poll any completed background BVH build without blocking the frame.
         let _ = self.raywatcher_harvest.poll_background_build();
@@ -4200,11 +4188,13 @@ impl Renderer {
             // scene worker. Expanding nearby placements and camera-facing LODs can
             // involve hundreds of thousands of triangles; do not do that on the
             // render/UI thread when Hardware is enabled.
+            let tree_species = self.far_trees.rt_species_snapshot();
             let tree_harvest = crate::modules::raywatcher::harvest::TreeHarvestConfig {
                 eye: camera.pos,
                 view_direction: camera.direction(),
-                max_distance: tree_max_distance,
-                lod_scale: tree_lod_scale,
+                max_distance: detail_radius.min(640.0),
+                lod_scale: self.detail.tree_lod_scale
+                    * lod_scale(self.detail.scenery_quality, Class::Trees),
                 triangle_budget: 420_000,
             };
             // Diagnostics log is written immediately on toggle-on and every 4s above.

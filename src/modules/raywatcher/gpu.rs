@@ -7171,9 +7171,6 @@ mod reflection_sampling_regression_tests {
             .expect("distant shadow branch");
         assert!(distant_shadow.contains("CANDIDATE_NON_OPAQUE_TRIANGLE"));
         assert!(distant_shadow.contains("accept_opacity("));
-        assert!(distant_shadow.contains("float depth_atten = exp(-0.55)"));
-        assert!(distant_shadow.contains("foliage.albedo.rgb * warm_tint"));
-        assert!(distant_shadow.contains("has_alpha_mask"));
         assert!(!distant_shadow.contains("RAY_FLAG_FORCE_OPAQUE"));
         let fast_occlusion = DXR_SHADER
             .split("bool occluded_fast(")
@@ -7202,34 +7199,6 @@ mod reflection_sampling_regression_tests {
     fn sky_and_cloud_reflection_atlas_uses_four_times_the_previous_edge_resolution() {
         assert_eq!(SKY_ENV_FACE, 512);
         assert!(DXR_SHADER.contains("SKY_ENV_FACE_F = 512.0"));
-    }
-
-    #[test]
-    fn canopy_transmission_counts_only_alpha_accepted_foliage_layers() {
-        let detailed = DXR_SHADER
-            .split("uint foliage_layers = 0u;")
-            .nth(1)
-            .and_then(|tail| tail.split("bool occluded_fast(").next())
-            .expect("detailed canopy shadow path");
-        let first_accept = detailed
-            .find("if (accept_opacity(cand_prim")
-            .expect("primary foliage alpha test");
-        let first_count = detailed
-            .find("foliage_layers = min(foliage_layers + 1u, 6u);")
-            .expect("primary accepted foliage count");
-        assert!(
-            first_accept < first_count,
-            "transparent card holes must not deepen the canopy"
-        );
-
-        let second_accept = detailed
-            .find("if (accept_opacity(cp2")
-            .expect("terrain-skip foliage alpha test");
-        let second_count = detailed[second_accept..]
-            .find("foliage_layers = min(foliage_layers + 1u, 6u);")
-            .map(|offset| offset + second_accept)
-            .expect("secondary accepted foliage count");
-        assert!(second_accept < second_count);
     }
 
     #[test]

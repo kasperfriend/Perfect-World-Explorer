@@ -282,41 +282,9 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
             }
         }
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            res.occluded = true;
             res.t_blocker = q.CommittedRayT();
-            // The fast/distant path used to turn every accepted foliage texel
-            // into a fully opaque blocker. Preserve one layer of transmission
-            // for alpha-masked foliage; non-masked alpha geometry has already
-            // used stochastic opacity in accept_opacity and must not be faded
-            // a second time here.
-            if (q.CommittedInstanceID() != 1u) {
-                uint prim = q.CommittedPrimitiveIndex()
-                    + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
-                if (prim < tri_count) {
-                    uint raw_lo = asuint(tris[prim].c.w);
-                    uint raw_hi = asuint(tris[prim].n.w);
-                    bool has_alpha_mask = (raw_lo | raw_hi) != 0u;
-                    if (has_alpha_mask) {
-                        Material foliage = material_of(prim);
-                        float depth_atten = exp(-0.55);
-                        float tr = saturate(((1.0 - foliage.surface.w) * 0.44 + 0.12) * depth_atten);
-                        float3 warm_tint = lerp(
-                            float3(0.45, 0.85, 0.35),
-                            float3(1.15, 1.05, 0.55),
-                            depth_atten);
-                        res.transmittance = clamp(
-                            foliage.albedo.rgb * warm_tint,
-                            float3(0.06, 0.08, 0.04),
-                            float3(0.95, 0.95, 0.95)) * tr;
-                    } else {
-                        res.transmittance = float3(0.0, 0.0, 0.0);
-                    }
-                } else {
-                    res.transmittance = float3(0.0, 0.0, 0.0);
-                }
-            } else {
-                res.transmittance = float3(0.0, 0.0, 0.0);
-            }
-            res.occluded = any(res.transmittance < float3(0.999, 0.999, 0.999));
+            res.transmittance = float3(0.0, 0.0, 0.0);
         }
         return res;
     }
@@ -328,8 +296,8 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
             uint cand_prim = q.CandidatePrimitiveIndex() + (q.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
+            foliage_layers = min(foliage_layers + 1u, 6u);
             if (accept_opacity(cand_prim, q.CandidateTriangleBarycentrics(), seed, tri_count)) {
-                foliage_layers = min(foliage_layers + 1u, 6u);
                 q.CommitNonOpaqueTriangleHit();
             }
         }
@@ -361,8 +329,8 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
                 while (q2.Proceed()) {
                     if (q2.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
                         uint cp2 = q2.CandidatePrimitiveIndex() + (q2.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
+                        foliage_layers = min(foliage_layers + 1u, 6u);
                         if (accept_opacity(cp2, q2.CandidateTriangleBarycentrics(), seed ^ 19u, tri_count)) {
-                            foliage_layers = min(foliage_layers + 1u, 6u);
                             q2.CommitNonOpaqueTriangleHit();
                         }
                     }

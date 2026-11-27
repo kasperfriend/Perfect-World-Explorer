@@ -222,7 +222,7 @@ pub struct RtTreeTriangle {
     pub alpha_mask: u64,
     /// Camera-facing leaf quad pivot in local tree space; zero and rho=-1 for branches/fronds.
     pub leaf_center: glam::Vec3,
-    /// Original SpeedTree leaf rho, applied at per-frame harvest. Non-finite means non-leaf.
+    /// Original SpeedTree leaf rho, applied at per-frame harvest; -1 means this is not a leaf.
     pub leaf_rho: f32,
 }
 
@@ -238,9 +238,6 @@ pub struct RtTreeLodDiag {
     pub masked_tris: usize,
     pub unmasked_foliage_tris: usize,
 }
-
-/// Sentinel kept outside SpeedTree's finite rho domain for branch/frond triangles.
-const NO_LEAF_RHO: f32 = f32::NEG_INFINITY;
 
 /// Local-space SpeedTree LOD meshes retained for Raywatcher RT harvesting.
 pub struct RtTreeSpecies {
@@ -416,9 +413,7 @@ fn transform_tree_lod_for_view(
             return None;
         }
         let mut moved = *triangle;
-        // SpeedTree rho is a signed rotation; negative values are valid billboards.
-        // Use a non-finite sentinel rather than colliding with part of that domain.
-        if moved.leaf_rho.is_finite() {
+        if moved.leaf_rho >= 0.0 {
             let pivot = moved.leaf_center;
             let rho = moved.leaf_rho;
             // Rho is shared by all three vertices, so evaluate its azimuth
@@ -443,10 +438,9 @@ fn transform_tree_lod_for_view(
             moved.a = transform(moved.a);
             moved.b = transform(moved.b);
             moved.c = transform(moved.c);
-            // Match the raster leaf shader: it preserves the authored normal
-            // when one is present (otherwise harvest supplied world-up already).
+            moved.normal = glam::Vec3::Y;
             moved.leaf_center = glam::Vec3::ZERO;
-            moved.leaf_rho = NO_LEAF_RHO;
+            moved.leaf_rho = -1.0;
         }
         transformed.push(moved);
     }
@@ -486,7 +480,6 @@ fn sample_tri_alpha_mask49(
     u1: [f32; 2],
     u2: [f32; 2],
     cutoff: f32,
-    inclusive_cutoff: bool,
 ) -> (u64, [f32; 3], u32) {
     let mut mask = 0u64;
     let mut rgb_sum = [0.0f32; 3];
@@ -504,12 +497,7 @@ fn sample_tri_alpha_mask49(
                 u0[1] * bw + u1[1] * bx + u2[1] * by,
             ];
             let (rgb, a) = sample_rgba_uv(img, uv);
-            let accepted = if inclusive_cutoff {
-                a >= cutoff
-            } else {
-                a > cutoff
-            };
-            if accepted {
+            if a >= cutoff {
                 mask |= 1u64 << (iy * 7 + ix);
                 hits += 1;
                 rgb_sum[0] += rgb[0] * a;
@@ -944,20 +932,10 @@ impl FarTrees {
                             }
                             let norm = cross.normalize();
                             if is_foliage {
-                                let uses_authored_cutoff = authored_mips
-                                    && lod
-                                        .frond_alpha_ref
-                                        .is_some_and(|reference| reference >= 0.0);
                                 let frond_cutoff =
                                     raster_alpha_cutoff(authored_mips, lod.frond_alpha_ref);
-                                let (mask, albedo, hits) = sample_tri_alpha_mask49(
-                                    img,
-                                    v0.uv,
-                                    v1.uv,
-                                    v2.uv,
-                                    frond_cutoff,
-                                    !uses_authored_cutoff,
-                                );
+                                let (mask, albedo, hits) =
+                                    sample_tri_alpha_mask49(img, v0.uv, v1.uv, v2.uv, frond_cutoff);
                                 if hits == 0 {
                                     ldiag.frond_skipped += 1;
                                     continue;
@@ -979,7 +957,7 @@ impl FarTrees {
                                     opacity: foliage_opacity(hits),
                                     alpha_mask: mask,
                                     leaf_center: glam::Vec3::ZERO,
-                                    leaf_rho: NO_LEAF_RHO,
+                                    leaf_rho: -1.0,
                                 });
                             } else {
                                 let uv_mid = [
@@ -998,7 +976,7 @@ impl FarTrees {
                                     opacity: 1.0,
                                     alpha_mask: 0,
                                     leaf_center: glam::Vec3::ZERO,
-                                    leaf_rho: NO_LEAF_RHO,
+                                    leaf_rho: -1.0,
                                 });
                             }
                         }
@@ -1016,7 +994,6 @@ impl FarTrees {
                             leaf.uv[1],
                             leaf.uv[2],
                             leaf_cutoff,
-                            !authored_mips,
                         );
                         let (m1, a1, h1) = sample_tri_alpha_mask49(
                             foliage_image,
@@ -1024,7 +1001,6 @@ impl FarTrees {
                             leaf.uv[2],
                             leaf.uv[3],
                             leaf_cutoff,
-                            !authored_mips,
                         );
                         if h0 + h1 == 0 {
                             ldiag.leaves_skipped += 1;
@@ -2253,11 +2229,8 @@ pub fn harvest_rt_tree_species_cancellable(
         };
         let src_tris = &sp.lods[chosen_lod_idx];
         let offset = glam::Vec3::from_array(pos);
-        let has_billboards = *billboard_lods[si][chosen_lod_idx].get_or_insert_with(|| {
-            src_tris
-                .iter()
-                .any(|triangle| triangle.leaf_rho.is_finite())
-        });
+        let has_billboards = *billboard_lods[si][chosen_lod_idx]
+            .get_or_insert_with(|| src_tris.iter().any(|triangle| triangle.leaf_rho >= 0.0));
         let local_triangles = if has_billboards {
             let cache = &mut transformed_lods[si][chosen_lod_idx];
             if cache.is_none() {
@@ -2338,19 +2311,6 @@ mod raywatcher_tree_tests {
     }
 
     #[test]
-    fn authored_leaf_alpha_cutoff_is_strict_while_legacy_cutoff_is_inclusive() {
-        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([120, 160, 90, 84]));
-        let uv0 = [0.0, 0.0];
-        let uv1 = [1.0, 0.0];
-        let uv2 = [0.0, 1.0];
-        let cutoff = 84.0 / 255.0;
-        let (_, _, strict_hits) = sample_tri_alpha_mask49(&image, uv0, uv1, uv2, cutoff, false);
-        let (_, _, inclusive_hits) = sample_tri_alpha_mask49(&image, uv0, uv1, uv2, cutoff, true);
-        assert_eq!(strict_hits, 0, "authored raster cutoff discards equality");
-        assert_eq!(inclusive_hits, 49, "legacy raster cutoff keeps equality");
-    }
-
-    #[test]
     fn tree_harvest_stops_promptly_when_the_background_scene_is_cancelled() {
         let species = RtTreeSpecies {
             species_id: 1,
@@ -2390,7 +2350,7 @@ mod raywatcher_tree_tests {
             opacity: 1.0,
             alpha_mask: 0,
             leaf_center: glam::Vec3::ZERO,
-            leaf_rho: NO_LEAF_RHO,
+            leaf_rho: -1.0,
         };
         let leaf = RtTreeTriangle {
             a: glam::Vec3::new(-1.0, 4.0, 0.0),
@@ -2402,8 +2362,7 @@ mod raywatcher_tree_tests {
             opacity: 0.65,
             alpha_mask: 0,
             leaf_center: glam::Vec3::ZERO,
-            // Negative SpeedTree rotations are valid billboard values.
-            leaf_rho: -0.37,
+            leaf_rho: 0.0,
         };
         let species = RtTreeSpecies {
             species_id: 0,
@@ -2433,13 +2392,6 @@ mod raywatcher_tree_tests {
             (out[2].a - out[0].a - glam::Vec3::X * 10.0).length() < 1e-5,
             "the cached billboard transform must be identical across placements"
         );
-        let expected_negative_rho = glam::Vec3::new(10.0, 0.0, 10.0)
-            + speedtree_leaf_corner([-1.0, 0.0, 4.0], glam::Vec3::X, -0.37);
-        assert!(
-            (out[1].a - expected_negative_rho).length() < 1e-5,
-            "negative-rho leaves must use the same camera-facing transform as raster"
-        );
-        assert_eq!(out[1].normal, glam::Vec3::Y);
         assert!(
             out.iter().any(|t| t.opacity < 0.99),
             "leaves must carry per-material alpha"
@@ -2462,7 +2414,7 @@ mod raywatcher_tree_tests {
             opacity: 1.0,
             alpha_mask: 0,
             leaf_center: glam::Vec3::ZERO,
-            leaf_rho: NO_LEAF_RHO,
+            leaf_rho: -1.0,
         };
         let leaf = RtTreeTriangle {
             leaf_rho: 0.25,
@@ -2494,10 +2446,10 @@ mod raywatcher_tree_tests {
         assert_eq!(result, (1, 12, 0));
         assert_eq!(out.len(), 12);
         assert_eq!(
-            out[0].leaf_rho, NO_LEAF_RHO,
+            out[0].leaf_rho, -1.0,
             "fallback LOD billboard must be transformed"
         );
-        assert_eq!(out[0].normal, glam::Vec3::Z);
+        assert_eq!(out[0].normal, glam::Vec3::Y);
     }
 
     #[test]
@@ -2512,7 +2464,7 @@ mod raywatcher_tree_tests {
             opacity: 1.0,
             alpha_mask: 0,
             leaf_center: glam::Vec3::ZERO,
-            leaf_rho: NO_LEAF_RHO,
+            leaf_rho: -1.0,
         };
         let species = RtTreeSpecies {
             species_id: 3,
@@ -2552,7 +2504,7 @@ mod raywatcher_tree_tests {
             opacity: 1.0,
             alpha_mask: 0,
             leaf_center: glam::Vec3::ZERO,
-            leaf_rho: NO_LEAF_RHO,
+            leaf_rho: -1.0,
         };
         let species = RtTreeSpecies {
             species_id: 4,
@@ -2591,7 +2543,7 @@ mod raywatcher_tree_tests {
             opacity: 1.0,
             alpha_mask: 0,
             leaf_center: glam::Vec3::ZERO,
-            leaf_rho: NO_LEAF_RHO,
+            leaf_rho: -1.0,
         };
         let species = RtTreeSpecies {
             species_id: 5,
@@ -2645,7 +2597,7 @@ mod raywatcher_tree_tests {
             opacity: 1.0,
             alpha_mask: 0,
             leaf_center: glam::Vec3::ZERO,
-            leaf_rho: NO_LEAF_RHO,
+            leaf_rho: -1.0,
         };
         let species = RtTreeSpecies {
             species_id: 1,
@@ -2687,7 +2639,7 @@ mod raywatcher_tree_tests {
             glam::Vec3::new(0.3, 0.8, -0.4),
             glam::Vec3::new(-0.2, -0.1, 0.9),
         ] {
-            for rho in [-0.37, 0.0, 0.37, 2.1, 1000.0, 1001.0] {
+            for rho in [0.0, 0.37, 2.1, 1000.0, 1001.0] {
                 let source = [RtTreeTriangle {
                     a: vertices[0],
                     b: vertices[1],
@@ -2715,14 +2667,6 @@ mod raywatcher_tree_tests {
                         "cached transform diverged for rho={rho}: {got:?} vs {expected:?}"
                     );
                 }
-                assert_eq!(
-                    actual.normal, source[0].normal,
-                    "billboard transform must preserve the raster-authored leaf normal for rho={rho}"
-                );
-                assert_eq!(
-                    actual.leaf_rho, NO_LEAF_RHO,
-                    "transformed leaf must be marked as already facing the current view"
-                );
             }
         }
     }

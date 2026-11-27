@@ -384,11 +384,8 @@ impl Harvester {
     }
 
     /// Whether the frustum ray scene needs to be rebuilt based on hysteresis
-    /// (>= max(256, 0.25 * view_distance) horizontal camera travel) or
-    /// world content/config changes. Camera rotation alone deliberately does
-    /// not invalidate cached RT tree geometry: SpeedTree leaf cards are
-    /// view-oriented sprites, and rebuilding them while turning makes their
-    /// shadows visibly rotate across the ground.
+    /// (`>= max(256, 0.25 * view_distance)` horizontal camera travel) or world
+    /// content/config changes.
     pub fn needs_frustum_rebuild(
         &self,
         config: HarvestConfig,
@@ -401,6 +398,9 @@ impl Harvester {
             return true;
         }
         let far_bucket = (view_distance / 128.0).round() as u32;
+        // World/config changes are correctness invalidations, not camera-motion
+        // churn. Never hide newly streamed pages or terrain behind the movement
+        // cooldown; only apply hysteresis after the content keys match.
         if self.last_build_config != Some(config)
             || self.last_build_terrain_gen != terrain_generation
             || self.last_build_content_hash != content_hash
@@ -422,8 +422,7 @@ impl Harvester {
         }
     }
 
-    /// Fast-path cache check for scene_frustum. view_forward is intentionally
-    /// ignored so rotating the camera leaves RT foliage shadows stable.
+    /// Fast-path cache check for [`Self::scene_frustum`].
     #[allow(clippy::too_many_arguments)]
     pub fn cached_if_unchanged_frustum(
         &self,
@@ -1186,8 +1185,10 @@ fn frustum_signature(
     terrain_generation: u64,
     content_hash: u64,
 ) -> Signature {
-    // Camera rotation does not rebuild view-facing leaf cards: keep the RT
-    // approximation stable until position, distance or scene content changes.
+    // Snap to 64-unit steps and omit camera yaw/pitch: the harvested BVH/BLAS
+    // covers 360 degrees around the camera out to `view_distance`, so rotating
+    // the camera never triggers a CPU BVH or DXR BLAS rebuild stall, and
+    // buildings behind the camera still cast shadows into the view.
     let snap = config.chunk_size.max(256.0);
     let anchor = ((eye.x / snap).round() as i32, (eye.z / snap).round() as i32);
     let far_bucket = ((view_distance / 128.0).round() as u32) as u64;
@@ -2228,7 +2229,7 @@ mod tests {
     }
 
     #[test]
-    fn rotating_camera_reuses_cached_tree_shadow_geometry() {
+    fn rotating_camera_reuses_cached_bvh_without_rebuilding() {
         let mut harvester = Harvester::new();
         let config = HarvestConfig::default();
         let eye = Vec3::new(10.0, 20.0, 10.0);
@@ -2249,12 +2250,11 @@ mod tests {
             &[],
             &[],
         );
-        // A 180-degree camera turn must keep the same cached RT geometry.
-        // Raster cards face the camera, but the RT shadow approximation is
-        // intentionally frozen until a real scene rebuild.
+        // Rotating 180 degrees at the same position must be a cache hit so
+        // looking around never triggers a CPU BVH or DXR BLAS rebuild stall.
         let cached = harvester
             .cached_if_unchanged_frustum(config, eye, Vec3::Z, 1000.0, 1, 42)
-            .expect("camera rotation must not rebuild view-facing leaf geometry");
+            .expect("rotating the camera must hit the 360-degree BVH cache");
         assert!(std::sync::Arc::ptr_eq(&first, &cached));
     }
 
