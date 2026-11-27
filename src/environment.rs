@@ -595,8 +595,7 @@ impl Environments {
         // AutoFamily fog is a scene-level fallback only. EC-BSD area fog stays
         // authoritative whenever an area is selected.
         let auto_fog = (|| -> Result<crate::sky_config::AutoFogConfig, String> {
-            let mut file =
-                fs::File::open(element_root(dir).join("configs.pck")).map_err(|e| e.to_string())?;
+            let mut file = fs::File::open(dir.join("configs.pck")).map_err(|e| e.to_string())?;
             // `configs.pck` is an Angelica File Package, not the retail v2 PCK
             // `textures.pck` uses. The retail reader rejects its guard, which
             // silently disabled the AutoFamily fog fallback.
