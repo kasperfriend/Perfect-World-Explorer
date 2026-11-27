@@ -125,6 +125,7 @@ pub struct Architect {
     object_drag_snapshot: Option<Vec<PlacedObject>>,
     undo_objects: Vec<Vec<PlacedObject>>,
     redo_objects: Vec<Vec<PlacedObject>>,
+    object_history_action: bool,
 }
 
 impl Architect {
@@ -201,6 +202,7 @@ impl Architect {
             object_drag_snapshot: None,
             undo_objects: Vec::new(),
             redo_objects: Vec::new(),
+            object_history_action: false,
         };
         editor.refresh_projects();
         editor
@@ -635,6 +637,7 @@ impl Architect {
     }
 
     fn undo_objects(&mut self) {
+        self.object_history_action = true;
         if let Some(previous) = self.undo_objects.pop() {
             self.redo_objects.push(std::mem::replace(&mut self.project.objects, previous));
             self.selected_placement = self.selected_placement.filter(|index| *index < self.project.objects.len());
@@ -643,6 +646,7 @@ impl Architect {
     }
 
     fn redo_objects(&mut self) {
+        self.object_history_action = true;
         if let Some(next) = self.redo_objects.pop() {
             self.undo_objects.push(std::mem::replace(&mut self.project.objects, next));
             self.selected_placement = self.selected_placement.filter(|index| *index < self.project.objects.len());
@@ -1210,6 +1214,7 @@ impl Architect {
         if !self.enabled {
             return None;
         }
+        self.object_history_action = false;
         let objects_before_ui = self.project.objects.clone();
         if self.selected_map.is_empty() || self.selected_map == "__empty__" {
             self.selected_map = current_map.id.clone();
@@ -1791,7 +1796,7 @@ impl Architect {
                 }
             }
         }
-        if !self.object_dragging && objects_before_ui != self.project.objects {
+        if !self.object_history_action && !self.object_dragging && objects_before_ui != self.project.objects {
             self.push_object_undo(objects_before_ui);
         }
         map_request
