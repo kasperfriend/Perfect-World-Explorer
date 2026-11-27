@@ -99,6 +99,11 @@ impl Modules {
         self.architect.renderer_scenery_placements()
     }
 
+    /// Transient SpeedTree instances for the native vegetation renderer.
+    pub fn architect_tree_placements(&self) -> Vec<crate::scene::EditorTreePlacement> {
+        self.architect.renderer_tree_placements()
+    }
+
     pub fn prepare_architect_preview(
         &mut self,
         device: &wgpu::Device,
