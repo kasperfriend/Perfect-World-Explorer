@@ -1214,23 +1214,22 @@ impl Architect {
     /// the native baked-scenery loader. This is deliberately separate from the
     /// ECM/SMD model queue: BMDs need the scenery material/lighting pipeline.
     fn renderer_bmd_path(asset: &str, map_id: &str) -> Option<String> {
-        let (archive, inner) = if let Some((archive, inner)) = asset.split_once("::") {
+        let inner = if let Some((archive, inner)) = asset.split_once("::") {
             let archive_name = Path::new(archive)
                 .file_name()
                 .map(|name| name.to_string_lossy().to_ascii_lowercase())?;
             if archive_name != "litmodels.pck" {
                 return None;
             }
-            (Some(archive), inner)
+            inner
         } else {
             // EC-BSD source-scene rows already carry a map-relative BMD path
             // such as 1/litmodel_1399.bmd rather than an archive-qualified path.
             if Path::new(asset).is_absolute() || asset.contains(':') {
                 return None;
             }
-            (None, asset)
+            asset
         };
-        let _ = archive;
         let mut path = crate::ecmodel::normalize(inner);
         if !path.ends_with(".bmd") {
             return None;
