@@ -2911,7 +2911,7 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let centre_gp = vec2<i32>(clamp(
         (vec2<f32>(pixel) + vec2<f32>(0.5)) * grid_scale,
         vec2<f32>(0.0),
-        gmax,
+        gmax
     ));
     let centre_normal_data = textureLoad(src_normals, centre_gp, 0);
     let centre_normal = centre_normal_data.xyz;
@@ -2921,7 +2921,7 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let history_cap = select(
         params.misc.z,
         min(params.misc.z, 6.0),
-        centre_normal_data.w <= 0.12,
+        centre_normal_data.w <= 0.12
     );
     let centre_raw = textureLoad(history_colour, pixel, 0);
     // Once temporal history has converged and variance is near its floor, the
@@ -7341,6 +7341,13 @@ mod reflection_sampling_regression_tests {
         assert!(DENOISE_SHADER.contains("weight_sum <= 1e-4"));
         assert!(DENOISE_SHADER.contains("water_motion_alpha"));
         assert!(DENOISE_SHADER.contains("min(params.misc.z, 6.0)"));
+    }
+
+    #[test]
+    fn final_atrous_iteration_skips_converged_low_variance_pixels() {
+        assert!(DENOISE_SHADER.contains("step >= 4"));
+        assert!(DENOISE_SHADER.contains("centre_moments.w >= history_cap"));
+        assert!(DENOISE_SHADER.contains("centre_variance <= max(params.misc.y * 4.0, 1e-4)"));
     }
 
     #[test]
