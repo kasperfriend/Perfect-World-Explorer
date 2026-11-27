@@ -449,8 +449,9 @@ impl Architect {
             match fields.first().copied().unwrap_or("") {
                 "name" if fields.len() == 2 => project.name = Self::decode(fields[1])?,
                 "source_map" if fields.len() == 2 => project.source_map = Self::decode(fields[1])?,
-                "object" if (version == 1 && fields.len() == 9)
-                    || (version == 2 && fields.len() == 13) =>
+                "object"
+                    if (version == 1 && fields.len() == 9)
+                        || (version == 2 && fields.len() == 13) =>
                 {
                     if project.objects.len() >= 100_000 {
                         return Err("Architect project has too many object placements".into());
@@ -468,8 +469,12 @@ impl Architect {
                             Self::decode(fields[1])?,
                             Self::decode(fields[2])?,
                             Self::decode(fields[3])?,
-                            fields[4].parse::<bool>().map_err(|_| "invalid object visibility")?,
-                            fields[5].parse::<bool>().map_err(|_| "invalid object lock state")?,
+                            fields[4]
+                                .parse::<bool>()
+                                .map_err(|_| "invalid object visibility")?,
+                            fields[5]
+                                .parse::<bool>()
+                                .map_err(|_| "invalid object lock state")?,
                             &fields[6..],
                         )
                     };
@@ -1851,7 +1856,11 @@ impl Architect {
                     let label = format!(
                         "{}{}",
                         if object.visible { "" } else { "◌ " },
-                        if object.locked { format!("🔒 {}", object.name) } else { object.name.clone() }
+                        if object.locked {
+                            format!("🔒 {}", object.name)
+                        } else {
+                            object.name.clone()
+                        }
                     );
                     hierarchy
                         .entry(if object.group.trim().is_empty() {
@@ -1883,28 +1892,36 @@ impl Architect {
                                         }
                                         if ui.small_button("Hide").clicked() {
                                             for (index, _) in rows {
-                                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                                if let Some(object) =
+                                                    self.project.objects.get_mut(*index)
+                                                {
                                                     object.visible = false;
                                                 }
                                             }
                                         }
                                         if ui.small_button("Show").clicked() {
                                             for (index, _) in rows {
-                                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                                if let Some(object) =
+                                                    self.project.objects.get_mut(*index)
+                                                {
                                                     object.visible = true;
                                                 }
                                             }
                                         }
                                         if ui.small_button("Lock").clicked() {
                                             for (index, _) in rows {
-                                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                                if let Some(object) =
+                                                    self.project.objects.get_mut(*index)
+                                                {
                                                     object.locked = true;
                                                 }
                                             }
                                         }
                                         if ui.small_button("Unlock").clicked() {
                                             for (index, _) in rows {
-                                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                                if let Some(object) =
+                                                    self.project.objects.get_mut(*index)
+                                                {
                                                     object.locked = false;
                                                 }
                                             }
@@ -1912,8 +1929,12 @@ impl Architect {
                                     });
                                     for (index, label) in rows {
                                         if !self.object_filter.is_empty()
-                                            && !label.to_lowercase().contains(&self.object_filter.to_lowercase())
-                                            && !group.to_lowercase().contains(&self.object_filter.to_lowercase())
+                                            && !label
+                                                .to_lowercase()
+                                                .contains(&self.object_filter.to_lowercase())
+                                            && !group
+                                                .to_lowercase()
+                                                .contains(&self.object_filter.to_lowercase())
                                         {
                                             continue;
                                         }
@@ -1930,8 +1951,11 @@ impl Architect {
                                                     self.selected_placement = Some(*index);
                                                 } else {
                                                     self.selected_placements.remove(index);
-                                                    self.selected_placement =
-                                                        self.selected_placements.iter().copied().min();
+                                                    self.selected_placement = self
+                                                        .selected_placements
+                                                        .iter()
+                                                        .copied()
+                                                        .min();
                                                 }
                                             } else {
                                                 self.selected_placements.clear();
@@ -2802,10 +2826,8 @@ mod tests {
 
     #[test]
     fn version_one_projects_migrate_objects_with_default_hierarchy_metadata() {
-        let path = std::env::temp_dir().join(format!(
-            "pwe-architect-legacy-{}.pwa",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("pwe-architect-legacy-{}.pwa", std::process::id()));
         let asset = Architect::encode("models/legacy/guard.ecm");
         fs::write(
             &path,
