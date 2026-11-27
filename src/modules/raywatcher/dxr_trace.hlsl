@@ -1281,17 +1281,11 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
             float3 fresnel_rgb = (metalness > 0.1) ? lerp(float3(fresnel, fresnel, fresnel), metal_tint * fresnel, metalness) : float3(fresnel, fresnel, fresnel);
             float trim_scale = 1.0;
-            // Opt #9: Use opacity-aware RT traversal so alpha-tested foliage (tree
-            // leaves) is reflected correctly. closest_hit_fast forces opaque and
-            // skips leaves, producing broken leaf reflections. Water needs no
-            // alpha test, so the fast path stays for distant water rays.
-            float refl_max_t = is_water ? min(params.lens.y, 750.0) : min(params.lens.y, 140.0);
-            Hit rhit;
-            if (is_water && dist > 560.0) {
-                rhit = closest_hit_fast(ray_origin, reflect_dir, bias, refl_max_t, opaque_offset, tri_count);
-            } else {
-                rhit = closest_hit(ray_origin, reflect_dir, bias, refl_max_t, opaque_offset, tri_count);
-            }
+            // Always use opacity-aware traversal, including distant water rays.
+            // The forced-opaque shortcut turns leaf cards into solid rectangles
+            // and makes foliage reflections visibly differ from the raster tree.
+            float refl_max_t = min(params.lens.y, 750.0);
+            Hit rhit = closest_hit(ray_origin, reflect_dir, bias, refl_max_t, opaque_offset, tri_count);
             float eff_max_t = (rhit.index != 0xffffffffu) ? rhit.t : refl_max_t;
 
             float3 refl_col = float3(0.0, 0.0, 0.0);
