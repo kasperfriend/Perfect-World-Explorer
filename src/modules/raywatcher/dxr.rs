@@ -263,6 +263,8 @@ mod imp {
 
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL: u32 = 0;
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL: u32 = 1;
+    const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE: u32 = 0x1;
+    const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE: u32 = 0x1;
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE: u32 = 0x4;
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD: u32 = 0x8;
     const D3D12_ELEMENTS_LAYOUT_ARRAY: u32 = 0;
@@ -1943,9 +1945,13 @@ mod imp {
                         },
                     },
                 };
-                let blas_inputs = BuildAsInputs {
+                // Dynamic meshes keep a per-slot updateable BLAS. Refit the
+                // existing structure instead of rebuilding its hierarchy every
+                // animated frame; the three slots keep in-flight GPU reads isolated.
+                let mut blas_inputs = BuildAsInputs {
                     ty: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
-                    flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
+                    flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE
+                        | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
                     num_descs: 1,
                     descs_layout: D3D12_ELEMENTS_LAYOUT_ARRAY,
                     u: BuildInputsUnion {
@@ -1975,7 +1981,16 @@ mod imp {
                     self.dyn_blas[s] = Some((cap, buf));
                 }
                 let blas_gpu_va = self.dyn_blas[s].as_ref().unwrap().1.gpu_va;
-                let mut scratch_needed = align256(info.scratch_data_size_in_bytes);
+                let update_blas = self.dyn_blas[s]
+                    .as_ref()
+                    .is_some_and(|(cap, _)| *cap >= bsize)
+                    && self.has_dyn_instance;
+                if update_blas {
+                    blas_inputs.flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+                }
+                let mut scratch_needed = align256(
+                    info.scratch_data_size_in_bytes.max(info.update_scratch_data_size_in_bytes),
+                );
 
                 let inst0 = InstanceDesc {
                     transform: [
@@ -2005,9 +2020,10 @@ mod imp {
                 let inst_ref = self.dyn_inst_desc[s].as_ref().unwrap();
                 inst_ref.write_upload(inst_bytes)?;
 
-                let tlas_inputs = BuildAsInputs {
+                let mut tlas_inputs = BuildAsInputs {
                     ty: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-                    flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
+                    flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE
+                        | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
                     num_descs: 2,
                     descs_layout: D3D12_ELEMENTS_LAYOUT_ARRAY,
                     u: BuildInputsUnion {
@@ -2056,6 +2072,16 @@ mod imp {
                     self.dyn_tlas[s] = Some((cap, buf));
                 }
                 let tlas_gpu_va = self.dyn_tlas[s].as_ref().unwrap().1.gpu_va;
+                let update_tlas = self.dyn_tlas[s]
+                    .as_ref()
+                    .is_some_and(|(cap, _)| *cap >= tsize)
+                    && self.has_dyn_instance;
+                if update_tlas {
+                    tlas_inputs.flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+                }
+                scratch_needed = scratch_needed.max(align256(
+                    tlas_info.scratch_data_size_in_bytes.max(tlas_info.update_scratch_data_size_in_bytes),
+                ));
                 let scratch_va = self.reusable_scratch.as_ref().unwrap().1.gpu_va;
 
                 let slot_idx = self.ring.acquire("DXR-DynAS")?;
@@ -2069,7 +2095,7 @@ mod imp {
                 let blas_desc = BuildAsDesc {
                     dest_as_data: blas_gpu_va,
                     inputs: blas_inputs,
-                    source_as_data: 0,
+                    source_as_data: if update_blas { blas_gpu_va } else { 0 },
                     scratch_as_data: scratch_va,
                 };
                 cmdlist4_build_as(list4, &blas_desc);
@@ -2082,7 +2108,7 @@ mod imp {
                 let tlas_desc = BuildAsDesc {
                     dest_as_data: tlas_gpu_va,
                     inputs: tlas_inputs,
-                    source_as_data: 0,
+                    source_as_data: if update_tlas { tlas_gpu_va } else { 0 },
                     scratch_as_data: scratch_va,
                 };
                 cmdlist4_build_as(list4, &tlas_desc);
