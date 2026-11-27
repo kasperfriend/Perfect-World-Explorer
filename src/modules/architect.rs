@@ -2730,9 +2730,21 @@ mod tests {
     fn marquee_selection_rect_is_direction_independent_and_inclusive() {
         let start = egui::pos2(100.0, 80.0);
         let end = egui::pos2(20.0, 160.0);
-        assert!(Architect::marquee_contains(start, end, egui::pos2(20.0, 80.0)));
-        assert!(Architect::marquee_contains(start, end, egui::pos2(60.0, 120.0)));
-        assert!(!Architect::marquee_contains(start, end, egui::pos2(101.0, 120.0)));
+        assert!(Architect::marquee_contains(
+            start,
+            end,
+            egui::pos2(20.0, 80.0)
+        ));
+        assert!(Architect::marquee_contains(
+            start,
+            end,
+            egui::pos2(60.0, 120.0)
+        ));
+        assert!(!Architect::marquee_contains(
+            start,
+            end,
+            egui::pos2(101.0, 120.0)
+        ));
     }
 
     #[test]
