@@ -1616,9 +1616,52 @@ fn run(
     });
     Ok(())
 }
+/// Append-only storage shared by streamed whole-world pages.
+pub struct WorldGeometryArena {
+    chunks: Vec<WorldGeometryChunk>,
+}
+struct WorldGeometryChunk {
+    buffer: Arc<wgpu::Buffer>,
+    used: u64,
+}
+impl Default for WorldGeometryArena {
+    fn default() -> Self { Self { chunks: Vec::new() } }
+}
+impl WorldGeometryArena {
+    const CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+
+    fn allocate(&mut self, device: &wgpu::Device, bytes: u64) -> (Arc<wgpu::Buffer>, u64) {
+        let bytes = (bytes.max(4) + 3) & !3;
+        let needs_chunk = match self.chunks.last() {
+            Some(chunk) => chunk.used.saturating_add(bytes) > chunk.buffer.size(),
+            None => true,
+        };
+        if needs_chunk {
+            let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("whole-world shared geometry arena"),
+                size: Self::CHUNK_BYTES.max(bytes),
+                usage: wgpu::BufferUsages::VERTEX
+                    | wgpu::BufferUsages::INDEX
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.chunks.push(WorldGeometryChunk { buffer, used: 0 });
+        }
+        let chunk = self.chunks.last_mut().expect("geometry arena chunk");
+        let offset = chunk.used;
+        chunk.used += bytes;
+        (Arc::clone(&chunk.buffer), offset)
+    }
+
+    pub fn reset(&mut self) {
+        self.chunks.clear();
+    }
+}
+
+/// A GPU page can reference a subrange of a shared arena chunk.
 pub struct GpuPage {
-    /// Vertex and index data share one allocation; indices remain page-local.
-    geometry: wgpu::Buffer,
+    geometry: Arc<wgpu::Buffer>,
+    vertex_offset: u64,
     vertex_bytes: u64,
     index_offset: u64,
     index_bytes: u64,
@@ -1882,7 +1925,8 @@ impl GpuPage {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
         });
         Self {
-            geometry,
+            geometry: Arc::new(geometry),
+            vertex_offset: 0,
             vertex_bytes,
             index_offset,
             index_bytes: index_data.len() as u64,
@@ -1908,6 +1952,7 @@ impl GpuPage {
         normal: &wgpu::Buffer,
         reflected: &wgpu::Buffer,
         existing: &[Self],
+        arena: &mut WorldGeometryArena,
         belt: &mut wgpu::util::StagingBelt,
         encoder: &mut wgpu::CommandEncoder,
         page: &Page,
@@ -1991,28 +2036,23 @@ impl GpuPage {
         let vertex_bytes = vertex_data.len() as u64;
         let index_offset = (vertex_bytes + 3) & !3;
         let index_bytes = index_data.len() as u64;
-        let geometry = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("whole-world object geometry (vertices + indices)"),
-            size: (index_offset + index_bytes).max(4),
-            usage: wgpu::BufferUsages::VERTEX
-                | wgpu::BufferUsages::INDEX
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let page_bytes = index_offset + index_bytes;
+        let (geometry, vertex_offset) = arena.allocate(device, page_bytes);
         if !vertex_data.is_empty() {
             let size = std::num::NonZeroU64::new(vertex_bytes).expect("non-empty vertex upload");
-            belt.write_buffer(encoder, &geometry, 0, size, device)
+            belt.write_buffer(encoder, &geometry, vertex_offset, size, device)
                 .copy_from_slice(vertex_data);
         }
         if !index_data.is_empty() {
             let size = std::num::NonZeroU64::new(index_bytes).expect("non-empty index upload");
-            belt.write_buffer(encoder, &geometry, index_offset, size, device)
+            belt.write_buffer(encoder, &geometry, vertex_offset + index_offset, size, device)
                 .copy_from_slice(index_data);
         }
         Self {
             geometry,
+            vertex_offset,
             vertex_bytes,
-            index_offset,
+            index_offset: vertex_offset + index_offset,
             index_bytes,
             count: page.indices.len() as u32,
             normal: normal_bg,
@@ -2046,7 +2086,8 @@ impl GpuPage {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
         });
         Self {
-            geometry,
+            geometry: Arc::new(geometry),
+            vertex_offset: 0,
             vertex_bytes,
             index_offset,
             index_bytes: index_data.len() as u64,
@@ -2078,7 +2119,7 @@ impl GpuPage {
             },
             &[],
         );
-        pass.set_vertex_buffer(0, self.geometry.slice(0..self.vertex_bytes));
+        pass.set_vertex_buffer(0, self.geometry.slice(self.vertex_offset..self.vertex_offset + self.vertex_bytes));
         pass.set_index_buffer(
             self.geometry
                 .slice(self.index_offset..self.index_offset + self.index_bytes),
@@ -2155,7 +2196,7 @@ impl GpuPage {
             let p = &pages[cmd.page];
             if bound != Some(cmd.page) {
                 pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
-                pass.set_vertex_buffer(0, p.geometry.slice(0..p.vertex_bytes));
+                pass.set_vertex_buffer(0, p.geometry.slice(p.vertex_offset..p.vertex_offset + p.vertex_bytes));
                 pass.set_index_buffer(
                     p.geometry
                         .slice(p.index_offset..p.index_offset + p.index_bytes),
@@ -2303,7 +2344,7 @@ impl GpuPage {
                             &[],
                         );
                     }
-                    pass.set_vertex_buffer(0, page.geometry.slice(0..page.vertex_bytes));
+                    pass.set_vertex_buffer(0, page.geometry.slice(page.vertex_offset..page.vertex_offset + page.vertex_bytes));
                     pass.set_index_buffer(
                         page.geometry
                             .slice(page.index_offset..page.index_offset + page.index_bytes),
@@ -2525,7 +2566,7 @@ impl GpuPage {
                             &[],
                         );
                     }
-                    pass.set_vertex_buffer(0, page.geometry.slice(0..page.vertex_bytes));
+                    pass.set_vertex_buffer(0, page.geometry.slice(page.vertex_offset..page.vertex_offset + page.vertex_bytes));
                     pass.set_index_buffer(
                         page.geometry
                             .slice(page.index_offset..page.index_offset + page.index_bytes),
@@ -2561,7 +2602,7 @@ impl GpuPage {
                             &[],
                         );
                     }
-                    pass.set_vertex_buffer(0, page.geometry.slice(0..page.vertex_bytes));
+                    pass.set_vertex_buffer(0, page.geometry.slice(page.vertex_offset..page.vertex_offset + page.vertex_bytes));
                     pass.set_index_buffer(
                         page.geometry
                             .slice(page.index_offset..page.index_offset + page.index_bytes),
@@ -2609,7 +2650,7 @@ impl GpuPage {
             },
             &[],
         );
-        pass.set_vertex_buffer(0, self.geometry.slice(0..self.vertex_bytes));
+        pass.set_vertex_buffer(0, self.geometry.slice(self.vertex_offset..self.vertex_offset + self.vertex_bytes));
         pass.set_index_buffer(
             self.geometry
                 .slice(self.index_offset..self.index_offset + self.index_bytes),
