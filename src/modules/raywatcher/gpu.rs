@@ -82,8 +82,8 @@ fn restir_history_valid_for_frame(
 /// Maximum active point lights + luminous world effects packed for ReSTIR DI.
 pub const MAX_RAY_LIGHTS: usize = 128;
 
-/// Legacy cache allocation retained for descriptor compatibility (65,536 16-byte cells = 1 MiB); shader reads/writes are disabled because hash slots are untagged.
-pub const RADIANCE_CACHE_CELLS: usize = 65_536;
+/// One-cell dummy retained for descriptor compatibility; the collision-prone cache is disabled.
+pub const RADIANCE_CACHE_CELLS: usize = 1;
 
 /// Uniform per-frame scene-illumination albedo recovery gain (`1 / max(scene_illum, 0.08)`).
 /// Preserves true dark stone/wood albedo by day while allowing night point lights to
@@ -6509,7 +6509,7 @@ mod shader_optimization_regression_tests {
         assert!(dxr.contains("float4 rc_query("));
         assert!(dxr.contains("Disabled: this 16-bit spatial hash stores no key/tag"));
         assert!(!dxr.contains("InterlockedAdd(radiance_cache[slot]"));
-        assert_eq!(super::RADIANCE_CACHE_CELLS * 16, 1024 * 1024);
+        assert_eq!(super::RADIANCE_CACHE_CELLS * 16, 16);
     }
 
     #[test]
