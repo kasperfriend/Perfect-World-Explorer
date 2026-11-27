@@ -7278,6 +7278,30 @@ mod reflection_sampling_regression_tests {
     use super::*;
 
     const DXR_SHADER: &str = include_str!("dxr_trace.hlsl");
+    const GPU_SOURCE: &str = include_str!("gpu.rs");
+
+    #[test]
+    fn temporal_reprojection_uses_bilinear_depth_validated_history() {
+        assert!(DENOISE_SHADER.contains("let sample_pos = source - vec2<f32>(0.5)"));
+        assert!(DENOISE_SHADER.contains("depth_error > 0.05"));
+        assert!(DENOISE_SHADER.contains("weight_sum <= 1e-4"));
+        assert!(DENOISE_SHADER.contains("water_motion_alpha"));
+        assert!(DENOISE_SHADER.contains("min(params.misc.z, 6.0)"));
+    }
+
+    #[test]
+    fn temporal_history_is_copied_before_later_atrous_iterations_overwrite_it() {
+        assert!(GPU_SOURCE.contains("if iteration == 0"));
+        assert!(GPU_SOURCE.contains("&self._history_colour_tex"));
+        assert!(GPU_SOURCE.contains("&self._history_moments_tex"));
+        assert!(GPU_SOURCE.contains("temporal history colour"));
+    }
+
+    #[test]
+    fn temporal_reprojection_reconstructs_from_the_jittered_depth_matrix() {
+        assert!(GPU_SOURCE.contains("let current_inv = params.inv_view_projection;"));
+        assert!(GPU_SOURCE.contains("(prev_vp * current_inv).to_cols_array_2d()"));
+    }
 
     #[test]
     fn reflections_fetch_colour_from_full_resolution_raster() {
