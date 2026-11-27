@@ -662,6 +662,7 @@ impl Harvester {
                     far,
                     config,
                     Some(worker_cancel.as_ref()),
+                    MAX_SCENE_TRIANGLES.saturating_sub(triangles.len()),
                 ) else {
                     return;
                 };
@@ -1474,8 +1475,9 @@ fn push_instances_chunked(
     far: f32,
     config: HarvestConfig,
 ) -> usize {
+    let remaining = MAX_SCENE_TRIANGLES.saturating_sub(triangles.len());
     push_instances_chunked_cancellable(
-        triangles, materials, instances, eye, frustum, far, config, None,
+        triangles, materials, instances, eye, frustum, far, config, None, remaining,
     )
     .unwrap_or(0)
 }
@@ -1489,11 +1491,17 @@ fn push_instances_chunked_cancellable(
     far: f32,
     config: HarvestConfig,
     cancel: Option<&AtomicBool>,
+    triangle_budget: usize,
 ) -> Option<usize> {
     if harvest_cancelled(cancel) {
         return None;
     }
-    if instances.is_empty() || config.max_instances == 0 {
+    // Each proxy is a closed box made from exactly 12 triangles. Apply the
+    // global scene budget before expanding boxes, not after allocating and
+    // truncating potentially millions of triangles.
+    let instance_budget = triangle_budget / 12;
+    let start_triangle_count = triangles.len();
+    if instances.is_empty() || config.max_instances == 0 || instance_budget == 0 {
         return Some(0);
     }
     let chunk = config.chunk_size.max(32.0);
@@ -1522,50 +1530,59 @@ fn push_instances_chunked_cancellable(
             .or_default()
             .push((dist_sq + inst.half.length_squared(), index));
     }
-    let mut pushed = 0usize;
-    let mut palette: std::collections::HashMap<(u8, u8, u8), u32> =
-        std::collections::HashMap::new();
+
+    // Enforce the existing nearest-per-chunk limit first, then apply the hard
+    // scene-wide triangle budget globally. HashMap iteration order is random;
+    // sorting the retained candidates makes both the selected geometry and
+    // material assignment deterministic while preserving the nearest objects.
+    let mut candidates = Vec::new();
     for (_, mut list) in chunks {
         if harvest_cancelled(cancel) {
             return None;
         }
         if list.len() > config.max_instances {
-            list.select_nth_unstable_by(config.max_instances, |a, b| a.0.total_cmp(&b.0));
-            list.truncate(config.max_instances);
-            list.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-        }
-        triangles.reserve(list.len() * 12);
-        for (list_index, (_, index)) in list.into_iter().enumerate() {
-            if list_index & 0x3ff == 0 && harvest_cancelled(cancel) {
-                return None;
-            }
-            let instance = instances[index];
-            let key = (
-                (instance.albedo[0].clamp(0.0, 1.0) * 31.0).round() as u8,
-                (instance.albedo[1].clamp(0.0, 1.0) * 31.0).round() as u8,
-                (instance.albedo[2].clamp(0.0, 1.0) * 31.0).round() as u8,
-            );
-            let material = *palette.entry(key).or_insert_with(|| {
-                let id = materials.len() as u32;
-                let is_foliage = instance.albedo[1] > instance.albedo[0] * 1.2
-                    && instance.albedo[1] > instance.albedo[2] * 1.2;
-                let opacity = if is_foliage { 0.62 } else { 1.0 };
-                materials.push(RayMaterial {
-                    albedo: [
-                        instance.albedo[0],
-                        instance.albedo[1],
-                        instance.albedo[2],
-                        1.0,
-                    ],
-                    surface: [0.75, 0.05, 0.0, opacity],
-                });
-                id
+            list.select_nth_unstable_by(config.max_instances, |a, b| {
+                a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1))
             });
-            push_box(triangles, instance, material);
-            pushed += 1;
+            list.truncate(config.max_instances);
         }
+        candidates.extend(list);
     }
-    Some(pushed)
+    candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    candidates.truncate(instance_budget);
+
+    let mut palette: std::collections::HashMap<(u8, u8, u8), u32> =
+        std::collections::HashMap::new();
+    triangles.reserve(candidates.len().saturating_mul(12));
+    for (list_index, (_, index)) in candidates.into_iter().enumerate() {
+        if list_index & 0x3ff == 0 && harvest_cancelled(cancel) {
+            return None;
+        }
+        let instance = instances[index];
+        let key = (
+            (instance.albedo[0].clamp(0.0, 1.0) * 31.0).round() as u8,
+            (instance.albedo[1].clamp(0.0, 1.0) * 31.0).round() as u8,
+            (instance.albedo[2].clamp(0.0, 1.0) * 31.0).round() as u8,
+        );
+        let material = *palette.entry(key).or_insert_with(|| {
+            let id = materials.len() as u32;
+            let is_foliage = instance.albedo[1] > instance.albedo[0] * 1.2
+                && instance.albedo[1] > instance.albedo[2] * 1.2;
+            let opacity = if is_foliage { 0.62 } else { 1.0 };
+            materials.push(RayMaterial {
+                albedo: [
+                    instance.albedo[0],
+                    instance.albedo[1],
+                    instance.albedo[2],
+                    1.0,
+                ],
+                surface: [0.75, 0.05, 0.0, opacity],
+            });
+            id
+        });
+        push_box(triangles, instance, material);
+    }
+    Some(triangles.len().saturating_sub(start_triangle_count) / 12)
 }
 
 /// Chunked multi-LOD terrain harvesting covering the entire visible frustum
@@ -2086,6 +2103,52 @@ mod tests {
             far_hit.is_some(),
             "terrain near far frustum edge must be traced"
         );
+    }
+
+    #[test]
+    fn chunked_instance_global_budget_keeps_nearest_and_never_overbuilds() {
+        let eye = Vec3::new(0.0, 10.0, 0.0);
+        let mut instances = Vec::new();
+        for i in 0..6 {
+            instances.push(InstanceProxy {
+                centre: Vec3::new(0.0, 5.0, 20.0 + i as f32 * 10.0),
+                half: Vec3::splat(2.0),
+                albedo: [0.5, 0.5, 0.5],
+                yaw: 0.0,
+            });
+            instances.push(InstanceProxy {
+                centre: Vec3::new(0.0, 5.0, 540.0 + i as f32 * 10.0),
+                half: Vec3::splat(2.0),
+                albedo: [0.5, 0.5, 0.5],
+                yaw: 0.0,
+            });
+        }
+        let cfg = HarvestConfig {
+            max_instances: 3,
+            chunk_size: 256.0,
+            ..HarvestConfig::default()
+        };
+        let frustum = Frustum::from_view_projection(Mat4::IDENTITY);
+        let mut triangles = Vec::new();
+        let mut materials = Vec::new();
+        let pushed = push_instances_chunked_cancellable(
+            &mut triangles,
+            &mut materials,
+            &instances,
+            eye,
+            &frustum,
+            1000.0,
+            cfg,
+            None,
+            24, // room for exactly two proxy boxes
+        )
+        .expect("not cancelled");
+        assert_eq!(pushed, 2);
+        assert_eq!(triangles.len(), 24);
+        let min_z = triangles.iter().flat_map(|t| [t.a[2], t.b[2], t.c[2]]).fold(f32::INFINITY, f32::min);
+        let max_z = triangles.iter().flat_map(|t| [t.a[2], t.b[2], t.c[2]]).fold(f32::NEG_INFINITY, f32::max);
+        assert!((min_z - 18.0).abs() < 1e-4, "nearest box min z: {min_z}");
+        assert!((max_z - 32.0).abs() < 1e-4, "nearest boxes max z: {max_z}");
     }
 
     #[test]
