@@ -3983,6 +3983,12 @@ pub struct RaywatcherGpu {
     last_scene_albedo_gain: f32,
     filter_colour_tex: [wgpu::Texture; 2],
     filter_moments_tex: [wgpu::Texture; 2],
+    /// First à-trous iteration is preserved as temporal history; later passes
+    /// must not feed their increasingly blurred output back into SVGF.
+    history_colour: wgpu::TextureView,
+    history_moments: wgpu::TextureView,
+    _history_colour_tex: wgpu::Texture,
+    _history_moments_tex: wgpu::Texture,
     temporal_colour: wgpu::TextureView,
     temporal_moments: wgpu::TextureView,
     _temporal_colour_tex: wgpu::Texture,
@@ -4246,6 +4252,10 @@ impl RaywatcherGpu {
             let (b, bv) = plane(device, "raywatcher filter moments b", w, h, GUIDE_FORMAT);
             ([a, b], [av, bv])
         };
+        let (history_colour_tex, history_colour) =
+            plane(device, "raywatcher temporal history colour", w, h, COLOUR_FORMAT);
+        let (history_moments_tex, history_moments) =
+            plane(device, "raywatcher temporal history moments", w, h, GUIDE_FORMAT);
         let (temporal_colour_tex, temporal_colour) =
             plane(device, "raywatcher temporal colour", w, h, COLOUR_FORMAT);
         let (temporal_moments_tex, temporal_moments) =
@@ -4312,8 +4322,8 @@ impl RaywatcherGpu {
                 &grid,
                 &motion,
                 &depth,
-                &filter_colour[0],
-                &filter_moments[0],
+                &history_colour,
+                &history_moments,
                 &temporal_colour,
                 &temporal_moments,
             ),
@@ -4324,8 +4334,8 @@ impl RaywatcherGpu {
                 &grid,
                 &motion,
                 &depth,
-                &filter_colour[1],
-                &filter_moments[1],
+                &history_colour,
+                &history_moments,
                 &temporal_colour,
                 &temporal_moments,
             ),
@@ -4420,6 +4430,10 @@ impl RaywatcherGpu {
             last_scene_albedo_gain: 1.25,
             filter_colour_tex,
             filter_moments_tex,
+            history_colour,
+            history_moments,
+            _history_colour_tex: history_colour_tex,
+            _history_moments_tex: history_moments_tex,
             temporal_colour,
             temporal_moments,
             _temporal_colour_tex: temporal_colour_tex,
@@ -4815,8 +4829,8 @@ impl RaywatcherGpu {
                     &self.grid,
                     &self.motion,
                     &self.depth,
-                    &self.filter_colour[0],
-                    &self.filter_moments[0],
+                    &self.history_colour,
+                    &self.history_moments,
                     &self.temporal_colour,
                     &self.temporal_moments,
                 ),
@@ -4827,8 +4841,8 @@ impl RaywatcherGpu {
                     &self.grid,
                     &self.motion,
                     &self.depth,
-                    &self.filter_colour[1],
-                    &self.filter_moments[1],
+                    &self.history_colour,
+                    &self.history_moments,
                     &self.temporal_colour,
                     &self.temporal_moments,
                 ),
@@ -4996,6 +5010,10 @@ impl RaywatcherGpu {
         self.filter_moments = filter_moments;
         self.filter_colour_tex = filter_colour_tex;
         self.filter_moments_tex = filter_moments_tex;
+        self.history_colour = history_colour;
+        self.history_moments = history_moments;
+        self._history_colour_tex = history_colour_tex;
+        self._history_moments_tex = history_moments_tex;
         self.temporal_colour = temporal_colour;
         self.temporal_moments = temporal_moments;
         self._temporal_colour_tex = temporal_colour_tex;
@@ -5685,6 +5703,46 @@ impl RaywatcherGpu {
             pass.set_pipeline(&self.pipelines.atrous);
             pass.set_bind_group(0, &self.atrous_bind_groups[iteration as usize], &[]);
             pass.dispatch_workgroups(rw.div_ceil(8), rh.div_ceil(8), 1);
+        }
+        if iteration == 0 {
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.filter_colour_tex[0],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &self._history_colour_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: rw,
+                    height: rh,
+                    depth_or_array_layers: 1,
+                },
+            );
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.filter_moments_tex[0],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &self._history_moments_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: rw,
+                    height: rh,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
         let final_plane = ((iterations - 1) % 2) as usize;
         self.last_output_plane = final_plane;
