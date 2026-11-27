@@ -7161,6 +7161,25 @@ mod reflection_sampling_regression_tests {
         assert!(
             DXR_SHADER.contains("Hit rhit = closest_hit(ray_origin, reflect_dir, bias, refl_max_t")
         );
+        // Both distant and near DXR shadow paths must preserve alpha-tested
+        // foliage. A forced-opaque first-hit shortcut produces rectangular
+        // leaf-card shadows even though the near path has an alpha mask.
+        let distant_shadow = DXR_SHADER
+            .split("if (fast_mode) {")
+            .nth(1)
+            .and_then(|tail| tail.split("    // Enhancement #10: Track foliage").next())
+            .expect("distant shadow branch");
+        assert!(distant_shadow.contains("CANDIDATE_NON_OPAQUE_TRIANGLE"));
+        assert!(distant_shadow.contains("accept_opacity("));
+        assert!(!distant_shadow.contains("RAY_FLAG_FORCE_OPAQUE"));
+        let fast_occlusion = DXR_SHADER
+            .split("bool occluded_fast(")
+            .nth(1)
+            .and_then(|tail| tail.split("// Opacity-aware boolean occlusion").next())
+            .expect("fast occlusion helper");
+        assert!(fast_occlusion.contains("accept_opacity("));
+        assert!(!fast_occlusion.contains("RAY_FLAG_FORCE_OPAQUE"));
+        assert!(!DXR_SHADER.contains("RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES>"));
     }
 
     #[test]
