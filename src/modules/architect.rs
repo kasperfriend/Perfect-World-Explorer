@@ -2303,7 +2303,10 @@ impl Architect {
         // Pick staged project objects directly in the viewport. Their editor
         // transform is independent from the immutable source-scene instances.
         if pressed
-            && matches!(self.cursor, CursorMode::Select | CursorMode::MultiSelect)
+            && matches!(
+                self.cursor,
+                CursorMode::Select | CursorMode::MultiSelect | CursorMode::Lasso
+            )
             && !over_ui
         {
             let mut axis_pick = None;
