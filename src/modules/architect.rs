@@ -2313,7 +2313,10 @@ impl Architect {
             && !over_ui
         {
             let mut axis_pick = None;
-            if let (Some(index), Some(pointer)) = (self.selected_placement, pointer) {
+            if let (Some(index), Some(pointer)) = (
+                self.selected_placement.filter(|_| self.cursor == CursorMode::Select),
+                pointer,
+            ) {
                 if let Some(object) = self.project.objects.get(index) {
                     let origin = Vec3::from_array(object.position);
                     let project_point = |point: Vec3| {
