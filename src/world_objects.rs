@@ -1064,12 +1064,19 @@ fn allocate_slot(
             page.atlas[dst..dst + s.w * 4].copy_from_slice(&tex.rgba[src..src + s.w * 4]);
         }
     } else {
+        // Nearest-neighbour source X coordinates are identical for every row.
+        // Precompute them once instead of performing an integer division for
+        // every output pixel; the row loop then does only indexed 4-byte copies.
+        let source_x: Vec<usize> = (0..s.w)
+            .map(|px| (((2 * px + 1) * tex.width) / (2 * s.w)).min(tex.width - 1))
+            .collect();
         for py in 0..s.h {
             let sy = (((2 * py + 1) * tex.height) / (2 * s.h)).min(tex.height - 1);
-            for px in 0..s.w {
-                let sx = (((2 * px + 1) * tex.width) / (2 * s.w)).min(tex.width - 1);
-                let src = (sy * tex.width + sx) * 4;
-                let dst = ((s.y + py) * SIDE + s.x + px) * 4;
+            let source_row = sy * tex.width * 4;
+            let target_row = ((s.y + py) * SIDE + s.x) * 4;
+            for (px, &sx) in source_x.iter().enumerate() {
+                let src = source_row + sx * 4;
+                let dst = target_row + px * 4;
                 page.atlas[dst..dst + 4].copy_from_slice(&tex.rgba[src..src + 4]);
             }
         }
