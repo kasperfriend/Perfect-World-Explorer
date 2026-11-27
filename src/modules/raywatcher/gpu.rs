@@ -5505,42 +5505,15 @@ impl RaywatcherGpu {
     /// (`COLOUR_FORMAT`) and record its world-space anchor.
     pub fn finish_terrain_map_blit(
         &mut self,
-        device: &wgpu::Device,
+        _device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         anchor: (f32, f32),
     ) {
-        if !self.blit_pipeline.iter().any(|(fmt, _)| *fmt == COLOUR_FORMAT) {
-
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("raywatcher blit"),
-                bind_group_layouts: &[&self.pipelines.blit_layout],
-                push_constant_ranges: &[],
-            });
-            let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("raywatcher blit"),
-                layout: Some(&pl),
-                vertex: wgpu::VertexState {
-                    module: &self.pipelines.blit_module,
-                    entry_point: "vs",
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &self.pipelines.blit_module,
-                    entry_point: "fs",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: COLOUR_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-            });
-            self.blit_pipeline.push((COLOUR_FORMAT, pipe));
-        }
-        let Some((_, pipe)) = self.blit_pipeline.iter().find(|(fmt, _)| *fmt == COLOUR_FORMAT) else {
+        let Some((_, pipe)) = self
+            .blit_pipeline
+            .iter()
+            .find(|(fmt, _)| *fmt == COLOUR_FORMAT)
+        else {
             return;
         };
         let Some((_, _, _, _, _, bg)) = self.terrain_map_scratch.as_ref() else {
@@ -5716,7 +5689,11 @@ impl RaywatcherGpu {
             else {
                 return;
             };
-            let Some((_, blit_pipe)) = self.blit_pipeline.iter().find(|(fmt, _)| *fmt == COLOUR_FORMAT) else {
+            let Some((_, blit_pipe)) = self
+                .blit_pipeline
+                .iter()
+                .find(|(fmt, _)| *fmt == COLOUR_FORMAT)
+            else {
                 return;
             };
             {
@@ -5952,7 +5929,6 @@ impl RaywatcherGpu {
         );
         let target_format = destination.format();
         if !self.composite_pipeline.iter().any(|(fmt, _)| *fmt == target_format) {
-
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("raywatcher composite"),
                 bind_group_layouts: &[&self.pipelines.composite_layout],
@@ -6048,7 +6024,6 @@ impl RaywatcherGpu {
         }
         let target_format = destination.format();
         if !self.blit_pipeline.iter().any(|(fmt, _)| *fmt == target_format) {
-
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("raywatcher blit"),
                 bind_group_layouts: &[&self.pipelines.blit_layout],
