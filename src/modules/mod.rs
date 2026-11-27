@@ -94,6 +94,11 @@ impl Modules {
         self.architect.renderer_placements()
     }
 
+    /// Transient BMD scenery instances for the native baked-scenery renderer.
+    pub fn architect_scenery_placements(&self) -> Vec<crate::scene::EditorSceneryPlacement> {
+        self.architect.renderer_scenery_placements()
+    }
+
     pub fn prepare_architect_preview(
         &mut self,
         device: &wgpu::Device,
