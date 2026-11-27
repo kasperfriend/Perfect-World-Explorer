@@ -1817,6 +1817,10 @@ impl Architect {
                         .or_default()
                         .push((index, label));
                 }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.object_filter)
+                        .hint_text("Filter placements and scene objects"),
+                );
                 egui::ScrollArea::vertical()
                     .max_height(180.)
                     .show(ui, |ui| {
@@ -1825,7 +1829,49 @@ impl Architect {
                                 .id_source(("architect_group", group))
                                 .default_open(true)
                                 .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.small_button("Select group").clicked() {
+                                            self.selected_placements =
+                                                rows.iter().map(|(index, _)| *index).collect();
+                                            self.selected_placement =
+                                                self.selected_placements.iter().copied().min();
+                                        }
+                                        if ui.small_button("Hide").clicked() {
+                                            for (index, _) in rows {
+                                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                                    object.visible = false;
+                                                }
+                                            }
+                                        }
+                                        if ui.small_button("Show").clicked() {
+                                            for (index, _) in rows {
+                                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                                    object.visible = true;
+                                                }
+                                            }
+                                        }
+                                        if ui.small_button("Lock").clicked() {
+                                            for (index, _) in rows {
+                                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                                    object.locked = true;
+                                                }
+                                            }
+                                        }
+                                        if ui.small_button("Unlock").clicked() {
+                                            for (index, _) in rows {
+                                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                                    object.locked = false;
+                                                }
+                                            }
+                                        }
+                                    });
                                     for (index, label) in rows {
+                                        if !self.object_filter.is_empty()
+                                            && !label.to_lowercase().contains(&self.object_filter.to_lowercase())
+                                            && !group.to_lowercase().contains(&self.object_filter.to_lowercase())
+                                        {
+                                            continue;
+                                        }
                                         if ui
                                             .selectable_label(
                                                 self.selected_placements.contains(index)
