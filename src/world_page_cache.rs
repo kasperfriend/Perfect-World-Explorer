@@ -14,7 +14,7 @@ use std::{
 
 const CACHE_MAGIC: &[u8; 8] = b"PWWPAGE1";
 const PAGE_MAGIC: &[u8; 8] = b"PWWPG001";
-const FORMAT: u64 = 2;
+const FORMAT: u64 = 3;
 const MAX_CACHED_PAGES: usize = 100_000;
 const MAX_CACHED_VERTICES: usize = 16_000_000;
 const MAX_CACHED_INDICES: usize = 100_000_000;
@@ -175,10 +175,12 @@ impl Writer {
             write_hashed(file, &mut hash, mip)?;
         }
         if !page.placements.is_empty() {
-            let mut buf = Vec::with_capacity(page.placements.len() * 22);
+            let mut buf = Vec::with_capacity(page.placements.len() * 30);
             for placement in &page.placements {
                 buf.extend_from_slice(&placement.start.to_le_bytes());
                 buf.extend_from_slice(&placement.end.to_le_bytes());
+                buf.extend_from_slice(&placement.vertex_start.to_le_bytes());
+                buf.extend_from_slice(&placement.vertex_end.to_le_bytes());
                 buf.extend_from_slice(&placement.export_id.to_le_bytes());
                 buf.extend_from_slice(&placement.order.to_le_bytes());
                 buf.push(u8::from(placement.visibility.reflect));
@@ -374,23 +376,30 @@ impl Reader {
         }
         let mut placements = Vec::with_capacity(placement_count);
         if placement_count > 0 {
-            let pbytes = read_byte_vec(file, &mut hash, placement_count * 22)?;
-            for chunk in pbytes.chunks_exact(22) {
+            let pbytes = read_byte_vec(file, &mut hash, placement_count * 30)?;
+            for chunk in pbytes.chunks_exact(30) {
                 let start = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
                 let end = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
-                let export_id = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
-                let order = u64::from_le_bytes(chunk[12..20].try_into().unwrap());
+                let vertex_start = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+                let vertex_end = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
+                let export_id = u32::from_le_bytes(chunk[16..20].try_into().unwrap());
+                let order = u64::from_le_bytes(chunk[20..28].try_into().unwrap());
                 if start > end || end as usize > index_count {
                     return Err("invalid cached placement index range".into());
+                }
+                if vertex_start > vertex_end || vertex_end as usize > vertex_count {
+                    return Err("invalid cached placement vertex range".into());
                 }
                 placements.push(PlacementRange {
                     start,
                     end,
+                    vertex_start,
+                    vertex_end,
                     export_id,
                     order,
                     visibility: crate::scenery_visibility::Visibility {
-                        reflect: chunk[20] != 0,
-                        refract: chunk[21] != 0,
+                        reflect: chunk[28] != 0,
+                        refract: chunk[29] != 0,
                     },
                 });
             }
@@ -698,25 +707,32 @@ fn decode_page_slab(slab: &[u8]) -> Result<Page, String> {
     if placement_count > 0 {
         let pos = cur.position() as usize;
         let pbytes = payload
-            .get(pos..pos + placement_count * 22)
+            .get(pos..pos + placement_count * 30)
             .ok_or("truncated cached placements")?;
-        cur.set_position((pos + placement_count * 22) as u64);
-        for chunk in pbytes.chunks_exact(22) {
+        cur.set_position((pos + placement_count * 30) as u64);
+        for chunk in pbytes.chunks_exact(30) {
             let start = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
             let end = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
-            let export_id = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
-            let order = u64::from_le_bytes(chunk[12..20].try_into().unwrap());
+            let vertex_start = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+            let vertex_end = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
+            let export_id = u32::from_le_bytes(chunk[16..20].try_into().unwrap());
+            let order = u64::from_le_bytes(chunk[20..28].try_into().unwrap());
             if start > end || end as usize > index_count {
                 return Err("invalid cached placement index range".into());
+            }
+            if vertex_start > vertex_end || vertex_end as usize > vertex_count {
+                return Err("invalid cached placement vertex range".into());
             }
             placements.push(PlacementRange {
                 start,
                 end,
+                vertex_start,
+                vertex_end,
                 export_id,
                 order,
                 visibility: crate::scenery_visibility::Visibility {
-                    reflect: chunk[20] != 0,
-                    refract: chunk[21] != 0,
+                    reflect: chunk[28] != 0,
+                    refract: chunk[29] != 0,
                 },
             });
         }
@@ -860,6 +876,8 @@ mod tests {
             placements: vec![PlacementRange {
                 start: 0,
                 end: 1,
+                vertex_start: 0,
+                vertex_end: 1,
                 export_id: 4,
                 order: 12,
                 visibility: crate::scenery_visibility::Visibility {
