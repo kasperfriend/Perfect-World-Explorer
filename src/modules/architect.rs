@@ -1983,6 +1983,50 @@ mod tests {
     }
 
     #[test]
+    fn object_undo_redo_restores_complete_placement_snapshots() {
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element/element.data"),
+            None,
+            "a01".into(),
+        );
+        let original = PlacedObject {
+            asset: "models/test.ecm".into(),
+            position: [1., 2., 3.],
+            rotation: [0.; 3],
+            scale: 1.,
+        };
+        editor.project.objects.push(original.clone());
+        let before = editor.project.objects.clone();
+        editor.project.objects[0].position = [4., 5., 6.];
+        editor.push_object_undo(before);
+        assert_eq!(editor.project.objects[0].position, [4., 5., 6.]);
+        editor.undo_objects();
+        assert_eq!(editor.project.objects[0].position, original.position);
+        editor.redo_objects();
+        assert_eq!(editor.project.objects[0].position, [4., 5., 6.]);
+    }
+
+    #[test]
+    fn placements_from_another_source_map_are_not_submitted_to_renderer() {
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element/element.data"),
+            None,
+            "a01".into(),
+        );
+        editor.enabled = true;
+        editor.project.source_map = "b02".into();
+        editor.project.objects.push(PlacedObject {
+            asset: "models/test.ecm".into(),
+            position: [0.; 3],
+            rotation: [0.; 3],
+            scale: 1.,
+        });
+        assert!(editor.renderer_placements().is_empty());
+        editor.project.source_map = "a01".into();
+        assert_eq!(editor.renderer_placements().len(), 1);
+    }
+
+    #[test]
     fn sculpt_brush_updates_shared_heights_and_replays_reversibly() {
         let mut builder = crate::terrain_store::Builder::new_resident(8, 8, 4).unwrap();
         for by in 0..2 {
