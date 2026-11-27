@@ -1612,7 +1612,10 @@ impl Architect {
                 }
             }
             for (_, asset, position) in scene {
-                if Self::renderer_asset_path(&asset).is_none() {
+                if Self::renderer_asset_path(&asset).is_none()
+                    && Self::renderer_bmd_path(&asset, &self.current_map_id).is_none()
+                    && self.renderer_tree_type(&asset).is_none()
+                {
                     continue;
                 }
                 let portable_asset = self.portable_asset_path(&asset);
@@ -1655,7 +1658,10 @@ impl Architect {
         let before = self.project.objects.clone();
         let mut pasted = Vec::with_capacity(self.clipboard_objects.len());
         for source in &self.clipboard_objects {
-            if Self::renderer_asset_path(&source.asset).is_none() {
+            if Self::renderer_asset_path(&source.asset).is_none()
+                && Self::renderer_bmd_path(&source.asset, &self.current_map_id).is_none()
+                && self.renderer_tree_type(&source.asset).is_none()
+            {
                 continue;
             }
             let mut object = source.clone();
