@@ -1764,6 +1764,7 @@ mod imp {
             src_norm: &wgpu::Texture,
             src_raster: &wgpu::Texture,
             src_screen_raster: &wgpu::Texture,
+            copy_screen_raster: bool,
             src_sky_env: &wgpu::Texture,
             copy_sky_env: bool,
             src_terrain_map: &wgpu::Texture,
@@ -1781,7 +1782,7 @@ mod imp {
                     &self.targets.in_screen_raster.texture,
                     self.targets.screen_extent.0,
                     self.targets.screen_extent.1,
-                    true,
+                    copy_screen_raster,
                 ),
                 (
                     src_sky_env,
