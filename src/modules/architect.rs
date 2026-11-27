@@ -1279,6 +1279,7 @@ impl Architect {
     }
 
     fn toolbar(&mut self, ctx: &egui::Context) {
+        let previous_cursor = self.cursor;
         egui::TopBottomPanel::top("architect_toolbar")
             .exact_height(46.)
             .frame(
@@ -1353,6 +1354,14 @@ impl Architect {
                     });
                 });
             });
+        if self.cursor != previous_cursor {
+            // A tool switch must not commit a stale viewport gesture. In
+            // particular, leaving Multi-select while a marquee is held must
+            // never finalize a rectangle on the next pointer-up.
+            self.cancel_object_drag();
+            self.brush_dragging = false;
+            self.last_brush_position = None;
+        }
     }
 
     fn terrain_hit(
