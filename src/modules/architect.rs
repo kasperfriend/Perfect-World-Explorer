@@ -395,7 +395,10 @@ impl Architect {
             let _ = fs::remove_file(&backup);
             fs::rename(path, &backup).map_err(|e| {
                 let _ = fs::remove_file(&temp);
-                format!("Could not preserve previous project {}: {e}", path.display())
+                format!(
+                    "Could not preserve previous project {}: {e}",
+                    path.display()
+                )
             })?;
         }
         if let Err(error) = fs::rename(&temp, path) {
@@ -672,9 +675,13 @@ impl Architect {
     }
 
     fn push_object_undo(&mut self, snapshot: Vec<PlacedObject>) {
-        if snapshot == self.project.objects { return; }
+        if snapshot == self.project.objects {
+            return;
+        }
         self.undo_objects.push(snapshot);
-        if self.undo_objects.len() > 128 { self.undo_objects.remove(0); }
+        if self.undo_objects.len() > 128 {
+            self.undo_objects.remove(0);
+        }
         self.redo_objects.clear();
     }
 
@@ -1003,7 +1010,10 @@ impl Architect {
         if !self.enabled
             || (!self.project.source_map.is_empty()
                 && !self.current_map_id.is_empty()
-                && !self.project.source_map.eq_ignore_ascii_case(&self.current_map_id))
+                && !self
+                    .project
+                    .source_map
+                    .eq_ignore_ascii_case(&self.current_map_id))
         {
             return Vec::new();
         }
@@ -1861,9 +1871,9 @@ impl Architect {
         ) && !over_ui
         {
             pointer.and_then(|position| {
-                self.map.as_ref().and_then(|map| {
-                    Self::terrain_hit(position, screen, view_projection, map)
-                })
+                self.map
+                    .as_ref()
+                    .and_then(|map| Self::terrain_hit(position, screen, view_projection, map))
             })
         } else {
             None
@@ -1928,7 +1938,8 @@ impl Architect {
             if axis_pick.is_none() {
                 if let Some(pointer) = pointer {
                     for (index, object) in self.project.objects.iter().enumerate() {
-                        let clip = view_projection.project_point3(Vec3::from_array(object.position));
+                        let clip =
+                            view_projection.project_point3(Vec3::from_array(object.position));
                         if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
                             continue;
                         }
@@ -1937,9 +1948,7 @@ impl Architect {
                             screen.top() + (1. - clip.y) * 0.5 * screen.height(),
                         );
                         let distance = point.distance(pointer);
-                        if distance <= 20.
-                            && nearest.is_none_or(|(_, best)| distance < best)
-                        {
+                        if distance <= 20. && nearest.is_none_or(|(_, best)| distance < best) {
                             nearest = Some((index, distance));
                         }
                     }
@@ -1964,12 +1973,8 @@ impl Architect {
                                     .as_ref()
                                     .is_none_or(|(_, best, _, _)| distance < *best)
                             {
-                                nearest_scene = Some((
-                                    scene_index,
-                                    distance,
-                                    asset.to_string(),
-                                    position,
-                                ));
+                                nearest_scene =
+                                    Some((scene_index, distance, asset.to_string(), position));
                             }
                         }
                         scene_index += 1;
@@ -2032,8 +2037,8 @@ impl Architect {
                             if let (Some(start), Some(current)) =
                                 (self.object_drag_start_pointer, pointer)
                             {
-                                object.position[1] =
-                                    self.object_drag_start_position[1] - (current.y - start.y) * 0.1;
+                                object.position[1] = self.object_drag_start_position[1]
+                                    - (current.y - start.y) * 0.1;
                             }
                         }
                         Some(2) => {
@@ -2075,7 +2080,10 @@ impl Architect {
             if let Some(position) = hit {
                 let spacing = self.map.as_ref().map_or(1., |m| m.spacing);
                 let step = (self.brush_radius * 0.18).max(spacing).max(0.25);
-                let previous = self.last_brush_position.map(Vec3::from_array).unwrap_or(position);
+                let previous = self
+                    .last_brush_position
+                    .map(Vec3::from_array)
+                    .unwrap_or(position);
                 let distance = (position - previous).length();
                 if distance >= step || self.last_brush_position.is_none() {
                     // Interpolate along fast pointer movement so a high-speed drag
@@ -2155,9 +2163,7 @@ impl Architect {
             }
         }
         if self.cursor == CursorMode::Sculpt {
-            if let (Some(position), Some(map)) =
-                (self.brush_cursor_position, self.map.as_ref())
-            {
+            if let (Some(position), Some(map)) = (self.brush_cursor_position, self.map.as_ref()) {
                 let center = Vec3::from_array(position);
                 let mut points = Vec::with_capacity(65);
                 for n in 0..=64 {
@@ -2185,14 +2191,14 @@ impl Architect {
                         egui::Order::Foreground,
                         egui::Id::new("architect_brush_cursor"),
                     ))
-                    .add(egui::Shape::line(
-                        points,
-                        egui::Stroke::new(1.8, color),
-                    ));
+                    .add(egui::Shape::line(points, egui::Stroke::new(1.8, color)));
                 }
             }
         }
-        if !self.object_history_action && !self.object_dragging && objects_before_ui != self.project.objects {
+        if !self.object_history_action
+            && !self.object_dragging
+            && objects_before_ui != self.project.objects
+        {
             self.push_object_undo(objects_before_ui);
         }
         map_request
@@ -2208,11 +2214,18 @@ mod tests {
         let mut builder = crate::terrain_store::Builder::new_resident(8, 8, 4).unwrap();
         for by in 0..2 {
             for bx in 0..2 {
-                builder.block(bx, by, &[0.; 16], &[[0, 127, 0]; 16]).unwrap();
+                builder
+                    .block(bx, by, &[0.; 16], &[[0, 127, 0]; 16])
+                    .unwrap();
             }
         }
         let (heights, _) = builder.finish(0).unwrap();
-        let map = crate::navigation::MapSpace { width: 8, height: 8, spacing: 1., heights };
+        let map = crate::navigation::MapSpace {
+            width: 8,
+            height: 8,
+            spacing: 1.,
+            heights,
+        };
         let eye = Vec3::new(0., 10., 10.);
         let direction = Vec3::new(0., -1., -1.).normalize();
         let view = glam::Mat4::look_to_rh(eye, direction, Vec3::Y);
@@ -2224,7 +2237,8 @@ mod tests {
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100., 100.)),
             vp,
             &map,
-        ).expect("center ray should hit flat terrain");
+        )
+        .expect("center ray should hit flat terrain");
         assert!(hit.x.abs() < 0.05);
         assert!(hit.z.abs() < 0.05);
         assert!(hit.y.abs() < 0.1);
