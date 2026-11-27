@@ -3145,6 +3145,7 @@ mod tests {
             object_drag_snapshot: None,
             marquee_start: None,
             marquee_current: None,
+            lasso_points: Vec::new(),
             undo_objects: Vec::new(),
             redo_objects: Vec::new(),
             object_history_action: false,
