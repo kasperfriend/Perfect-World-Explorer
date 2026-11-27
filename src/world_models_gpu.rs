@@ -341,6 +341,22 @@ impl World {
                     {
                         return None;
                     }
+                    if self.editor_placements.get(index).is_some_and(|previous| {
+                        previous.position == placement.position
+                            && previous.rotation == placement.rotation
+                            && previous.scale == placement.scale
+                    }) {
+                        return Some((
+                            self.assets.instances[self.native_instance_count + index]
+                                .placement
+                                .clone(),
+                            self.slots[self.native_instance_count + index]
+                                .transform
+                                .as_ref()
+                                .ok()
+                                .copied()?,
+                        ));
+                    }
                     editor_scene_transform(placement, u32::try_from(index).unwrap_or(u32::MAX)).ok()
                 })
                 .collect::<Option<Vec<_>>>();
