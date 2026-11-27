@@ -2057,9 +2057,10 @@ mod imp {
                     self.reusable_scratch = Some((cap, buf));
                 }
                 let tsize = align256(tlas_info.result_data_max_size_in_bytes);
-                let update_tlas = self.dyn_tlas[s]
-                    .as_ref()
-                    .is_some_and(|(cap, _)| *cap >= tsize)
+                let update_tlas = update_blas
+                    && self.dyn_tlas[s]
+                        .as_ref()
+                        .is_some_and(|(cap, _)| *cap >= tsize)
                     && self.has_dyn_instance;
                 if self.dyn_tlas[s]
                     .as_ref()
