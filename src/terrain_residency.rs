@@ -28,7 +28,7 @@ pub struct Block {
     level: u8,
     cases: [u8; 4],
     vertices: Vec<Vertex>,
-    indices: Vec<u32>,
+    indices: std::sync::Arc<[u32]>,
     /// World-space `[x0, y0, z0, x1, y1, z1]` of the block surface.
     bounds: [f32; 6],
 }
@@ -107,7 +107,7 @@ impl Residency {
     /// Apply one window to the resident set: evict blocks outside it, build the
     /// blocks that entered and re-mesh the ones whose level changed. `level_of`
     /// returns `0` for a block the rule does not draw.
-    pub fn update<L, B>(
+    pub fn update<L, B, I>(
         &mut self,
         window: &crate::terrain_lod::Window,
         level_of: L,
@@ -115,14 +115,15 @@ impl Residency {
     ) -> Result<Census, String>
     where
         L: Fn(usize, usize) -> u8,
-        B: FnMut(usize, usize, u8) -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String>,
+        B: FnMut(usize, usize, u8) -> Result<(Vec<Vertex>, I, [f32; 6]), String>,
+        I: Into<std::sync::Arc<[u32]>>,
     {
         self.update_stitched(window, |x, y| (level_of(x, y), [0; 4]), build)
     }
 
     /// Stitching is geometry: a neighbor can change our boundary without
     /// changing our own resolution. Include all four cases in the cache key.
-    pub fn update_stitched<L, B>(
+    pub fn update_stitched<L, B, I>(
         &mut self,
         window: &crate::terrain_lod::Window,
         state_of: L,
@@ -130,7 +131,8 @@ impl Residency {
     ) -> Result<Census, String>
     where
         L: Fn(usize, usize) -> (u8, [u8; 4]),
-        B: FnMut(usize, usize, u8) -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String>,
+        B: FnMut(usize, usize, u8) -> Result<(Vec<Vertex>, I, [f32; 6]), String>,
+        I: Into<std::sync::Arc<[u32]>>,
     {
         let mut census = Census::default();
         // Eviction first: the client's loader drops the slots the window left.
@@ -174,7 +176,7 @@ impl Residency {
                         level,
                         cases,
                         vertices,
-                        indices,
+                        indices: indices.into(),
                         bounds,
                     },
                 );
@@ -189,7 +191,7 @@ impl Residency {
     /// flythroughs: collects all entering or re-meshed blocks and builds their
     /// stitched surfaces concurrently across CPU cores when 4 or more blocks
     /// are stale in the same crossing.
-    pub fn update_stitched_parallel<L, B>(
+    pub fn update_stitched_parallel<L, B, I>(
         &mut self,
         window: &crate::terrain_lod::Window,
         state_of: L,
@@ -197,8 +199,9 @@ impl Residency {
     ) -> Result<Census, String>
     where
         L: Fn(usize, usize) -> (u8, [u8; 4]),
-        B: Fn(usize, usize, u8, [u8; 4]) -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String>
+        B: Fn(usize, usize, u8, [u8; 4]) -> Result<(Vec<Vertex>, I, [f32; 6]), String>
             + Sync,
+        I: Into<std::sync::Arc<[u32]>> + Send,
     {
         let mut census = Census::default();
         let before = self.blocks.len();
@@ -333,7 +336,7 @@ impl Residency {
                         level,
                         cases,
                         vertices,
-                        indices,
+                        indices: indices.into(),
                         bounds,
                     },
                 );
