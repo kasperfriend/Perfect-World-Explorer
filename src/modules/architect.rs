@@ -274,6 +274,23 @@ impl Architect {
     }
 
     fn write_project(&self, path: &Path) -> Result<(), String> {
+        if self.project.objects.len() > 100_000 || self.project.strokes.len() > 100_000 {
+            return Err("Architect project exceeds the record-count safety limit".into());
+        }
+        for object in &self.project.objects {
+            if object.asset.is_empty() || object.asset.len() > 16 * 1024
+                || !object.position.iter().chain(object.rotation.iter()).all(|v| v.is_finite())
+                || !object.scale.is_finite() || object.scale <= 0. {
+                return Err("Project contains an invalid object asset or transform".into());
+            }
+        }
+        for stroke in &self.project.strokes {
+            if !stroke.position.iter().all(|v| v.is_finite())
+                || !stroke.radius.is_finite() || stroke.radius <= 0.
+                || !stroke.strength.is_finite() {
+                return Err("Project contains an invalid terrain operation".into());
+            }
+        }
         let mut out = String::from("PWE_ARCHITECT\t1\n");
         out.push_str(&format!("name\t{}\n", Self::encode(&self.project.name)));
         out.push_str(&format!(
@@ -315,12 +332,32 @@ impl Architect {
         }
         let parent = path.parent().ok_or("project path has no parent")?;
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        let temp = path.with_extension("pwa.tmp");
+        let file_name = path.file_name().and_then(|name| name.to_str()).ok_or("invalid project filename")?;
+        let temp = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+        let backup = path.with_extension("pwa.bak");
+        let _ = fs::remove_file(&temp);
         fs::write(&temp, out).map_err(|e| format!("{}: {e}", temp.display()))?;
-        if path.exists() {
-            fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Ok(file) = fs::OpenOptions::new().read(true).open(&temp) {
+            file.sync_all().map_err(|e| format!("{}: {e}", temp.display()))?;
         }
-        fs::rename(&temp, path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let had_previous = path.exists();
+        if had_previous {
+            let _ = fs::remove_file(&backup);
+            fs::rename(path, &backup).map_err(|e| {
+                let _ = fs::remove_file(&temp);
+                format!("Could not preserve previous project {}: {e}", path.display())
+            })?;
+        }
+        if let Err(error) = fs::rename(&temp, path) {
+            if had_previous {
+                let _ = fs::rename(&backup, path);
+            }
+            let _ = fs::remove_file(&temp);
+            return Err(format!("{}: {error}", path.display()));
+        }
+        if had_previous {
+            let _ = fs::remove_file(&backup);
+        }
         Ok(())
     }
 
@@ -863,7 +900,11 @@ impl Architect {
     /// queue. Other archive types remain browsable/pinnable but are not guessed
     /// into a renderer format they do not implement.
     pub fn renderer_placements(&self) -> Vec<crate::world_models_gpu::EditorPlacement> {
-        if !self.enabled {
+        if !self.enabled
+            || (!self.project.source_map.is_empty()
+                && !self.current_map_id.is_empty()
+                && !self.project.source_map.eq_ignore_ascii_case(&self.current_map_id))
+        {
             return Vec::new();
         }
         self.project
