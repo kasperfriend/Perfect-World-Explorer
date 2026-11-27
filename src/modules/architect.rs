@@ -1918,6 +1918,65 @@ impl Architect {
                     }
                 }
                 self.selected_placement = nearest.map(|(index, _)| index);
+                if self.selected_placement.is_some() {
+                    self.selected_scene_object = None;
+                    self.selected_scene_transform = None;
+                } else if let Some(pointer) = pointer {
+                    let mut scene_index = 0usize;
+                    let mut nearest_scene: Option<(usize, f32, String, [f32; 3])> = None;
+                    let mut consider = |asset: &str, position: [f32; 3]| {
+                        let clip = view_projection.project_point3(Vec3::from_array(position));
+                        if clip.is_finite() && (0.0..=1.0).contains(&clip.z) {
+                            let point = egui::pos2(
+                                screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
+                                screen.top() + (1. - clip.y) * 0.5 * screen.height(),
+                            );
+                            let distance = point.distance(pointer);
+                            if distance <= 20.
+                                && nearest_scene
+                                    .as_ref()
+                                    .is_none_or(|(_, best, _, _)| distance < *best)
+                            {
+                                nearest_scene = Some((
+                                    scene_index,
+                                    distance,
+                                    asset.to_string(),
+                                    position,
+                                ));
+                            }
+                        }
+                        scene_index += 1;
+                    };
+                    for block in &scene.blocks {
+                        for model in &block.models {
+                            consider(&model.path, model.position);
+                        }
+                        for tree in &block.trees {
+                            if let Some(kind) = scene.tree_types.get(tree.tree_type as usize) {
+                                consider(&kind.tree, tree.position);
+                                if !kind.composite.is_empty() {
+                                    consider(&kind.composite, tree.position);
+                                }
+                            }
+                        }
+                        for effect in &block.effects {
+                            consider(&effect.path, effect.position);
+                        }
+                    }
+                    for ornament in ornaments {
+                        consider(&ornament.path, ornament.position);
+                    }
+                    if let Some((index, _, asset, position)) = nearest_scene {
+                        self.selected_scene_object = Some(index);
+                        self.selected_scene_transform = Some(position);
+                        self.selected_asset = Some(asset);
+                    } else {
+                        self.selected_scene_object = None;
+                        self.selected_scene_transform = None;
+                    }
+                    self.multi_selection.clear();
+                    self.multi_scene_items.clear();
+                }
             }
             self.object_drag_axis = axis_pick;
             self.object_dragging = self.selected_placement.is_some()
