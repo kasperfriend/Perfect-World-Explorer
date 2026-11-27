@@ -645,6 +645,50 @@ impl Preview {
         }
         queue.submit(Some(encoder.finish()));
     }
+    /// Draw an interactive preview for compact asset-browser popups.
+    /// Left-drag orbits, Shift+left-drag pans, and the wheel zooms while the
+    /// pointer is over the image. The response is returned so the owning
+    /// floating window can keep the hovered asset alive as the pointer moves
+    /// from the file list into this preview.
+    pub fn show_interactive(&mut self, ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
+        let response = if let Some(error) = &self.error {
+            ui.colored_label(egui::Color32::LIGHT_RED, error)
+        } else {
+            ui.add(
+                egui::Image::new((self.target.texture_id, size))
+                    .sense(egui::Sense::click_and_drag()),
+            )
+        };
+        let shift = ui.input(|input| input.modifiers.shift);
+        if let Some(mode) = drag_mode(&response, shift) {
+            let delta = ui.input(|input| input.pointer.delta());
+            match mode {
+                Drag::Pan => self.pan_by(delta),
+                Drag::Orbit => {
+                    self.yaw = orbit_yaw(self.yaw, delta.x);
+                    self.pitch = orbit_pitch(self.pitch, delta.y);
+                }
+            }
+        }
+        if response.hovered() {
+            let wheel = ui.input(|input| input.smooth_scroll_delta.y);
+            if wheel.abs() > f32::EPSILON {
+                self.zoom = (self.zoom * (-wheel * 0.002).exp()).clamp(0.3, 5.0);
+            }
+        }
+        for warning in &self.warnings {
+            ui.label(egui::RichText::new(warning).small().weak());
+        }
+        if let Some(error) = &self.animation_error {
+            ui.label(
+                egui::RichText::new(error)
+                    .small()
+                    .color(egui::Color32::YELLOW),
+            );
+        }
+        response
+    }
+
     /// Draw the offscreen model target inside an egui panel.
     pub fn show(&self, ui: &mut egui::Ui, size: egui::Vec2) {
         if let Some(error) = &self.error {
