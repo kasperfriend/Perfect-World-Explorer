@@ -1764,14 +1764,18 @@ impl Architect {
                                 .clicked()
                             {
                                 if self.cursor == CursorMode::MultiSelect {
-                                    if !self.selected_placements.insert(*index) {
+                                    if self.selected_placements.insert(*index) {
+                                        self.selected_placement = Some(*index);
+                                    } else {
                                         self.selected_placements.remove(index);
+                                        self.selected_placement =
+                                            self.selected_placements.iter().copied().min();
                                     }
                                 } else {
                                     self.selected_placements.clear();
                                     self.selected_placements.insert(*index);
+                                    self.selected_placement = Some(*index);
                                 }
-                                self.selected_placement = Some(*index);
                             }
                         }
                     });
@@ -1821,12 +1825,16 @@ impl Architect {
                 }
                 if let Some(mut duplicate) = duplicate_placement {
                     duplicate.position[0] += 1.0;
+                    let index = self.project.objects.len();
                     self.project.objects.push(duplicate);
-                    self.selected_placement = Some(self.project.objects.len() - 1);
+                    self.selected_placements.clear();
+                    self.selected_placements.insert(index);
+                    self.selected_placement = Some(index);
                     self.status = "Duplicated custom placement.".into();
                 }
                 if let Some(index) = delete_placement {
                     self.project.objects.remove(index);
+                    self.selected_placements.clear();
                     self.selected_placement = None;
                 }
                 ui.label(format!(
