@@ -3929,9 +3929,10 @@ impl Renderer {
         // pixels are produced afterwards. Keep every original raster term until
         // a complete RT frame from the previous iteration exists. That closes
         // the one-frame hole during first-use initialization and scene/AS swaps.
-        let rt_output_ready = self.raywatcher_gpu.as_ref().is_some_and(|gpu| {
-            gpu.render_extent() == render_extent && gpu.can_replace_raster_effects()
-        });
+        let rt_output_ready = !self.raywatcher_harvest.is_building_in_background()
+            && self.raywatcher_gpu.as_ref().is_some_and(|gpu| {
+                gpu.render_extent() == render_extent && gpu.can_replace_raster_effects()
+            });
         // The previous completed RT image remains valid while a new scene/AS
         // is prepared. Do not toggle the native mirror based on CPU harvester
         // activity: that made reflections alternate every time a background
