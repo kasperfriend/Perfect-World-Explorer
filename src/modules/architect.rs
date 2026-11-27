@@ -2569,6 +2569,8 @@ mod tests {
         assert!(editor.renderer_placements().is_empty());
         editor.project.source_map = "a01".into();
         assert_eq!(editor.renderer_placements().len(), 1);
+        editor.project.objects[0].visible = false;
+        assert!(editor.renderer_placements().is_empty());
     }
 
     #[test]
@@ -2657,8 +2659,8 @@ mod tests {
                 asset: "models/场景/城堡.bmd".into(),
                 name: "Castle".into(),
                 group: "Buildings".into(),
-                visible: true,
-                locked: false,
+                visible: false,
+                locked: true,
                 position: [1., 2., 3.],
                 rotation: [0.1, 0.2, 0.3],
                 scale: 1.25,
@@ -2738,8 +2740,8 @@ mod tests {
         assert_eq!(loaded.objects[0].asset, project.objects[0].asset);
         assert_eq!(loaded.objects[0].name, "Castle");
         assert_eq!(loaded.objects[0].group, "Buildings");
-        assert!(loaded.objects[0].visible);
-        assert!(!loaded.objects[0].locked);
+        assert!(!loaded.objects[0].visible);
+        assert!(loaded.objects[0].locked);
         assert_eq!(loaded.strokes.len(), 1);
         assert_eq!(loaded.strokes[0].mode, BrushMode::Smooth);
         assert_eq!(
