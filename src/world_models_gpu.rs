@@ -1522,7 +1522,7 @@ fn draw_one(
     }
     if let Some(draw) = &slot.draw {
         if slot.geometry_dirty || slot.vertex_fog != Some(f.vertex_fog) {
-            draw.update(queue, asset, &posed.meshes, f)?;
+            draw.update_posed(queue, asset, &posed.meshes, f)?;
             slot.geometry_dirty = false;
             slot.vertex_fog = Some(f.vertex_fog);
         } else {
