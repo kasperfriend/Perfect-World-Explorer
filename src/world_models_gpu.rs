@@ -238,18 +238,28 @@ impl World {
             .into_iter()
             .map(|entry| {
                 let path = crate::ecmodel::normalize(&entry.name);
-                let path = if path.starts_with("gfx/") { path } else { format!("gfx/{path}") };
+                let path = if path.starts_with("gfx/") {
+                    path
+                } else {
+                    format!("gfx/{path}")
+                };
                 (path, entry)
             })
             .collect();
         Self::with_reader(device, format, assets, move |path| {
             let normalized = crate::ecmodel::normalize(path);
             if normalized.starts_with("gfx/") {
-                let pack = gfx_pack.as_mut().ok_or_else(|| "gfx.pck is unavailable".to_owned())?;
-                let entry = gfx_entries.get(&normalized).ok_or_else(|| format!("missing GFX resource: {normalized}"))?;
+                let pack = gfx_pack
+                    .as_mut()
+                    .ok_or_else(|| "gfx.pck is unavailable".to_owned())?;
+                let entry = gfx_entries
+                    .get(&normalized)
+                    .ok_or_else(|| format!("missing GFX resource: {normalized}"))?;
                 crate::pck::read_entry(pack, entry)
             } else {
-                let entry = entries.get(&normalized).ok_or_else(|| format!("missing model texture: {normalized}"))?;
+                let entry = entries
+                    .get(&normalized)
+                    .ok_or_else(|| format!("missing model texture: {normalized}"))?;
                 crate::pck::read_entry(&mut pack, entry)
             }
         })
@@ -431,7 +441,9 @@ impl World {
                 asset
             } else {
                 let loaded = if path.ends_with(".ecm") {
-                    crate::model_asset::ModelAsset::load_with(&path, |dependency| (self.read)(dependency))
+                    crate::model_asset::ModelAsset::load_with(&path, |dependency| {
+                        (self.read)(dependency)
+                    })
                 } else {
                     (self.read)(&path)
                         .and_then(|bytes| crate::ecmodel::parse_smd(&bytes))
@@ -446,8 +458,13 @@ impl World {
                                 }
                             };
                             let skeleton = relative(&smd.skeleton);
-                            let skins: Vec<_> = smd.skins.iter().map(|value| relative(value)).collect();
-                            crate::model_asset::ModelAsset::load_static_skins_with(&skeleton, &skins, |dependency| (self.read)(dependency))
+                            let skins: Vec<_> =
+                                smd.skins.iter().map(|value| relative(value)).collect();
+                            crate::model_asset::ModelAsset::load_static_skins_with(
+                                &skeleton,
+                                &skins,
+                                |dependency| (self.read)(dependency),
+                            )
                         })
                 };
                 match loaded {

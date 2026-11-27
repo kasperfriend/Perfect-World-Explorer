@@ -656,7 +656,11 @@ impl Preview {
             ui.label(egui::RichText::new(warning).small().weak());
         }
         if let Some(error) = &self.animation_error {
-            ui.label(egui::RichText::new(error).small().color(egui::Color32::YELLOW));
+            ui.label(
+                egui::RichText::new(error)
+                    .small()
+                    .color(egui::Color32::YELLOW),
+            );
         }
     }
     pub fn select_action(&mut self, action: usize) {

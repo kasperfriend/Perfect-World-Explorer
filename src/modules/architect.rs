@@ -171,7 +171,8 @@ impl Architect {
             .join("Architect")
             .join("Worlds");
         let client_root = element.parent().unwrap_or(&element).to_path_buf();
-        let preview_assets = crate::modules::librarian::archive::LibrarianAssets::open(&client_root);
+        let preview_assets =
+            crate::modules::librarian::archive::LibrarianAssets::open(&client_root);
         let mut editor = Self {
             enabled: false,
             client_root,
@@ -768,8 +769,7 @@ impl Architect {
             let a = points[current];
             let b = points[previous];
             let crosses = (a.y > point.y) != (b.y > point.y)
-                && point.x
-                    < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x;
+                && point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x;
             if crosses {
                 inside = !inside;
             }
@@ -982,7 +982,10 @@ impl Architect {
     fn preview_path_for_asset(&self, asset: &str) -> Result<String, String> {
         let portable = self.portable_asset_path(asset);
         let path = if let Some((archive, entry)) = portable.split_once("::") {
-            let archive_name = Path::new(archive).file_name().map(|name| name.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            let archive_name = Path::new(archive)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
             let entry = crate::ecmodel::normalize(entry);
             match (archive_name.as_str(), entry.as_str()) {
                 ("models.pck", value) if value.starts_with("models/") && value.ends_with(".ecm") => value.to_owned(),
@@ -994,19 +997,42 @@ impl Architect {
         };
         let supported = (path.starts_with("models/") && path.ends_with(".ecm"))
             || (path.starts_with("gfx/") && path.ends_with(".smd"));
-        if supported { Ok(path) } else { Err("Preview supports ECM models in models.pck and static SMD models in gfx.pck. Other files are resources, textures or effect definitions, not directly placeable meshes.".into()) }
+        if supported {
+            Ok(path)
+        } else {
+            Err("Preview supports ECM models in models.pck and static SMD models in gfx.pck. Other files are resources, textures or effect definitions, not directly placeable meshes.".into())
+        }
     }
 
-    pub fn prepare_preview(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut egui_wgpu::Renderer, format: wgpu::TextureFormat) {
-        let asset = self.hovered_asset.as_deref().or(self.selected_asset.as_deref());
+    pub fn prepare_preview(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut egui_wgpu::Renderer,
+        format: wgpu::TextureFormat,
+    ) {
+        let asset = self
+            .hovered_asset
+            .as_deref()
+            .or(self.selected_asset.as_deref());
         let Some(asset) = asset else {
             self.preview_message = "Hover or select an ECM/SMD model to preview it.".into();
             return;
         };
         match self.preview_path_for_asset(asset) {
             Ok(path) => {
-                let preview = self.preview.get_or_insert_with(|| crate::modules::librarian::preview3d::Preview::new(device, renderer, format));
-                preview.update(device, queue, format, &mut self.preview_assets, &path, None, false);
+                let preview = self.preview.get_or_insert_with(|| {
+                    crate::modules::librarian::preview3d::Preview::new(device, renderer, format)
+                });
+                preview.update(
+                    device,
+                    queue,
+                    format,
+                    &mut self.preview_assets,
+                    &path,
+                    None,
+                    false,
+                );
                 self.preview_message.clear();
             }
             Err(message) => self.preview_message = message,
@@ -1142,14 +1168,26 @@ impl Architect {
             (None, asset)
         };
         let normalized = crate::ecmodel::normalize(path);
-        let archive_name = archive.and_then(|archive| Path::new(archive).file_name()).map(|name| name.to_string_lossy().to_ascii_lowercase());
-        let valid_model = normalized.starts_with("models/") && normalized.ends_with(".ecm")
-            && archive_name.as_deref().is_none_or(|name| name == "models.pck");
+        let archive_name = archive
+            .and_then(|archive| Path::new(archive).file_name())
+            .map(|name| name.to_string_lossy().to_ascii_lowercase());
+        let valid_model = normalized.starts_with("models/")
+            && normalized.ends_with(".ecm")
+            && archive_name
+                .as_deref()
+                .is_none_or(|name| name == "models.pck");
         let valid_static_gfx = normalized.ends_with(".smd")
             && (normalized.starts_with("gfx/") || archive_name.as_deref() == Some("gfx.pck"))
             && archive_name.as_deref().is_none_or(|name| name == "gfx.pck");
-        let normalized = if valid_static_gfx && !normalized.starts_with("gfx/") { format!("gfx/{normalized}") } else { normalized };
-        let safe_segments = normalized.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..") && !normalized.contains(':');
+        let normalized = if valid_static_gfx && !normalized.starts_with("gfx/") {
+            format!("gfx/{normalized}")
+        } else {
+            normalized
+        };
+        let safe_segments = normalized
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+            && !normalized.contains(':');
         (safe_segments && (valid_model || valid_static_gfx)).then_some(normalized)
     }
 
@@ -1426,17 +1464,30 @@ impl Architect {
         }
     }
 
-    fn ray_plane_hit(pointer: egui::Pos2, viewport: egui::Rect, view_projection: glam::Mat4, height: f32) -> Option<Vec3> {
+    fn ray_plane_hit(
+        pointer: egui::Pos2,
+        viewport: egui::Rect,
+        view_projection: glam::Mat4,
+        height: f32,
+    ) -> Option<Vec3> {
         let uv = egui::vec2(
             (pointer.x - viewport.left()) / viewport.width().max(1.) * 2. - 1.,
             1. - (pointer.y - viewport.top()) / viewport.height().max(1.) * 2.,
         );
         let inverse = view_projection.inverse();
-        if !inverse.is_finite() { return None; }
+        if !inverse.is_finite() {
+            return None;
+        }
         let near = inverse.project_point3(Vec3::new(uv.x, uv.y, 1.));
         let far = inverse.project_point3(Vec3::new(uv.x, uv.y, 0.));
         let direction = (far - near).normalize_or_zero();
-        if !near.is_finite() || !direction.is_finite() || direction.length_squared() < 0.5 || direction.y.abs() < 1e-5 { return None; }
+        if !near.is_finite()
+            || !direction.is_finite()
+            || direction.length_squared() < 0.5
+            || direction.y.abs() < 1e-5
+        {
+            return None;
+        }
         let distance = (height - near.y) / direction.y;
         (distance >= 0. && distance.is_finite()).then(|| near + direction * distance)
     }
@@ -1747,23 +1798,40 @@ impl Architect {
         if self.selected_asset.is_some() || self.hovered_asset.is_some() {
             egui::Window::new("Asset preview")
                 .id(egui::Id::new("architect_asset_preview"))
-                .default_pos(egui::pos2((screen.width() - 330.).max(12.), (screen.height() - 330.).max(60.)))
+                .default_pos(egui::pos2(
+                    (screen.width() - 330.).max(12.),
+                    (screen.height() - 330.).max(60.),
+                ))
                 .default_size(egui::vec2(320., 340.))
                 .resizable(true)
                 .show(ctx, |ui| {
-                    let label = self.hovered_asset.as_deref().or(self.selected_asset.as_deref()).unwrap_or("");
+                    let label = self
+                        .hovered_asset
+                        .as_deref()
+                        .or(self.selected_asset.as_deref())
+                        .unwrap_or("");
                     ui.label(egui::RichText::new(label).small().strong());
                     if self.preview_message.is_empty() {
                         if let Some(preview) = &self.preview {
-                            preview.show(ui, egui::vec2(ui.available_width().min(280.), ui.available_width().min(280.)));
+                            preview.show(
+                                ui,
+                                egui::vec2(
+                                    ui.available_width().min(280.),
+                                    ui.available_width().min(280.),
+                                ),
+                            );
                         }
                     } else {
                         ui.label(egui::RichText::new(&self.preview_message).small().weak());
                     }
                     if ui.button("Select this asset").clicked() {
-                        if let Some(asset) = self.hovered_asset.clone() { self.selected_asset = Some(asset); }
+                        if let Some(asset) = self.hovered_asset.clone() {
+                            self.selected_asset = Some(asset);
+                        }
                     }
-                    if ui.button("Place selected asset").clicked() { self.add_selected_asset_at_camera(camera); }
+                    if ui.button("Place selected asset").clicked() {
+                        self.add_selected_asset_at_camera(camera);
+                    }
                 });
         }
 
@@ -2355,11 +2423,19 @@ impl Architect {
             None
         };
         let hit = if self.cursor == CursorMode::Place && !over_ui {
-            terrain_hit.or_else(|| pointer.and_then(|position| {
-                let height = self.map.as_ref().map(|map| map.ground(camera.x, camera.z)).unwrap_or(0.);
-                Self::ray_plane_hit(position, screen, view_projection, height)
-            }))
-        } else { terrain_hit };
+            terrain_hit.or_else(|| {
+                pointer.and_then(|position| {
+                    let height = self
+                        .map
+                        .as_ref()
+                        .map(|map| map.ground(camera.x, camera.z))
+                        .unwrap_or(0.);
+                    Self::ray_plane_hit(position, screen, view_projection, height)
+                })
+            })
+        } else {
+            terrain_hit
+        };
         self.brush_cursor_position = hit.map(|position| position.to_array());
         if pressed && self.cursor == CursorMode::Place && !over_ui {
             if let Some(position) = hit {
@@ -2399,7 +2475,8 @@ impl Architect {
         {
             let mut axis_pick = None;
             if let (Some(index), Some(pointer)) = (
-                self.selected_placement.filter(|_| self.cursor == CursorMode::Select),
+                self.selected_placement
+                    .filter(|_| self.cursor == CursorMode::Select),
                 pointer,
             ) {
                 if let Some(object) = self.project.objects.get(index) {
@@ -2612,8 +2689,7 @@ impl Architect {
                     if !object.visible {
                         continue;
                     }
-                    let clip =
-                        view_projection.project_point3(Vec3::from_array(object.position));
+                    let clip = view_projection.project_point3(Vec3::from_array(object.position));
                     if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
                         continue;
                     }
@@ -2953,14 +3029,8 @@ mod tests {
             egui::pos2(70.0, 80.0),
             egui::pos2(20.0, 70.0),
         ];
-        assert!(Architect::lasso_contains(
-            &polygon,
-            egui::pos2(40.0, 40.0)
-        ));
-        assert!(Architect::lasso_contains(
-            &polygon,
-            egui::pos2(50.0, 20.0)
-        ));
+        assert!(Architect::lasso_contains(&polygon, egui::pos2(40.0, 40.0)));
+        assert!(Architect::lasso_contains(&polygon, egui::pos2(50.0, 20.0)));
         assert!(!Architect::lasso_contains(
             &polygon,
             egui::pos2(100.0, 90.0)
@@ -3195,7 +3265,9 @@ mod tests {
             flatten_height: 0.,
             selected_asset: None,
             hovered_asset: None,
-            preview_assets: crate::modules::librarian::archive::LibrarianAssets::open(Path::new("/client")),
+            preview_assets: crate::modules::librarian::archive::LibrarianAssets::open(Path::new(
+                "/client",
+            )),
             preview: None,
             preview_message: String::new(),
             selected_archive: None,
