@@ -657,6 +657,7 @@ impl Harvester {
                 let real_mesh_tris = triangles.len() - before_mesh;
 
                 let before_proxy = triangles.len();
+                let proxy_triangle_budget = MAX_SCENE_TRIANGLES.saturating_sub(triangles.len());
                 let Some(instance_count) = push_instances_chunked_cancellable(
                     &mut triangles,
                     &mut materials,
@@ -666,7 +667,7 @@ impl Harvester {
                     far,
                     config,
                     Some(worker_cancel.as_ref()),
-                    MAX_SCENE_TRIANGLES.saturating_sub(triangles.len()),
+                    proxy_triangle_budget,
                 ) else {
                     return;
                 };
