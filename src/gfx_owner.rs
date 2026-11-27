@@ -1844,6 +1844,7 @@ mod tests {
         manager.update(50, &mut publications);
         assert_eq!(manager.status().live, 1);
         assert_eq!(manager.status().loads, 1);
+        assert_eq!(manager.live_owner_indices, [0]);
         publications.consume_into(&mut grid);
         assert!(grid.query([1., 2., 3.], 1.).is_none());
         // Before StartTime the clock advances but nothing is published.
@@ -1859,6 +1860,7 @@ mod tests {
         publications.consume_into(&mut grid);
         assert_eq!(manager.status().live, 0);
         assert_eq!(manager.status().removed, 1);
+        assert!(manager.live_owner_indices.is_empty());
         assert!(grid.query([1., 2., 3.], 1.).is_none());
         manager.update(500, &mut publications);
         assert!(publications.len() == 0);
