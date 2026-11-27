@@ -339,6 +339,12 @@ struct DrawArgs {
     base_vertex: i32,
     first_instance: u32,
 };
+struct Run {
+    first_cmd: u32,
+    command_count: u32,
+    first_output: u32,
+    _pad: u32,
+};
 struct Params {
     frustum: array<vec4<f32>, 6>,
     eye_proj: vec4<f32>,
@@ -348,6 +354,11 @@ struct Params {
 @group(0) @binding(0) var<storage, read> bounds: array<Bounds>;
 @group(0) @binding(1) var<storage, read_write> draw_args: array<DrawArgs>;
 @group(0) @binding(2) var<uniform> p: Params;
+@group(0) @binding(3) var<storage, read> runs: array<Run>;
+@group(0) @binding(4) var<storage, read_write> counts: array<u32>;
+var<workgroup> prefix: array<u32, 64>;
+var<workgroup> cursor: u32;
+var<workgroup> output_count: u32;
 
 fn finite(v: f32) -> bool {
     return v >= -3.0e38 && v <= 3.0e38;
@@ -405,17 +416,70 @@ fn visible_aabb(b: Bounds) -> bool {
     return true;
 }
 @compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= p.flags.x {
+fn main(
+    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(local_invocation_id) local: vec3<u32>,
+) {
+    if group.x >= p.flags.x {
         return;
     }
-    let b = bounds[id.x];
-    var visible = b.index_count > 0u && visible_aabb(b);
-    draw_args[id.x].index_count = b.index_count;
-    draw_args[id.x].instance_count = select(0u, 1u, visible);
-    draw_args[id.x].first_index = b.first_index;
-    draw_args[id.x].base_vertex = 0;
-    draw_args[id.x].first_instance = 0u;
+    let run = runs[group.x];
+    let lane = local.x;
+    if lane == 0u {
+        cursor = 0u;
+        output_count = 0u;
+    }
+    workgroupBarrier();
+
+    loop {
+        let command_in_run = cursor + lane;
+        var keep = 0u;
+        if command_in_run < run.command_count {
+            let b = bounds[run.first_cmd + command_in_run];
+            if b.index_count > 0u && visible_aabb(b) {
+                keep = 1u;
+            }
+        }
+        prefix[lane] = keep;
+        workgroupBarrier();
+
+        var step = 1u;
+        loop {
+            if step >= 64u {
+                break;
+            }
+            var add = 0u;
+            if lane >= step {
+                add = prefix[lane - step];
+            }
+            workgroupBarrier();
+            prefix[lane] = prefix[lane] + add;
+            workgroupBarrier();
+            step = step * 2u;
+        }
+
+        if keep != 0u {
+            let b = bounds[run.first_cmd + command_in_run];
+            let output_index = run.first_output + output_count + prefix[lane] - 1u;
+            draw_args[output_index].index_count = b.index_count;
+            draw_args[output_index].instance_count = 1u;
+            draw_args[output_index].first_index = b.first_index;
+            draw_args[output_index].base_vertex = 0;
+            draw_args[output_index].first_instance = 0u;
+        }
+        workgroupBarrier();
+        if lane == 0u {
+            output_count = output_count + prefix[63u];
+            cursor = cursor + 64u;
+        }
+        workgroupBarrier();
+        if cursor >= run.command_count {
+            break;
+        }
+    }
+    if lane == 0u {
+        counts[group.x] = output_count;
+    }
 }
 "#;
 
@@ -432,6 +496,15 @@ struct WorldGpuCullBounds {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct WorldGpuCullRun {
+    first_cmd: u32,
+    command_count: u32,
+    first_output: u32,
+    pad: u32,
+}
+
 struct WorldGpuCullParams {
     frustum: [[f32; 4]; 6],
     eye_proj: [f32; 4],
@@ -458,6 +531,8 @@ struct WorldGpuCullView {
     _bounds: wgpu::Buffer,
     indirect: wgpu::Buffer,
     params: wgpu::Buffer,
+    _runs: wgpu::Buffer,
+    counts: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     runs: Vec<WorldIndirectRun>,
     ready: bool,
