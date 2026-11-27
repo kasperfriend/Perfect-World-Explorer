@@ -216,6 +216,10 @@ impl Normals {
     }
 }
 impl Reader {
+    /// Source revision captured when this reader snapshot was created.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
     fn page(&mut self, index: usize) -> Result<usize, String> {
         if index >= self.store.len {
             return Err(format!("terrain cell {index} out of bounds"));
@@ -1334,6 +1338,36 @@ mod tests {
             one
         );
         assert!(source_identity(header, &sub, &["missing".to_string()]).is_err());
+    }
+
+    #[test]
+    fn editor_overlay_is_shared_atomic_and_snapshot_consistent() {
+        let dir = Temp::new();
+        let (heights, normals) = fixture(&dir.0, 224, false);
+        let index = 5 * 32 + 7;
+        let original = height(7, 5);
+        let mut old_reader = heights.reader();
+        assert_eq!(old_reader.revision(), 0);
+
+        heights
+            .apply_cells(&[(index, 123.5, [12, 34, 56])])
+            .unwrap();
+        assert_eq!(heights.revision(), 1);
+        assert_eq!(heights.at(index), 123.5);
+        assert_eq!(normals.at(index), [12, 34, 56]);
+        assert_eq!(old_reader.cell(index).unwrap(), (original, normal(7, 5)));
+
+        let mut new_reader = heights.reader();
+        assert_eq!(new_reader.revision(), 1);
+        assert_eq!(new_reader.cell(index).unwrap(), (123.5, [12, 34, 56]));
+
+        // A bad cell rejects the whole batch; neither the valid first entry nor
+        // the revision is published.
+        assert!(heights
+            .apply_cells(&[(index, 999.0, [1, 2, 3]), (heights.0.len, 1.0, [0, 0, 0])])
+            .is_err());
+        assert_eq!(heights.revision(), 1);
+        assert_eq!(heights.at(index), 123.5);
     }
 
     #[test]
