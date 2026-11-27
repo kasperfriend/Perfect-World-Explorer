@@ -67,6 +67,11 @@ pub fn contains(bounds: Option<[f32; 4]>, p: [f32; 3]) -> bool {
         p[0] >= x0 && p[0] < x1 && p[2] >= z0 && p[2] < z1
     })
 }
+/// Keep full fog visibly inside the resident terrain boundary. The diagonal-FOV
+/// term accounts for screen corners; this additional inset hides the final
+/// rasterized terrain edge rather than letting it coincide with full fog.
+const FOG_EDGE_INSET: f32 = 0.85;
+
 /// Conservative view-Z limit: every visible boundary point is at least the
 /// nearest XZ edge away, and its forward projection is >= distance*cos(diagonal
 /// half-FOV). This hides the edge even at screen corners, not only the centre.
@@ -80,7 +85,7 @@ pub fn fog_cap(bounds: [f32; 4], eye: [f32; 3], aspect: f32) -> Option<f32> {
         .min(eye[2] - bounds[2])
         .min(bounds[3] - eye[2]);
     let tangent = 35f32.to_radians().tan();
-    Some((d / (1. + tangent * tangent * (1. + aspect.max(0.01).powi(2))).sqrt() * 0.95).max(0.01))
+    Some((d / (1. + tangent * tangent * (1. + aspect.max(0.01).powi(2))).sqrt() * FOG_EDGE_INSET).max(0.01))
 }
 pub fn fit_fog(start: f32, end: f32, cap: f32) -> [f32; 2] {
     let end = end.min(cap).max(0.01);
@@ -103,9 +108,10 @@ mod residency_tests {
             let cap = fog_cap([-448., 512., -448., 512.], [0., 300., 0.], aspect).unwrap();
             let diagonal_cos =
                 1. / (1. + 35f32.to_radians().tan().powi(2) * (1. + aspect * aspect)).sqrt();
-            assert!(cap < 448. * diagonal_cos);
+            assert!(cap < 448. * diagonal_cos * FOG_EDGE_INSET + 0.001);
             let [start, end] = fit_fog(400., 1000., cap);
             assert!(start < end && end <= cap);
+            assert!(end <= 448. * diagonal_cos * FOG_EDGE_INSET + 0.001);
         }
         assert_eq!(fog_cap([-1., 1., -1., 1.], [5., 0., 0.], 1.), None);
     }
