@@ -1837,6 +1837,10 @@ impl Architect {
                     }
                 });
                 if self.selected_placements.len() > 1 {
+                    let active_position = self
+                        .selected_placement
+                        .and_then(|index| self.project.objects.get(index))
+                        .map(|object| object.position);
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Hide selected").clicked() {
                             for index in &self.selected_placements {
@@ -1880,6 +1884,24 @@ impl Architect {
                             }
                         }
                     });
+                    if let Some(target) = active_position {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Align selection to active:");
+                            for (axis, label) in [(0usize, "X"), (1, "Y"), (2, "Z")] {
+                                if ui.small_button(label).clicked() {
+                                    for index in &self.selected_placements {
+                                        if let Some(object) = self.project.objects.get_mut(*index) {
+                                            object.position[axis] = target[axis];
+                                        }
+                                    }
+                                    self.status = format!(
+                                        "Aligned {} selected placements on the {label} axis.",
+                                        self.selected_placements.len()
+                                    );
+                                }
+                            }
+                        });
+                    }
                 }
                 let mut delete_placement = None;
                 let mut duplicate_placement = None;
