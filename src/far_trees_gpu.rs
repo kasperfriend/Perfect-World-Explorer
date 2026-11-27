@@ -2048,7 +2048,8 @@ pub fn harvest_rt_tree_species_cancellable(
     let max_d2 = max_dist * max_dist;
     let scale = lod_scale.clamp(0.25, 4.0);
     // Boost #20: Fast XZ bounding reject before 3D distance + squared LOD thresholds (zero sqrt).
-    let mut candidates: Vec<(f32, usize, [f32; 3])> = Vec::with_capacity(512);
+    let mut candidates: Vec<(f32, usize, [f32; 3], usize)> = Vec::with_capacity(512);
+    let mut desired_triangles = 0usize;
     for (si, sp) in species_list.iter().enumerate() {
         if sp.lods.is_empty() {
             continue;
@@ -2069,11 +2070,30 @@ pub fn harvest_rt_tree_species_cancellable(
             let dy = pos[1] - eye.y;
             let d2 = dx * dx + dy * dy + dz * dz;
             if d2 <= max_d2 {
-                candidates.push((d2, si, pos));
+                // Resolve the raster-compatible LOD while the placement is
+                // already hot in the distance scan. If all desired LODs fit
+                // the budget together, candidate order cannot affect output
+                // and the O(n log n) nearest-first sort is unnecessary.
+                let distance = approximate_client_distance(d2);
+                let lod_count = sp.lods.len().min(3);
+                let mut lod_idx = raster_lod_index(distance, sp.height, scale, lod_count);
+                while lod_idx > 0
+                    && sp.lods[lod_idx].len() < 12
+                    && !sp.lods[lod_idx - 1].is_empty()
+                {
+                    lod_idx -= 1;
+                }
+                desired_triangles = desired_triangles.saturating_add(sp.lods[lod_idx].len());
+                candidates.push((d2, si, pos, lod_idx));
             }
         }
     }
-    candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    // When over budget, nearest trees must retain priority because a farther
+    // tree may be omitted or forced to a coarser LOD. Otherwise preserve scan
+    // order and avoid sorting entirely.
+    if desired_triangles > tri_budget {
+        candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    }
 
     // Each species/LOD has identical local geometry for every placement. Cache
     // its camera-facing leaf transform once, rather than repeating three vertex
@@ -2090,19 +2110,13 @@ pub fn harvest_rt_tree_species_cancellable(
     let mut real_instances = 0usize;
     let mut real_tris = 0usize;
     let mut budget_skips = 0usize;
-    for (candidate_index, (d2, si, pos)) in candidates.into_iter().enumerate() {
+    for (candidate_index, (_, si, pos, lod_idx)) in candidates.into_iter().enumerate() {
         if candidate_index & 0x3f == 0 && cancelled(cancel) {
             out.truncate(start_len);
             return (0, 0, 0);
         }
         let sp = &species_list[si];
-        let distance = approximate_client_distance(d2);
         let lod_count = sp.lods.len().min(3);
-        let mut lod_idx = raster_lod_index(distance, sp.height, scale, lod_count);
-        // Match the raster path's rule: don't use a leaf-stripped outer LOD when a finer full LOD exists.
-        while lod_idx > 0 && sp.lods[lod_idx].len() < 12 && !sp.lods[lod_idx - 1].is_empty() {
-            lod_idx -= 1;
-        }
         let remaining = tri_budget.saturating_sub(out.len() - start_len);
         // Under pressure, try only progressively coarser *real* SpeedTree LODs.
         // If none fits, omit the instance rather than injecting synthetic card geometry.
