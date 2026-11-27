@@ -2399,11 +2399,8 @@ mod raywatcher_tree_tests {
             (out[2].a - out[0].a - glam::Vec3::X * 10.0).length() < 1e-5,
             "the cached billboard transform must be identical across placements"
         );
-        let expected_negative_rho = speedtree_leaf_corner(
-            [-1.0, 0.0, 4.0],
-            glam::Vec3::X,
-            -0.37,
-        );
+        let expected_negative_rho = glam::Vec3::new(10.0, 0.0, 10.0)
+            + speedtree_leaf_corner([-1.0, 0.0, 4.0], glam::Vec3::X, -0.37);
         assert!(
             (out[1].a - expected_negative_rho).length() < 1e-5,
             "negative-rho leaves must use the same camera-facing transform as raster"
