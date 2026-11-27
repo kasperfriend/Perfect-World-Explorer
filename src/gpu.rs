@@ -858,8 +858,7 @@ fn build(
     // re-meshed, and blocks the window leaves release their geometry.
     let mut terrain_reader = t.heights.reader();
     let terrain_revision = terrain_reader.revision();
-    if t
-        .terrain_material_window
+    if t.terrain_material_window
         .is_some_and(|(_, previous_revision)| previous_revision != terrain_revision)
     {
         // Every cached near block and the whole-world LOD depend on heights and
