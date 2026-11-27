@@ -230,7 +230,35 @@ impl BlockSurface {
 /// `step ..= cells-step` at `step` resolution; the four edge rings join the
 /// block boundary, whose nodes sit at `edge_stride` spacing, to that interior.
 /// The two adjacent rings together fill each corner cell exactly once.
+/// Return the immutable, lazily-built surface for a terrain LOD/edge variant.
+///
+/// There are only 243 possible combinations (three levels and 3^4 edge
+/// stitch patterns). Terrain-window rebuilds revisit these combinations for
+/// thousands of blocks, so retain each triangulation instead of rebuilding its
+/// vertex/index topology on every camera crossing. The cache is process-wide,
+/// thread-safe, and initializes each variant only when first requested.
+pub fn block_surface_cached(level: u8, cases: [u8; 4]) -> &'static BlockSurface {
+    static SURFACES: std::sync::OnceLock<Vec<std::sync::OnceLock<BlockSurface>>> =
+        std::sync::OnceLock::new();
+    let level = level.clamp(1, MAX_LEVEL);
+    let cases = cases.map(|case| case.min(2));
+    let slot = (level as usize - 1) * 81
+        + cases[0] as usize * 27
+        + cases[1] as usize * 9
+        + cases[2] as usize * 3
+        + cases[3] as usize;
+    SURFACES
+        .get_or_init(|| (0..243).map(|_| std::sync::OnceLock::new()).collect())[slot]
+        .get_or_init(|| build_block_surface(level, cases))
+}
+
+/// Owned compatibility wrapper for callers that need to modify or consume a
+/// surface. Hot terrain residency code should use block_surface_cached.
 pub fn block_surface(level: u8, cases: [u8; 4]) -> BlockSurface {
+    block_surface_cached(level, cases).clone()
+}
+
+fn build_block_surface(level: u8, cases: [u8; 4]) -> BlockSurface {
     let level = level.clamp(1, MAX_LEVEL);
     let s = step(level);
     let u = CELLS / s; // block edge in step units
@@ -696,6 +724,29 @@ mod tests {
         let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
         let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
         !(neg && pos)
+    }
+
+    #[test]
+    fn cached_surface_variants_are_stable_and_match_owned_surfaces() {
+        for level in 1..=MAX_LEVEL {
+            for encoded in 0..81 {
+                let cases = [
+                    encoded / 27 % 3,
+                    encoded / 9 % 3,
+                    encoded / 3 % 3,
+                    encoded % 3,
+                ];
+                let cached = block_surface_cached(level, cases);
+                assert!(std::ptr::eq(cached, block_surface_cached(level, cases)));
+                assert_eq!(cached.grid, block_surface(level, cases).grid);
+                assert_eq!(cached.indices, block_surface(level, cases).indices);
+            }
+        }
+        // Invalid edge values are clamped to the same canonical cache entry.
+        assert!(std::ptr::eq(
+            block_surface_cached(3, [9, 0, 0, 0]),
+            block_surface_cached(3, [2, 0, 0, 0]),
+        ));
     }
 
     #[test]
