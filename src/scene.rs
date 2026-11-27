@@ -400,6 +400,19 @@ impl Scene {
     }
 }
 
+/// A non-destructive BMD scenery instance authored by Architect. It is
+/// submitted through the same baked-scenery path as EC-BSD ornaments.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorSceneryPlacement {
+    /// Archive-relative path, including its litmodels/<map-id>/ namespace.
+    pub path: String,
+    pub position: [f32; 3],
+    pub direction: [f32; 3],
+    pub up: [f32; 3],
+    pub scale: f32,
+    pub map_id: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Ornament {
     pub export_id: u32,
