@@ -1256,6 +1256,17 @@ impl Architect {
                     path = format!("litmodels/{relative}");
                 } else if first == "world" {
                     return None;
+                } else if first
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_alphabetic())
+                    && first
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+                {
+                    // A different map namespace must never be silently nested
+                    // under the active map's prefix.
+                    return None;
                 } else {
                     path = format!("{namespace}{relative}");
                 }
@@ -1283,7 +1294,7 @@ impl Architect {
         {
             return Vec::new();
         }
-        let mut placements = self
+        let placements = self
             .project
             .objects
             .iter()
@@ -4422,6 +4433,11 @@ mod tests {
             .as_deref(),
             Some("litmodels/a01/1/litmodel_42.bmd")
         );
+        assert!(Architect::renderer_bmd_path(
+            "element/litmodels.pck::litmodels/a11/1/litmodel_42.bmd",
+            "a01"
+        )
+        .is_none());
         assert!(Architect::renderer_bmd_path(
             "element/models.pck::litmodels/a01/1/litmodel_42.bmd",
             "a01"
