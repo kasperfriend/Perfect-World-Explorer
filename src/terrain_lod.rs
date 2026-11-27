@@ -204,7 +204,7 @@ pub fn edge_cases(own: u8, neighbours: [Option<u8>; 4]) -> [u8; 4] {
 pub struct BlockSurface {
     /// Grid coordinates (0..=CELLS) of each vertex.
     pub grid: Vec<[u32; 2]>,
-    pub indices: Vec<u32>,
+    pub indices: std::sync::Arc<[u32]>,
     /// Interior cells (as the native per-level index grid) and edge ring cells.
     pub interior_cells: usize,
     pub ring_cells: usize,
@@ -339,7 +339,7 @@ fn build_block_surface(level: u8, cases: [u8; 4]) -> BlockSurface {
     }
     BlockSurface {
         grid: b.grid,
-        indices: b.indices,
+        indices: b.indices.into(),
         interior_cells: q * q,
         ring_cells: u * u - q * q,
     }
