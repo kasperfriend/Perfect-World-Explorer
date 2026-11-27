@@ -1711,6 +1711,92 @@ impl WorldPageMeta {
         }
     }
 }
+
+/// Copy all eight whole-world atlas mip levels through one staging allocation.
+/// Rows are padded to wgpu's copy alignment; the source atlas remains tightly
+/// packed in CPU memory. This keeps texture copies in the same command encoder
+/// as the page geometry uploads instead of issuing one queue texture write per mip.
+fn stage_page_atlas_mips(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    belt: &mut wgpu::util::StagingBelt,
+    image: &wgpu::Texture,
+    page: &Page,
+) {
+    let mut levels = Vec::with_capacity(8);
+    let mut width = SIDE;
+    let mut height = page.used_height;
+    let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+    let mut total_bytes = 0usize;
+
+    for mip in 0..8u32 {
+        let source = if mip == 0 {
+            &page.atlas
+        } else {
+            &page.mips[(mip - 1) as usize]
+        };
+        let row_bytes = width * 4;
+        let padded_row_bytes = (row_bytes + alignment - 1) / alignment * alignment;
+        total_bytes = (total_bytes + alignment - 1) / alignment * alignment;
+        levels.push((mip, width, height, row_bytes, padded_row_bytes, total_bytes));
+        total_bytes += padded_row_bytes * height;
+        width /= 2;
+        height /= 2;
+        debug_assert_eq!(source.len(), row_bytes * (height * 2));
+    }
+
+    let mut packed = vec![0u8; total_bytes];
+    for (mip, width, height, row_bytes, padded_row_bytes, offset) in &levels {
+        let source = if *mip == 0 {
+            &page.atlas
+        } else {
+            &page.mips[(*mip - 1) as usize]
+        };
+        for row in 0..*height {
+            let src = row * *row_bytes;
+            let dst = *offset + row * *padded_row_bytes;
+            packed[dst..dst + *row_bytes]
+                .copy_from_slice(&source[src..src + *row_bytes]);
+        }
+        let _ = width;
+    }
+
+    let upload_size = std::num::NonZeroU64::new(total_bytes as u64)
+        .expect("whole-world atlas upload must not be empty");
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("whole-world atlas mip upload"),
+        size: total_bytes as u64,
+        usage: wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    belt.write_buffer(encoder, &staging, 0, upload_size, device)
+        .copy_from_slice(&packed);
+
+    for (mip, width, height, _, padded_row_bytes, offset) in levels {
+        encoder.copy_buffer_to_texture(
+            wgpu::ImageCopyBuffer {
+                buffer: &staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: offset as u64,
+                    bytes_per_row: Some(padded_row_bytes as u32),
+                    rows_per_image: Some(height as u32),
+                },
+            },
+            wgpu::ImageCopyTexture {
+                texture: image,
+                mip_level: mip,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: width as u32,
+                height: height as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+}
+
 impl GpuPage {
     pub fn release_cpu_ranges(&mut self) {
         self.placements.clear();
@@ -1983,36 +2069,7 @@ impl GpuPage {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            let mut width = SIDE;
-            let mut height = page.used_height;
-            for mip in 0..8u32 {
-                let level = if mip == 0 {
-                    &page.atlas
-                } else {
-                    &page.mips[(mip - 1) as usize]
-                };
-                queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: &image,
-                        mip_level: mip,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    level,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some((width * 4) as u32),
-                        rows_per_image: Some(height as u32),
-                    },
-                    wgpu::Extent3d {
-                        width: width as u32,
-                        height: height as u32,
-                        depth_or_array_layers: 1,
-                    },
-                );
-                width /= 2;
-                height /= 2;
-            }
+            stage_page_atlas_mips(device, encoder, belt, &image, page);
             let view = image.create_view(&Default::default());
             let make = |buf: &wgpu::Buffer| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
