@@ -135,7 +135,11 @@ impl Heights {
     }
     /// Clear all non-destructive editor overrides and publish a new revision.
     pub fn clear_edits(&self) -> Result<(), String> {
-        let mut edits = self.0.edits.write().map_err(|_| "terrain edit lock poisoned")?;
+        let mut edits = self
+            .0
+            .edits
+            .write()
+            .map_err(|_| "terrain edit lock poisoned")?;
         if !edits.is_empty() {
             *edits = Arc::new(HashMap::new());
             self.0.revision.fetch_add(1, Ordering::Release);
@@ -156,7 +160,11 @@ impl Heights {
         if cells.is_empty() {
             return Ok(());
         }
-        let mut edits = self.0.edits.write().map_err(|_| "terrain edit lock poisoned")?;
+        let mut edits = self
+            .0
+            .edits
+            .write()
+            .map_err(|_| "terrain edit lock poisoned")?;
         let mut next = (**edits).clone();
         for (index, height, normal) in cells {
             next.insert(*index, (*height, *normal));
