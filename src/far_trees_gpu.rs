@@ -504,7 +504,12 @@ fn sample_tri_alpha_mask49(
                 u0[1] * bw + u1[1] * bx + u2[1] * by,
             ];
             let (rgb, a) = sample_rgba_uv(img, uv);
-            if if inclusive_cutoff { a >= cutoff } else { a > cutoff } {
+            let accepted = if inclusive_cutoff {
+                a >= cutoff
+            } else {
+                a > cutoff
+            };
+            if accepted {
                 mask |= 1u64 << (iy * 7 + ix);
                 hits += 1;
                 rgb_sum[0] += rgb[0] * a;
