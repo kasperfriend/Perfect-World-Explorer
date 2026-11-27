@@ -524,6 +524,8 @@ struct MeshData {
     tree_center: (f32, f32),
     detail: DetailSettings,
     lod: LodState,
+    /// Source height/normal revision captured by this mesh build.
+    terrain_revision: u64,
     /// Resident terrain blocks and the index range each occupies.
     spans: Vec<crate::terrain_residency::Span>,
     terrain_end: u32,
@@ -855,6 +857,7 @@ fn build(
     // meshed at the level `0x77e360` picked, blocks whose level changed are
     // re-meshed, and blocks the window leaves release their geometry.
     let mut terrain_reader = t.heights.reader();
+    let terrain_revision = terrain_reader.revision();
     let census = residency.update_stitched(
         &win,
         |x, y| {
@@ -1656,6 +1659,7 @@ fn build(
         tree_center: (cx, cz),
         detail,
         lod: lod_state,
+        terrain_revision,
         spans,
         terrain_end,
         object_start,
@@ -1733,6 +1737,8 @@ struct Renderer {
     detail: DetailSettings,
     /// Window/levels the current terrain mesh was built for.
     lod: LodState,
+    /// Height/normal edit revision represented by the current GPU terrain mesh.
+    terrain_revision: u64,
     /// Resident terrain blocks (`0x77e250`) and the runs submitted last frame.
     spans: Vec<crate::terrain_residency::Span>,
     terrain_runs: Vec<(u32, u32)>,
@@ -2551,6 +2557,7 @@ impl Renderer {
             object_mv_view,
             center: m.center,
             lod: m.lod,
+            terrain_revision: m.terrain_revision,
             spans: m.spans,
             terrain_runs: Vec::new(),
             far_terrain_runs: Vec::new(),
@@ -3005,6 +3012,7 @@ impl Renderer {
             upload.materials.release_gpu_source();
         }
         self.grass.update(&self.device, &self.queue, m.grass);
+        self.terrain_revision = m.terrain_revision;
         // A streamed scenery page is a deterministic function of the textures it
         // packs and the ornaments it places, so most pages of a crossing are the
         // pages the renderer already holds. Reusing them saves a 4096² atlas
@@ -6557,6 +6565,7 @@ pub fn run(
                             aim != &renderer.lod
                                 || renderer.detail != settings.detail
                                 || renderer.local_scenery_skipped != skip_local_scenery
+                                || renderer.terrain_revision != map_space.heights.revision()
                         }
                         None => false,
                     };
