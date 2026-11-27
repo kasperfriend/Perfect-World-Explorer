@@ -2117,7 +2117,7 @@ impl Architect {
             }
             self.object_drag_axis = axis_pick;
             self.object_drag_group.clear();
-            self.object_drag_start_hit = hit.map(Vec3::to_array);
+            self.object_drag_start_hit = hit.map(|position| position.to_array());
             self.object_dragging = self.cursor == CursorMode::Select
                 && self.selected_placement.is_some()
                 && ((self.selected_placements.len() > 1 && hit.is_some())
