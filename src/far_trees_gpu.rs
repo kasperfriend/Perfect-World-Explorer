@@ -1475,7 +1475,10 @@ mod tests {
                 });
             }
             groups.push(Group {
+                tree_type: group,
+                native_count: 4,
                 positions: vec![[0.; 3]; 4],
+                transforms: vec![[0.0, 1.0]; 4],
                 height: 5. * (group as f32 + 1.),
                 first_batch,
             });
@@ -1532,12 +1535,18 @@ mod tests {
         ];
         let groups = vec![
             Group {
+                tree_type: 0,
+                native_count: 2,
                 positions: vec![[0.; 3]; 2],
+                transforms: vec![[0.0, 1.0]; 2],
                 height: 5.,
                 first_batch: 0,
             },
             Group {
+                tree_type: 1,
+                native_count: 2,
                 positions: vec![[0.; 3]; 2],
+                transforms: vec![[0.0, 1.0]; 2],
                 height: 9.,
                 first_batch: 3,
             },
