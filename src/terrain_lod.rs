@@ -292,21 +292,21 @@ pub fn block_surface(level: u8, cases: [u8; 4]) -> BlockSurface {
             let oa = outer(a, &mut b);
             // Inner nodes shared with the neighbouring segment: both ends are
             // included, except the two corners of the ring (t = 0 and t = u,
-            // which belong to the perpendicular rings).
-            let chain: Vec<u32> = (a..=e)
-                .filter(|&t| t >= 1 && t <= u - 1)
-                .map(|t| inner(t, &mut b))
-                .collect();
+            // which belong to the perpendicular rings). Stream the tiny chain
+            // directly into the fan instead of allocating a Vec for every ring
+            // segment generated during LOD/edge rebuilds.
+            let mut previous = None;
+            for t in (a..=e).filter(|&t| t >= 1 && t <= u - 1) {
+                let current = inner(t, &mut b);
+                if let Some(last) = previous {
+                    b.tri(oa, last, current);
+                }
+                previous = Some(current);
+            }
             let oe = outer(e, &mut b);
-            // `chain` is never empty: the ring's two end corners are the only
-            // step units excluded and every segment keeps at least one.
-            debug_assert!(!chain.is_empty(), "ring segment {a}..{e} has no inner node");
-            for w in chain.windows(2) {
-                b.tri(oa, w[0], w[1]);
-            }
-            if let Some(&last) = chain.last() {
-                b.tri(oa, last, oe);
-            }
+            // At least one interior node remains in every segment.
+            let last = previous.expect("ring segment must contain an inner node");
+            b.tri(oa, last, oe);
             a = e;
         }
     }
