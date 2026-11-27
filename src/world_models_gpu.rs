@@ -317,7 +317,7 @@ impl World {
     }
     /// Replace Architect's transient project layer without disturbing native map
     /// instances. Asset geometry is cached by normalized ECM path; edits only
-    /// rebuild the lightweight placement/pose slots.
+    /// update placement transforms and invalidate only the affected poses.
     pub fn sync_editor_placements(&mut self, placements: &[EditorPlacement]) {
         if self.editor_placements == placements {
             return;
@@ -326,7 +326,7 @@ impl World {
         // During a transform drag the asset set is unchanged. Update only the
         // lightweight placement matrices and scene records: rebuilding slots
         // here would discard draw objects and reinitialize animation playback
-        // on every mouse movement, even though the model geometry did not move.
+        // on every mouse movement, even though the source geometry is unchanged.
         let editor_instances = self
             .assets
             .instances
