@@ -393,10 +393,16 @@ impl Architect {
     /// pages remain immutable; the renderer and navigation readers see the
     /// same sparse height/normal overrides through MapSpace.
     fn apply_stroke(&self, stroke: &TerrainStroke) -> Result<usize, String> {
-        let map = self.map.as_ref().ok_or("No terrain is loaded for sculpting")?;
+        let map = self
+            .map
+            .as_ref()
+            .ok_or("No terrain is loaded for sculpting")?;
         if !self.project.source_map.is_empty()
             && !self.current_map_id.is_empty()
-            && !self.project.source_map.eq_ignore_ascii_case(&self.current_map_id)
+            && !self
+                .project
+                .source_map
+                .eq_ignore_ascii_case(&self.current_map_id)
         {
             return Err(format!(
                 "Project belongs to map {}, but the loaded terrain is {}.",
@@ -407,7 +413,10 @@ impl Architect {
             return Err("Terrain dimensions or spacing are invalid".into());
         }
         if stroke.mode == BrushMode::Paint {
-            return Err("Terrain paint is not implemented yet; choose Raise, Lower, Flatten or Smooth.".into());
+            return Err(
+                "Terrain paint is not implemented yet; choose Raise, Lower, Flatten or Smooth."
+                    .into(),
+            );
         }
         let radius = stroke.radius.clamp(0.1, 10000.);
         let cx = stroke.position[0] / map.spacing + map.width as f32 * 0.5;
@@ -488,12 +497,38 @@ impl Architect {
         for y in ny0..=ny1 {
             for x in nx0..=nx1 {
                 let center = height_at(x, y, &mut source);
-                let left = if x > 0 { height_at(x - 1, y, &mut source) } else { center };
-                let right = if x + 1 < map.width { height_at(x + 1, y, &mut source) } else { center };
-                let north = if y > 0 { height_at(x, y - 1, &mut source) } else { center };
-                let south = if y + 1 < map.height { height_at(x, y + 1, &mut source) } else { center };
-                let dx = (right - left) / (if x == 0 || x + 1 == map.width { map.spacing } else { 2. * map.spacing });
-                let dz = (north - south) / (if y == 0 || y + 1 == map.height { map.spacing } else { 2. * map.spacing });
+                let left = if x > 0 {
+                    height_at(x - 1, y, &mut source)
+                } else {
+                    center
+                };
+                let right = if x + 1 < map.width {
+                    height_at(x + 1, y, &mut source)
+                } else {
+                    center
+                };
+                let north = if y > 0 {
+                    height_at(x, y - 1, &mut source)
+                } else {
+                    center
+                };
+                let south = if y + 1 < map.height {
+                    height_at(x, y + 1, &mut source)
+                } else {
+                    center
+                };
+                let dx = (right - left)
+                    / (if x == 0 || x + 1 == map.width {
+                        map.spacing
+                    } else {
+                        2. * map.spacing
+                    });
+                let dz = (north - south)
+                    / (if y == 0 || y + 1 == map.height {
+                        map.spacing
+                    } else {
+                        2. * map.spacing
+                    });
                 let normal = Vec3::new(-dx, 1., -dz).normalize_or_zero();
                 let encoded = [
                     (normal.x * 127.).round().clamp(-127., 127.) as i8,
@@ -610,7 +645,8 @@ impl Architect {
                         || erased_source_map.eq_ignore_ascii_case(&self.current_map_id);
                     if belongs_here {
                         if let Err(error) = map.heights.clear_edits() {
-                            self.status = format!("Project erased, but terrain reset failed: {error}");
+                            self.status =
+                                format!("Project erased, but terrain reset failed: {error}");
                         }
                     }
                 }
