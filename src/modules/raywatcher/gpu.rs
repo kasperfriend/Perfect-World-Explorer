@@ -6617,6 +6617,61 @@ mod phase_r1_tests {
             }
         }
         assert!(seen.into_iter().all(|covered| covered));
+
+        // Every internal bound must enclose both children; this is the
+        // conservative-pruning invariant that guarantees no light is lost.
+        for (index, node) in nodes.iter().enumerate() {
+            if node.min[3] >= 0.0 {
+                continue;
+            }
+            let children = [index + 1, node.max[3] as usize];
+            for child_index in children {
+                let child = &nodes[child_index];
+                for axis in 0..3 {
+                    assert!(child.min[axis] >= node.min[axis] - 1e-5);
+                    assert!(child.max[axis] <= node.max[axis] + 1e-5);
+                }
+            }
+        }
+
+        // Exercise the same point-query traversal as the shaders and compare
+        // its candidate superset against every exact sphere intersection.
+        for sample in 0..128 {
+            let point = glam::Vec3::new(
+                (sample as f32 * 0.37).sin() * 110.0,
+                (sample as f32 * 0.19).cos() * 48.0,
+                (sample as f32 * 0.53).sin() * 96.0,
+            );
+            let mut candidates = Vec::new();
+            let mut stack = vec![0usize];
+            while let Some(index) = stack.pop() {
+                let node = &nodes[index];
+                if (0..3).any(|axis| point[axis] < node.min[axis] || point[axis] > node.max[axis]) {
+                    continue;
+                }
+                if node.min[3] >= 0.0 {
+                    let first = node.max[3] as usize;
+                    let count = node.min[3] as usize;
+                    candidates.extend_from_slice(&order[first..first + count]);
+                } else {
+                    stack.push(node.max[3] as usize);
+                    stack.push(index + 1);
+                }
+            }
+            candidates.sort_unstable();
+            let mut expected: Vec<u32> = positions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, light)| {
+                    let delta = point - glam::Vec3::new(light[0], light[1], light[2]);
+                    (delta.length_squared() < light[3] * light[3]).then_some(index as u32)
+                })
+                .collect();
+            expected.sort_unstable();
+            for light in expected {
+                assert!(candidates.binary_search(&light).is_ok(), "BVH pruned contributing light {light}");
+            }
+        }
     }
 
     #[test]
