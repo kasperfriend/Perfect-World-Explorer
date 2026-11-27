@@ -553,7 +553,9 @@ mod tests {
             .update_stitched_parallel(
                 &first,
                 |_, _| (3, [0; 4]),
-                |_, _, _, _| panic!("unchanged terrain blocks must not be rebuilt"),
+                |_, _, _, _| -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String> {
+                    panic!("unchanged terrain blocks must not be rebuilt")
+                },
             )
             .unwrap();
         assert_eq!(unchanged.loaded, 0);
@@ -576,7 +578,9 @@ mod tests {
             .update_stitched_parallel(
                 &shifted,
                 |x, y| (if x == 1 && y == 0 { 0 } else { 3 }, [0; 4]),
-                |_, _, _, _| panic!("level-zero blocks must not be built"),
+                |_, _, _, _| -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String> {
+                    panic!("level-zero blocks must not be built")
+                },
             )
             .unwrap();
         assert_eq!(disabled.evicted, 1);
@@ -605,7 +609,9 @@ mod tests {
             .update_stitched(
                 &win,
                 |x, _| (3, if x == 0 { [0, 0, 0, 1] } else { [0; 4] }),
-                |_, _, _| panic!("unchanged stitched mesh must be reused"),
+                |_, _, _| -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String> {
+                    panic!("unchanged stitched mesh must be reused")
+                },
             )
             .unwrap();
         assert_eq!(c.remeshed, 0);
@@ -617,7 +623,9 @@ mod tests {
         let win = window(0, 0, 1, 1);
         r.update(&win, |_, _| 3, |_, _, _| Ok(block(0.))).unwrap();
         let c = r
-            .update(&win, |_, _| 0, |_, _, _| panic!("disabled"))
+            .update(&win, |_, _| 0, |_, _, _| -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String> {
+                panic!("disabled")
+            })
             .unwrap();
         assert_eq!(c.resident, 0);
         assert_eq!(c.triangles, 0);
