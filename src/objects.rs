@@ -241,6 +241,7 @@ pub struct Objects {
     /// Uniform scales for the transient Architect tail, keyed by combined
     /// ornament index. Native EC-BSD ornaments retain their authored scale.
     editor_scales: HashMap<usize, f32>,
+    editor_placements: Vec<crate::scene::EditorSceneryPlacement>,
     /// Canonical in-memory keys built once instead of formatting and lowercasing
     /// the same placement path on every streamed batch.
     model_names: Vec<String>,
@@ -415,6 +416,7 @@ impl Objects {
             native_ornaments: ornaments.clone(),
             ornaments,
             editor_scales: HashMap::new(),
+            editor_placements: Vec::new(),
             model_names,
             models: HashMap::new(),
             cache: TextureCache::new(tex_budget_bytes()),
@@ -437,7 +439,14 @@ impl Objects {
     /// Replace the transient BMD placements while preserving every native
     /// EC-BSD ornament. The ordinary scenery residency, BMD parser, texture
     /// resolver, atlas builder and GPU page path then handle both identically.
-    pub fn set_editor_ornaments(&mut self, placements: &[crate::scene::EditorSceneryPlacement]) {
+    pub fn set_editor_ornaments(
+        &mut self,
+        placements: &[crate::scene::EditorSceneryPlacement],
+    ) -> bool {
+        if self.editor_placements == placements {
+            return false;
+        }
+        self.editor_placements = placements.to_vec();
         let mut combined = self.native_ornaments.to_vec();
         let base = combined.len();
         self.editor_scales.clear();
@@ -467,6 +476,7 @@ impl Objects {
                 self.litmodel_map_id = placement.map_id.clone();
             }
         }
+        true
     }
 
     /// Uniform instance scale for a BMD placement; native map scenery defaults
