@@ -1477,6 +1477,32 @@ mod tests {
     }
 
     #[test]
+    fn alpha_cutout_mask_controls_cpu_shadow_visibility_at_hit_barycentrics() {
+        let tri = RayTriangle::with_kind_and_mask(
+            Vec3::new(-1.0, -1.0, 2.0),
+            Vec3::new(1.0, -1.0, 2.0),
+            Vec3::new(0.0, 1.0, 2.0),
+            Vec3::NEG_Z,
+            0,
+            3.0,
+            1u64 << 15,
+        );
+        let scene = SceneGeometry::build(
+            vec![tri],
+            vec![RayMaterial {
+                albedo: [0.2, 0.6, 0.2, 1.0],
+                surface: [0.8, 0.0, 0.0, 0.8],
+            }],
+        );
+        // (u=.25, v=.25) maps to mask cell (1,2), bit 15: opaque foliage.
+        let covered = Vec3::new(-0.5, -0.5, 0.0);
+        assert!(scene.occluded(covered, Vec3::Z, 0.01, 3.0));
+        // (u=.80, v=.10) maps to a clear cell: the ray must pass through.
+        let cutout = Vec3::new(0.6, -0.8, 0.0);
+        assert!(!scene.occluded(cutout, Vec3::Z, 0.01, 3.0));
+    }
+
+    #[test]
     fn gpu_struct_layouts_match_wgsl_and_hlsl_stride() {
         assert_eq!(std::mem::size_of::<RayTriangle>(), 64);
         assert_eq!(std::mem::size_of::<BvhNode>(), 32);
