@@ -282,9 +282,28 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
             }
         }
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
-            res.occluded = true;
             res.t_blocker = q.CommittedRayT();
-            res.transmittance = float3(0.0, 0.0, 0.0);
+            // The fast/distant path used to turn every accepted foliage texel
+            // into a fully opaque blocker. Preserve one layer of transmission
+            // for alpha-masked foliage; non-masked alpha geometry has already
+            // used stochastic opacity in accept_opacity and must not be faded
+            // a second time here.
+            float transmission = 0.0;
+            if (q.CommittedInstanceID() != 1u) {
+                uint prim = q.CommittedPrimitiveIndex()
+                    + (q.CommittedGeometryIndex() != 0u ? opaque_offset : 0u);
+                if (prim < tri_count) {
+                    uint raw_lo = asuint(tris[prim].c.w);
+                    uint raw_hi = asuint(tris[prim].n.w);
+                    bool has_alpha_mask = (raw_lo | raw_hi) != 0u;
+                    if (has_alpha_mask) {
+                        Material foliage = material_of(prim);
+                        transmission = 1.0 - saturate(foliage.surface.w);
+                    }
+                }
+            }
+            res.transmittance = float3(transmission, transmission, transmission);
+            res.occluded = transmission < 0.999;
         }
         return res;
     }
