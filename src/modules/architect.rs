@@ -738,7 +738,12 @@ impl Architect {
             return;
         };
         match Self::read_project(&path) {
-            Ok(project) => {
+            Ok(mut project) => {
+                if project.source_map.is_empty()
+                    && (!project.objects.is_empty() || !project.strokes.is_empty())
+                {
+                    project.source_map = self.current_map_id.clone();
+                }
                 self.project_name = project.name.clone();
                 self.selected_map = if project.source_map.is_empty() {
                     "__empty__".into()
