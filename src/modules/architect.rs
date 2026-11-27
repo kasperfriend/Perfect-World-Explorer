@@ -120,6 +120,8 @@ pub struct Architect {
     brush_cursor_position: Option<[f32; 3]>,
     brush_dragging: bool,
     last_brush_position: Option<[f32; 3]>,
+    object_dragging: bool,
+    object_drag_y_offset: f32,
 }
 
 impl Architect {
@@ -191,6 +193,8 @@ impl Architect {
             brush_cursor_position: None,
             brush_dragging: false,
             last_brush_position: None,
+            object_dragging: false,
+            object_drag_y_offset: 0.,
         };
         editor.refresh_projects();
         editor
@@ -1631,6 +1635,33 @@ impl Architect {
         let over_ui = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
         let hit = if self.cursor == CursorMode::Sculpt && !over_ui { pointer.and_then(|p| self.map.as_ref().and_then(|m| Self::terrain_hit(p, screen, view_projection, m))) } else { None };
         self.brush_cursor_position = hit.map(Vec3::to_array);
+        // Pick staged project objects directly in the viewport. Their editor
+        // transform is independent from the immutable source-scene instances.
+        if pressed && self.cursor == CursorMode::Select && !over_ui {
+            let mut nearest: Option<(usize, f32)> = None;
+            if let Some(pointer) = pointer {
+                for (index, object) in self.project.objects.iter().enumerate() {
+                    let clip = view_projection.project_point3(Vec3::from_array(object.position));
+                    if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) { continue; }
+                    let point = egui::pos2(screen.left() + (clip.x + 1.) * 0.5 * screen.width(), screen.top() + (1. - clip.y) * 0.5 * screen.height());
+                    let distance = point.distance(pointer);
+                    if distance <= 20. && nearest.is_none_or(|(_, best)| distance < best) { nearest = Some((index, distance)); }
+                }
+            }
+            self.selected_placement = nearest.map(|(index, _)| index);
+            self.object_dragging = self.selected_placement.is_some() && hit.is_some();
+            if let (Some(index), Some(hit)) = (self.selected_placement, hit) {
+                self.object_drag_y_offset = self.project.objects[index].position[1] - hit.y;
+            }
+        }
+        if self.object_dragging && down && self.cursor == CursorMode::Select && !over_ui {
+            if let (Some(index), Some(hit)) = (self.selected_placement, hit) {
+                if let Some(object) = self.project.objects.get_mut(index) {
+                    object.position = [hit.x, hit.y + self.object_drag_y_offset, hit.z];
+                }
+            }
+        }
+        if released || !down { self.object_dragging = false; }
         if pressed && self.cursor == CursorMode::Sculpt && !over_ui && hit.is_some() { self.brush_dragging = true; self.last_brush_position = None; }
         if self.brush_dragging && down {
             if let Some(position) = hit {
@@ -1647,6 +1678,21 @@ impl Architect {
             }
         }
         if released || !down { self.brush_dragging = false; self.last_brush_position = None; }
+        if let Some(index) = self.selected_placement.filter(|index| *index < self.project.objects.len()) {
+            let object = &self.project.objects[index];
+            let origin = Vec3::from_array(object.position);
+            let project_point = |point: Vec3| -> Option<egui::Pos2> {
+                let clip = view_projection.project_point3(point);
+                (clip.is_finite() && (0.0..=1.0).contains(&clip.z)).then(|| egui::pos2(screen.left() + (clip.x + 1.) * 0.5 * screen.width(), screen.top() + (1. - clip.y) * 0.5 * screen.height()))
+            };
+            if let Some(center) = project_point(origin) {
+                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("architect_transform_gizmo")));
+                painter.circle_stroke(center, 6., egui::Stroke::new(2., egui::Color32::WHITE));
+                for (axis, color) in [(Vec3::X, egui::Color32::from_rgb(245,75,75)), (Vec3::Y, egui::Color32::from_rgb(90,230,120)), (Vec3::Z, egui::Color32::from_rgb(90,150,255))] {
+                    if let Some(end) = project_point(origin + axis * 24.) { painter.line_segment([center, end], egui::Stroke::new(3., color)); painter.circle_filled(end, 4., color); }
+                }
+            }
+        }
         if self.cursor == CursorMode::Sculpt {
             if let (Some(position), Some(map)) = (self.brush_cursor_position, self.map.as_ref()) {
                 let center = Vec3::from_array(position);
