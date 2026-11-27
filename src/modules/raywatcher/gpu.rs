@@ -3971,8 +3971,7 @@ pub struct RaywatcherGpu {
     // Ping-pong planes: index 0 and 1 alternate as the filter advances.
     filter_colour: [wgpu::TextureView; 2],
     filter_moments: [wgpu::TextureView; 2],
-    temporal_bind_groups: [wgpu::BindGroup; 2],
-    last_output_plane: usize,
+    temporal_bind_group: wgpu::BindGroup,
     atrous_bind_groups: Vec<wgpu::BindGroup>,
     compose_bind_groups: [wgpu::BindGroup; 2],
     compose_uniforms: wgpu::Buffer,
@@ -4314,32 +4313,18 @@ impl RaywatcherGpu {
             &radiance_cache,
             &restir_reservoirs,
         );
-        let temporal_bind_groups = [
-            Self::temporal_binding(
-                device,
-                &pipelines,
-                &temporal_uniforms,
-                &grid,
-                &motion,
-                &depth,
-                &history_colour,
-                &history_moments,
-                &temporal_colour,
-                &temporal_moments,
-            ),
-            Self::temporal_binding(
-                device,
-                &pipelines,
-                &temporal_uniforms,
-                &grid,
-                &motion,
-                &depth,
-                &history_colour,
-                &history_moments,
-                &temporal_colour,
-                &temporal_moments,
-            ),
-        ];
+        let temporal_bind_group = Self::temporal_binding(
+            device,
+            &pipelines,
+            &temporal_uniforms,
+            &grid,
+            &motion,
+            &depth,
+            &history_colour,
+            &history_moments,
+            &temporal_colour,
+            &temporal_moments,
+        );
         let atrous_bind_groups = Self::atrous_bindings(
             device,
             &pipelines,
@@ -4418,8 +4403,7 @@ impl RaywatcherGpu {
             trace_bind_group,
             filter_colour,
             filter_moments,
-            temporal_bind_groups,
-            last_output_plane: 0,
+            temporal_bind_group,
             atrous_bind_groups,
             compose_bind_groups,
             compose_uniforms,
@@ -4821,32 +4805,18 @@ impl RaywatcherGpu {
                 &self.radiance_cache,
                 &self.restir_reservoirs,
             );
-            self.temporal_bind_groups = [
-                Self::temporal_binding(
-                    device,
-                    pipelines,
-                    &self.temporal_uniforms,
-                    &self.grid,
-                    &self.motion,
-                    &self.depth,
-                    &self.history_colour,
-                    &self.history_moments,
-                    &self.temporal_colour,
-                    &self.temporal_moments,
-                ),
-                Self::temporal_binding(
-                    device,
-                    pipelines,
-                    &self.temporal_uniforms,
-                    &self.grid,
-                    &self.motion,
-                    &self.depth,
-                    &self.history_colour,
-                    &self.history_moments,
-                    &self.temporal_colour,
-                    &self.temporal_moments,
-                ),
-            ];
+            self.temporal_bind_group = Self::temporal_binding(
+                device,
+                pipelines,
+                &self.temporal_uniforms,
+                &self.grid,
+                &self.motion,
+                &self.depth,
+                &self.history_colour,
+                &self.history_moments,
+                &self.temporal_colour,
+                &self.temporal_moments,
+            );
             self.atrous_bind_groups = Self::atrous_bindings(
                 device,
                 pipelines,
@@ -4941,33 +4911,18 @@ impl RaywatcherGpu {
             &self.radiance_cache,
             &self.restir_reservoirs,
         );
-        self.temporal_bind_groups = [
-            Self::temporal_binding(
-                device,
-                pipelines,
-                &self.temporal_uniforms,
-                &self.grid,
-                &motion,
-                &depth,
-                &history_colour,
-                &history_moments,
-                &temporal_colour,
-                &temporal_moments,
-            ),
-            Self::temporal_binding(
-                device,
-                pipelines,
-                &self.temporal_uniforms,
-                &self.grid,
-                &motion,
-                &depth,
-                &history_colour,
-                &history_moments,
-                &temporal_colour,
-                &temporal_moments,
-            ),
-        ];
-        self.last_output_plane = 0;
+        self.temporal_bind_group = Self::temporal_binding(
+            device,
+            pipelines,
+            &self.temporal_uniforms,
+            &self.grid,
+            &motion,
+            &depth,
+            &history_colour,
+            &history_moments,
+            &temporal_colour,
+            &temporal_moments,
+        );
         self.atrous_bind_groups = Self::atrous_bindings(
             device,
             pipelines,
@@ -5682,7 +5637,7 @@ impl RaywatcherGpu {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipelines.temporal);
-            pass.set_bind_group(0, &self.temporal_bind_groups[self.last_output_plane], &[]);
+            pass.set_bind_group(0, &self.temporal_bind_group, &[]);
             pass.dispatch_workgroups(rw.div_ceil(8), rh.div_ceil(8), 1);
         }
         let iterations = config.iterations.clamp(1, MAX_PASSES as u32);
@@ -5750,7 +5705,6 @@ impl RaywatcherGpu {
                 }
         }
         let final_plane = ((iterations - 1) % 2) as usize;
-        self.last_output_plane = final_plane;
         // Opt #16: Replace full-screen compose_pass compute shader (4 loads + 2 stores + barrier)
         // with a direct hardware DMA copy from the final à-trous plane to `self.output`.
         encoder.copy_texture_to_texture(
