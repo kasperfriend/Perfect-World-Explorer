@@ -1298,46 +1298,10 @@ impl Architect {
             })
             .collect::<Vec<_>>();
 
-        // BMDs use the baked-scenery renderer, so publish the live placement
-        // preview to that renderer as well as the committed project objects.
-        if self.cursor == CursorMode::Place {
-            if let (Some(asset), Some(mut position)) = (
-                self.selected_asset.as_deref(),
-                self.brush_cursor_position,
-            ) {
-                if let Some(path) = Self::renderer_bmd_path(asset, &self.current_map_id) {
-                    if self.snap == SnapMode::Terrain {
-                        if let Some(map) = &self.map {
-                            position[1] = map.ground(position[0], position[2]) + 0.5;
-                        }
-                    } else if matches!(self.snap, SnapMode::Objects | SnapMode::Smart) {
-                        if let Some(target) = self.selected_scene_transform {
-                            position = target;
-                        } else if self.snap == SnapMode::Smart {
-                            if let Some(map) = &self.map {
-                                position[1] = map.ground(position[0], position[2]) + 0.5;
-                            }
-                        }
-                    }
-                    let exists = placements.iter().any(|placement| {
-                        placement.path == path
-                            && placement.position.iter().zip(position).all(|(a, b)| {
-                                (*a - b).abs() < 0.01
-                            })
-                    });
-                    if !exists {
-                        placements.push(crate::scene::EditorSceneryPlacement {
-                            path,
-                            position,
-                            direction: Vec3::Z.to_array(),
-                            up: Vec3::Y.to_array(),
-                            scale: 1.0,
-                            map_id: self.current_map_id.to_ascii_lowercase(),
-                        });
-                    }
-                }
-            }
-        }
+        // Unlike the ECM renderer, baked scenery is rebuilt into texture
+        // atlases. Do not submit a per-frame pointer ghost here: that would
+        // rebuild the atlas on every mouse move. A BMD becomes live when the
+        // user commits it; a transform-only BMD preview is a separate task.
         placements
     }
 
