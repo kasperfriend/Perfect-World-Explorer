@@ -80,6 +80,7 @@ pub struct LibrarianAssets {
     configs: Option<PckArchive>,
     surfaces: Option<PckArchive>,
     models: Option<Result<PckArchive, String>>,
+    litmodels: Option<Result<PckArchive, String>>,
     gfx: Option<Result<PckArchive, String>>,
     loose_gfx: HashMap<String, PathBuf>,
     textures: Option<Result<PckArchive, String>>,
@@ -95,6 +96,7 @@ impl LibrarianAssets {
             configs,
             surfaces,
             models: None,
+            litmodels: None,
             gfx: None,
             loose_gfx: HashMap::new(),
             textures: None,
@@ -274,6 +276,32 @@ impl LibrarianAssets {
             false
         };
         in_archive || self.loose_resource(path).is_some()
+    }
+
+    /// Read one map-partitioned static BMD from litmodels.pck. The caller
+    /// supplies the canonical `litmodels/<map-id>/...` key produced by the
+    /// Architect resolver; archive indexing remains lazy like other assets.
+    pub fn read_litmodel_resource(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        let normalized = normalize_archive_path(path);
+        if !normalized.starts_with("litmodels/")
+            || safe_join(&self.element_root, &path.replace('\\', "/")).is_none()
+        {
+            return Err(format!("invalid litmodel asset path '{path}'"));
+        }
+        if self.litmodels.is_none() {
+            self.litmodels = Some(PckArchive::open(&self.element_root, "litmodels.pck"));
+        }
+        let result = match self.litmodels.as_mut().unwrap() {
+            Ok(archive) => archive.read(&normalized),
+            Err(error) => Err(error.clone()),
+        };
+        result.or_else(|error| {
+            self.loose_resource(path).ok_or_else(|| {
+                format!(
+                    "{error}; check that litmodels.pck or the matching loose BMD is installed"
+                )
+            })
+        })
     }
 
     /// Unified package reader compatible with `ModelAsset` and `model_draw_gpu::Draw`.
