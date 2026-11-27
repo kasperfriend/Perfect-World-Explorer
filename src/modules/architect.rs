@@ -23,6 +23,7 @@ enum Dock {
 enum CursorMode {
     Select,
     MultiSelect,
+    Lasso,
     Place,
     Sculpt,
 }
@@ -136,6 +137,7 @@ pub struct Architect {
     object_drag_snapshot: Option<Vec<PlacedObject>>,
     marquee_start: Option<egui::Pos2>,
     marquee_current: Option<egui::Pos2>,
+    lasso_points: Vec<egui::Pos2>,
     undo_objects: Vec<Vec<PlacedObject>>,
     redo_objects: Vec<Vec<PlacedObject>>,
     object_history_action: bool,
@@ -222,6 +224,8 @@ impl Architect {
             object_drag_snapshot: None,
             marquee_start: None,
             marquee_current: None,
+            lasso_points: Vec::new(),
+            lasso_points: Vec::new(),
             undo_objects: Vec::new(),
             redo_objects: Vec::new(),
             object_history_action: false,
@@ -746,6 +750,26 @@ impl Architect {
         Self::marquee_rect(start, current).contains(point)
     }
 
+    fn lasso_contains(points: &[egui::Pos2], point: egui::Pos2) -> bool {
+        if points.len() < 3 {
+            return false;
+        }
+        let mut inside = false;
+        let mut previous = points.len() - 1;
+        for current in 0..points.len() {
+            let a = points[current];
+            let b = points[previous];
+            let crosses = (a.y > point.y) != (b.y > point.y)
+                && point.x
+                    < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x;
+            if crosses {
+                inside = !inside;
+            }
+            previous = current;
+        }
+        inside
+    }
+
     fn cancel_object_drag(&mut self) {
         self.object_dragging = false;
         self.object_drag_axis = None;
@@ -755,6 +779,7 @@ impl Architect {
         self.object_drag_snapshot = None;
         self.marquee_start = None;
         self.marquee_current = None;
+        self.lasso_points.clear();
     }
 
     fn push_object_undo(&mut self, snapshot: Vec<PlacedObject>) {
@@ -1297,6 +1322,7 @@ impl Architect {
                     ui.separator();
                     ui.selectable_value(&mut self.cursor, CursorMode::Select, "Select");
                     ui.selectable_value(&mut self.cursor, CursorMode::MultiSelect, "Multi-select");
+                    ui.selectable_value(&mut self.cursor, CursorMode::Lasso, "Lasso");
                     ui.selectable_value(&mut self.cursor, CursorMode::Place, "Place");
                     ui.selectable_value(&mut self.cursor, CursorMode::Sculpt, "Sculpt");
                     ui.separator();
@@ -2237,7 +2263,7 @@ impl Architect {
         let over_ui = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
         let hit = if matches!(
             self.cursor,
-            CursorMode::Sculpt | CursorMode::Select | CursorMode::MultiSelect | CursorMode::Place
+            CursorMode::Sculpt | CursorMode::Select | CursorMode::MultiSelect | CursorMode::Lasso | CursorMode::Place
         ) && !over_ui
         {
             pointer.and_then(|position| {
@@ -2329,6 +2355,7 @@ impl Architect {
                 let picked_placement = nearest.map(|(index, _)| index);
                 let begin_marquee =
                     self.cursor == CursorMode::MultiSelect && picked_placement.is_none();
+                let begin_lasso = self.cursor == CursorMode::Lasso;
                 if self.cursor == CursorMode::MultiSelect {
                     if let Some(index) = picked_placement {
                         self.selected_placements.insert(index);
@@ -2341,6 +2368,13 @@ impl Architect {
                         self.selected_scene_object = None;
                         self.selected_scene_transform = None;
                     }
+                } else if begin_lasso {
+                    self.lasso_points.clear();
+                    if let Some(position) = pointer {
+                        self.lasso_points.push(position);
+                    }
+                    self.selected_scene_object = None;
+                    self.selected_scene_transform = None;
                 } else {
                     let clicked_inside_group = picked_placement
                         .is_some_and(|index| self.selected_placements.contains(&index));
@@ -2352,9 +2386,9 @@ impl Architect {
                         }
                     }
                 }
-                if begin_marquee {
-                    // Multi-select empty-space drags are reserved for marquee
-                    // selection; do not fall through to source-scene picking.
+                if begin_marquee || begin_lasso {
+                    // Selection gestures own the viewport drag; do not fall
+                    // through to source-scene picking or object transforms.
                 } else if self.selected_placement.is_some() {
                     self.selected_scene_object = None;
                     self.selected_scene_transform = None;
@@ -2455,6 +2489,55 @@ impl Architect {
             && !over_ui
         {
             self.marquee_current = pointer;
+        }
+        if !self.lasso_points.is_empty() && down && self.cursor == CursorMode::Lasso && !over_ui {
+            if let Some(position) = pointer {
+                if self
+                    .lasso_points
+                    .last()
+                    .is_none_or(|last| last.distance(position) >= 3.0)
+                {
+                    self.lasso_points.push(position);
+                }
+            }
+        }
+        if !self.lasso_points.is_empty() && (released || !down) {
+            if !over_ui {
+                if let Some(position) = pointer {
+                    if self
+                        .lasso_points
+                        .last()
+                        .is_none_or(|last| last.distance(position) >= 1.0)
+                    {
+                        self.lasso_points.push(position);
+                    }
+                }
+            }
+            if self.lasso_points.len() >= 3 {
+                for (index, object) in self.project.objects.iter().enumerate() {
+                    if !object.visible {
+                        continue;
+                    }
+                    let clip =
+                        view_projection.project_point3(Vec3::from_array(object.position));
+                    if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
+                        continue;
+                    }
+                    let projected = egui::pos2(
+                        screen.left() + (clip.x + 1.0) * 0.5 * screen.width(),
+                        screen.top() + (1.0 - clip.y) * 0.5 * screen.height(),
+                    );
+                    if Self::lasso_contains(&self.lasso_points, projected) {
+                        self.selected_placements.insert(index);
+                    }
+                }
+                self.selected_placement = self
+                    .selected_placement
+                    .filter(|index| self.selected_placements.contains(index))
+                    .or_else(|| self.selected_placements.iter().copied().min());
+                self.status = format!("Selected {} placements.", self.selected_placements.len());
+            }
+            self.lasso_points.clear();
         }
         if self.marquee_start.is_some() && (released || !down) {
             let release_position = if over_ui {
@@ -2621,6 +2704,16 @@ impl Architect {
                 egui::Color32::from_rgba_unmultiplied(70, 145, 235, 28),
                 egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 175, 255)),
             );
+        }
+        if self.lasso_points.len() >= 2 {
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("architect_lasso_selection"),
+            ))
+            .add(egui::Shape::line(
+                self.lasso_points.clone(),
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 210, 175)),
+            ));
         }
         if let Some(index) = self
             .selected_placement
