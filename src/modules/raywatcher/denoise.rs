@@ -45,7 +45,7 @@ pub struct DenoiseConfig {
     /// Depth weight falloff, as a fraction of the pixel's depth difference.
     pub phi_depth: f32,
     /// Per-frame blend floor: the least the current frame is allowed to count.
-    /// `0.05` means a pixel with perfect history still updates 5% per frame.
+    /// `0.10` means a pixel with perfect history still updates 10% per frame.
     pub temporal_floor: f32,
     /// Variance clamp multiplier. Larger accepts more history.
     pub variance_gamma: f32,
@@ -77,10 +77,10 @@ impl DenoiseConfig {
         self.phi_colour = finite(self.phi_colour, 4.).clamp(0.1, 64.);
         self.phi_normal = finite(self.phi_normal, 32.).clamp(1., 256.);
         self.phi_depth = finite(self.phi_depth, 0.5).clamp(1e-3, 64.);
-        self.temporal_floor = finite(self.temporal_floor, 0.05).clamp(0.01, 1.);
+        self.temporal_floor = finite(self.temporal_floor, 0.10).clamp(0.01, 1.);
         self.variance_gamma = finite(self.variance_gamma, 3.).clamp(0.5, 16.);
         self.variance_floor = finite(self.variance_floor, 1e-4).clamp(1e-8, 1.);
-        self.max_history = finite(self.max_history, 64.).clamp(1., 256.);
+        self.max_history = finite(self.max_history, 16.).clamp(1., 256.);
     }
 
     /// Tap spacing for iteration `i`: 1, 2, 4, ...
