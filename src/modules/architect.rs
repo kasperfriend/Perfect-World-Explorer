@@ -114,6 +114,9 @@ pub struct Architect {
     hovered_asset: Option<String>,
     preview_assets: crate::modules::librarian::archive::LibrarianAssets,
     preview: Option<crate::modules::librarian::preview3d::Preview>,
+    /// Exact local-space bounds cached per loaded client mesh. Never substitute
+    /// guessed class dimensions for an object's actual geometry.
+    preview_bounds: HashMap<String, ([f32; 3], [f32; 3])>,
     preview_message: String,
     selected_archive: Option<PathBuf>,
     archive_entries: Vec<String>,
@@ -211,6 +214,7 @@ impl Architect {
             hovered_asset: None,
             preview_assets,
             preview: None,
+            preview_bounds: HashMap::new(),
             preview_message: "Hover or select an ECM/SMD model to preview it.".into(),
             selected_archive: None,
             archive_entries: Vec::new(),
@@ -1048,6 +1052,9 @@ impl Architect {
                     None,
                     false,
                 );
+                if let Some(bounds) = preview.model_bounds() {
+                    self.preview_bounds.insert(path.clone(), bounds);
+                }
                 self.preview_message.clear();
             }
             Err(message) => self.preview_message = message,
@@ -1245,7 +1252,7 @@ impl Architect {
                 self.selected_asset.as_deref().and_then(Self::renderer_asset_path),
                 self.brush_cursor_position,
             ) {
-                if matches!(self.snap, SnapMode::Off | SnapMode::Terrain) {
+                if self.snap == SnapMode::Terrain {
                     if let Some(map) = &self.map {
                         position[1] = map.ground(position[0], position[2]) + 0.5;
                     }
@@ -2778,7 +2785,8 @@ impl Architect {
             if let Some(position) = hit {
                 let mut placement = position.to_array();
                 match self.snap {
-                    SnapMode::Off | SnapMode::Terrain => {
+                    SnapMode::Off => {}
+                    SnapMode::Terrain => {
                         if let Some(map) = &self.map {
                             placement[1] = map.ground(placement[0], placement[2]) + 0.5;
                         }
@@ -2828,29 +2836,41 @@ impl Architect {
                         })
                     };
                     if let Some(center) = project_point(origin) {
+                        let axis_end = |axis: Vec3| {
+                            project_point(origin + axis * 24.).map(|projected| {
+                                let direction = projected - center;
+                                let direction = if direction.length_sq() > 0.0001 {
+                                    direction.normalized()
+                                } else {
+                                    egui::Vec2::ZERO
+                                };
+                                center + direction * 76.0
+                            })
+                        };
                         match self.transform_mode {
                             TransformMode::Move | TransformMode::Scale => {
                                 for (axis_index, axis) in
                                     [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate()
                                 {
-                                    if project_point(origin + axis * 24.)
-                                        .is_some_and(|end| end.distance(pointer) <= 13.)
-                                    {
+                                    if axis_end(axis).is_some_and(|end| {
+                                        let segment = end - center;
+                                        let t = ((pointer - center).dot(segment)
+                                            / segment.length_sq().max(0.001))
+                                            .clamp(0.0, 1.0);
+                                        center.distance(center + segment * t - pointer) <= 12.0
+                                    }) {
                                         axis_pick = Some(axis_index);
                                         break;
                                     }
                                 }
                             }
                             TransformMode::Rotate => {
-                                            let radius = center.distance(
-                                    project_point(origin + Vec3::X * 24.).unwrap_or(center),
-                                );
                                 let distance = center.distance(pointer);
-                                if (distance - radius).abs() <= 9. {
+                                if (distance - 54.0).abs() <= 10.0 {
                                     axis_pick = Some(1);
-                                } else if (distance - radius * 1.28).abs() <= 9. {
+                                } else if (distance - 69.0).abs() <= 10.0 {
                                     axis_pick = Some(0);
-                                } else if (distance - radius * 0.72).abs() <= 9. {
+                                } else if (distance - 39.0).abs() <= 10.0 {
                                     axis_pick = Some(2);
                                 }
                             }
@@ -3386,35 +3406,43 @@ impl Architect {
                     (Vec3::Z, egui::Color32::from_rgb(90, 150, 255)),
                 ];
                 painter.circle_stroke(center, 5., egui::Stroke::new(2., egui::Color32::WHITE));
+                let axis_end = |axis: Vec3| {
+                    project_point(origin + axis * 24.).map(|projected| {
+                        let direction = projected - center;
+                        let direction = if direction.length_sq() > 0.0001 {
+                            direction.normalized()
+                        } else {
+                            egui::Vec2::ZERO
+                        };
+                        center + direction * 76.0
+                    })
+                };
                 match self.transform_mode {
                     TransformMode::Move => for (axis, color) in axes {
-                        if let Some(end) = project_point(origin + axis * 24.) {
-                            painter.line_segment([center, end], egui::Stroke::new(3., color));
-                            painter.circle_filled(end, 4., color);
+                        if let Some(end) = axis_end(axis) {
+                            painter.line_segment([center, end], egui::Stroke::new(4., color));
+                            painter.circle_filled(end, 6., color);
                         }
                     },
                     TransformMode::Rotate => {
-                        let radius = center
-                            .distance(project_point(origin + Vec3::X * 24.).unwrap_or(center))
-                            .max(12.);
-                        for (scale, color) in [
-                            (1.28, axes[0].1),
-                            (1.0, axes[1].1),
-                            (0.72, axes[2].1),
+                        for (radius, color) in [
+                            (69.0, axes[0].1),
+                            (54.0, axes[1].1),
+                            (39.0, axes[2].1),
                         ] {
                             painter.circle_stroke(
                                 center,
-                                radius * scale,
-                                egui::Stroke::new(2.5, color),
+                                radius,
+                                egui::Stroke::new(3.0, color),
                             );
                         }
                     },
                     TransformMode::Scale => for (axis, color) in axes {
-                        if let Some(end) = project_point(origin + axis * 24.) {
-                            painter.line_segment([center, end], egui::Stroke::new(3., color));
+                        if let Some(end) = axis_end(axis) {
+                            painter.line_segment([center, end], egui::Stroke::new(4., color));
                             painter.rect_filled(
-                                egui::Rect::from_center_size(end, egui::vec2(9., 9.)),
-                                1.,
+                                egui::Rect::from_center_size(end, egui::vec2(12., 12.)),
+                                2.,
                                 color,
                             );
                         }
@@ -3463,22 +3491,15 @@ impl Architect {
             egui::Id::new("architect_selected_object_bounds"),
         ));
         for (asset, position, scale, euler) in outline_items {
-            let lower = asset.to_ascii_lowercase();
-            let fallback_half = if lower.contains("tree") || lower.contains("forest") {
-                Vec3::new(3.5, 9.0, 3.5)
-            } else if lower.ends_with(".bmd") || lower.contains("building") {
-                Vec3::new(5.0, 5.0, 5.0)
-            } else if lower.ends_with(".gfx") || lower.contains("effect") {
-                Vec3::new(2.5, 3.5, 2.5)
-            } else {
-                Vec3::new(2.0, 2.5, 2.0)
+            // Use the exact mesh bounds for this asset. If the mesh has not
+            // been loaded yet, omit the outline rather than draw a misleading
+            // guessed-size box that can be wildly wrong for PW models.
+            let Some((min, max)) = Self::renderer_asset_path(&asset)
+                .and_then(|path| self.preview_bounds.get(&path).copied())
+            else {
+                continue;
             };
-            let actual_bounds = (self.selected_asset.as_deref() == Some(asset.as_str()))
-                .then(|| self.preview.as_ref().and_then(|preview| preview.model_bounds()))
-                .flatten();
-            let (local_min, local_max) = actual_bounds
-                .map(|(min, max)| (Vec3::from_array(min), Vec3::from_array(max)))
-                .unwrap_or((-fallback_half, fallback_half));
+            let (local_min, local_max) = (Vec3::from_array(min), Vec3::from_array(max));
             let center = Vec3::from_array(position);
             let rotation = glam::Quat::from_euler(
                 glam::EulerRot::XYZ,
