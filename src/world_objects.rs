@@ -14,10 +14,21 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::SyncSender,
-        Arc,
+        Arc, OnceLock,
     },
 };
 use wgpu::util::DeviceExt;
+/// Query the host CPU budget once, not once per mip level of every page.
+fn mip_worker_limit() -> usize {
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(4)
+    })
+}
+
 pub(crate) const SIDE: usize = 4096;
 const DEFAULT_MAX_VERTICES: usize = 2_000_000;
 const MAX_PAGE_VERTICES: usize = 8_000_000;
@@ -819,11 +830,7 @@ impl Page {
                 // A 32-way fan-out for every mip level oversubscribes typical
                 // desktop CPUs and creates short-lived threads repeatedly.
                 // Four workers are enough for these memory-bandwidth-bound rows.
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-                    .min(4)
-                    .min(nh.div_ceil(2).max(1))
+                mip_worker_limit().min(nh.div_ceil(2).max(1))
             } else {
                 1
             };
