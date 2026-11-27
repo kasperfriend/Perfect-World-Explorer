@@ -418,8 +418,9 @@ fn main() {
                     });
                 }
                 queue.submit(Some(e.finish()));
+                let mut edge_encoder = device.create_command_encoder(&Default::default());
                 water.render_edge(
-                    &device,
+                    &mut edge_encoder,
                     &queue,
                     glam::Mat4::IDENTITY,
                     0.33,
@@ -428,6 +429,7 @@ fn main() {
                     if cutoff { None } else { Some((&vb, &ib, 0)) },
                     (&vb, &ib, 6),
                 );
+                queue.submit(Some(edge_encoder.finish()));
                 let read = device.create_buffer(&wgpu::BufferDescriptor {
                     label: None,
                     size: 64 * 64 * 4,
