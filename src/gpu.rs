@@ -4265,6 +4265,10 @@ impl Renderer {
                 let worker_scene = scene.clone();
                 let worker_extent = depth_extent;
                 let worker_grid = plan.grid;
+                // The Raywatcher composite writes into RenderScale's texture.
+                // Capture its exact format so its matching PSOs are ready before
+                // the first traced frame instead of being compiled on that frame.
+                let worker_output_format = destination.format();
                 let worker_hardware = hardware_mode;
                 let triangle_count = worker_scene.triangles.len();
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -4278,6 +4282,7 @@ impl Renderer {
                                 worker_scene,
                                 worker_extent,
                                 worker_grid,
+                                worker_output_format,
                             );
                             if worker_hardware {
                                 gpu.initialize_hardware();
