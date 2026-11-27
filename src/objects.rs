@@ -235,6 +235,12 @@ pub struct UnresolvedTexture {
 }
 pub struct Objects {
     pub ornaments: Arc<[Ornament]>,
+    /// Immutable source-map placements; Architect placements are appended to
+    /// a separate transient tail and never written back into EC-BSD data.
+    native_ornaments: Arc<[Ornament]>,
+    /// Uniform scales for the transient Architect tail, keyed by combined
+    /// ornament index. Native EC-BSD ornaments retain their authored scale.
+    editor_scales: HashMap<usize, f32>,
     /// Canonical in-memory keys built once instead of formatting and lowercasing
     /// the same placement path on every streamed batch.
     model_names: Vec<String>,
@@ -406,7 +412,9 @@ impl Objects {
             element.to_path_buf(),
         );
         Ok(Self {
+            native_ornaments: ornaments.clone(),
             ornaments,
+            editor_scales: HashMap::new(),
             model_names,
             models: HashMap::new(),
             cache: TextureCache::new(tex_budget_bytes()),
@@ -426,6 +434,51 @@ impl Objects {
             unresolved_seen: HashSet::new(),
         })
     }
+    /// Replace the transient BMD placements while preserving every native
+    /// EC-BSD ornament. The ordinary scenery residency, BMD parser, texture
+    /// resolver, atlas builder and GPU page path then handle both identically.
+    pub fn set_editor_ornaments(&mut self, placements: &[crate::scene::EditorSceneryPlacement]) {
+        let mut combined = self.native_ornaments.to_vec();
+        let base = combined.len();
+        self.editor_scales.clear();
+        for (offset, placement) in placements.iter().enumerate() {
+            combined.push(Ornament {
+                export_id: u32::MAX.saturating_sub(offset as u32),
+                offset: 0,
+                position: placement.position,
+                direction: placement.direction,
+                up: placement.up,
+                extra: 0,
+                path: placement.path.clone(),
+                map_id: placement.map_id.clone(),
+            });
+            if placement.scale.is_finite() && placement.scale > 0.0 {
+                self.editor_scales.insert(base + offset, placement.scale);
+            }
+        }
+        self.ornaments = combined.into();
+        self.model_names = self
+            .ornaments
+            .iter()
+            .map(|ornament| litmodel_key(&ornament.path))
+            .collect();
+        if self.native_ornaments.is_empty() {
+            if let Some(placement) = placements.first() {
+                self.litmodel_map_id = placement.map_id.clone();
+            }
+        }
+    }
+
+    /// Uniform instance scale for a BMD placement; native map scenery defaults
+    /// to 1 because its transform is authored by EC-BSD direction/up vectors.
+    pub fn placement_scale(&self, index: usize) -> f32 {
+        self.editor_scales.get(&index).copied().unwrap_or(1.0)
+    }
+
+    pub fn native_ornament_count(&self) -> usize {
+        self.native_ornaments.len()
+    }
+
     pub fn update(&mut self, world_x: f32, world_z: f32, range: f32) -> Result<Vec<usize>, String> {
         let ids: Vec<usize> = self
             .ornaments
