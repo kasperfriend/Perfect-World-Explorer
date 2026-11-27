@@ -347,9 +347,11 @@ impl World {
                     {
                         return None;
                     }
-                    if self.editor_placements
+                    if self
+                        .editor_placements
                         .get(index)
-                        .is_some_and(|previous| !editor_transform_changed(previous, placement)) {
+                        .is_some_and(|previous| !editor_transform_changed(previous, placement))
+                    {
                         return Some((
                             self.assets.instances[self.native_instance_count + index]
                                 .placement
