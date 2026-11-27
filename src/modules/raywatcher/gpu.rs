@@ -7183,7 +7183,7 @@ mod reflection_sampling_regression_tests {
         let point_shadow = DXR_SHADER
             .split("bool occluded_point_light(")
             .nth(1)
-            .and_then(|tail| tail.split("bool occluded_directional").next())
+            .and_then(|tail| tail.split("uint point_light_order_at").next())
             .unwrap_or_else(|| DXR_SHADER.split("bool occluded_point_light(").nth(1).unwrap());
         assert!(point_shadow.contains("accept_opacity("));
         assert!(!point_shadow.contains("RAY_FLAG_FORCE_OPAQUE"));
