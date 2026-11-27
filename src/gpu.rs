@@ -10701,7 +10701,10 @@ mod handoff_exit_tests {
         // Only the code above the tests, or these assertions would match
         // themselves.
         let src = include_str!("gpu.rs");
-        let code = &src[..src.find("#[cfg(test)]").expect("the test module")];
+        let code = src
+            .split("#[cfg(test)]\nmod handoff_exit_tests")
+            .next()
+            .expect("the handoff test module");
         // One definition, used by both the `Failed` and `Disconnected` arms.
         assert_eq!(code.matches("fn restore_old_window(").count(), 1);
         assert_eq!(code.matches("restore_old_window(&window);").count(), 2);
