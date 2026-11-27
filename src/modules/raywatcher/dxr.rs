@@ -2035,7 +2035,9 @@ mod imp {
                 if tlas_info.result_data_max_size_in_bytes == 0 {
                     return Ok(());
                 }
-                scratch_needed = scratch_needed.max(align256(tlas_info.scratch_data_size_in_bytes));
+                scratch_needed = scratch_needed.max(align256(
+                    tlas_info.scratch_data_size_in_bytes.max(tlas_info.update_scratch_data_size_in_bytes),
+                ));
                 if self
                     .reusable_scratch
                     .as_ref()
@@ -2077,12 +2079,9 @@ mod imp {
                     self.dyn_tlas[s] = Some((cap, buf));
                 }
                 let tlas_gpu_va = self.dyn_tlas[s].as_ref().unwrap().1.gpu_va;
-                if update_blas {
+                if update_tlas {
                     tlas_inputs.flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
                 }
-                scratch_needed = scratch_needed.max(align256(
-                    tlas_info.scratch_data_size_in_bytes.max(tlas_info.update_scratch_data_size_in_bytes),
-                ));
                 let scratch_va = self.reusable_scratch.as_ref().unwrap().1.gpu_va;
 
                 let slot_idx = self.ring.acquire("DXR-DynAS")?;
