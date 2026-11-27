@@ -114,7 +114,6 @@ pub fn compute_scene_albedo_gain(
     raw_gain * (1.0 - day_t) + 1.0 * day_t
 }
 
-
 /// Build a conservative world-space BVH over active point-light influence
 /// spheres. Each node bounds the full radius cube of every descendant light,
 /// so point queries can prune whole subtrees without dropping any contribution.
@@ -6586,7 +6585,10 @@ mod phase_r1_tests {
         }
         packed_indices.truncate(MAX_RAY_LIGHTS);
         packed_indices.sort_unstable();
-        assert_eq!(packed_indices, (0..MAX_RAY_LIGHTS as u32).collect::<Vec<_>>());
+        assert_eq!(
+            packed_indices,
+            (0..MAX_RAY_LIGHTS as u32).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -6673,7 +6675,10 @@ mod phase_r1_tests {
                 .collect();
             expected.sort_unstable();
             for light in expected {
-                assert!(candidates.binary_search(&light).is_ok(), "BVH pruned contributing light {light}");
+                assert!(
+                    candidates.binary_search(&light).is_ok(),
+                    "BVH pruned contributing light {light}"
+                );
             }
         }
     }
