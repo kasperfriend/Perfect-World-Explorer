@@ -2060,6 +2060,10 @@ pub fn harvest_rt_tree_species_cancellable(
         .iter()
         .map(|_| std::array::from_fn(|_| None))
         .collect();
+    let mut billboard_lods: Vec<[Option<bool>; 3]> = species_list
+        .iter()
+        .map(|_| std::array::from_fn(|_| None))
+        .collect();
 
     let mut real_instances = 0usize;
     let mut real_tris = 0usize;
@@ -2095,8 +2099,9 @@ pub fn harvest_rt_tree_species_cancellable(
             continue;
         };
         let offset = glam::Vec3::from_array(pos);
-        let source_has_billboards = src_tris.iter().any(|triangle| triangle.leaf_rho >= 0.0);
-        let local_triangles = if source_has_billboards {
+        let has_billboards = *billboard_lods[si][lod_idx]
+            .get_or_insert_with(|| src_tris.iter().any(|triangle| triangle.leaf_rho >= 0.0));
+        let local_triangles = if has_billboards {
             let cache = &mut transformed_lods[si][lod_idx];
             if cache.is_none() {
                 *cache = transform_tree_lod_for_view(src_tris, view_direction, cancel);
