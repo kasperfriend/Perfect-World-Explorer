@@ -3103,18 +3103,11 @@ impl Renderer {
             } else {
                 1.
             });
-        let mut active_fog = camera.active_fog();
-        // PR #44's client fallback for outdoor air fog is 60..400 with the
-        // neutral blue-grey colour. The viewer's later residency cap could
-        // squeeze that interval against the resident-window boundary, making
-        // fog appear only at the edge instead of around the camera. Keep the
-        // fallback range in view space; do not couple atmospheric fog to the
-        // terrain streaming/cutoff window.
-        if active_fog.enabled && camera.underwater_depth <= 0. {
-            active_fog.start = 60.;
-            active_fog.end = 400.;
-            active_fog.color = [70. / 255., 77. / 255., 91. / 255.];
-        }
+        // Keep the selected environment fog intact. The no-region fallback
+        // (60..400, blue-grey) is supplied by Environments::endpoints_for;
+        // overriding every active outdoor region here would discard authored
+        // EC-BSD fog. The old residency cap is intentionally not applied.
+        let active_fog = camera.active_fog();
         let (mut fog_range, fog_color) = (active_fog.range(), active_fog.color4());
         // Uniform fog_range.w is the terrain day/night factor; the shader reads
         // it instead of overloading sun.w (the lightmap-availability flag).
