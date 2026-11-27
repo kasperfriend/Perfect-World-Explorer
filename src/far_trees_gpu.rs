@@ -144,7 +144,7 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {
  let constants=groups[placement.group];
  let distance=client_distance(position,p.camera.xyz);
  if distance<0. {return;}
- let selection=select_level(distance,constants.height,p.camera.w);
+ let selection=select_level(distance,constants.height*placement.scale,p.camera.w);
  let fraction=selection.z;
  let secondary=selection.w>0.5;
  append(placement.group,u32(selection.x),position,vec2<f32>(fraction,select(0.,1.,secondary)),placement.yaw,placement.scale);
@@ -1451,6 +1451,12 @@ impl FarTrees {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_records_preserve_editor_yaw_and_uniform_scale() {
+        let instance = Instance::new([1.0, 2.0, 3.0], [0.25, 2.0], 1.5, 2.5);
+        assert_eq!(instance.data, [1.0, 2.0, 3.0, 1.5, 0.25, 2.0, 2.5, 0.0]);
+    }
 
     #[test]
     fn legacy_cutout_still_covers_fronds_and_leaves_without_native_refs() {
