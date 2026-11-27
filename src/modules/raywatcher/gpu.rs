@@ -6933,7 +6933,10 @@ mod shader_optimization_regression_tests {
             assert!(source.contains("point_light_bvh_max"));
             assert!(source.contains("point_light_order"));
             assert!(source.contains("point_light_order_at"));
-            assert!(source.contains("near_stack[near_sp++] = 0u") || source.contains("near_stack[near_sp] = 0u"));
+            assert!(
+                source.contains("near_stack[near_sp++] = 0u")
+                    || source.contains("near_stack[near_sp] = 0u")
+            );
         }
         assert!(RAY_SHADER.contains("light_stack: array<u32, 16>"));
         assert!(dxr.contains("uint light_stack[16]"));
