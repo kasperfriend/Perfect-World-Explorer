@@ -349,6 +349,12 @@ impl World {
                     let slot_index = self.native_instance_count + index;
                     self.assets.instances[slot_index].placement = scene_placement;
                     self.slots[slot_index].transform = Ok(transform);
+                    // Pose sampling is keyed by animation time, not by world
+                    // transform. Invalidate only the posed geometry so the next
+                    // advance rebuilds vertices with the new matrix while keeping
+                    // the existing playback clock and GPU Draw allocation alive.
+                    self.slots[slot_index].posed = None;
+                    self.slots[slot_index].geometry_dirty = true;
                 }
                 self.editor_placements = placements.to_vec();
                 return;
