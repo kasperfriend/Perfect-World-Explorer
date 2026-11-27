@@ -458,8 +458,15 @@ impl SceneGeometry {
 
             let left_half_bounds = bounds_for_partition(&tri_bounds, left_half, cancel)?;
             let right_half_bounds = bounds_for_partition(&tri_bounds, right_half, cancel)?;
-            let left_mid = partition_sah(&tri_bounds, &centroids, left_half, left_half_bounds, cancel)?;
-            let right_mid = partition_sah(&tri_bounds, &centroids, right_half, right_half_bounds, cancel)?;
+            let left_mid =
+                partition_sah(&tri_bounds, &centroids, left_half, left_half_bounds, cancel)?;
+            let right_mid = partition_sah(
+                &tri_bounds,
+                &centroids,
+                right_half,
+                right_half_bounds,
+                cancel,
+            )?;
             let (a_idx, b_idx) = left_half.split_at_mut(left_mid);
             let (c_idx, d_idx) = right_half.split_at_mut(right_mid);
 
@@ -491,8 +498,16 @@ impl SceneGeometry {
                 return None;
             }
 
-            let max_depth = a_state.depth.max(b_state.depth).max(c_state.depth).max(d_state.depth);
-            let widest_leaf = a_state.widest.max(b_state.widest).max(c_state.widest).max(d_state.widest);
+            let max_depth = a_state
+                .depth
+                .max(b_state.depth)
+                .max(c_state.depth)
+                .max(d_state.depth);
+            let widest_leaf = a_state
+                .widest
+                .max(b_state.widest)
+                .max(c_state.widest)
+                .max(d_state.widest);
             let left_group_root = 1u32;
             let a_root = left_group_root + 1;
             let b_root = a_root + a_state.nodes.len() as u32;
@@ -506,31 +521,86 @@ impl SceneGeometry {
             right_bounds.union(&d_bounds);
 
             let mut nodes = Vec::with_capacity(
-                1 + 1 + a_state.nodes.len() + b_state.nodes.len()
-                    + 1 + c_state.nodes.len() + d_state.nodes.len(),
+                1 + 1
+                    + a_state.nodes.len()
+                    + b_state.nodes.len()
+                    + 1
+                    + c_state.nodes.len()
+                    + d_state.nodes.len(),
             );
             nodes.push(BvhNode {
-                min: [root_bounds.min.x, root_bounds.min.y, root_bounds.min.z, -1.0],
-                max: [root_bounds.max.x, root_bounds.max.y, root_bounds.max.z, right_group_root as f32],
+                min: [
+                    root_bounds.min.x,
+                    root_bounds.min.y,
+                    root_bounds.min.z,
+                    -1.0,
+                ],
+                max: [
+                    root_bounds.max.x,
+                    root_bounds.max.y,
+                    root_bounds.max.z,
+                    right_group_root as f32,
+                ],
             });
             nodes.push(BvhNode {
-                min: [left_bounds.min.x, left_bounds.min.y, left_bounds.min.z, -1.0],
-                max: [left_bounds.max.x, left_bounds.max.y, left_bounds.max.z, b_root as f32],
+                min: [
+                    left_bounds.min.x,
+                    left_bounds.min.y,
+                    left_bounds.min.z,
+                    -1.0,
+                ],
+                max: [
+                    left_bounds.max.x,
+                    left_bounds.max.y,
+                    left_bounds.max.z,
+                    b_root as f32,
+                ],
             });
 
             let mut order = Vec::with_capacity(n);
             append_parallel_subtree(&mut nodes, &mut order, a_state, a_root, 0, cancel)?;
             let b_order_offset = order.len() as u32;
-            append_parallel_subtree(&mut nodes, &mut order, b_state, b_root, b_order_offset, cancel)?;
+            append_parallel_subtree(
+                &mut nodes,
+                &mut order,
+                b_state,
+                b_root,
+                b_order_offset,
+                cancel,
+            )?;
 
             nodes.push(BvhNode {
-                min: [right_bounds.min.x, right_bounds.min.y, right_bounds.min.z, -1.0],
-                max: [right_bounds.max.x, right_bounds.max.y, right_bounds.max.z, d_root as f32],
+                min: [
+                    right_bounds.min.x,
+                    right_bounds.min.y,
+                    right_bounds.min.z,
+                    -1.0,
+                ],
+                max: [
+                    right_bounds.max.x,
+                    right_bounds.max.y,
+                    right_bounds.max.z,
+                    d_root as f32,
+                ],
             });
             let c_order_offset = order.len() as u32;
-            append_parallel_subtree(&mut nodes, &mut order, c_state, c_root, c_order_offset, cancel)?;
+            append_parallel_subtree(
+                &mut nodes,
+                &mut order,
+                c_state,
+                c_root,
+                c_order_offset,
+                cancel,
+            )?;
             let d_order_offset = order.len() as u32;
-            append_parallel_subtree(&mut nodes, &mut order, d_state, d_root, d_order_offset, cancel)?;
+            append_parallel_subtree(
+                &mut nodes,
+                &mut order,
+                d_state,
+                d_root,
+                d_order_offset,
+                cancel,
+            )?;
 
             geometry.nodes = nodes;
             geometry.order = order;
@@ -1244,14 +1314,22 @@ mod tests {
                 (Some(hit), Some((t, triangle))) => {
                     hits += 1;
                     assert_eq!(hit.triangle, triangle, "parallel BVH nearest triangle");
-                    assert!((hit.t - t).abs() < 1e-3, "parallel BVH distance {} vs {}", hit.t, t);
+                    assert!(
+                        (hit.t - t).abs() < 1e-3,
+                        "parallel BVH distance {} vs {}",
+                        hit.t,
+                        t
+                    );
                 }
                 (actual, expected) => {
                     panic!("parallel BVH and brute force disagree: {actual:?} vs {expected:?}")
                 }
             }
         }
-        assert!(hits > 20, "the test rays must exercise actual hits ({hits})");
+        assert!(
+            hits > 20,
+            "the test rays must exercise actual hits ({hits})"
+        );
     }
 
     #[test]
