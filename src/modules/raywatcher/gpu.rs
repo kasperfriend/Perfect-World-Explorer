@@ -3021,8 +3021,7 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// The compose shader: writes the final render-extent colour and guide planes
-/// (resampling the ray-grid guides cleanly onto render-extent pixels).
+/// Fullscreen sampling shader used to present the denoised output.
 const BLIT_SHADER: &str = r#"
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var src_samp: sampler;
@@ -4763,7 +4762,6 @@ impl RaywatcherGpu {
             }],
         });
         let (output, output_view) = plane(device, "raywatcher output", w, h, COLOUR_FORMAT);
-        let (guide, guide_view) = plane(device, "raywatcher output guide", w, h, GUIDE_FORMAT);
         self.trace_bind_group = Self::trace_bindings(
             device,
             pipelines,
@@ -5435,7 +5433,7 @@ impl RaywatcherGpu {
         self.traced_last_frame = true;
     }
 
-    /// Record the in-house temporal + à-trous + compose denoiser passes.
+    /// Record the in-house temporal + à-trous denoiser passes.
     pub fn record_denoise(
         &mut self,
         queue: &wgpu::Queue,
