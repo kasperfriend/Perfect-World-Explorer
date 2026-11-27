@@ -1321,6 +1321,68 @@ impl Architect {
         }
     }
 
+    /// Pick the closest source-scene anchor under the pointer. The returned
+    /// depth is reverse-Z (larger values are nearer), matching the viewer's
+    /// projection and the GPU depth test.
+    fn pick_source_scene(
+        pointer: egui::Pos2,
+        screen: egui::Rect,
+        view_projection: glam::Mat4,
+        scene: &crate::scene::Scene,
+        ornaments: &[crate::scene::Ornament],
+    ) -> Option<(usize, f32, f32, String, [f32; 3])> {
+        let mut scene_index = 0usize;
+        let mut nearest_scene: Option<(usize, f32, f32, String, [f32; 3])> = None;
+        let mut consider = |asset: &str, position: [f32; 3]| {
+            let clip = view_projection.project_point3(Vec3::from_array(position));
+            if clip.is_finite() && (0.0..=1.0).contains(&clip.z) {
+                let point = egui::pos2(
+                    screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
+                    screen.top() + (1. - clip.y) * 0.5 * screen.height(),
+                );
+                let score = point.distance(pointer) / Self::source_pick_radius(asset);
+                if score <= 1.0
+                    && nearest_scene.as_ref().is_none_or(
+                        |(_, best_score, best_depth, _, _)| {
+                            score < *best_score - 0.025
+                                || ((score - *best_score).abs() <= 0.025
+                                    && clip.z > *best_depth)
+                        },
+                    )
+                {
+                    nearest_scene = Some((
+                        scene_index,
+                        score,
+                        clip.z,
+                        asset.to_string(),
+                        position,
+                    ));
+                }
+            }
+            scene_index += 1;
+        };
+        for block in &scene.blocks {
+            for model in &block.models {
+                consider(&model.path, model.position);
+            }
+            for tree in &block.trees {
+                if let Some(kind) = scene.tree_types.get(tree.tree_type as usize) {
+                    consider(&kind.tree, tree.position);
+                    if !kind.composite.is_empty() {
+                        consider(&kind.composite, tree.position);
+                    }
+                }
+            }
+            for effect in &block.effects {
+                consider(&effect.path, effect.position);
+            }
+        }
+        for ornament in ornaments {
+            consider(&ornament.path, ornament.position);
+        }
+        nearest_scene
+    }
+
     fn scene_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -2598,7 +2660,31 @@ impl Architect {
                         }
                     }
                 }
-                let picked_placement = nearest.map(|(index, _, _)| index);
+                let source_pick = if self.cursor == CursorMode::Select {
+                    pointer.and_then(|pointer| {
+                        Self::pick_source_scene(pointer, screen, view_projection, scene, ornaments)
+                    })
+                } else {
+                    None
+                };
+                // Resolve both editor and source-scene candidates together. A
+                // source model in front of a staged placement must be selectable,
+                // while a nearer staged object still wins when their hit targets
+                // overlap. Reverse-Z makes the larger depth value the nearer one.
+                let source_is_frontmost = match (nearest.as_ref(), source_pick.as_ref()) {
+                    (None, Some(_)) => true,
+                    (Some(_), None) | (None, None) => false,
+                    (Some((_, project_score, project_depth)), Some((_, scene_score, scene_depth, _, _))) => {
+                        scene_score < project_score - 0.025
+                            || ((scene_score - project_score).abs() <= 0.025
+                                && scene_depth > project_depth)
+                    }
+                };
+                let picked_placement = if source_is_frontmost {
+                    None
+                } else {
+                    nearest.map(|(index, _, _)| index)
+                };
                 let begin_marquee =
                     self.cursor == CursorMode::MultiSelect && picked_placement.is_none();
                 let begin_lasso = self.cursor == CursorMode::Lasso;
@@ -2638,70 +2724,17 @@ impl Architect {
                 } else if self.selected_placement.is_some() {
                     self.selected_scene_object = None;
                     self.selected_scene_transform = None;
-                } else if let Some(pointer) = pointer {
-                    let mut scene_index = 0usize;
-                    let mut nearest_scene: Option<(usize, f32, f32, String, [f32; 3])> = None;
-                    let mut consider = |asset: &str, position: [f32; 3]| {
-                        let clip = view_projection.project_point3(Vec3::from_array(position));
-                        if clip.is_finite() && (0.0..=1.0).contains(&clip.z) {
-                            let point = egui::pos2(
-                                screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
-                                screen.top() + (1. - clip.y) * 0.5 * screen.height(),
-                            );
-                            let distance = point.distance(pointer);
-                            // A scene object's origin is often inside its mesh or
-                            // far below its visible canopy. Use a class-aware
-                            // screen-space hit envelope rather than requiring a
-                            // near-pixel-perfect click on the serialized origin.
-                            let radius = Self::source_pick_radius(asset);
-                            let score = distance / radius;
-                            if score <= 1.0
-                                && nearest_scene.as_ref().is_none_or(
-                                    |(_, best_score, best_depth, _, _)| {
-                                        score < *best_score - 0.025
-                                            || ((score - *best_score).abs() <= 0.025
-                                                && clip.z > *best_depth)
-                                    },
-                                )
-                            {
-                                nearest_scene = Some((
-                                    scene_index,
-                                    score,
-                                    clip.z,
-                                    asset.to_string(),
-                                    position,
-                                ));
-                            }
-                        }
-                        scene_index += 1;
-                    };
-                    for block in &scene.blocks {
-                        for model in &block.models {
-                            consider(&model.path, model.position);
-                        }
-                        for tree in &block.trees {
-                            if let Some(kind) = scene.tree_types.get(tree.tree_type as usize) {
-                                consider(&kind.tree, tree.position);
-                                if !kind.composite.is_empty() {
-                                    consider(&kind.composite, tree.position);
-                                }
-                            }
-                        }
-                        for effect in &block.effects {
-                            consider(&effect.path, effect.position);
-                        }
-                    }
-                    for ornament in ornaments {
-                        consider(&ornament.path, ornament.position);
-                    }
-                    if let Some((index, _, _, asset, position)) = nearest_scene {
+                } else if source_is_frontmost {
+                    if let Some((index, _, _, asset, position)) = source_pick {
                         self.selected_scene_object = Some(index);
                         self.selected_scene_transform = Some(position);
                         self.selected_asset = Some(asset);
-                    } else {
-                        self.selected_scene_object = None;
-                        self.selected_scene_transform = None;
                     }
+                    self.multi_selection.clear();
+                    self.multi_scene_items.clear();
+                } else {
+                    self.selected_scene_object = None;
+                    self.selected_scene_transform = None;
                     self.multi_selection.clear();
                     self.multi_scene_items.clear();
                 }
