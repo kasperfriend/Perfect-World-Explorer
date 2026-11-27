@@ -1812,7 +1812,7 @@ impl Architect {
                                 let asset = format!("{}::{}", archive.display(), entry);
                                 let label = Path::new(entry).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| entry.clone());
                                 let response = ui.selectable_label(self.selected_asset.as_deref() == Some(asset.as_str()), format!("📦 {label} · {size} B"));
-                                response.on_hover_text(format!(
+                                let response = response.on_hover_text(format!(
                                     "{entry}\nType: {}\nUnpacked: {size} bytes\nStored: {compressed} bytes",
                                     Path::new(entry).extension().and_then(|extension| extension.to_str()).unwrap_or("unknown").to_ascii_uppercase()
                                 ));
