@@ -5255,13 +5255,18 @@ impl Renderer {
         // refraction passes all read the same matrix, and this used to be
         // extracted from it three times per frame.
         let frustum = crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array());
+        // Classify water batches once for this view. The same visible set drives
+        // the main depth-copy decision, optional refraction copy, and later water
+        // rendering; repeating the four-corner clip test in each consumer wastes
+        // CPU time in zones with many authored water surfaces.
+        let mut visible = std::mem::take(&mut self.visible_water_batches);
+        visible.clear();
+        visible.extend(self.water_batches.iter().filter(|b| b.visible(matrix)).cloned());
+        let has_visible_complex_water = visible.iter().any(|b| !b.simple);
         // The main depth is copied into the water's `terrain_depth` for the edge
         // reconstruction, which only the water surface reads (and only when it is
         // above the plane). No water plane on screen, no reader.
-        let water_edge_reads_terrain_depth = self
-            .water_batches
-            .iter()
-            .any(|b| !b.simple && b.visible(matrix));
+        let water_edge_reads_terrain_depth = has_visible_complex_water;
         self.draw_opaque(
             &mut e,
             "main scene",
@@ -5353,12 +5358,7 @@ impl Renderer {
         // this copy can never be read: the only frame that needs it is one with
         // reflections off, where no per-plane pass runs and the surface still
         // samples the refraction by screen UV.
-        if !camera.water_reflections
-            && self
-                .water_batches
-                .iter()
-                .any(|b| !b.simple && b.visible(matrix))
-        {
+        if !camera.water_reflections && has_visible_complex_water {
             self.water.copy_scene_to_refraction(&mut e);
         }
         if use_post {
@@ -5394,20 +5394,13 @@ impl Renderer {
                     camera.gamma_setting,
                 );
             }
+            self.visible_water_batches = visible;
             self.end_frame(stage_ms, lap_at);
             return;
         }
 
         // The reflection texture is reused only after its previous water draw is
         // submitted. Each distinct height gets its own mirror and clip plane.
-        let mut visible = std::mem::take(&mut self.visible_water_batches);
-        visible.clear();
-        visible.extend(
-            self.water_batches
-                .iter()
-                .filter(|b| b.visible(matrix))
-                .cloned(),
-        );
         visible.sort_by(|a, b| {
             b.distance_squared(camera.pos)
                 .total_cmp(&a.distance_squared(camera.pos))
