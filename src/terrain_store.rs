@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
 };
 /// Decoded hot-set budget in bytes when `PW_TERRAIN_RAM_MIB` is unset.
@@ -89,6 +89,9 @@ struct Store {
     width: usize,
     side: usize,
     data: Data,
+    /// Sparse, non-destructive editor overlay shared by all readers.
+    edits: RwLock<HashMap<usize, (f32, [i8; 3])>>,
+    revision: AtomicU64,
 }
 #[derive(Clone)]
 pub struct Heights(Arc<Store>);
@@ -104,6 +107,8 @@ impl From<Vec<f32>> for Heights {
             width: values.len(),
             side: 1,
             data: Data::Memory(values),
+            edits: RwLock::new(HashMap::new()),
+            revision: AtomicU64::new(0),
         }))
     }
 }
@@ -114,7 +119,39 @@ impl Heights {
             current: None,
         }
     }
+    /// Grid dimensions in source cells (width, height).
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.0.width, self.0.len / self.0.width.max(1))
+    }
+    /// Monotonically increasing after each successful editor commit.
+    pub fn revision(&self) -> u64 {
+        self.0.revision.load(Ordering::Acquire)
+    }
+    /// Atomically publish sparse height/normal overrides shared by all readers.
+    /// All indices and heights are validated before any cell is changed.
+    pub fn apply_cells(&self, cells: &[(usize, f32, [i8; 3])]) -> Result<(), String> {
+        for (index, height, _) in cells {
+            if *index >= self.0.len {
+                return Err(format!("terrain edit cell {index} out of bounds"));
+            }
+            if !height.is_finite() {
+                return Err(format!("terrain edit cell {index} has non-finite height"));
+            }
+        }
+        if cells.is_empty() {
+            return Ok(());
+        }
+        let mut edits = self.0.edits.write().map_err(|_| "terrain edit lock poisoned")?;
+        for (index, height, normal) in cells {
+            edits.insert(*index, (*height, *normal));
+        }
+        self.0.revision.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
     pub fn at(&self, index: usize) -> f32 {
+        if let Some((height, _)) = self.0.edits.read().unwrap().get(&index) {
+            return *height;
+        }
         match &self.0.data {
             Data::Memory(v) => v[index],
             Data::Resident(grid) => grid.heights[index],
@@ -157,6 +194,9 @@ impl Heights {
 }
 impl Normals {
     pub fn at(&self, index: usize) -> [i8; 3] {
+        if let Some((_, normal)) = self.0.edits.read().unwrap().get(&index) {
+            return *normal;
+        }
         if let Data::Resident(grid) = &self.0.data {
             return grid.normals[index];
         }
@@ -240,6 +280,12 @@ impl Reader {
         Ok(local)
     }
     pub fn cell(&mut self, index: usize) -> Result<(f32, [i8; 3]), String> {
+        if index >= self.store.len {
+            return Err(format!("terrain cell {index} out of bounds"));
+        }
+        if let Some(cell) = self.store.edits.read().unwrap().get(&index).copied() {
+            return Ok(cell);
+        }
         match &self.store.data {
             Data::Memory(values) => {
                 return values
@@ -263,6 +309,9 @@ impl Reader {
         Ok((page.heights[local], page.normals[local]))
     }
     pub fn height(&mut self, index: usize) -> f32 {
+        if let Some((height, _)) = self.store.edits.read().unwrap().get(&index) {
+            return *height;
+        }
         match &self.store.data {
             Data::Memory(values) => return values[index],
             Data::Resident(grid) => return grid.heights[index],
@@ -274,6 +323,9 @@ impl Reader {
         self.current.as_ref().unwrap().1.heights[local]
     }
     pub fn normal(&mut self, index: usize) -> [i8; 3] {
+        if let Some((_, normal)) = self.store.edits.read().unwrap().get(&index) {
+            return *normal;
+        }
         match &self.store.data {
             Data::Memory(_) => {
                 assert!(index < self.store.len);
@@ -527,6 +579,8 @@ impl Builder {
                 width: self.width,
                 side: self.side,
                 data: Data::Resident(grid),
+                edits: RwLock::new(HashMap::new()),
+                revision: AtomicU64::new(0),
             });
             return Ok((Heights(Arc::clone(&store)), Normals(store)));
         }
@@ -616,6 +670,8 @@ impl Builder {
                     },
                 },
             })),
+            edits: RwLock::new(HashMap::new()),
+            revision: AtomicU64::new(0),
         });
         Ok((Heights(Arc::clone(&store)), Normals(store)))
     }
@@ -896,6 +952,8 @@ pub fn restore(
                 },
             },
         })),
+        edits: RwLock::new(HashMap::new()),
+        revision: AtomicU64::new(0),
     });
     eprintln!(
         "Terrain cache: warm start, {pages} verified blocks reused from {} (source decode and recompression skipped), decoded hot-set budget {:.2} MiB",
