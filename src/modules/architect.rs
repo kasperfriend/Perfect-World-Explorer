@@ -1220,30 +1220,30 @@ impl Architect {
             }
             Some(point.y - map.ground(point.x, point.z))
         };
-        let mut last_t = 0.;
-        let mut last_delta = delta(near)?;
-        for step in 1..=512 {
+        let mut previous: Option<(f32, f32)> = None;
+        for step in 0..=512 {
             let t = step as f32 * 64.;
             let point = near + direction * t;
             let Some(current_delta) = delta(point) else {
                 continue;
             };
-            if last_delta >= 0. && current_delta <= 0. {
-                let (mut lo, mut hi) = (last_t, t);
-                for _ in 0..12 {
-                    let mid = (lo + hi) * 0.5;
-                    if delta(near + direction * mid).is_some_and(|value| value > 0.) {
-                        lo = mid;
-                    } else {
-                        hi = mid;
+            if let Some((last_t, last_delta)) = previous {
+                if last_delta >= 0. && current_delta <= 0. {
+                    let (mut lo, mut hi) = (last_t, t);
+                    for _ in 0..12 {
+                        let mid = (lo + hi) * 0.5;
+                        if delta(near + direction * mid).is_some_and(|value| value > 0.) {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
                     }
+                    let mut hit = near + direction * ((lo + hi) * 0.5);
+                    hit.y = map.ground(hit.x, hit.z) + 0.05;
+                    return Some(hit);
                 }
-                let mut hit = near + direction * ((lo + hi) * 0.5);
-                hit.y = map.ground(hit.x, hit.z) + 0.05;
-                return Some(hit);
             }
-            last_t = t;
-            last_delta = current_delta;
+            previous = Some((t, current_delta));
         }
         None
     }
