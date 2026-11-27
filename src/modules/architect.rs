@@ -47,6 +47,10 @@ enum BrushMode {
 #[derive(Clone, Debug, PartialEq)]
 struct PlacedObject {
     asset: String,
+    name: String,
+    group: String,
+    visible: bool,
+    locked: bool,
     position: [f32; 3],
     rotation: [f32; 3],
     scale: f32,
@@ -321,6 +325,9 @@ impl Architect {
         for object in &self.project.objects {
             if object.asset.is_empty()
                 || object.asset.len() > 16 * 1024
+                || object.name.trim().is_empty()
+                || object.name.len() > 1024
+                || object.group.len() > 1024
                 || !object
                     .position
                     .iter()
@@ -341,7 +348,7 @@ impl Architect {
                 return Err("Project contains an invalid terrain operation".into());
             }
         }
-        let mut out = String::from("PWE_ARCHITECT\t1\n");
+        let mut out = String::from("PWE_ARCHITECT\t2\n");
         out.push_str(&format!("name\t{}\n", Self::encode(&self.project.name)));
         out.push_str(&format!(
             "source_map\t{}\n",
@@ -349,8 +356,12 @@ impl Architect {
         ));
         for object in &self.project.objects {
             out.push_str(&format!(
-                "object\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
+                "object\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
                 Self::encode(&object.asset),
+                Self::encode(&object.name),
+                Self::encode(&object.group),
+                object.visible,
+                object.locked,
                 object.position[0],
                 object.position[1],
                 object.position[2],
@@ -427,21 +438,46 @@ impl Architect {
         }
         let source = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut lines = source.lines();
-        if lines.next() != Some("PWE_ARCHITECT\t1") {
-            return Err("unsupported Architect project version".into());
-        }
+        let version = match lines.next() {
+            Some("PWE_ARCHITECT\t1") => 1,
+            Some("PWE_ARCHITECT\t2") => 2,
+            _ => return Err("unsupported Architect project version".into()),
+        };
         let mut project = Project::default();
         for (line_no, line) in lines.enumerate() {
             let fields = line.split('\t').collect::<Vec<_>>();
             match fields.first().copied().unwrap_or("") {
                 "name" if fields.len() == 2 => project.name = Self::decode(fields[1])?,
                 "source_map" if fields.len() == 2 => project.source_map = Self::decode(fields[1])?,
-                "object" if fields.len() == 9 => {
+                "object" if (version == 1 && fields.len() == 9)
+                    || (version == 2 && fields.len() == 13) =>
+                {
                     if project.objects.len() >= 100_000 {
                         return Err("Architect project has too many object placements".into());
                     }
+                    let (asset, name, group, visible, locked, numbers) = if version == 1 {
+                        let asset = Self::decode(fields[1])?;
+                        let name = Path::new(&asset)
+                            .file_stem()
+                            .map(|stem| stem.to_string_lossy().into_owned())
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or_else(|| "Object".into());
+                        (asset, name, "Default".into(), true, false, &fields[2..])
+                    } else {
+                        (
+                            Self::decode(fields[1])?,
+                            Self::decode(fields[2])?,
+                            Self::decode(fields[3])?,
+                            fields[4].parse::<bool>().map_err(|_| "invalid object visibility")?,
+                            fields[5].parse::<bool>().map_err(|_| "invalid object lock state")?,
+                            &fields[6..],
+                        )
+                    };
+                    if name.trim().is_empty() || name.len() > 1024 || group.len() > 1024 {
+                        return Err("invalid object name or hierarchy group".into());
+                    }
                     let mut n = [0f32; 7];
-                    for (slot, value) in n.iter_mut().zip(&fields[2..]) {
+                    for (slot, value) in n.iter_mut().zip(numbers) {
                         *slot = value.parse().map_err(|_| {
                             format!("invalid object number on line {}", line_no + 2)
                         })?;
@@ -450,7 +486,11 @@ impl Architect {
                         }
                     }
                     project.objects.push(PlacedObject {
-                        asset: Self::decode(fields[1])?,
+                        asset,
+                        name,
+                        group,
+                        visible,
+                        locked,
                         position: [n[0], n[1], n[2]],
                         rotation: [n[3], n[4], n[5]],
                         scale: n[6].clamp(0.01, 1000.),
@@ -1029,6 +1069,9 @@ impl Architect {
             .objects
             .iter()
             .filter_map(|object| {
+                if !object.visible {
+                    return None;
+                }
                 Some(crate::world_models_gpu::EditorPlacement {
                     path: Self::renderer_asset_path(&object.asset)?,
                     position: object.position,
@@ -1058,7 +1101,14 @@ impl Architect {
         }
         let portable_asset = self.portable_asset_path(&asset);
         self.project.objects.push(PlacedObject {
+            name: Path::new(&portable_asset)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Object".into()),
             asset: portable_asset,
+            group: "Default".into(),
+            visible: true,
+            locked: false,
             position,
             rotation: [0.; 3],
             scale: 1.,
@@ -1091,7 +1141,14 @@ impl Architect {
             }
             let portable_asset = self.portable_asset_path(&asset);
             self.project.objects.push(PlacedObject {
+                name: Path::new(&portable_asset)
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Object".into()),
                 asset: portable_asset,
+                group: "Default".into(),
+                visible: true,
+                locked: false,
                 position,
                 rotation: [0.; 3],
                 scale: 1.,
@@ -2400,6 +2457,10 @@ mod tests {
         );
         let original = PlacedObject {
             asset: "models/test.ecm".into(),
+            name: "Test object".into(),
+            group: "Default".into(),
+            visible: true,
+            locked: false,
             position: [1., 2., 3.],
             rotation: [0.; 3],
             scale: 1.,
@@ -2426,6 +2487,10 @@ mod tests {
         editor.project.source_map = "b02".into();
         editor.project.objects.push(PlacedObject {
             asset: "models/test.ecm".into(),
+            name: "Test object".into(),
+            group: "Default".into(),
+            visible: true,
+            locked: false,
             position: [0.; 3],
             rotation: [0.; 3],
             scale: 1.,
@@ -2519,6 +2584,10 @@ mod tests {
             source_map: "a01".into(),
             objects: vec![PlacedObject {
                 asset: "models/场景/城堡.bmd".into(),
+                name: "Castle".into(),
+                group: "Buildings".into(),
+                visible: true,
+                locked: false,
                 position: [1., 2., 3.],
                 rotation: [0.1, 0.2, 0.3],
                 scale: 1.25,
