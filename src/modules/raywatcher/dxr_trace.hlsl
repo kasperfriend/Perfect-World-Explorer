@@ -328,8 +328,8 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
             uint cand_prim = q.CandidatePrimitiveIndex() + (q.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
-            foliage_layers = min(foliage_layers + 1u, 6u);
             if (accept_opacity(cand_prim, q.CandidateTriangleBarycentrics(), seed, tri_count)) {
+                foliage_layers = min(foliage_layers + 1u, 6u);
                 q.CommitNonOpaqueTriangleHit();
             }
         }
@@ -361,8 +361,8 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
                 while (q2.Proceed()) {
                     if (q2.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
                         uint cp2 = q2.CandidatePrimitiveIndex() + (q2.CandidateGeometryIndex() != 0u ? opaque_offset : 0u);
-                        foliage_layers = min(foliage_layers + 1u, 6u);
                         if (accept_opacity(cp2, q2.CandidateTriangleBarycentrics(), seed ^ 19u, tri_count)) {
+                            foliage_layers = min(foliage_layers + 1u, 6u);
                             q2.CommitNonOpaqueTriangleHit();
                         }
                     }
