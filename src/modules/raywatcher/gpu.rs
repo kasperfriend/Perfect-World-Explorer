@@ -3804,7 +3804,8 @@ impl RaywatcherGpu {
         // The terrain-map and sky-environment blits both target COLOUR_FORMAT.
         // Build this shared PSO during renderer construction so neither path
         // pays pipeline compilation on its first visible frame.
-        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let blit_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("raywatcher blit"),
             bind_group_layouts: &[&pipelines.blit_layout],
             push_constant_ranges: &[],
@@ -5928,7 +5929,11 @@ impl RaywatcherGpu {
             ]),
         );
         let target_format = destination.format();
-        if !self.composite_pipeline.iter().any(|(fmt, _)| *fmt == target_format) {
+        if !self
+            .composite_pipeline
+            .iter()
+            .any(|(fmt, _)| *fmt == target_format)
+        {
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("raywatcher composite"),
                 bind_group_layouts: &[&self.pipelines.composite_layout],
@@ -5958,7 +5963,11 @@ impl RaywatcherGpu {
             });
             self.composite_pipeline.push((target_format, pipe));
         }
-        let Some((_, pipe)) = self.composite_pipeline.iter().find(|(fmt, _)| *fmt == target_format) else {
+        let Some((_, pipe)) = self
+            .composite_pipeline
+            .iter()
+            .find(|(fmt, _)| *fmt == target_format)
+        else {
             return;
         };
         let Some((_, _, _, _, bg)) = self.raster_copy.as_ref() else {
@@ -6023,7 +6032,11 @@ impl RaywatcherGpu {
             return;
         }
         let target_format = destination.format();
-        if !self.blit_pipeline.iter().any(|(fmt, _)| *fmt == target_format) {
+        if !self
+            .blit_pipeline
+            .iter()
+            .any(|(fmt, _)| *fmt == target_format)
+        {
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("raywatcher blit"),
                 bind_group_layouts: &[&self.pipelines.blit_layout],
@@ -6053,7 +6066,11 @@ impl RaywatcherGpu {
             });
             self.blit_pipeline.push((target_format, pipe));
         }
-        let Some((_, pipe)) = self.blit_pipeline.iter().find(|(fmt, _)| *fmt == target_format) else {
+        let Some((_, pipe)) = self
+            .blit_pipeline
+            .iter()
+            .find(|(fmt, _)| *fmt == target_format)
+        else {
             return;
         };
         let dst_view = destination.create_view(&Default::default());
