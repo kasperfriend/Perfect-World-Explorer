@@ -133,6 +133,15 @@ impl Heights {
     pub fn revision(&self) -> u64 {
         self.0.revision.load(Ordering::Acquire)
     }
+    /// Clear all non-destructive editor overrides and publish a new revision.
+    pub fn clear_edits(&self) -> Result<(), String> {
+        let mut edits = self.0.edits.write().map_err(|_| "terrain edit lock poisoned")?;
+        if !edits.is_empty() {
+            *edits = Arc::new(HashMap::new());
+            self.0.revision.fetch_add(1, Ordering::Release);
+        }
+        Ok(())
+    }
     /// Atomically publish sparse height/normal overrides shared by all readers.
     /// All indices and heights are validated before any cell is changed.
     pub fn apply_cells(&self, cells: &[(usize, f32, [i8; 3])]) -> Result<(), String> {
