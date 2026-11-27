@@ -801,11 +801,15 @@ impl Page {
             // Parallelize mip levels 1..=4 (>= 256 KiB) across horizontal bands
             // while keeping tiny tail mips (levels 5..7) single-threaded.
             let threads = if nw * nh * 4 >= 256 * 1024 {
+                // Page finishing already runs beside cache I/O and GPU uploads.
+                // A 32-way fan-out for every mip level oversubscribes typical
+                // desktop CPUs and creates short-lived threads repeatedly.
+                // Four workers are enough for these memory-bandwidth-bound rows.
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1)
-                    .min(32)
-                    .min(nh.max(1))
+                    .min(4)
+                    .min(nh.div_ceil(2).max(1))
             } else {
                 1
             };
