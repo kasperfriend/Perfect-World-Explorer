@@ -1105,7 +1105,7 @@ impl Architect {
             if is_dir {
                 let response = egui::CollapsingHeader::new(format!("📁 {label}"))
                     .id_source(child.to_string_lossy().to_string())
-                    .show(ui, |ui| self.show_tree(ui, &child, depth + 1, camera));
+                    .show(ui, |ui| self.show_tree(ui, &child, depth + 1, _camera));
                 response.header_response.context_menu(|ui| {
                     if ui.button("Pin folder to quick bar").clicked() {
                         self.pin(child.to_string_lossy().into_owned());
@@ -1576,7 +1576,7 @@ impl Architect {
         label: &str,
         asset: &str,
         position: [f32; 3],
-        camera: Vec3,
+        _camera: Vec3,
     ) {
         if !self.object_filter.is_empty()
             && !label
