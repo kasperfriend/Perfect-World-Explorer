@@ -3503,6 +3503,10 @@ impl Renderer {
             let delta = if advance { camera.logic_delta_ms } else { 0 };
             let frame = receiving_model_frame(uniform, camera, light);
             models.set_frustum(Some(*frustum));
+            // Only the main view consumes model geometry in this configuration.
+            // Water mirrors/refraction can see off-main-frustum objects, so keep
+            // full pose evaluation whenever either secondary view is active.
+            models.set_pose_culling(!camera.water_reflections && camera.underwater_depth <= 0.);
             models.set_keep_unbounded(crate::objects::unbounded_textures());
             models.update_pass(
                 &self.device,
