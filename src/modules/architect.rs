@@ -2784,15 +2784,30 @@ impl Architect {
                             )
                         })
                     };
-                    if project_point(origin).is_some() {
-                        for (axis_index, axis) in
-                            [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate()
-                        {
-                            if project_point(origin + axis * 24.)
-                                .is_some_and(|end| end.distance(pointer) <= 12.)
-                            {
-                                axis_pick = Some(axis_index);
-                                break;
+                    if let Some(center) = project_point(origin) {
+                        match self.transform_mode {
+                            TransformMode::Move | TransformMode::Scale => {
+                                for (axis_index, axis) in
+                                    [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate()
+                                {
+                                    if project_point(origin + axis * 24.)
+                                        .is_some_and(|end| end.distance(pointer) <= 13.)
+                                    {
+                                        axis_pick = Some(axis_index);
+                                        break;
+                                    }
+                                }
+                            }
+                            TransformMode::Rotate => {
+                                let radius = center.distance(project_point(origin + Vec3::X * 24.).unwrap_or(center));
+                                let distance = center.distance(pointer);
+                                if (distance - radius).abs() <= 9. {
+                                    axis_pick = Some(1);
+                                } else if (distance - radius * 1.28).abs() <= 9. {
+                                    axis_pick = Some(0);
+                                } else if (distance - radius * 0.72).abs() <= 9. {
+                                    axis_pick = Some(2);
+                                }
                             }
                         }
                     }
@@ -2928,7 +2943,7 @@ impl Architect {
                 && selected_is_unlocked
                 && ((self.selected_placements.len() > 1 && hit.is_some())
                     || (self.selected_placements.len() <= 1
-                        && (hit.is_some() || self.object_drag_axis == Some(1))));
+                        && (hit.is_some() || self.object_drag_axis.is_some())));
             if self.object_dragging && self.selected_placements.len() > 1 {
                 self.object_drag_group = self
                     .selected_placements
@@ -3048,43 +3063,66 @@ impl Architect {
             self.marquee_current = None;
         }
         if self.object_dragging && down && self.cursor == CursorMode::Select && !over_ui {
-            if !self.object_drag_group.is_empty() {
-                if let (Some(start), Some(current)) = (self.object_drag_start_hit, hit) {
-                    let delta = Vec3::from_array(current.to_array()) - Vec3::from_array(start);
-                    for (index, position) in &self.object_drag_group {
-                        if let Some(object) = self.project.objects.get_mut(*index) {
-                            object.position = (Vec3::from_array(*position) + delta).to_array();
+            let indices = if self.object_drag_group.is_empty() {
+                self.selected_placement.into_iter().collect::<Vec<_>>()
+            } else {
+                self.object_drag_group.iter().map(|(index, _)| *index).collect()
+            };
+            let pivot = self
+                .selected_placement
+                .and_then(|index| self.project.objects.get(index))
+                .map(|object| Vec3::from_array(object.position))
+                .unwrap_or(Vec3::ZERO);
+            match self.transform_mode {
+                TransformMode::Move => {
+                    if !self.object_drag_group.is_empty() {
+                        if let (Some(start), Some(current)) = (self.object_drag_start_hit, hit) {
+                            let delta = Vec3::from_array(current.to_array()) - Vec3::from_array(start);
+                            for (index, position) in &self.object_drag_group {
+                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                    object.position = (Vec3::from_array(*position) + delta).to_array();
+                                }
+                            }
+                        }
+                    } else if let Some(index) = self.selected_placement {
+                        if let Some(object) = self.project.objects.get_mut(index) {
+                            match self.object_drag_axis {
+                                Some(0) => if let Some(hit) = hit { object.position[0] = hit.x + self.object_drag_xz_offset[0]; },
+                                Some(1) => if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer) { object.position[1] = self.object_drag_start_position[1] - (current.y - start.y) * 0.1; },
+                                Some(2) => if let Some(hit) = hit { object.position[2] = hit.z + self.object_drag_xz_offset[1]; },
+                                _ => if let Some(hit) = hit { object.position = [hit.x + self.object_drag_xz_offset[0], hit.y + self.object_drag_y_offset, hit.z + self.object_drag_xz_offset[1]]; },
+                            }
                         }
                     }
                 }
-            } else if let Some(index) = self.selected_placement {
-                if let Some(object) = self.project.objects.get_mut(index) {
-                    match self.object_drag_axis {
-                        Some(0) => {
-                            if let Some(hit) = hit {
-                                object.position[0] = hit.x + self.object_drag_xz_offset[0];
+                TransformMode::Rotate => {
+                    if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer) {
+                        let axis = self.object_drag_axis.unwrap_or(1);
+                        let angle = (current.x - start.x - (current.y - start.y) * 0.35) * 0.01;
+                        for index in indices {
+                            if let Some(object) = self.project.objects.get_mut(index) {
+                                let original = self.object_drag_snapshot.as_ref().and_then(|items| items.get(index)).cloned();
+                                if let Some(original) = original {
+                                    let relative = Vec3::from_array(original.position) - pivot;
+                                    let rotation = match axis { 0 => glam::Quat::from_rotation_x(angle), 1 => glam::Quat::from_rotation_y(angle), _ => glam::Quat::from_rotation_z(angle) };
+                                    object.position = (pivot + rotation * relative).to_array();
+                                    object.rotation = original.rotation;
+                                    object.rotation[axis] += angle;
+                                }
                             }
                         }
-                        Some(1) => {
-                            if let (Some(start), Some(current)) =
-                                (self.object_drag_start_pointer, pointer)
-                            {
-                                object.position[1] = self.object_drag_start_position[1]
-                                    - (current.y - start.y) * 0.1;
-                            }
-                        }
-                        Some(2) => {
-                            if let Some(hit) = hit {
-                                object.position[2] = hit.z + self.object_drag_xz_offset[1];
-                            }
-                        }
-                        _ => {
-                            if let Some(hit) = hit {
-                                object.position = [
-                                    hit.x + self.object_drag_xz_offset[0],
-                                    hit.y + self.object_drag_y_offset,
-                                    hit.z + self.object_drag_xz_offset[1],
-                                ];
+                    }
+                }
+                TransformMode::Scale => {
+                    if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer) {
+                        let factor = (-(current.y - start.y) * 0.01).exp().clamp(0.05, 20.0);
+                        for index in indices {
+                            if let Some(object) = self.project.objects.get_mut(index) {
+                                if let Some(original) = self.object_drag_snapshot.as_ref().and_then(|items| items.get(index)) {
+                                    object.scale = (original.scale * factor).clamp(0.01, 100.0);
+                                    let relative = Vec3::from_array(original.position) - pivot;
+                                    object.position = (pivot + relative * factor).to_array();
+                                }
                             }
                         }
                     }
@@ -3206,16 +3244,31 @@ impl Architect {
                     egui::Order::Foreground,
                     egui::Id::new("architect_transform_gizmo"),
                 ));
-                painter.circle_stroke(center, 6., egui::Stroke::new(2., egui::Color32::WHITE));
-                for (axis, color) in [
+                let axes = [
                     (Vec3::X, egui::Color32::from_rgb(245, 75, 75)),
                     (Vec3::Y, egui::Color32::from_rgb(90, 230, 120)),
                     (Vec3::Z, egui::Color32::from_rgb(90, 150, 255)),
-                ] {
-                    if let Some(end) = project_point(origin + axis * 24.) {
-                        painter.line_segment([center, end], egui::Stroke::new(3., color));
-                        painter.circle_filled(end, 4., color);
-                    }
+                ];
+                painter.circle_stroke(center, 5., egui::Stroke::new(2., egui::Color32::WHITE));
+                match self.transform_mode {
+                    TransformMode::Move => for (axis, color) in axes {
+                        if let Some(end) = project_point(origin + axis * 24.) {
+                            painter.line_segment([center, end], egui::Stroke::new(3., color));
+                            painter.circle_filled(end, 4., color);
+                        }
+                    },
+                    TransformMode::Rotate => {
+                        let radius = center.distance(project_point(origin + Vec3::X * 24.).unwrap_or(center)).max(12.);
+                        for (scale, color) in [(1.28, axes[0].1), (1.0, axes[1].1), (0.72, axes[2].1)] {
+                            painter.circle_stroke(center, radius * scale, egui::Stroke::new(2.5, color));
+                        }
+                    },
+                    TransformMode::Scale => for (axis, color) in axes {
+                        if let Some(end) = project_point(origin + axis * 24.) {
+                            painter.line_segment([center, end], egui::Stroke::new(3., color));
+                            painter.rect_filled(egui::Rect::from_center_size(end, egui::vec2(9., 9.)), 1., color);
+                        }
+                    },
                 }
             }
         }
