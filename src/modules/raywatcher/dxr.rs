@@ -866,6 +866,7 @@ mod imp {
         /// (Walker + Populator) avoiding per-frame WDDM allocations and CPU/GPU races.
         dyn_verts: [Option<(u64, RawBuffer)>; 3],
         dyn_blas: [Option<(u64, RawBuffer)>; 3],
+        dyn_blas_vertex_counts: [u32; 3],
         dyn_tlas: [Option<(u64, RawBuffer)>; 3],
         dyn_inst_desc: [Option<RawBuffer>; 3],
         dyn_slot: usize,
@@ -1004,6 +1005,7 @@ mod imp {
                 reusable_instance_desc,
                 dyn_verts: [None, None, None],
                 dyn_blas: [None, None, None],
+                dyn_blas_vertex_counts: [0; 3],
                 dyn_tlas: [None, None, None],
                 dyn_inst_desc: [None, None, None],
                 dyn_slot: 0,
@@ -1963,6 +1965,9 @@ mod imp {
                     return Ok(());
                 }
                 let bsize = align256(info.result_data_max_size_in_bytes);
+                let update_blas = self.dyn_blas_vertex_counts[s] == tri_count
+                    && self.dyn_blas[s].as_ref().is_some_and(|(cap, _)| *cap >= bsize)
+                    && self.has_dyn_instance;
                 if self.dyn_blas[s]
                     .as_ref()
                     .is_none_or(|(cap, _)| *cap < bsize)
@@ -1981,10 +1986,6 @@ mod imp {
                     self.dyn_blas[s] = Some((cap, buf));
                 }
                 let blas_gpu_va = self.dyn_blas[s].as_ref().unwrap().1.gpu_va;
-                let update_blas = self.dyn_blas[s]
-                    .as_ref()
-                    .is_some_and(|(cap, _)| *cap >= bsize)
-                    && self.has_dyn_instance;
                 if update_blas {
                     blas_inputs.flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
                 }
@@ -2054,6 +2055,10 @@ mod imp {
                     self.reusable_scratch = Some((cap, buf));
                 }
                 let tsize = align256(tlas_info.result_data_max_size_in_bytes);
+                let update_tlas = self.dyn_tlas[s]
+                    .as_ref()
+                    .is_some_and(|(cap, _)| *cap >= tsize)
+                    && self.has_dyn_instance;
                 if self.dyn_tlas[s]
                     .as_ref()
                     .is_none_or(|(cap, _)| *cap < tsize)
@@ -2072,11 +2077,7 @@ mod imp {
                     self.dyn_tlas[s] = Some((cap, buf));
                 }
                 let tlas_gpu_va = self.dyn_tlas[s].as_ref().unwrap().1.gpu_va;
-                let update_tlas = self.dyn_tlas[s]
-                    .as_ref()
-                    .is_some_and(|(cap, _)| *cap >= tsize)
-                    && self.has_dyn_instance;
-                if update_tlas {
+                if update_blas {
                     tlas_inputs.flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
                 }
                 scratch_needed = scratch_needed.max(align256(
@@ -2121,6 +2122,7 @@ mod imp {
                     self.retired_buffers.push((fence, retired_now));
                 }
                 self.has_dyn_instance = true;
+                self.dyn_blas_vertex_counts[s] = tri_count;
                 self.dyn_active_tlas_va = Some(tlas_gpu_va);
                 self.dyn_last_hash = h;
                 self.write_tlas_descriptor();
