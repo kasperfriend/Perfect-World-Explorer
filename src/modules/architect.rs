@@ -1427,6 +1427,21 @@ impl Architect {
         }
     }
 
+    fn ray_plane_hit(pointer: egui::Pos2, viewport: egui::Rect, view_projection: glam::Mat4, height: f32) -> Option<Vec3> {
+        let uv = egui::vec2(
+            (pointer.x - viewport.left()) / viewport.width().max(1.) * 2. - 1.,
+            1. - (pointer.y - viewport.top()) / viewport.height().max(1.) * 2.,
+        );
+        let inverse = view_projection.inverse();
+        if !inverse.is_finite() { return None; }
+        let near = inverse.project_point3(Vec3::new(uv.x, uv.y, 1.));
+        let far = inverse.project_point3(Vec3::new(uv.x, uv.y, 0.));
+        let direction = (far - near).normalize_or_zero();
+        if !near.is_finite() || !direction.is_finite() || direction.length_squared() < 0.5 || direction.y.abs() < 1e-5 { return None; }
+        let distance = (height - near.y) / direction.y;
+        (distance >= 0. && distance.is_finite()).then(|| near + direction * distance)
+    }
+
     fn terrain_hit(
         pointer: egui::Pos2,
         viewport: egui::Rect,
@@ -1742,12 +1757,11 @@ impl Architect {
                 .show(ctx, |ui| {
                     let label = self.hovered_asset.as_deref().or(self.selected_asset.as_deref()).unwrap_or("");
                     ui.label(egui::RichText::new(label).small().strong());
-                    if let Some(preview) = &self.preview {
-                        preview.show(ui, egui::vec2(ui.available_width().min(280.), ui.available_width().min(280.)));
+                    if self.preview_message.is_empty() {
+                        if let Some(preview) = &self.preview {
+                            preview.show(ui, egui::vec2(ui.available_width().min(280.), ui.available_width().min(280.)));
+                        }
                     } else {
-                        ui.label(egui::RichText::new(&self.preview_message).weak());
-                    }
-                    if !self.preview_message.is_empty() {
                         ui.label(egui::RichText::new(&self.preview_message).small().weak());
                     }
                     if ui.button("Select this asset").clicked() {
@@ -2327,7 +2341,7 @@ impl Architect {
             )
         });
         let over_ui = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
-        let hit = if matches!(
+        let terrain_hit = if matches!(
             self.cursor,
             CursorMode::Sculpt
                 | CursorMode::Select
@@ -2344,6 +2358,12 @@ impl Architect {
         } else {
             None
         };
+        let hit = if self.cursor == CursorMode::Place && !over_ui {
+            terrain_hit.or_else(|| pointer.and_then(|position| {
+                let height = self.map.as_ref().map(|map| map.ground(camera.x, camera.z)).unwrap_or(0.);
+                Self::ray_plane_hit(position, screen, view_projection, height)
+            }))
+        } else { terrain_hit };
         self.brush_cursor_position = hit.map(|position| position.to_array());
         if pressed && self.cursor == CursorMode::Place && !over_ui {
             if let Some(position) = hit {
@@ -2368,6 +2388,8 @@ impl Architect {
                     }
                 }
                 self.add_selected_asset_at_position(placement);
+            } else {
+                self.status = "Could not project the pointer into the world. Move the cursor over the viewport and try again.".into();
             }
         }
         // Pick staged project objects directly in the viewport. Their editor
