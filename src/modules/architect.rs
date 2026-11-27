@@ -739,6 +739,8 @@ impl Architect {
             self.selected_placement = self
                 .selected_placement
                 .filter(|index| *index < self.project.objects.len());
+            self.selected_placements
+                .retain(|index| *index < self.project.objects.len());
             self.status = "Undid object edit.".into();
         }
     }
@@ -751,6 +753,8 @@ impl Architect {
             self.selected_placement = self
                 .selected_placement
                 .filter(|index| *index < self.project.objects.len());
+            self.selected_placements
+                .retain(|index| *index < self.project.objects.len());
             self.status = "Redid object edit.".into();
         }
     }
@@ -2686,6 +2690,10 @@ mod tests {
         assert_eq!(loaded.source_map, project.source_map);
         assert_eq!(loaded.objects.len(), 1);
         assert_eq!(loaded.objects[0].asset, project.objects[0].asset);
+        assert_eq!(loaded.objects[0].name, "Castle");
+        assert_eq!(loaded.objects[0].group, "Buildings");
+        assert!(loaded.objects[0].visible);
+        assert!(!loaded.objects[0].locked);
         assert_eq!(loaded.strokes.len(), 1);
         assert_eq!(loaded.strokes[0].mode, BrushMode::Smooth);
         assert_eq!(
@@ -2696,6 +2704,32 @@ mod tests {
             editor.portable_asset_path("/client/element/models.pck::models/tree.ecm"),
             "element/models.pck::models/tree.ecm"
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn version_one_projects_migrate_objects_with_default_hierarchy_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "pwe-architect-legacy-{}.pwa",
+            std::process::id()
+        ));
+        let asset = Architect::encode("models/legacy/guard.ecm");
+        fs::write(
+            &path,
+            format!(
+                "PWE_ARCHITECT\t1\nname\t{}\nsource_map\t{}\nobject\t{}\t1\t2\t3\t0\t0\t0\t1\n",
+                Architect::encode("Legacy map"),
+                Architect::encode("a01"),
+                asset
+            ),
+        )
+        .unwrap();
+        let loaded = Architect::read_project(&path).unwrap();
+        assert_eq!(loaded.objects.len(), 1);
+        assert_eq!(loaded.objects[0].name, "guard");
+        assert_eq!(loaded.objects[0].group, "Default");
+        assert!(loaded.objects[0].visible);
+        assert!(!loaded.objects[0].locked);
         let _ = fs::remove_file(path);
     }
 
