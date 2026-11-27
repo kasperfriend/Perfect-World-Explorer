@@ -5221,6 +5221,17 @@ impl RaywatcherGpu {
                 || software_fallback_ready(self.scene.counts.triangles, self.scene.counts.nodes))
     }
 
+    /// Preflight whether the backend can dispatch a new trace on this frame.
+    /// During a scene rebuild the old DXR tracer remains available; first-use
+    /// initialization and missing software BVHs correctly report not-ready.
+    pub fn can_trace_this_frame(&self, hardware_mode: bool) -> bool {
+        if hardware_mode && !self.dxr_failed {
+            self.dxr.is_some()
+        } else {
+            software_fallback_ready(self.scene.counts.triangles, self.scene.counts.nodes)
+        }
+    }
+
     pub fn can_replace_water_reflections(&self) -> bool {
         self.can_replace_raster_effects()
     }
