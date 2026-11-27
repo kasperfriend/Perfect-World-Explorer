@@ -2094,7 +2094,19 @@ mod imp {
                 }
                 let scratch_va = self.reusable_scratch.as_ref().unwrap().1.gpu_va;
 
-                let slot_idx = self.ring.acquire("DXR-DynAS")?;
+                let slot_idx = match self.ring.try_acquire("DXR-DynAS")? {
+                    Some(index) => index,
+                    None => {
+                        // The dynamic character is optional for this frame.
+                        // Keep the previous TLAS instance active rather than
+                        // blocking the render thread on a busy DXR fence.
+                        let fence = self.ring.current_fence();
+                        if !retired_now.is_empty() {
+                            self.retired_buffers.push((fence, retired_now));
+                        }
+                        return Ok(());
+                    }
+                };
                 let list_ptr = self.ring.slot_mut(slot_idx).list.as_mut_ptr();
                 let list4 = com_query_interface(
                     list_ptr as *mut c_void,
