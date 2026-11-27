@@ -6859,7 +6859,7 @@ mod shader_optimization_regression_tests {
     fn native_water_uses_a_stable_planar_mirror_ray_and_physical_dielectric_fresnel() {
         let dxr = include_str!("dxr_trace.hlsl");
         assert!(RAY_SHADER.contains("maximum <= base || is_water"));
-        assert!(RAY_SHADER.contains("var h = refl_base_n;"));
+        assert!(RAY_SHADER.contains("let h = refl_base_n;"));
         assert!(RAY_SHADER.contains("if (!is_water)"));
         assert!(RAY_SHADER.contains("is_water && dot(base_normal, view_dir) > 0.0"));
         assert!(RAY_SHADER.contains("select(0.04, 0.0204, is_water)"));
