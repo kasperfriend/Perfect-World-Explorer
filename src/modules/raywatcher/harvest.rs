@@ -1553,9 +1553,8 @@ fn push_instances_chunked_cancellable(
         }
         candidates.extend(list);
     }
-    let by_distance = |a: &(f32, usize), b: &(f32, usize)| {
-        a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1))
-    };
+    let by_distance =
+        |a: &(f32, usize), b: &(f32, usize)| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1));
     if candidates.len() > instance_budget {
         // Partition in linear expected time rather than sorting every
         // candidate when the global budget is much smaller than the world.
@@ -2158,8 +2157,14 @@ mod tests {
         .expect("not cancelled");
         assert_eq!(pushed, 2);
         assert_eq!(triangles.len(), 24);
-        let min_z = triangles.iter().flat_map(|t| [t.a[2], t.b[2], t.c[2]]).fold(f32::INFINITY, f32::min);
-        let max_z = triangles.iter().flat_map(|t| [t.a[2], t.b[2], t.c[2]]).fold(f32::NEG_INFINITY, f32::max);
+        let min_z = triangles
+            .iter()
+            .flat_map(|t| [t.a[2], t.b[2], t.c[2]])
+            .fold(f32::INFINITY, f32::min);
+        let max_z = triangles
+            .iter()
+            .flat_map(|t| [t.a[2], t.b[2], t.c[2]])
+            .fold(f32::NEG_INFINITY, f32::max);
         assert!((min_z - 18.0).abs() < 1e-4, "nearest box min z: {min_z}");
         assert!((max_z - 32.0).abs() < 1e-4, "nearest boxes max z: {max_z}");
     }
