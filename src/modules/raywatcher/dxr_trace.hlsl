@@ -24,6 +24,10 @@ struct Params {
     float4 point_light_meta;            // x: active light count (<= 128), y: pl_shadows, z: write_albedo, w: write_guide
     float4 point_lights_pos_rad[128];   // xyz: world pos, w: radius
     float4 point_lights_col_int[128];   // rgb: colour, w: intensity
+    float4 point_light_bvh_meta;        // x: active node count
+    float4 point_light_bvh_min[63];
+    float4 point_light_bvh_max[63];
+    uint4 point_light_order[32];        // four original light indices per vector
     float4 terrain_map_bounds;          // x: min_x, y: max_z, z: inv_diameter, w: valid (>0.5)
     column_major float4x4 prev_vp;
     float4 restir; // x=reservoir buffer enabled, y=max adaptive samples, z=spatial reuse count, w=history parity
@@ -468,6 +472,11 @@ bool occluded_point_light(float3 origin, float3 dir, float t_min, float t_max, f
         }
     }
     return true;
+}
+
+uint point_light_order_at(uint index) {
+    uint4 packed = params.point_light_order[index >> 2u];
+    return packed[index & 3u];
 }
 
 float point_light_falloff(float dist, float radius) {
@@ -1611,12 +1620,33 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         // Zero-visual-cost Perf Boost: fast AABB+radius pre-check before touching G-buffer neighbors.
         // Eliminates 16-24 G-buffer texture fetches on 80-95% of pixels with no nearby point lights!
         bool any_pl_near = false;
-        for (uint pre_i = 0u; pre_i < pl_count; pre_i = pre_i + 1u) {
-            float4 pr = params.point_lights_pos_rad[pre_i];
-            float3 d_pre = pr.xyz - world_pos;
-            if (abs(d_pre.x) < pr.w && abs(d_pre.z) < pr.w && abs(d_pre.y) < pr.w && dot(d_pre, d_pre) < pr.w * pr.w) {
-                any_pl_near = true;
-                break;
+        uint near_stack[16];
+        uint near_sp = 0u;
+        if (params.point_light_bvh_meta.x > 0.5) {
+            near_stack[near_sp++] = 0u;
+        }
+        [loop] while (near_sp > 0u && !any_pl_near) {
+            uint node_index = near_stack[--near_sp];
+            float4 node_min = params.point_light_bvh_min[node_index];
+            float4 node_max = params.point_light_bvh_max[node_index];
+            if (any(world_pos < node_min.xyz) || any(world_pos > node_max.xyz)) {
+                continue;
+            }
+            if (node_min.w >= 0.0) {
+                uint leaf_count = (uint)node_min.w;
+                uint leaf_first = (uint)node_max.w;
+                for (uint offset = 0u; offset < leaf_count; ++offset) {
+                    uint pre_i = point_light_order_at(leaf_first + offset);
+                    float4 pr = params.point_lights_pos_rad[pre_i];
+                    float3 d_pre = pr.xyz - world_pos;
+                    if (abs(d_pre.x) < pr.w && abs(d_pre.z) < pr.w && abs(d_pre.y) < pr.w && dot(d_pre, d_pre) < pr.w * pr.w) {
+                        any_pl_near = true;
+                        break;
+                    }
+                }
+            } else {
+                near_stack[near_sp++] = (uint)node_max.w;
+                near_stack[near_sp++] = node_index + 1u;
             }
         }
         float3 pl_normal = normal;
@@ -1698,7 +1728,23 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float exact_ws[4] = { 0.0, 0.0, 0.0, 0.0 };
         float3 exact_cols[4] = { float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0) };
 
-        if (any_pl_near) for (uint li = 0u; li < pl_count; li = li + 1u) {
+        uint light_stack[16];
+        uint light_sp = 0u;
+        if (any_pl_near && params.point_light_bvh_meta.x > 0.5) {
+            light_stack[light_sp++] = 0u;
+        }
+        [loop] while (light_sp > 0u) {
+            uint node_index = light_stack[--light_sp];
+            float4 node_min = params.point_light_bvh_min[node_index];
+            float4 node_max = params.point_light_bvh_max[node_index];
+            if (any(world_pos < node_min.xyz) || any(world_pos > node_max.xyz)) {
+                continue;
+            }
+            if (node_min.w >= 0.0) {
+                uint leaf_count = (uint)node_min.w;
+                uint leaf_first = (uint)node_max.w;
+                for (uint offset = 0u; offset < leaf_count; ++offset) {
+                    uint li = point_light_order_at(leaf_first + offset);
             float4 pl_pr = params.point_lights_pos_rad[li];
             float3 to_l = pl_pr.xyz - world_pos;
             if (abs(to_l.x) >= pl_pr.w || abs(to_l.z) >= pl_pr.w || abs(to_l.y) >= pl_pr.w) {
@@ -1749,6 +1795,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 res1_phat = p_hat;
                 res1_col = pl_ci.rgb;
                 res1_w = w;
+            }
+        
+                }
+            } else {
+                light_stack[light_sp++] = (uint)node_max.w;
+                light_stack[light_sp++] = node_index + 1u;
             }
         }
 
