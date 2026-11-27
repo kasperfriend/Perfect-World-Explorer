@@ -6575,6 +6575,14 @@ mod phase_r1_tests {
         assert_eq!(packed.point_light_meta[0] as usize, MAX_RAY_LIGHTS);
         assert_eq!(packed.point_lights_pos_rad[127][0], 127.0);
         assert_eq!(packed.point_lights_col_int[127][3], 3.0);
+        assert_eq!(packed.point_light_bvh_meta[0] as usize, 63);
+        let mut packed_indices = Vec::new();
+        for group in packed.point_light_order {
+            packed_indices.extend(group);
+        }
+        packed_indices.truncate(MAX_RAY_LIGHTS);
+        packed_indices.sort_unstable();
+        assert_eq!(packed_indices, (0..MAX_RAY_LIGHTS as u32).collect::<Vec<_>>());
     }
 
     #[test]
@@ -6850,6 +6858,23 @@ mod shader_optimization_regression_tests {
         assert!(dxr.contains("Disabled: this 16-bit spatial hash stores no key/tag"));
         assert!(!dxr.contains("InterlockedAdd(radiance_cache[slot]"));
         assert_eq!(super::RADIANCE_CACHE_CELLS * 16, 16);
+    }
+
+    #[test]
+    fn point_light_bvh_layout_and_traversal_match_in_software_and_dxr() {
+        let dxr = include_str!("dxr_trace.hlsl");
+        for source in [RAY_SHADER, dxr] {
+            assert!(source.contains("point_light_bvh_meta"));
+            assert!(source.contains("point_light_bvh_min"));
+            assert!(source.contains("point_light_bvh_max"));
+            assert!(source.contains("point_light_order"));
+            assert!(source.contains("point_light_order_at"));
+            assert!(source.contains("near_stack[near_sp++] = 0u") || source.contains("near_stack[near_sp] = 0u"));
+        }
+        assert!(RAY_SHADER.contains("light_stack: array<u32, 16>"));
+        assert!(dxr.contains("uint light_stack[16]"));
+        assert!(RAY_SHADER.contains("let leaf_count = u32(node_min.w)"));
+        assert!(dxr.contains("uint leaf_count = (uint)node_min.w"));
     }
 
     #[test]
