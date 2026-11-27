@@ -164,6 +164,9 @@ pub struct World {
     frustum: Option<[[f32; 4]; 6]>,
     scratch_candidates: Vec<model_queue::AlphaCandidate>,
     scratch_failures: Vec<(usize, String)>,
+    /// Pose culling is safe only when the main view is the only model view this
+    /// frame; mirrors/refraction may see objects outside its frustum.
+    pose_culling: bool,
 }
 
 impl World {
@@ -262,6 +265,7 @@ impl World {
             frustum: None,
             scratch_candidates: Vec::new(),
             scratch_failures: Vec::new(),
+            pose_culling: false,
         })
     }
     /// A world with no model assets of its own.
@@ -286,6 +290,12 @@ impl World {
         // Normalize once per view rather than taking six square roots for
         // every retained model slot on every main/reflection/refraction pass.
         self.frustum = frustum.map(normalize_frustum_planes);
+    }
+
+    /// Enable expensive-pose deferral only when no secondary model view will
+    /// consume objects outside the main camera frustum.
+    pub fn set_pose_culling(&mut self, enabled: bool) {
+        self.pose_culling = enabled;
     }
     /// Attach the real GFX archive so installed producers can load their roots.
     /// Root text is GBK-decoded here; the owner manager never guesses an
@@ -1065,7 +1075,8 @@ impl World {
         // parent is outside the camera view. In worlds without such attachments,
         // defer expensive skinning/mesh generation for off-frustum models while
         // still advancing their playback clocks.
-        let defer_offscreen_poses = !self.producers.iter().any(|producer| producer.hook.is_some());
+        let defer_offscreen_poses = self.pose_culling
+            && !self.producers.iter().any(|producer| producer.hook.is_some());
         let len = self.slots.len();
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
