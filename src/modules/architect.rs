@@ -2915,8 +2915,59 @@ impl Architect {
                             screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
                             screen.top() + (1. - clip.y) * 0.5 * screen.height(),
                         );
-                        let score =
-                            point.distance(pointer) / Self::source_pick_radius(&object.asset);
+                        // Prefer the projected mesh footprint over a small
+                        // origin-only click radius. This makes tall/wide models
+                        // selectable where their visible geometry actually is.
+                        let projected_bounds = Self::renderer_asset_path(&object.asset)
+                            .and_then(|path| self.preview_bounds.get(&path).copied())
+                            .map(|(min, max)| {
+                                let rotation = glam::Quat::from_euler(
+                                    glam::EulerRot::XYZ,
+                                    object.rotation[0],
+                                    object.rotation[1],
+                                    object.rotation[2],
+                                );
+                                let center = Vec3::from_array(object.position);
+                                let mut rect = egui::Rect::NOTHING;
+                                let mut count = 0usize;
+                                for bits in 0..8 {
+                                    let local = Vec3::new(
+                                        if bits & 1 == 0 { min[0] } else { max[0] },
+                                        if bits & 2 == 0 { min[1] } else { max[1] },
+                                        if bits & 4 == 0 { min[2] } else { max[2] },
+                                    ) * object.scale.max(0.01);
+                                    let world = center + rotation * local;
+                                    let projected = view_projection.project_point3(world);
+                                    if projected.is_finite() && (0.0..=1.0).contains(&projected.z) {
+                                        let screen_point = egui::pos2(
+                                            screen.left() + (projected.x + 1.) * 0.5 * screen.width(),
+                                            screen.top() + (1. - projected.y) * 0.5 * screen.height(),
+                                        );
+                                        rect.extend_with(screen_point);
+                                        count += 1;
+                                    }
+                                }
+                                (count > 0).then_some(rect.expand(8.0))
+                            });
+                        let score = if let Some(rect) = projected_bounds {
+                            let dx = if pointer.x < rect.left() {
+                                rect.left() - pointer.x
+                            } else if pointer.x > rect.right() {
+                                pointer.x - rect.right()
+                            } else {
+                                0.0
+                            };
+                            let dy = if pointer.y < rect.top() {
+                                rect.top() - pointer.y
+                            } else if pointer.y > rect.bottom() {
+                                pointer.y - rect.bottom()
+                            } else {
+                                0.0
+                            };
+                            dx.hypot(dy) / 14.0
+                        } else {
+                            point.distance(pointer) / Self::source_pick_radius(&object.asset)
+                        };
                         if score <= 1.0
                             && nearest.is_none_or(|(_, best_score, best_depth)| {
                                 score < best_score - 0.025
