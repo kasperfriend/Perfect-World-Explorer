@@ -1494,8 +1494,8 @@ mod tests {
                 surface: [0.8, 0.0, 0.0, 0.8],
             }],
         );
-        // (u=.25, v=.25) maps to mask cell (1,2), bit 15: opaque foliage.
-        let covered = Vec3::new(-0.5, -0.5, 0.0);
+        // Barycentrics (u=.20, v=.28) map to mask cell (1,2), bit 15: opaque foliage.
+        let covered = Vec3::new(-0.32, -0.44, 0.0);
         assert!(scene.occluded(covered, Vec3::Z, 0.01, 3.0));
         // (u=.80, v=.10) maps to a clear cell: the ray must pass through.
         let cutout = Vec3::new(0.6, -0.8, 0.0);
