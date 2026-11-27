@@ -5177,6 +5177,9 @@ impl RaywatcherGpu {
             }
             Ok(Err(err)) => {
                 self.dxr_init = None;
+                if let Some(old) = self.dxr.take() {
+                    retire_dxr_async(old);
+                }
                 self.dxr_init_scene = None;
                 self.dxr_failed = true;
                 eprintln!("[Raywatcher] DXR 1.1 init failed ({err}); falling back to Software");
@@ -5185,6 +5188,9 @@ impl RaywatcherGpu {
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.dxr_init = None;
+                if let Some(old) = self.dxr.take() {
+                    retire_dxr_async(old);
+                }
                 self.dxr_init_scene = None;
                 self.dxr_failed = true;
                 eprintln!("[Raywatcher] DXR initialization worker exited without a result; falling back to Software");
@@ -5544,7 +5550,9 @@ impl RaywatcherGpu {
                         eprintln!(
                             "[Raywatcher] DXR 1.1 trace failed ({err}); falling back to Software"
                         );
-                        self.dxr = None;
+                        if let Some(old) = self.dxr.take() {
+                            retire_dxr_async(old);
+                        }
                         self.dxr_failed = true;
                         if !software_fallback_ready(
                             self.scene.counts.triangles,
