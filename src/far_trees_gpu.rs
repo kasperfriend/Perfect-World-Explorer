@@ -336,9 +336,8 @@ fn select_harvest_lod(
 ) -> Option<usize> {
     (start_lod..lod_count).find(|&candidate| {
         let triangles = &species.lods[candidate];
-        let sparse_outer_lod = candidate > 0
-            && triangles.len() < 12
-            && !species.lods[candidate - 1].is_empty();
+        let sparse_outer_lod =
+            candidate > 0 && triangles.len() < 12 && !species.lods[candidate - 1].is_empty();
         !triangles.is_empty() && !sparse_outer_lod && triangles.len() <= remaining
     })
 }
@@ -2095,14 +2094,11 @@ pub fn harvest_rt_tree_species_cancellable(
                 let distance = approximate_client_distance(d2);
                 let lod_count = sp.lods.len().min(3);
                 let mut lod_idx = raster_lod_index(distance, sp.height, scale, lod_count);
-                while lod_idx > 0
-                    && sp.lods[lod_idx].len() < 12
-                    && !sp.lods[lod_idx - 1].is_empty()
+                while lod_idx > 0 && sp.lods[lod_idx].len() < 12 && !sp.lods[lod_idx - 1].is_empty()
                 {
                     lod_idx -= 1;
                 }
-                if let Some(preferred_lod) =
-                    select_harvest_lod(sp, lod_idx, lod_count, usize::MAX)
+                if let Some(preferred_lod) = select_harvest_lod(sp, lod_idx, lod_count, usize::MAX)
                 {
                     desired_triangles =
                         desired_triangles.saturating_add(sp.lods[preferred_lod].len());
@@ -2143,9 +2139,7 @@ pub fn harvest_rt_tree_species_cancellable(
         let remaining = tri_budget.saturating_sub(out.len() - start_len);
         // Under pressure, try only progressively coarser *real* SpeedTree LODs.
         // If none fits, omit the instance rather than injecting synthetic card geometry.
-        let Some(chosen_lod_idx) =
-            select_harvest_lod(sp, lod_idx, lod_count, remaining)
-        else {
+        let Some(chosen_lod_idx) = select_harvest_lod(sp, lod_idx, lod_count, remaining) else {
             budget_skips += 1;
             continue;
         };
@@ -2439,7 +2433,10 @@ mod raywatcher_tree_tests {
         );
         assert_eq!(result, (1, 1, 1));
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].a.x, 5.0, "fallback geometry still prioritizes nearest tree");
+        assert_eq!(
+            out[0].a.x, 5.0,
+            "fallback geometry still prioritizes nearest tree"
+        );
     }
 
     #[test]
