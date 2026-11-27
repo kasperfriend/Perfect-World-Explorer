@@ -1625,7 +1625,9 @@ struct WorldGeometryChunk {
     used: u64,
 }
 impl Default for WorldGeometryArena {
-    fn default() -> Self { Self { chunks: Vec::new() } }
+    fn default() -> Self {
+        Self { chunks: Vec::new() }
+    }
 }
 impl WorldGeometryArena {
     const CHUNK_BYTES: u64 = 32 * 1024 * 1024;
@@ -2119,7 +2121,11 @@ impl GpuPage {
             },
             &[],
         );
-        pass.set_vertex_buffer(0, self.geometry.slice(self.vertex_offset..self.vertex_offset + self.vertex_bytes));
+        pass.set_vertex_buffer(
+            0,
+            self.geometry
+                .slice(self.vertex_offset..self.vertex_offset + self.vertex_bytes),
+        );
         pass.set_index_buffer(
             self.geometry
                 .slice(self.index_offset..self.index_offset + self.index_bytes),
@@ -2196,7 +2202,11 @@ impl GpuPage {
             let p = &pages[cmd.page];
             if bound != Some(cmd.page) {
                 pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
-                pass.set_vertex_buffer(0, p.geometry.slice(p.vertex_offset..p.vertex_offset + p.vertex_bytes));
+                pass.set_vertex_buffer(
+                    0,
+                    p.geometry
+                        .slice(p.vertex_offset..p.vertex_offset + p.vertex_bytes),
+                );
                 pass.set_index_buffer(
                     p.geometry
                         .slice(p.index_offset..p.index_offset + p.index_bytes),
@@ -2344,7 +2354,11 @@ impl GpuPage {
                             &[],
                         );
                     }
-                    pass.set_vertex_buffer(0, page.geometry.slice(page.vertex_offset..page.vertex_offset + page.vertex_bytes));
+                    pass.set_vertex_buffer(
+                        0,
+                        page.geometry
+                            .slice(page.vertex_offset..page.vertex_offset + page.vertex_bytes),
+                    );
                     pass.set_index_buffer(
                         page.geometry
                             .slice(page.index_offset..page.index_offset + page.index_bytes),
@@ -2566,7 +2580,11 @@ impl GpuPage {
                             &[],
                         );
                     }
-                    pass.set_vertex_buffer(0, page.geometry.slice(page.vertex_offset..page.vertex_offset + page.vertex_bytes));
+                    pass.set_vertex_buffer(
+                        0,
+                        page.geometry
+                            .slice(page.vertex_offset..page.vertex_offset + page.vertex_bytes),
+                    );
                     pass.set_index_buffer(
                         page.geometry
                             .slice(page.index_offset..page.index_offset + page.index_bytes),
@@ -2602,7 +2620,11 @@ impl GpuPage {
                             &[],
                         );
                     }
-                    pass.set_vertex_buffer(0, page.geometry.slice(page.vertex_offset..page.vertex_offset + page.vertex_bytes));
+                    pass.set_vertex_buffer(
+                        0,
+                        page.geometry
+                            .slice(page.vertex_offset..page.vertex_offset + page.vertex_bytes),
+                    );
                     pass.set_index_buffer(
                         page.geometry
                             .slice(page.index_offset..page.index_offset + page.index_bytes),
@@ -2650,7 +2672,11 @@ impl GpuPage {
             },
             &[],
         );
-        pass.set_vertex_buffer(0, self.geometry.slice(self.vertex_offset..self.vertex_offset + self.vertex_bytes));
+        pass.set_vertex_buffer(
+            0,
+            self.geometry
+                .slice(self.vertex_offset..self.vertex_offset + self.vertex_bytes),
+        );
         pass.set_index_buffer(
             self.geometry
                 .slice(self.index_offset..self.index_offset + self.index_bytes),
