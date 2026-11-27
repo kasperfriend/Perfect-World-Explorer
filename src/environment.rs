@@ -783,6 +783,23 @@ mod tests {
     }
 
     #[test]
+    fn missing_autoscene_uses_the_pr44_outdoor_fog_fallback() {
+        // The user's client has no autoscene.cfg. In that case the no-region
+        // environment must keep PR #44's 60..400 blue-grey outdoor fallback.
+        let env = Environments::default();
+        let (_, fallback, _) = env.endpoints_for(None);
+        assert_eq!(fallback.air_day.start, 60.);
+        assert_eq!(fallback.air_day.end, 400.);
+        assert_eq!(fallback.air_night.start, 60.);
+        assert_eq!(fallback.air_night.end, 400.);
+        assert_eq!(
+            fallback.air_day.color,
+            [70. / 255., 77. / 255., 91. / 255.]
+        );
+        assert_eq!(fallback.air_night.color, fallback.air_day.color);
+    }
+
+    #[test]
     fn autofamily_fog_is_used_only_as_the_no_area_fallback() {
         let mut env = Environments::default();
         env.auto_fog = Some(crate::sky_config::AutoFogConfig {
