@@ -122,6 +122,9 @@ pub struct Architect {
     last_brush_position: Option<[f32; 3]>,
     object_dragging: bool,
     object_drag_y_offset: f32,
+    object_drag_axis: Option<usize>,
+    object_drag_start_pointer: Option<egui::Pos2>,
+    object_drag_start_position: [f32; 3],
     object_drag_snapshot: Option<Vec<PlacedObject>>,
     undo_objects: Vec<Vec<PlacedObject>>,
     redo_objects: Vec<Vec<PlacedObject>>,
@@ -199,6 +202,9 @@ impl Architect {
             last_brush_position: None,
             object_dragging: false,
             object_drag_y_offset: 0.,
+            object_drag_axis: None,
+            object_drag_start_pointer: None,
+            object_drag_start_position: [0.; 3],
             object_drag_snapshot: None,
             undo_objects: Vec::new(),
             redo_objects: Vec::new(),
@@ -1816,36 +1822,92 @@ impl Architect {
         // Pick staged project objects directly in the viewport. Their editor
         // transform is independent from the immutable source-scene instances.
         if pressed && self.cursor == CursorMode::Select && !over_ui {
-            let mut nearest: Option<(usize, f32)> = None;
-            if let Some(pointer) = pointer {
-                for (index, object) in self.project.objects.iter().enumerate() {
-                    let clip = view_projection.project_point3(Vec3::from_array(object.position));
-                    if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
-                        continue;
-                    }
-                    let point = egui::pos2(
-                        screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
-                        screen.top() + (1. - clip.y) * 0.5 * screen.height(),
-                    );
-                    let distance = point.distance(pointer);
-                    if distance <= 20.
-                        && nearest.is_none_or(|(_, best)| distance < best)
-                    {
-                        nearest = Some((index, distance));
+            let mut axis_pick = None;
+            if let (Some(index), Some(pointer)) = (self.selected_placement, pointer) {
+                if let Some(object) = self.project.objects.get(index) {
+                    let origin = Vec3::from_array(object.position);
+                    let project_point = |point: Vec3| {
+                        let clip = view_projection.project_point3(point);
+                        (clip.is_finite() && (0.0..=1.0).contains(&clip.z)).then(|| {
+                            egui::pos2(
+                                screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
+                                screen.top() + (1. - clip.y) * 0.5 * screen.height(),
+                            )
+                        })
+                    };
+                    if let Some(center) = project_point(origin) {
+                        for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                            if project_point(origin + axis * 24.)
+                                .is_some_and(|end| end.distance(pointer) <= 12.)
+                            {
+                                axis_pick = Some(axis_index);
+                                break;
+                            }
+                        }
+                        let _ = center;
                     }
                 }
             }
-            self.selected_placement = nearest.map(|(index, _)| index);
-            self.object_dragging = self.selected_placement.is_some() && hit.is_some();
+            let mut nearest: Option<(usize, f32)> = None;
+            if axis_pick.is_none() {
+                if let Some(pointer) = pointer {
+                    for (index, object) in self.project.objects.iter().enumerate() {
+                        let clip = view_projection.project_point3(Vec3::from_array(object.position));
+                        if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
+                            continue;
+                        }
+                        let point = egui::pos2(
+                            screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
+                            screen.top() + (1. - clip.y) * 0.5 * screen.height(),
+                        );
+                        let distance = point.distance(pointer);
+                        if distance <= 20.
+                            && nearest.is_none_or(|(_, best)| distance < best)
+                        {
+                            nearest = Some((index, distance));
+                        }
+                    }
+                }
+                self.selected_placement = nearest.map(|(index, _)| index);
+            }
+            self.object_drag_axis = axis_pick;
+            self.object_dragging = self.selected_placement.is_some()
+                && (hit.is_some() || self.object_drag_axis == Some(1));
             self.object_drag_snapshot = self.object_dragging.then(|| self.project.objects.clone());
-            if let (Some(index), Some(hit)) = (self.selected_placement, hit) {
-                self.object_drag_y_offset = self.project.objects[index].position[1] - hit.y;
+            self.object_drag_start_pointer = pointer;
+            if let Some(index) = self.selected_placement {
+                self.object_drag_start_position = self.project.objects[index].position;
+                if let Some(hit) = hit {
+                    self.object_drag_y_offset = self.project.objects[index].position[1] - hit.y;
+                }
             }
         }
         if self.object_dragging && down && self.cursor == CursorMode::Select && !over_ui {
-            if let (Some(index), Some(hit)) = (self.selected_placement, hit) {
+            if let Some(index) = self.selected_placement {
                 if let Some(object) = self.project.objects.get_mut(index) {
-                    object.position = [hit.x, hit.y + self.object_drag_y_offset, hit.z];
+                    match self.object_drag_axis {
+                        Some(0) => {
+                            if let Some(hit) = hit {
+                                object.position[0] = hit.x;
+                            }
+                        }
+                        Some(1) => {
+                            if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer) {
+                                object.position[1] =
+                                    self.object_drag_start_position[1] - (current.y - start.y) * 0.1;
+                            }
+                        }
+                        Some(2) => {
+                            if let Some(hit) = hit {
+                                object.position[2] = hit.z;
+                            }
+                        }
+                        _ => {
+                            if let Some(hit) = hit {
+                                object.position = [hit.x, hit.y + self.object_drag_y_offset, hit.z];
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1856,6 +1918,8 @@ impl Architect {
                 }
             }
             self.object_dragging = false;
+            self.object_drag_axis = None;
+            self.object_drag_start_pointer = None;
         }
         if pressed && self.cursor == CursorMode::Sculpt && !over_ui && hit.is_some() {
             self.brush_dragging = true;
