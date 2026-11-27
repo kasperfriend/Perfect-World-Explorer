@@ -2987,7 +2987,7 @@ impl Architect {
                 .is_some_and(|object| !object.locked);
             self.object_dragging = self.cursor == CursorMode::Select
                 && selected_is_unlocked
-                && ((self.selected_placements.len() > 1 && hit.is_some())
+                && ((self.selected_placements.len() > 1 && (hit.is_some() || self.object_drag_axis.is_some()))
                     || (self.selected_placements.len() <= 1
                         && (hit.is_some() || self.object_drag_axis.is_some())));
             if self.object_dragging && self.selected_placements.len() > 1 {
