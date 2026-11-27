@@ -1342,13 +1342,12 @@ impl Architect {
                 );
                 let score = point.distance(pointer) / Self::source_pick_radius(asset);
                 if score <= 1.0
-                    && nearest_scene.as_ref().is_none_or(
-                        |(_, best_score, best_depth, _, _)| {
+                    && nearest_scene
+                        .as_ref()
+                        .is_none_or(|(_, best_score, best_depth, _, _)| {
                             score < *best_score - 0.025
-                                || ((score - *best_score).abs() <= 0.025
-                                    && clip.z > *best_depth)
-                        },
-                    )
+                                || ((score - *best_score).abs() <= 0.025 && clip.z > *best_depth)
+                        })
                 {
                     nearest_scene = Some((
                         scene_index,
@@ -1450,11 +1449,16 @@ impl Architect {
                     .into_iter()
                     .map(|entry| (entry.name, entry.size, entry.compressed))
                     .collect::<Vec<_>>();
-                details.sort_by(|left, right| left.0.to_ascii_lowercase().cmp(&right.0.to_ascii_lowercase()));
+                details.sort_by(|left, right| {
+                    left.0
+                        .to_ascii_lowercase()
+                        .cmp(&right.0.to_ascii_lowercase())
+                });
                 self.archive_entries = details.iter().map(|(name, _, _)| name.clone()).collect();
                 self.archive_cache
                     .insert(path.clone(), self.archive_entries.clone());
-                self.archive_detail_cache.insert(path.clone(), details.clone());
+                self.archive_detail_cache
+                    .insert(path.clone(), details.clone());
                 self.archive_details = details;
                 self.status = format!(
                     "Indexed {} archive entries from {}.",
@@ -2648,12 +2652,12 @@ impl Architect {
                             screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
                             screen.top() + (1. - clip.y) * 0.5 * screen.height(),
                         );
-                        let score = point.distance(pointer) / Self::source_pick_radius(&object.asset);
+                        let score =
+                            point.distance(pointer) / Self::source_pick_radius(&object.asset);
                         if score <= 1.0
                             && nearest.is_none_or(|(_, best_score, best_depth)| {
                                 score < best_score - 0.025
-                                    || ((score - best_score).abs() <= 0.025
-                                        && clip.z > best_depth)
+                                    || ((score - best_score).abs() <= 0.025 && clip.z > best_depth)
                             })
                         {
                             nearest = Some((index, score, clip.z));
@@ -3095,10 +3099,14 @@ mod tests {
 
     #[test]
     fn source_scene_picking_uses_a_larger_target_for_trees_and_models() {
-        assert!(Architect::source_pick_radius("trees/forest/tree.ecm")
-            > Architect::source_pick_radius("effects/small.gfx"));
-        assert!(Architect::source_pick_radius("models/building.ecm")
-            >= Architect::source_pick_radius("misc/unknown.bin"));
+        assert!(
+            Architect::source_pick_radius("trees/forest/tree.ecm")
+                > Architect::source_pick_radius("effects/small.gfx")
+        );
+        assert!(
+            Architect::source_pick_radius("models/building.ecm")
+                >= Architect::source_pick_radius("misc/unknown.bin")
+        );
     }
 
     #[test]
