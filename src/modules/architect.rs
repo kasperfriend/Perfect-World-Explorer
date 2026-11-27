@@ -2889,6 +2889,7 @@ mod tests {
         );
         editor.marquee_start = Some(egui::pos2(10.0, 20.0));
         editor.marquee_current = Some(egui::pos2(80.0, 90.0));
+        editor.lasso_points = vec![egui::pos2(10.0, 10.0), egui::pos2(20.0, 20.0)];
         editor.object_dragging = true;
         editor.object_drag_axis = Some(1);
         editor.object_drag_start_pointer = Some(egui::pos2(40.0, 50.0));
@@ -2906,6 +2907,7 @@ mod tests {
         assert!(editor.object_drag_snapshot.is_none());
         assert_eq!(editor.marquee_start, None);
         assert_eq!(editor.marquee_current, None);
+        assert!(editor.lasso_points.is_empty());
     }
 
     #[test]
