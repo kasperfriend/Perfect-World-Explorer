@@ -6806,7 +6806,10 @@ mod phase_r1_tests {
                 }
             }
         }
-        assert!(exercised > 0, "the test rays must exercise reflection glow candidates");
+        assert!(
+            exercised > 0,
+            "the test rays must exercise reflection glow candidates"
+        );
     }
 
     #[test]
