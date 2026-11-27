@@ -996,7 +996,13 @@ impl Architect {
     }
 
     fn add_selected_asset_at_camera(&mut self, camera: Vec3) {
+        let position = self.placement_position(camera);
+        self.add_selected_asset_at_position(position);
+    }
+
+    fn add_selected_asset_at_position(&mut self, position: [f32; 3]) {
         let Some(asset) = self.selected_asset.clone() else {
+            self.status = "Choose an ECM asset before placing it.".into();
             return;
         };
         if Self::renderer_asset_path(&asset).is_none() {
@@ -1004,7 +1010,6 @@ impl Architect {
             return;
         }
         let portable_asset = self.portable_asset_path(&asset);
-        let position = self.placement_position(camera);
         self.project.objects.push(PlacedObject {
             asset: portable_asset,
             position,
@@ -1809,7 +1814,7 @@ impl Architect {
             )
         });
         let over_ui = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
-        let hit = if matches!(self.cursor, CursorMode::Sculpt | CursorMode::Select) && !over_ui {
+        let hit = if matches!(self.cursor, CursorMode::Sculpt | CursorMode::Select | CursorMode::Place) && !over_ui {
             pointer.and_then(|position| {
                 self.map.as_ref().and_then(|map| {
                     Self::terrain_hit(position, screen, view_projection, map)
@@ -1819,6 +1824,15 @@ impl Architect {
             None
         };
         self.brush_cursor_position = hit.map(Vec3::to_array);
+        if pressed && self.cursor == CursorMode::Place && !over_ui {
+            if let Some(position) = hit {
+                let mut placement = position.to_array();
+                if self.snap == SnapMode::Off {
+                    placement[1] += 0.5;
+                }
+                self.add_selected_asset_at_position(placement);
+            }
+        }
         // Pick staged project objects directly in the viewport. Their editor
         // transform is independent from the immutable source-scene instances.
         if pressed && self.cursor == CursorMode::Select && !over_ui {
