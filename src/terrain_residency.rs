@@ -199,8 +199,7 @@ impl Residency {
     ) -> Result<Census, String>
     where
         L: Fn(usize, usize) -> (u8, [u8; 4]),
-        B: Fn(usize, usize, u8, [u8; 4]) -> Result<(Vec<Vertex>, I, [f32; 6]), String>
-            + Sync,
+        B: Fn(usize, usize, u8, [u8; 4]) -> Result<(Vec<Vertex>, I, [f32; 6]), String> + Sync,
         I: Into<std::sync::Arc<[u32]>> + Send,
     {
         let mut census = Census::default();
@@ -241,48 +240,42 @@ impl Residency {
                 .min(16);
             if workers > 1 {
                 let chunk_size = stale.len().div_ceil(workers);
-                let built: Vec<(
-                    usize,
-                    usize,
-                    u8,
-                    [u8; 4],
-                    bool,
-                    Vec<Vertex>,
-                    I,
-                    [f32; 6],
-                )> = std::thread::scope(|s| -> Result<_, String> {
-                    let build_ref = &build;
-                    let handles: Vec<_> = stale
-                        .chunks(chunk_size)
-                        .map(|chunk| {
-                            s.spawn(move || {
-                                let mut local = Vec::with_capacity(chunk.len());
-                                for &(x, y, level, cases, was_present) in chunk {
-                                    let (vertices, indices, bounds) = build_ref(x, y, level, cases)
-                                        .map_err(|e| {
-                                            format!("terrain block ({x},{y}) level {level}: {e}")
-                                        })?;
-                                    local.push((
-                                        x,
-                                        y,
-                                        level,
-                                        cases,
-                                        was_present,
-                                        vertices,
-                                        indices,
-                                        bounds,
-                                    ));
-                                }
-                                Ok::<_, String>(local)
+                let built: Vec<(usize, usize, u8, [u8; 4], bool, Vec<Vertex>, I, [f32; 6])> =
+                    std::thread::scope(|s| -> Result<_, String> {
+                        let build_ref = &build;
+                        let handles: Vec<_> = stale
+                            .chunks(chunk_size)
+                            .map(|chunk| {
+                                s.spawn(move || {
+                                    let mut local = Vec::with_capacity(chunk.len());
+                                    for &(x, y, level, cases, was_present) in chunk {
+                                        let (vertices, indices, bounds) =
+                                            build_ref(x, y, level, cases).map_err(|e| {
+                                                format!(
+                                                    "terrain block ({x},{y}) level {level}: {e}"
+                                                )
+                                            })?;
+                                        local.push((
+                                            x,
+                                            y,
+                                            level,
+                                            cases,
+                                            was_present,
+                                            vertices,
+                                            indices,
+                                            bounds,
+                                        ));
+                                    }
+                                    Ok::<_, String>(local)
+                                })
                             })
-                        })
-                        .collect();
-                    let mut out = Vec::with_capacity(stale.len());
-                    for h in handles {
-                        out.extend(h.join().unwrap()?);
-                    }
-                    Ok(out)
-                })?;
+                            .collect();
+                        let mut out = Vec::with_capacity(stale.len());
+                        for h in handles {
+                            out.extend(h.join().unwrap()?);
+                        }
+                        Ok(out)
+                    })?;
                 for (x, y, level, cases, was_present, vertices, indices, bounds) in built {
                     if was_present {
                         census.remeshed += 1;
@@ -623,9 +616,13 @@ mod tests {
         let win = window(0, 0, 1, 1);
         r.update(&win, |_, _| 3, |_, _, _| Ok(block(0.))).unwrap();
         let c = r
-            .update(&win, |_, _| 0, |_, _, _| -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String> {
-                panic!("disabled")
-            })
+            .update(
+                &win,
+                |_, _| 0,
+                |_, _, _| -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String> {
+                    panic!("disabled")
+                },
+            )
             .unwrap();
         assert_eq!(c.resident, 0);
         assert_eq!(c.triangles, 0);
