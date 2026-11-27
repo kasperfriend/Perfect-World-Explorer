@@ -2333,6 +2333,21 @@ mod raywatcher_tree_tests {
     }
 
     #[test]
+    fn authored_leaf_alpha_cutoff_is_strict_while_legacy_cutoff_is_inclusive() {
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([120, 160, 90, 84]));
+        let uv0 = [0.0, 0.0];
+        let uv1 = [1.0, 0.0];
+        let uv2 = [0.0, 1.0];
+        let cutoff = 84.0 / 255.0;
+        let (_, _, strict_hits) =
+            sample_tri_alpha_mask49(&image, uv0, uv1, uv2, cutoff, false);
+        let (_, _, inclusive_hits) =
+            sample_tri_alpha_mask49(&image, uv0, uv1, uv2, cutoff, true);
+        assert_eq!(strict_hits, 0, "authored raster cutoff discards equality");
+        assert_eq!(inclusive_hits, 49, "legacy raster cutoff keeps equality");
+    }
+
+    #[test]
     fn tree_harvest_stops_promptly_when_the_background_scene_is_cancelled() {
         let species = RtTreeSpecies {
             species_id: 1,
