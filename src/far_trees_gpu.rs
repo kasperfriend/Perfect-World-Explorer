@@ -1714,8 +1714,8 @@ impl FarTrees {
 
     pub fn update_resident_lods(
         &mut self,
-        device: &wgpu::Device,
         queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         camera: [f32; 3],
         scale: f32,
         bounds: Option<[f32; 4]>,
@@ -1740,9 +1740,8 @@ impl FarTrees {
         // Zero the per-batch instance counts, keep the static draw spans.
         queue.write_buffer(&self.lod_args, 0, &self.lod_args_reset);
         queue.write_buffer(&self.lod_params, 0, bytemuck::bytes_of(&params));
-        let mut e = device.create_command_encoder(&Default::default());
         {
-            let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("tree lod selection"),
                 timestamp_writes: None,
             });
@@ -1750,7 +1749,9 @@ impl FarTrees {
             pass.set_bind_group(0, &self.lod_bind, &[]);
             pass.dispatch_workgroups(self.placements.div_ceil(64), 1, 1);
         }
-        queue.submit(Some(e.finish()));
+        // The caller records this before the first world draw in the same
+        // frame encoder. This keeps the compute-to-indirect dependency ordered
+        // while avoiding a standalone queue submission for tree LOD selection.
         self.last_resident_update = Some(key);
     }
     /// CPU LOD packing, kept for the checks that place one tree at a distance.
