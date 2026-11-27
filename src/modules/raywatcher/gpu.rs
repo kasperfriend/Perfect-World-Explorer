@@ -3797,6 +3797,7 @@ impl RaywatcherGpu {
         scene: Arc<super::bvh::SceneGeometry>,
         render_extent: (u32, u32),
         grid_extent: (u32, u32),
+        output_format: wgpu::TextureFormat,
     ) -> Self {
         let device_handle = device;
         let device = device_handle.as_ref();
@@ -3831,6 +3832,34 @@ impl RaywatcherGpu {
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
+        // RenderScale's destination can use the adapter's surface format
+        // (commonly BGRA8 sRGB), not Raywatcher's internal RGBA16F format.
+        // Build that exact variant here on the initialization worker so the
+        // first traced frame never creates a render pipeline synchronously.
+        let blit_output_pipeline = (output_format != COLOUR_FORMAT).then(|| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("raywatcher blit output format"),
+                layout: Some(&blit_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &pipelines.blit_module,
+                    entry_point: "vs",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &pipelines.blit_module,
+                    entry_point: "fs",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: output_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            })
+        });
         // The normal RT composite target uses COLOUR_FORMAT too. Compile its
         // PSO alongside the other first-use pipelines on the initialization
         // worker, rather than stalling the render thread on the first frame.
@@ -3861,6 +3890,30 @@ impl RaywatcherGpu {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
+        });
+        let composite_output_pipeline = (output_format != COLOUR_FORMAT).then(|| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("raywatcher composite output format"),
+                layout: Some(&composite_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &pipelines.composite_module,
+                    entry_point: "vs",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &pipelines.composite_module,
+                    entry_point: "fs",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: output_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            })
         });
         let gbuf_prep_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("raywatcher gbuf prep params"),
@@ -4070,9 +4123,21 @@ impl RaywatcherGpu {
             dlss_rr: None,
             dlss_rr_failed: false,
             dlss_rr_error: None,
-            blit_pipeline: vec![(COLOUR_FORMAT, blit_pipeline)],
+            blit_pipeline: {
+                let mut variants = vec![(COLOUR_FORMAT, blit_pipeline)];
+                if let Some(pipeline) = blit_output_pipeline {
+                    variants.push((output_format, pipeline));
+                }
+                variants
+            },
             blit_bind_group,
-            composite_pipeline: vec![(COLOUR_FORMAT, composite_pipeline)],
+            composite_pipeline: {
+                let mut variants = vec![(COLOUR_FORMAT, composite_pipeline)];
+                if let Some(pipeline) = composite_output_pipeline {
+                    variants.push((output_format, pipeline));
+                }
+                variants
+            },
             raster_copy: None,
             screen_raster_tex,
             screen_raster_view,
