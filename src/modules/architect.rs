@@ -3277,6 +3277,15 @@ impl Architect {
         // Draw a clear white 3D wire boundary for every selected project
         // placement. The current scene API exposes placement origins rather
         // than per-instance mesh bounds, so use conservative class-aware extents.
+        let project_outline_point = |point: Vec3| -> Option<egui::Pos2> {
+            let clip = view_projection.project_point3(point);
+            (clip.is_finite() && (0.0..=1.0).contains(&clip.z)).then(|| {
+                egui::pos2(
+                    screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
+                    screen.top() + (1. - clip.y) * 0.5 * screen.height(),
+                )
+            })
+        };
         let mut outline_items = self
             .selected_placements
             .iter()
@@ -3316,7 +3325,7 @@ impl Architect {
                     if bits & 2 == 0 { -half.y } else { half.y },
                     if bits & 4 == 0 { -half.z } else { half.z },
                 );
-                if let Some(projected) = project_point(point) {
+                if let Some(projected) = project_outline_point(point) {
                     corners[bits] = projected;
                     valid[bits] = true;
                 }
