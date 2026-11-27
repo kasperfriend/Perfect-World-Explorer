@@ -7462,8 +7462,6 @@ pub fn run(
                                                     ui.add_space(8.);
                                                     if ui.add_sized([button_width,42.],egui::Button::new(egui::RichText::new("MODULES").size(18.).strong())).clicked(){menu_page=MenuPage::Modules;}
                                                     ui.add_space(8.);
-                                                    if ui.add_sized([button_width,42.],egui::Button::new(egui::RichText::new("ARCHITECT  |  WORLD EDITOR").size(17.).strong()).fill(egui::Color32::from_rgb(38,83,116))).clicked(){renderer.modules.set_architect_active(true);menu_page=MenuPage::Closed;}
-                                                    ui.add_space(8.);
                                                     if ui.add_sized([button_width,40.],egui::Button::new(egui::RichText::new("TELEPORT LIST").size(17.))).clicked(){menu_page=MenuPage::Teleports;}
                                                     ui.add_space(8.);
                                                     if ui.add_sized([button_width,40.],egui::Button::new(egui::RichText::new("WORLD MAP  [M]").size(17.))).clicked(){menu_page=MenuPage::WorldMap;map_refresh=Instant::now()-std::time::Duration::from_secs(10);}
