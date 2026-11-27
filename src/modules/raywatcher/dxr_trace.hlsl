@@ -298,12 +298,26 @@ ShadowResult trace_sun_shadow(float3 origin, float3 dir, float t_min, float t_ma
                     bool has_alpha_mask = (raw_lo | raw_hi) != 0u;
                     if (has_alpha_mask) {
                         Material foliage = material_of(prim);
-                        transmission = 1.0 - saturate(foliage.surface.w);
+                        float depth_atten = exp(-0.55);
+                        float tr = saturate(((1.0 - foliage.surface.w) * 0.44 + 0.12) * depth_atten);
+                        float3 warm_tint = lerp(
+                            float3(0.45, 0.85, 0.35),
+                            float3(1.15, 1.05, 0.55),
+                            depth_atten);
+                        res.transmittance = clamp(
+                            foliage.albedo.rgb * warm_tint,
+                            float3(0.06, 0.08, 0.04),
+                            float3(0.95, 0.95, 0.95)) * tr;
+                    } else {
+                        res.transmittance = float3(0.0, 0.0, 0.0);
                     }
+                } else {
+                    res.transmittance = float3(0.0, 0.0, 0.0);
                 }
+            } else {
+                res.transmittance = float3(0.0, 0.0, 0.0);
             }
-            res.transmittance = float3(transmission, transmission, transmission);
-            res.occluded = transmission < 0.999;
+            res.occluded = any(res.transmittance < float3(0.999, 0.999, 0.999));
         }
         return res;
     }
