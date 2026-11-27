@@ -3754,7 +3754,6 @@ pub struct RaywatcherGpu {
         wgpu::Texture,
         wgpu::TextureView,
         wgpu::BindGroup,
-        wgpu::RenderPipeline,
     )>,
     /// Top-down real textured terrain albedo map (`TERRAIN_MAP_SIZE^2`, `COLOUR_FORMAT`).
     terrain_map_tex: wgpu::Texture,
@@ -3802,6 +3801,36 @@ impl RaywatcherGpu {
         let device_handle = device;
         let device = device_handle.as_ref();
         let pipelines = Pipelines::new(device);
+        // The terrain-map and sky-environment blits both target COLOUR_FORMAT.
+        // Build this shared PSO during renderer construction so neither path
+        // pays pipeline compilation on its first visible frame.
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("raywatcher blit"),
+            bind_group_layouts: &[&pipelines.blit_layout],
+            push_constant_ranges: &[],
+        });
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("raywatcher blit"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &pipelines.blit_module,
+                entry_point: "vs",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &pipelines.blit_module,
+                entry_point: "fs",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: COLOUR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
         let gbuf_prep_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("raywatcher gbuf prep params"),
             size: std::mem::size_of::<GbufPrepParams>() as u64,
@@ -4010,7 +4039,7 @@ impl RaywatcherGpu {
             dlss_rr: None,
             dlss_rr_failed: false,
             dlss_rr_error: None,
-            blit_pipeline: Vec::new(),
+            blit_pipeline: vec![(COLOUR_FORMAT, blit_pipeline)],
             blit_bind_group,
             composite_pipeline: Vec::new(),
             raster_copy: None,
@@ -5595,33 +5624,6 @@ impl RaywatcherGpu {
                 ..Default::default()
             });
             let blit_bg = Self::blit_binding(device, &self.pipelines, &scratch_view);
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("raywatcher sky env blit"),
-                bind_group_layouts: &[&self.pipelines.blit_layout],
-                push_constant_ranges: &[],
-            });
-            let blit_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("raywatcher sky env blit"),
-                layout: Some(&pl),
-                vertex: wgpu::VertexState {
-                    module: &self.pipelines.blit_module,
-                    entry_point: "vs",
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &self.pipelines.blit_module,
-                    entry_point: "fs",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: COLOUR_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-            });
             self.sky_env_scratch = Some((
                 sky_format,
                 scratch_tex,
@@ -5629,7 +5631,6 @@ impl RaywatcherGpu {
                 scratch_depth,
                 scratch_depth_view,
                 blit_bg,
-                blit_pipe,
             ));
         }
 
@@ -5711,9 +5712,11 @@ impl RaywatcherGpu {
                 _,
                 ref scratch_depth_view,
                 ref blit_bg,
-                ref blit_pipe,
             )) = self.sky_env_scratch
             else {
+                return;
+            };
+            let Some((_, blit_pipe)) = self.blit_pipeline.iter().find(|(fmt, _)| *fmt == COLOUR_FORMAT) else {
                 return;
             };
             {
