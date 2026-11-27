@@ -2125,7 +2125,9 @@ impl Architect {
             }
         }
         if self.cursor == CursorMode::Sculpt {
-            if let (Some(position), Some(map)) = (self.brush_cursor_position, self.map.as_ref()) {
+            if let (Some(position), Some(map)) =
+                (self.brush_cursor_position, self.map.as_ref())
+            {
                 let center = Vec3::from_array(position);
                 let mut points = Vec::with_capacity(65);
                 for n in 0..=64 {
