@@ -770,7 +770,10 @@ impl SceneGeometry {
                 for i in 0..count {
                     let tri_index = self.order[(first + i) as usize];
                     let tri = &self.triangles[tri_index as usize];
-                    if intersect_triangle(tri, origin, dir, t_min, t_max).is_some() {
+                    if let Some((_t, bary)) = intersect_triangle(tri, origin, dir, t_min, t_max) {
+                        if !accept_triangle_alpha_mask(tri, bary) {
+                            continue;
+                        }
                         let mat_idx =
                             (tri.material() as usize).min(self.materials.len().saturating_sub(1));
                         let opacity = self
@@ -1118,6 +1121,28 @@ fn partition_sah(
         None
     } else {
         Some(mid)
+    }
+}
+
+/// Match the GPU's 7x7 alpha-cutout lookup for a ray hit's barycentrics.
+fn accept_triangle_alpha_mask(tri: &RayTriangle, bary: [f32; 3]) -> bool {
+    let raw_lo = tri.c[3].to_bits();
+    let raw_hi = tri.normal[3].to_bits();
+    if (raw_lo | raw_hi) == 0 {
+        return true;
+    }
+    let unpack = |raw: u32| (raw & 0x00ff_ffff) | ((raw >> 7) & 0x0100_0000);
+    let lo = unpack(raw_lo);
+    let hi = unpack(raw_hi);
+    let s = bary[1].clamp(0.0, 1.0);
+    let t = (bary[2] / (1.0 - s).max(1e-4)).clamp(0.0, 1.0);
+    let x = ((s * 7.0) as usize).min(6);
+    let y = ((t * 7.0) as usize).min(6);
+    let bit = y * 7 + x;
+    if bit < 25 {
+        ((lo >> bit) & 1) != 0
+    } else {
+        ((hi >> (bit - 25)) & 1) != 0
     }
 }
 
