@@ -60,6 +60,14 @@ pub struct RayParams {
     pub point_lights_pos_rad: [[f32; 4]; 128],
     /// Matching light colours: `rgb` colour, `w` intensity.
     pub point_lights_col_int: [[f32; 4]; 128],
+    /// Conservative world-space point-light BVH metadata and nodes. Leaf nodes
+    /// reference ranges in point_light_order; internal nodes use left=index+1
+    /// and max.w=right-child, matching the scene BVH encoding.
+    pub point_light_bvh_meta: [f32; 4],
+    pub point_light_bvh_min: [[f32; 4]; 63],
+    pub point_light_bvh_max: [[f32; 4]; 63],
+    /// Four original light indices per vec4, avoiding uniform-array scalar stride.
+    pub point_light_order: [[u32; 4]; 32],
     /// Top-down real textured terrain albedo map bounds: `[min_x, max_z, inv_diameter, valid]`.
     pub terrain_map_bounds: [f32; 4],
     /// Previous frame's view-projection matrix, used to reproject GI reservoirs.
@@ -103,6 +111,78 @@ pub fn compute_scene_albedo_gain(
     // while preserving full night texture recovery under point lights.
     let day_t = ((sun_luma - 0.18) / 0.22).clamp(0.0, 1.0);
     raw_gain * (1.0 - day_t) + 1.0 * day_t
+}
+
+
+/// Build a conservative world-space BVH over active point-light influence
+/// spheres. Each node bounds the full radius cube of every descendant light,
+/// so point queries can prune whole subtrees without dropping any contribution.
+fn build_point_light_bvh(
+    positions: &[[f32; 4]; MAX_RAY_LIGHTS],
+    count: usize,
+) -> (Vec<BvhNode>, Vec<u32>) {
+    fn build(
+        indices: &mut [u32],
+        positions: &[[f32; 4]; MAX_RAY_LIGHTS],
+        nodes: &mut Vec<BvhNode>,
+        order: &mut Vec<u32>,
+    ) -> u32 {
+        let mut minimum = Vec3::splat(f32::INFINITY);
+        let mut maximum = Vec3::splat(f32::NEG_INFINITY);
+        for &index in indices.iter() {
+            let light = positions[index as usize];
+            let center = Vec3::new(light[0], light[1], light[2]);
+            let radius = Vec3::splat(light[3].max(0.0));
+            minimum = minimum.min(center - radius);
+            maximum = maximum.max(center + radius);
+        }
+        let node_index = nodes.len() as u32;
+        nodes.push(BvhNode {
+            min: [minimum.x, minimum.y, minimum.z, -1.0],
+            max: [maximum.x, maximum.y, maximum.z, 0.0],
+        });
+        if indices.len() <= 4 {
+            let first = order.len() as u32;
+            order.extend_from_slice(indices);
+            nodes[node_index as usize] = BvhNode {
+                min: [minimum.x, minimum.y, minimum.z, indices.len() as f32],
+                max: [maximum.x, maximum.y, maximum.z, first as f32],
+            };
+            return node_index;
+        }
+
+        let extent = maximum - minimum;
+        let mut axis = 0usize;
+        if extent.y > extent.x {
+            axis = 1;
+        }
+        if extent.z > extent[axis] {
+            axis = 2;
+        }
+        let midpoint = indices.len() / 2;
+        indices.select_nth_unstable_by(midpoint, |&left, &right| {
+            positions[left as usize][axis]
+                .partial_cmp(&positions[right as usize][axis])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let (left, right) = indices.split_at_mut(midpoint);
+        build(left, positions, nodes, order);
+        let right_child = build(right, positions, nodes, order);
+        nodes[node_index as usize] = BvhNode {
+            min: [minimum.x, minimum.y, minimum.z, -1.0],
+            max: [maximum.x, maximum.y, maximum.z, right_child as f32],
+        };
+        node_index
+    }
+
+    if count == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut indices: Vec<u32> = (0..count.min(MAX_RAY_LIGHTS) as u32).collect();
+    let mut nodes = Vec::with_capacity(63);
+    let mut order = Vec::with_capacity(indices.len());
+    build(&mut indices, positions, &mut nodes, &mut order);
+    (nodes, order)
 }
 
 impl RayParams {
@@ -169,6 +249,17 @@ impl RayParams {
             pl_col_int[pl_count] = [l.colour.x, l.colour.y, l.colour.z, l.intensity.max(0.0)];
             pl_count += 1;
         }
+        let (light_bvh_nodes, light_bvh_order) = build_point_light_bvh(&pl_pos_rad, pl_count);
+        let mut light_bvh_min = [[0.0f32; 4]; 63];
+        let mut light_bvh_max = [[0.0f32; 4]; 63];
+        let mut light_order = [[0u32; 4]; 32];
+        for (i, node) in light_bvh_nodes.iter().enumerate() {
+            light_bvh_min[i] = node.min;
+            light_bvh_max[i] = node.max;
+        }
+        for (i, &light_index) in light_bvh_order.iter().enumerate() {
+            light_order[i / 4][i % 4] = light_index;
+        }
         Self {
             inv_view_projection: params.inv_view_projection.to_cols_array_2d(),
             view_projection: params.view_projection.to_cols_array_2d(),
@@ -224,6 +315,10 @@ impl RayParams {
             ],
             point_lights_pos_rad: pl_pos_rad,
             point_lights_col_int: pl_col_int,
+            point_light_bvh_meta: [light_bvh_nodes.len() as f32, 0.0, 0.0, 0.0],
+            point_light_bvh_min: light_bvh_min,
+            point_light_bvh_max: light_bvh_max,
+            point_light_order: light_order,
             terrain_map_bounds: [0.0; 4],
             prev_view_projection: [[0.0; 4]; 4],
             restir: [
