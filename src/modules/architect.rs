@@ -101,6 +101,10 @@ pub struct Architect {
     brush_strength: f32,
     flatten_height: f32,
     selected_asset: Option<String>,
+    hovered_asset: Option<String>,
+    preview_assets: crate::modules::librarian::archive::LibrarianAssets,
+    preview: Option<crate::modules::librarian::preview3d::Preview>,
+    preview_message: String,
     selected_archive: Option<PathBuf>,
     archive_entries: Vec<String>,
     archive_error: Option<String>,
@@ -167,6 +171,7 @@ impl Architect {
             .join("Architect")
             .join("Worlds");
         let client_root = element.parent().unwrap_or(&element).to_path_buf();
+        let preview_assets = crate::modules::librarian::archive::LibrarianAssets::open(&client_root);
         let mut editor = Self {
             enabled: false,
             client_root,
@@ -188,6 +193,10 @@ impl Architect {
             brush_strength: 2.,
             flatten_height: 0.,
             selected_asset: None,
+            hovered_asset: None,
+            preview_assets,
+            preview: None,
+            preview_message: "Hover or select an ECM/SMD model to preview it.".into(),
             selected_archive: None,
             archive_entries: Vec::new(),
             archive_error: None,
@@ -970,6 +979,40 @@ impl Architect {
             });
     }
 
+    fn preview_path_for_asset(&self, asset: &str) -> Result<String, String> {
+        let portable = self.portable_asset_path(asset);
+        let path = if let Some((archive, entry)) = portable.split_once("::") {
+            let archive_name = Path::new(archive).file_name().map(|name| name.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            let entry = crate::ecmodel::normalize(entry);
+            match (archive_name.as_str(), entry.as_str()) {
+                ("models.pck", value) if value.starts_with("models/") && value.ends_with(".ecm") => value.to_owned(),
+                ("gfx.pck", value) if value.ends_with(".smd") => if value.starts_with("gfx/") { value.to_owned() } else { format!("gfx/{value}") },
+                _ => return Err("This archive entry is not a supported preview model. ECM models from models.pck and static SMD models from gfx.pck are supported.".into()),
+            }
+        } else {
+            crate::ecmodel::normalize(&portable)
+        };
+        let supported = (path.starts_with("models/") && path.ends_with(".ecm"))
+            || (path.starts_with("gfx/") && path.ends_with(".smd"));
+        if supported { Ok(path) } else { Err("Preview supports ECM models in models.pck and static SMD models in gfx.pck. Other files are resources, textures or effect definitions, not directly placeable meshes.".into()) }
+    }
+
+    pub fn prepare_preview(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut egui_wgpu::Renderer, format: wgpu::TextureFormat) {
+        let asset = self.hovered_asset.as_deref().or(self.selected_asset.as_deref());
+        let Some(asset) = asset else {
+            self.preview_message = "Hover or select an ECM/SMD model to preview it.".into();
+            return;
+        };
+        match self.preview_path_for_asset(asset) {
+            Ok(path) => {
+                let preview = self.preview.get_or_insert_with(|| crate::modules::librarian::preview3d::Preview::new(device, renderer, format));
+                preview.update(device, queue, format, &mut self.preview_assets, &path, None, false);
+                self.preview_message.clear();
+            }
+            Err(message) => self.preview_message = message,
+        }
+    }
+
     fn show_tree(&mut self, ui: &mut egui::Ui, path: &Path, depth: usize, camera: Vec3) {
         if depth > 12 {
             return;
@@ -1027,6 +1070,9 @@ impl Architect {
                     self.selected_asset.as_deref() == Some(child.to_string_lossy().as_ref()),
                     format!("📄 {label}"),
                 );
+                if response.hovered() {
+                    self.hovered_asset = Some(child.to_string_lossy().into_owned());
+                }
                 if response.clicked() {
                     if child
                         .extension()
@@ -1091,29 +1137,21 @@ impl Architect {
     }
 
     fn renderer_asset_path(asset: &str) -> Option<String> {
-        let path = if let Some((archive, entry)) = asset.split_once("::") {
-            let archive_name = Path::new(archive)
-                .file_name()
-                .map(|name| name.to_string_lossy());
-            if !archive_name.is_some_and(|name| name.eq_ignore_ascii_case("models.pck")) {
-                return None;
-            }
-            entry
+        let (archive, path) = if let Some((archive, entry)) = asset.split_once("::") {
+            (Some(archive), entry)
         } else {
-            asset
+            (None, asset)
         };
         let normalized = crate::ecmodel::normalize(path);
-        // PCK entry names are untrusted archive data. Normalize canonicalizes
-        // separators and case, but intentionally does not resolve dot segments;
-        // reject traversal before handing a path to the archive-backed reader.
-        let safe_segments = normalized
-            .split('/')
-            .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
-        (safe_segments
-            && normalized.starts_with("models/")
-            && normalized.ends_with(".ecm")
-            && !normalized.contains(':'))
-        .then_some(normalized)
+        let archive_name = archive.and_then(|archive| Path::new(archive).file_name()).map(|name| name.to_string_lossy().to_ascii_lowercase());
+        let valid_model = normalized.starts_with("models/") && normalized.ends_with(".ecm")
+            && archive_name.as_deref().is_none_or(|name| name == "models.pck");
+        let valid_static_gfx = normalized.ends_with(".smd")
+            && (normalized.starts_with("gfx/") || archive_name.as_deref() == Some("gfx.pck"))
+            && archive_name.as_deref().is_none_or(|name| name == "gfx.pck");
+        let normalized = if valid_static_gfx && !normalized.starts_with("gfx/") { format!("gfx/{normalized}") } else { normalized };
+        let safe_segments = normalized.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..") && !normalized.contains(':');
+        (safe_segments && (valid_model || valid_static_gfx)).then_some(normalized)
     }
 
     /// Current project's supported ECM placements, for the native GPU model
@@ -1161,7 +1199,7 @@ impl Architect {
             return;
         };
         if Self::renderer_asset_path(&asset).is_none() {
-            self.status = "Only ECM model entries from models.pck can currently be instantiated in the live viewport. Other client assets can still be pinned.".into();
+            self.status = "This file is indexed but not yet placeable. Placeable assets: ECM models from models.pck and static SMD models from gfx.pck; other files remain browseable.".into();
             return;
         }
         let portable_asset = self.portable_asset_path(&asset);
@@ -1645,6 +1683,7 @@ impl Architect {
                         self.archive_entries.clear();
                     }
                 });
+                self.hovered_asset = None;
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                     self.show_tree(ui, &self.client_root.clone(), 0, camera);
                 });
@@ -1665,7 +1704,8 @@ impl Architect {
                                     continue;
                                 }
                                 let label = Path::new(entry).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| entry.clone());
-                                let response = ui.selectable_label(false, format!("📦 {label}"));
+                                let response = ui.selectable_label(self.selected_asset.as_deref() == Some(format!("{}::{}", archive.display(), entry).as_str()), format!("📦 {label}"));
+                                if response.hovered() { self.hovered_asset = Some(format!("{}::{}", archive.display(), entry)); }
                                 if response.clicked() {
                                     self.selected_asset = Some(format!("{}::{}", archive.display(), entry));
                                     if self.cursor == CursorMode::Place { self.add_selected_asset_at_camera(camera); }
@@ -1684,11 +1724,38 @@ impl Architect {
                     ui.separator();
                     ui.label(egui::RichText::new(&asset).small().strong());
                     if ui.button("Add to quick bar").clicked() { self.pin(asset.clone()); }
-                    if ui.button("Record placement at camera").clicked() {
+                    if ui.button("Place at camera").clicked() {
                         self.add_selected_asset_at_camera(camera);
+                    }
+                    if let Some(message) = self.preview_message.strip_prefix("Preview supports") {
+                        ui.label(egui::RichText::new(format!("Preview supports{message}")).small().weak());
                     }
                 }
             });
+
+        if self.selected_asset.is_some() || self.hovered_asset.is_some() {
+            egui::Window::new("Asset preview")
+                .id(egui::Id::new("architect_asset_preview"))
+                .default_pos(egui::pos2((screen.width() - 330.).max(12.), (screen.height() - 330.).max(60.)))
+                .default_size(egui::vec2(320., 340.))
+                .resizable(true)
+                .show(ctx, |ui| {
+                    let label = self.hovered_asset.as_deref().or(self.selected_asset.as_deref()).unwrap_or("");
+                    ui.label(egui::RichText::new(label).small().strong());
+                    if let Some(preview) = &self.preview {
+                        preview.show(ui, egui::vec2(ui.available_width().min(280.), ui.available_width().min(280.)));
+                    } else {
+                        ui.label(egui::RichText::new(&self.preview_message).weak());
+                    }
+                    if !self.preview_message.is_empty() {
+                        ui.label(egui::RichText::new(&self.preview_message).small().weak());
+                    }
+                    if ui.button("Select this asset").clicked() {
+                        if let Some(asset) = self.hovered_asset.clone() { self.selected_asset = Some(asset); }
+                    }
+                    if ui.button("Place selected asset").clicked() { self.add_selected_asset_at_camera(camera); }
+                });
+        }
 
         egui::Window::new("Scene objects")
             .id(egui::Id::new("architect_scene_panel"))
@@ -3109,6 +3176,10 @@ mod tests {
             brush_strength: 2.,
             flatten_height: 0.,
             selected_asset: None,
+            hovered_asset: None,
+            preview_assets: crate::modules::librarian::archive::LibrarianAssets::open(Path::new("/client")),
+            preview: None,
+            preview_message: String::new(),
             selected_archive: None,
             archive_entries: Vec::new(),
             archive_error: None,
