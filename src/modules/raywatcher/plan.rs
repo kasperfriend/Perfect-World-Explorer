@@ -578,7 +578,7 @@ impl Plan {
             grid: ((render.0 / ray_scale).max(1), (render.1 / ray_scale).max(1)),
             render,
             replace_raster: settings.replace_raster,
-            point_light_shadows: true,
+            point_light_shadows: settings.point_light_shadows,
             debug_view: settings.debug_view,
         }
     }
@@ -745,6 +745,18 @@ mod tests {
         assert_eq!(Plan::decide(&s, (1920, 1080), false, |_| true), Plan::OFF);
         s.mode = RayTracingMode::Software;
         assert!(Plan::decide(&s, (1920, 1080), false, |_| true).trace);
+    }
+
+    #[test]
+    fn point_light_shadow_setting_is_respected_by_the_frame_plan() {
+        let mut s = settings();
+        s.mode = RayTracingMode::Software;
+        s.point_light_shadows = false;
+        let plan = Plan::decide(&s, (1920, 1080), false, |_| true);
+        assert!(!plan.point_light_shadows);
+        s.point_light_shadows = true;
+        let plan = Plan::decide(&s, (1920, 1080), false, |_| true);
+        assert!(plan.point_light_shadows);
     }
 
     #[test]
