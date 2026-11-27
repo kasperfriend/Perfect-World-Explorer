@@ -923,8 +923,6 @@ impl<'a> BuildState<'a> {
     }
 }
 
-
-
 /// Build one independent subtree at the depth below the two synthetic
 /// top-level grouping nodes used by the four-way parallel builder.
 fn build_parallel_partition<'a>(
