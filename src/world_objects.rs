@@ -3093,6 +3093,59 @@ mod page_tests {
         assert_eq!(page.slots.len(), 1);
     }
     #[test]
+    fn page_bounds_use_recorded_mesh_vertex_ranges() {
+        let vertex = |pos, kind| Vertex {
+            pos,
+            normal: [0., 1., 0.],
+            uv: [0., 0.],
+            color: [0.; 4],
+            kind,
+            diffuse: 0xffff_ffff,
+            night_diffuse: 0xffff_ffff,
+        };
+        let page = Page {
+            vertices: vec![
+                vertex([-12., 3., 7.], 2.02),
+                vertex([4., -5., 9.], 2.02),
+                vertex([8., 6., -2.], 2.02),
+            ],
+            // The mesh's referenced index range is deliberately tiny; the
+            // builder's vertex range is authoritative and conservative.
+            indices: vec![1],
+            atlas: Vec::new(),
+            shared_atlas: Some(0),
+            processed: 0,
+            used_height: 128,
+            mips: Vec::new(),
+            placements: vec![PlacementRange {
+                start: 0,
+                end: 1,
+                vertex_start: 0,
+                vertex_end: 3,
+                export_id: 1,
+                order: 0,
+                visibility: Visibility {
+                    reflect: true,
+                    refract: true,
+                },
+            }],
+            bounds: Vec::new(),
+            page_min: [f32::INFINITY; 3],
+            page_max: [f32::NEG_INFINITY; 3],
+            page_has_sdr: false,
+        }
+        .finish();
+
+        assert_eq!(page.bounds.len(), 1);
+        assert_eq!(page.bounds[0].min, [-12., -5., -2.]);
+        assert_eq!(page.bounds[0].max, [8., 6., 9.]);
+        assert!(page.bounds[0].has_sdr);
+        assert!(page.page_has_sdr);
+        assert_eq!(page.page_min, page.bounds[0].min);
+        assert_eq!(page.page_max, page.bounds[0].max);
+    }
+
+    #[test]
     fn trim_scales_y_and_builds_independent_mips() {
         let vertex = Vertex {
             pos: [0.; 3],
