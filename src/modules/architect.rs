@@ -1780,8 +1780,18 @@ impl Architect {
                         self.redo_objects();
                     }
                 });
-                ui.label(format!("{} stored brush operations · {} stored placements", self.project.strokes.len(), self.project.objects.len()));
-                ui.label(egui::RichText::new("Brush edits update the shared terrain, navigation and rendered mesh. Paint remains unavailable.").small().weak());
+                ui.label(format!(
+                    "{} stored brush operations · {} stored placements",
+                    self.project.strokes.len(),
+                    self.project.objects.len()
+                ));
+                ui.label(
+                    egui::RichText::new(
+                        "Brush edits update the shared terrain, navigation and rendered mesh. Paint remains unavailable.",
+                    )
+                    .small()
+                    .weak(),
+                );
             });
 
         egui::TopBottomPanel::bottom("architect_quick_bar")
@@ -1827,8 +1837,24 @@ impl Architect {
         if pressed && self.cursor == CursorMode::Place && !over_ui {
             if let Some(position) = hit {
                 let mut placement = position.to_array();
-                if self.snap == SnapMode::Off {
-                    placement[1] += 0.5;
+                match self.snap {
+                    SnapMode::Off | SnapMode::Terrain => {
+                        if let Some(map) = &self.map {
+                            placement[1] = map.ground(placement[0], placement[2]) + 0.5;
+                        }
+                    }
+                    SnapMode::Objects => {
+                        if let Some(selected) = self.selected_scene_transform {
+                            placement = selected;
+                        }
+                    }
+                    SnapMode::Smart => {
+                        if let Some(selected) = self.selected_scene_transform {
+                            placement = selected;
+                        } else if let Some(map) = &self.map {
+                            placement[1] = map.ground(placement[0], placement[2]) + 0.5;
+                        }
+                    }
                 }
                 self.add_selected_asset_at_position(placement);
             }
@@ -1850,7 +1876,9 @@ impl Architect {
                         })
                     };
                     if let Some(center) = project_point(origin) {
-                        for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                        for (axis_index, axis) in
+                            [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate()
+                        {
                             if project_point(origin + axis * 24.)
                                 .is_some_and(|end| end.distance(pointer) <= 12.)
                             {
@@ -1906,7 +1934,9 @@ impl Architect {
                             }
                         }
                         Some(1) => {
-                            if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer) {
+                            if let (Some(start), Some(current)) =
+                                (self.object_drag_start_pointer, pointer)
+                            {
                                 object.position[1] =
                                     self.object_drag_start_position[1] - (current.y - start.y) * 0.1;
                             }
@@ -1989,7 +2019,10 @@ impl Architect {
             self.brush_dragging = false;
             self.last_brush_position = None;
         }
-        if let Some(index) = self.selected_placement.filter(|index| *index < self.project.objects.len()) {
+        if let Some(index) = self
+            .selected_placement
+            .filter(|index| *index < self.project.objects.len())
+        {
             let object = &self.project.objects[index];
             let origin = Vec3::from_array(object.position);
             let project_point = |point: Vec3| -> Option<egui::Pos2> {
