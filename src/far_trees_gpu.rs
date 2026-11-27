@@ -292,8 +292,20 @@ fn speedtree_leaf_corner(corner: [f32; 3], view_direction: glam::Vec3, rho: f32)
 }
 
 #[inline]
+fn raster_alpha_cutoff(authored_mips: bool, authored_reference: Option<f32>) -> f32 {
+    if authored_mips {
+        authored_reference
+            .filter(|reference| reference.is_finite() && *reference >= 0.0)
+            .map(|reference| (reference / 255.0).clamp(0.0, 1.0))
+            .unwrap_or(0.5)
+    } else {
+        0.5
+    }
+}
+
+#[inline]
 fn leaf_alpha_cutoff(authored_mips: bool) -> f32 {
-    if authored_mips { 84.0 / 255.0 } else { 0.5 }
+    raster_alpha_cutoff(authored_mips, Some(84.0))
 }
 
 #[inline]
@@ -831,17 +843,10 @@ impl FarTrees {
                             }
                             let norm = cross.normalize();
                             if is_foliage {
-                                let frond_cutoff = lod
-                                    .frond_alpha_ref
-                                    .filter(|r| *r > 1.0)
-                                    .map(|r| (r / 255.0).clamp(0.30, 0.62))
-                                    .unwrap_or(0.46);
-                                let (mut mask, mut albedo, mut hits) =
+                                let frond_cutoff =
+                                    raster_alpha_cutoff(authored_mips, lod.frond_alpha_ref);
+                                let (mask, albedo, hits) =
                                     sample_tri_alpha_mask49(img, v0.uv, v1.uv, v2.uv, frond_cutoff);
-                                if hits == 0 && frond_cutoff > 0.36 {
-                                    (mask, albedo, hits) =
-                                        sample_tri_alpha_mask49(img, v0.uv, v1.uv, v2.uv, 0.34);
-                                }
                                 if hits == 0 {
                                     ldiag.frond_skipped += 1;
                                     continue;
@@ -894,36 +899,20 @@ impl FarTrees {
                         // for both triangles of this SpeedTree leaf card so shadows and reflections
                         // reproduce real individual leaves instead of flat boxy quads/diamonds.
                         let leaf_cutoff = leaf_alpha_cutoff(authored_mips);
-                        let (mut m0, mut a0, mut h0) = sample_tri_alpha_mask49(
+                        let (m0, a0, h0) = sample_tri_alpha_mask49(
                             &tree.composite,
                             leaf.uv[0],
                             leaf.uv[1],
                             leaf.uv[2],
                             leaf_cutoff,
                         );
-                        let (mut m1, mut a1, mut h1) = sample_tri_alpha_mask49(
+                        let (m1, a1, h1) = sample_tri_alpha_mask49(
                             &tree.composite,
                             leaf.uv[0],
                             leaf.uv[2],
                             leaf.uv[3],
                             leaf_cutoff,
                         );
-                        if h0 + h1 == 0 {
-                            (m0, a0, h0) = sample_tri_alpha_mask49(
-                                &tree.composite,
-                                leaf.uv[0],
-                                leaf.uv[1],
-                                leaf.uv[2],
-                                0.34,
-                            );
-                            (m1, a1, h1) = sample_tri_alpha_mask49(
-                                &tree.composite,
-                                leaf.uv[0],
-                                leaf.uv[2],
-                                leaf.uv[3],
-                                0.34,
-                            );
-                        }
                         if h0 + h1 == 0 {
                             ldiag.leaves_skipped += 1;
                             continue;
