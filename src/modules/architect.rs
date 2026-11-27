@@ -1284,9 +1284,7 @@ impl Architect {
     }
 
     fn renderer_tree_type(&self, asset: &str) -> Option<usize> {
-        let candidate = asset
-            .split_once("::")
-            .map_or(asset, |(_, entry)| entry);
+        let candidate = asset.split_once("::").map_or(asset, |(_, entry)| entry);
         let candidate = crate::ecmodel::normalize(candidate);
         self.tree_types.iter().position(|tree| {
             let path = crate::ecmodel::normalize(&tree.tree);
