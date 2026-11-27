@@ -292,6 +292,11 @@ fn speedtree_leaf_corner(corner: [f32; 3], view_direction: glam::Vec3, rho: f32)
 }
 
 #[inline]
+fn leaf_alpha_cutoff(authored_mips: bool) -> f32 {
+    if authored_mips { 84.0 / 255.0 } else { 0.5 }
+}
+
+#[inline]
 fn foliage_opacity(hits: u32) -> f32 {
     if hits >= 49 {
         // A fully covered 7x7 mask is encoded as unmasked; it must therefore be fully opaque too.
@@ -888,7 +893,7 @@ impl FarTrees {
                         // Sample exact 7x7 (49-bit) alpha cutout silhouettes from `tree.composite`
                         // for both triangles of this SpeedTree leaf card so shadows and reflections
                         // reproduce real individual leaves instead of flat boxy quads/diamonds.
-                        let leaf_cutoff = 0.48f32;
+                        let leaf_cutoff = leaf_alpha_cutoff(authored_mips);
                         let (mut m0, mut a0, mut h0) = sample_tri_alpha_mask49(
                             &tree.composite,
                             leaf.uv[0],
@@ -2174,6 +2179,12 @@ pub fn harvest_rt_tree_species_cancellable(
 #[cfg(test)]
 mod raywatcher_tree_tests {
     use super::*;
+
+    #[test]
+    fn rt_leaf_alpha_cutoff_matches_the_raster_shader_reference() {
+        assert!((leaf_alpha_cutoff(false) - 0.5).abs() < f32::EPSILON);
+        assert!((leaf_alpha_cutoff(true) - 84.0 / 255.0).abs() < f32::EPSILON);
+    }
 
     #[test]
     fn tree_harvest_stops_promptly_when_the_background_scene_is_cancelled() {
