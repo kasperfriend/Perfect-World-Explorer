@@ -1420,7 +1420,7 @@ impl World {
             if !slot.visible {
                 continue;
             }
-            if let Some(draw) = &mut slot.draw {
+            if let Some(draw) = &slot.draw {
                 draw.draw_opaque(pass);
             }
         }
@@ -1568,7 +1568,7 @@ fn draw_one(
         f.point_position = point.position;
         f.attenuation = point.stored_attenuation;
     }
-    if let Some(draw) = &slot.draw {
+    if let Some(draw) = &mut slot.draw {
         if slot.geometry_dirty || slot.vertex_fog != Some(f.vertex_fog) {
             draw.update_posed(queue, asset, &posed.meshes, f)?;
             slot.geometry_dirty = false;
