@@ -6120,7 +6120,10 @@ mod software_bvh_stack_tests {
         const STACK_SIZE: usize = super::super::bvh::MAX_DEPTH as usize + 2;
         assert_eq!(STACK_SIZE, 42);
         assert_eq!(RAY_SHADER.matches("var stack: array<u32, 42>;").count(), 2);
-        assert!(!RAY_SHADER.contains("sp < 42u"), "depth-bounded stack pushes must not branch on a redundant capacity check");
+        assert!(
+            !RAY_SHADER.contains("sp < 42u"),
+            "depth-bounded stack pushes must not branch on a redundant capacity check"
+        );
     }
 }
 
