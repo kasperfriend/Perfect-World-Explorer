@@ -317,6 +317,44 @@ impl World {
             return;
         }
 
+        // During a transform drag the asset set is unchanged. Update only the
+        // lightweight placement matrices and scene records: rebuilding slots
+        // here would discard draw objects and reinitialize animation playback
+        // on every mouse movement, even though the model geometry did not move.
+        let editor_instances = self.assets.instances.len().saturating_sub(self.native_instance_count);
+        let editor_slots = self.slots.len().saturating_sub(self.native_instance_count);
+        if placements.len() == editor_instances && placements.len() == editor_slots {
+            let updates = placements
+                .iter()
+                .enumerate()
+                .map(|(index, placement)| {
+                    let path = crate::ecmodel::normalize(&placement.path);
+                    if !path.ends_with(".ecm")
+                        || self.assets.instances[self.native_instance_count + index]
+                            .placement
+                            .path
+                            != path
+                    {
+                        return None;
+                    }
+                    editor_scene_transform(
+                        placement,
+                        u32::try_from(index).unwrap_or(u32::MAX),
+                    )
+                    .ok()
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(updates) = updates {
+                for (index, (scene_placement, transform)) in updates.into_iter().enumerate() {
+                    let slot_index = self.native_instance_count + index;
+                    self.assets.instances[slot_index].placement = scene_placement;
+                    self.slots[slot_index].transform = Ok(transform);
+                }
+                self.editor_placements = placements.to_vec();
+                return;
+            }
+        }
+
         self.assets.instances.truncate(self.native_instance_count);
         self.slots.truncate(self.native_instance_count);
         self.alpha
