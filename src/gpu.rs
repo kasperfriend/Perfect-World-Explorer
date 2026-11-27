@@ -3807,7 +3807,6 @@ impl Renderer {
         &mut self,
         render_extent: (u32, u32),
         reset_history: bool,
-        camera: &Camera,
     ) -> crate::modules::raywatcher::frame::RasterOverrides {
         use crate::modules::raywatcher::frame::RasterOverrides;
         let (availability, sdk_probe_pending) = {
@@ -3930,49 +3929,18 @@ impl Renderer {
         // pixels are produced afterwards. Keep every original raster term until
         // a complete RT frame from the previous iteration exists. That closes
         // the one-frame hole during first-use initialization and scene/AS swaps.
-        // Predict the scene/AS work that raywatcher_record will discover
-        // after the raster pass. If the camera anchor or world content already
-        // requires a harvest, do not disable raster effects on this frame.
-        let settings = self.modules.raywatcher().settings();
-        let view_distance = if settings.ray_length > 0.0 {
-            settings
-                .ray_length
-                .clamp(128.0, crate::modules::raywatcher::plan::MAX_RAY_LENGTH)
-        } else {
-            crate::modules::raywatcher::plan::DEFAULT_RAY_LENGTH
-        };
+        // Decide raster replacement from the backend that can dispatch now,
+        // not merely from a stale previous-frame-ready bit. An active DXR
+        // tracer remains usable while its replacement scene builds; first-use
+        // initialization and missing software BVHs keep the raster path on.
         let hardware_mode = self.modules.raywatcher().effective_mode()
             == crate::modules::raywatcher::plan::RayTracingMode::Hardware;
-        let hardware_failed = self
-            .raywatcher_gpu
-            .as_ref()
-            .is_some_and(|gpu| gpu.hardware_failed());
-        let skip_cpu_bvh = hardware_mode && !hardware_failed;
-        let active_pages_len = if self.world_done {
-            self.world_pages.len() as u64
-        } else {
-            self.local_pages.len() as u64
-        };
-        let content_hash = (active_pages_len << 16)
-            ^ (self.water_batches.len() as u64)
-            ^ (u64::from(skip_cpu_bvh) << 61)
-            ^ (u64::from(self.world_done) << 62);
-        let scene_rebuild_expected = self.raywatcher_harvest.needs_frustum_rebuild(
-            crate::modules::raywatcher::harvest::HarvestConfig::default(),
-            camera.pos,
-            view_distance,
-            0,
-            content_hash,
-        );
         let rt_output_ready = !reset_history
-            && !scene_rebuild_expected
-            && !self.raywatcher_harvest.is_building_in_background()
             && self.raywatcher_gpu.as_ref().is_some_and(|gpu| {
-                gpu.render_extent() == render_extent && gpu.can_replace_raster_effects()
+                gpu.render_extent() == render_extent
+                    && gpu.can_replace_raster_effects()
+                    && gpu.can_trace_this_frame(hardware_mode)
             });
-        // The active tracer continues producing fresh frames while a new
-        // scene/AS is prepared. Keep the replacement decision stable across
-        // CPU harvest completion so raster effects do not flicker at the swap.
         RasterOverrides::for_plan_when_ready(&plan, rt_output_ready)
     }
 
@@ -8507,7 +8475,7 @@ pub fn run(
                                 .raywatcher_mut()
                                 .sync_sdk_dir(&settings.upscale_sdk_dir);
                             let ray_overrides = renderer
-                                .raywatcher_plan(world_extent, camera_jumped, &camera);
+                                .raywatcher_plan(world_extent, camera_jumped);
                             renderer.raywatcher_overrides = ray_overrides;
                             renderer.render(
                                 &world_view,
