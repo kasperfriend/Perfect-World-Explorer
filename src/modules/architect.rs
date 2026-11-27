@@ -1742,9 +1742,6 @@ impl Architect {
                     if ui.button("Place at camera").clicked() {
                         self.add_selected_asset_at_camera(camera);
                     }
-                    if let Some(message) = self.preview_message.strip_prefix("Preview supports") {
-                        ui.label(egui::RichText::new(format!("Preview supports{message}")).small().weak());
-                    }
                 }
             });
 
