@@ -541,10 +541,15 @@ impl Draw {
             return Err("model pass blending changed; rebuild its pipeline".into());
         }
         let original = asset.descriptor.render_settings().original_color;
-        let mut updates = Vec::with_capacity(self.meshes.len());
+        // Validate every retained mesh and build all per-mesh constants before
+        // the first queue write. Keep only the small constants here; staging all
+        // converted vertices for every mesh at once caused a burst of temporary
+        // allocations proportional to the entire animated model.
+        let mut params_by_mesh = Vec::with_capacity(self.meshes.len());
         for (index, gpu) in self.meshes.iter().enumerate() {
             let Some(gpu) = gpu else {
                 // A hidden queue mesh keeps its buffers untouched.
+                params_by_mesh.push(None);
                 continue;
             };
             let pose = self
@@ -571,28 +576,40 @@ impl Draw {
                 asset.mesh_color(pose.skin, pose.mesh, original)
             };
             let diffuse_alpha_only = asset.diffuse_alpha_meshes.contains(&gpu.key);
-            let params = frame.params(
+            params_by_mesh.push(Some(frame.params(
                 material,
                 color,
                 diffuse_alpha_only,
                 gpu.face_shader.as_ref(),
-            )?;
-            let mut vertices = Vec::with_capacity(pose.vertices.len());
-            for (source, posed) in source.vertices.iter().zip(&pose.vertices) {
-                vertices.push(raster::Vertex {
+            )?));
+        }
+
+        // Queue writes copy their input immediately, so one scratch allocation
+        // can serve every mesh. Reusing it avoids one vertex Vec allocation per
+        // submesh and avoids retaining all converted vertices until the end.
+        let mut vertices = Vec::new();
+        for (index, gpu) in self.meshes.iter().enumerate() {
+            let Some(gpu) = gpu else {
+                continue;
+            };
+            let pose = &poses[self.pose_of[index]];
+            let source = &asset.skins[pose.skin].data.meshes[pose.mesh];
+            vertices.clear();
+            vertices.extend(source.vertices.iter().zip(&pose.vertices).map(|(source, posed)| {
+                raster::Vertex {
                     position: posed.position,
                     normal: posed.normal,
                     uv: source.uv,
                     fog: frame.vertex_fog,
-                });
-            }
-            updates.push((index, vertices, params));
-        }
-        for (index, vertices, params) in updates {
-            if let Some(gpu) = &self.meshes[index] {
-                gpu.mesh.update(queue, &vertices)?;
-                gpu.binding.update(queue, &params)?;
-            }
+                }
+            }));
+            gpu.mesh.update(queue, &vertices)?;
+            gpu.binding.update(
+                queue,
+                params_by_mesh[index]
+                    .as_ref()
+                    .ok_or("missing validated model constants")?,
+            )?;
         }
         Ok(())
     }
