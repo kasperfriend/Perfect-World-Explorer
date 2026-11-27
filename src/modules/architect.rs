@@ -2917,6 +2917,7 @@ impl Architect {
                     } else if let Some(index) = picked_placement {
                         self.selected_placements.insert(index);
                         self.selected_placement = Some(index);
+                        self.selected_asset = self.project.objects.get(index).map(|object| object.asset.clone());
                         self.selected_scene_object = None;
                         self.selected_scene_transform = None;
                     } else {
@@ -2936,6 +2937,9 @@ impl Architect {
                     let clicked_inside_group = picked_placement
                         .is_some_and(|index| self.selected_placements.contains(&index));
                     self.selected_placement = picked_placement;
+                    if let Some(index) = picked_placement {
+                        self.selected_asset = self.project.objects.get(index).map(|object| object.asset.clone());
+                    }
                     if !clicked_inside_group {
                         self.selected_placements.clear();
                         if let Some(index) = picked_placement {
