@@ -482,8 +482,14 @@ impl Harvester {
         terrain_generation: u64,
         content_hash: u64,
     ) -> Option<std::sync::Arc<SceneGeometry>> {
-        if self.needs_frustum_rebuild_for_view(config, eye, view_forward, view_distance, terrain_generation, content_hash)
-        {
+        if self.needs_frustum_rebuild_for_view(
+            config,
+            eye,
+            view_forward,
+            view_distance,
+            terrain_generation,
+            content_hash,
+        ) {
             None
         } else {
             self.cached.as_ref().map(|(_, scene)| scene.clone())
@@ -839,8 +845,14 @@ impl Harvester {
             terrain_generation,
             content_hash,
         );
-        if !self.needs_frustum_rebuild_for_view(config, eye, view_forward, view_distance, terrain_generation, content_hash)
-        {
+        if !self.needs_frustum_rebuild_for_view(
+            config,
+            eye,
+            view_forward,
+            view_distance,
+            terrain_generation,
+            content_hash,
+        ) {
             if let Some((_, scene)) = &self.cached {
                 return scene.clone();
             }
