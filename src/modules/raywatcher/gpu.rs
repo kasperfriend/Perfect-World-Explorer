@@ -781,7 +781,13 @@ struct Hit {
     normal: vec3<f32>,
 };
 
-fn closest_hit(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> Hit {
+fn closest_hit_impl(
+    origin: vec3<f32>,
+    dir: vec3<f32>,
+    t_min: f32,
+    t_max: f32,
+    reject_before: f32,
+) -> Hit {
     var hit: Hit;
     hit.t = t_max;
     hit.index = 0xffffffffu;
@@ -813,6 +819,13 @@ fn closest_hit(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> Hit
                 let tri_index = order[first + i];
                 let result = triangle_hit(tris[tri_index], origin, dir, t_min, hit.t);
                 if (result.x >= 0.0 && accept_opacity(tri_index, vec2<f32>(result.y, result.z), 0u)) {
+                    // ReSTIR only needs to reject a hit clearly in front of
+                    // its stored sample. Return immediately instead of
+                    // continuing the nearest-hit traversal through the tree.
+                    if (result.x < reject_before) {
+                        hit.index = 0xffffffffu;
+                        return hit;
+                    }
                     hit.t = result.x;
                     hit.index = tri_index;
                 }
@@ -839,6 +852,11 @@ fn closest_hit(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> Hit
         hit.normal = select(-geo, geo, dot(geo, dir) <= 0.0);
     }
     return hit;
+}
+
+// General closest-hit query; no early-rejection threshold.
+fn closest_hit(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> Hit {
+    return closest_hit_impl(origin, dir, t_min, t_max, -1.0);
 }
 
 fn ign(px: vec2<u32>, frame: u32) -> f32 {
@@ -1371,13 +1389,11 @@ fn restir_reuse_one(
     if (!is_sky) {
         let tolerance = max(0.35, sample_distance * 0.02);
         let min_t = max(0.05, bias * 0.25);
-        // The reservoir sample position is an existing surface hit. Only a
-        // blocker strictly before its tolerance interval can invalidate reuse;
-        // an any-hit query avoids finding the nearest triangle at/behind it.
-        if (sample_distance > min_t + tolerance
-            && occluded(ray_origin, direction, min_t, sample_distance - tolerance, 0u)) {
-            return;
-        }
+        let visible = closest_hit_impl(
+            ray_origin, direction, min_t, sample_distance + tolerance,
+            sample_distance - tolerance
+        );
+        if (visible.index == 0xffffffffu || abs(visible.t - sample_distance) > tolerance) { return; }
     }
     let target_density = max(luminance(source.radiance_m.xyz) * cosine, 1e-5);
     let target_over_pdf = target_density / max(cosine, 1e-5);
@@ -6122,21 +6138,15 @@ mod software_bvh_stack_tests {
     use super::*;
 
     #[test]
-    fn restir_spatial_visibility_uses_early_exit_occlusion_on_both_backends() {
-        let software = RAY_SHADER;
+    fn restir_software_visibility_rejects_blockers_during_nearest_hit_traversal() {
+        assert!(RAY_SHADER.contains("fn closest_hit_impl("));
+        assert!(RAY_SHADER.contains("if (result.x < reject_before)"));
+        assert!(RAY_SHADER.contains("sample_distance - tolerance"));
+        assert!(RAY_SHADER.contains("return closest_hit_impl(origin, dir, t_min, t_max, -1.0)"));
+        // DXR keeps the exact target-hit validation; the software-only
+        // early-reject optimisation must not silently weaken hardware reuse.
         let hardware = include_str!("dxr_trace.hlsl");
-        assert!(software.contains(
-            "occluded(ray_origin, direction, min_t, sample_distance - tolerance, 0u)"
-        ));
-        assert!(!software.contains(
-            "closest_hit(ray_origin, direction, max(0.05, bias * 0.25), sample_distance + tolerance)"
-        ));
-        assert!(hardware.contains(
-            "occluded_opacity(ray_origin, direction, min_t, sample_distance - tolerance"
-        ));
-        assert!(!hardware.contains(
-            "Hit visible = closest_hit(ray_origin, direction, max(0.05, bias * 0.25)"
-        ));
+        assert!(hardware.contains("Hit visible = closest_hit(ray_origin, direction"));
     }
 
     #[test]
