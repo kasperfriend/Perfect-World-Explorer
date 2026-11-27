@@ -110,9 +110,10 @@ impl Modules {
         scene: &crate::scene::Scene,
         ornaments: &[crate::scene::Ornament],
         camera: Vec3,
+        view_projection: glam::Mat4,
     ) -> Option<String> {
         self.architect
-            .ui(ctx, catalog, current_map, scene, ornaments, camera)
+            .ui(ctx, catalog, current_map, scene, ornaments, camera, view_projection)
     }
 
     pub fn prepare_librarian_preview(
