@@ -823,13 +823,12 @@ impl Page {
             };
             let (nw, nh) = (w / 2, h / 2);
             let mut out = vec![0u8; nw * nh * 4];
-            // Parallelize mip levels 1..=4 (>= 256 KiB) across horizontal bands
-            // while keeping tiny tail mips (levels 5..7) single-threaded.
-            let threads = if nw * nh * 4 >= 256 * 1024 {
+            // Parallelize only mip levels with at least 4 MiB of output.
+            // Smaller levels are faster to finish inline than to schedule a
+            // fresh scoped worker group for every page.
+            let threads = if nw * nh * 4 >= 4 * 1024 * 1024 {
                 // Page finishing already runs beside cache I/O and GPU uploads.
-                // A 32-way fan-out for every mip level oversubscribes typical
-                // desktop CPUs and creates short-lived threads repeatedly.
-                // Four workers are enough for these memory-bandwidth-bound rows.
+                // Four workers cap bandwidth contention on desktop CPUs.
                 mip_worker_limit().min(nh.div_ceil(2).max(1))
             } else {
                 1
