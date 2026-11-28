@@ -1027,7 +1027,8 @@ impl Architect {
                 _ => return Err("This archive entry is not a supported preview model. ECM models from models.pck and static SMD models from gfx.pck are supported.".into()),
             }
         } else {
-            crate::ecmodel::normalize(&portable)
+            let portable = portable.strip_prefix("element/").unwrap_or(&portable);
+            crate::ecmodel::normalize(portable)
         };
         let supported = (path.starts_with("models/") && path.ends_with(".ecm"))
             || (path.starts_with("gfx/") && path.ends_with(".smd"));
@@ -1060,7 +1061,7 @@ impl Architect {
                     .into();
             return;
         }
-        if let Some(path) = Self::renderer_bmd_path(asset, &self.current_map_id) {
+        if let Some(path) = self.renderer_bmd_asset_path(asset) {
             self.preview = None;
             let loaded = self
                 .preview_assets
@@ -1277,6 +1278,28 @@ impl Architect {
         (safe_segments && (valid_model || valid_static_gfx)).then_some(normalized)
     }
 
+    /// Resolve a loose or archive-qualified BMD through the client root.
+    fn renderer_bmd_asset_path(&self, asset: &str) -> Option<String> {
+        let portable = self.portable_asset_path(asset);
+        let portable = if portable.contains("::") {
+            portable
+        } else {
+            portable.strip_prefix("element/").unwrap_or(&portable).to_owned()
+        };
+        Self::renderer_bmd_path(&portable, &self.current_map_id)
+    }
+
+    /// Resolve a loose or archive-qualified ECM/SMD through the client root.
+    fn renderer_model_asset_path(&self, asset: &str) -> Option<String> {
+        let portable = self.portable_asset_path(asset);
+        let portable = if portable.contains("::") {
+            portable
+        } else {
+            portable.strip_prefix("element/").unwrap_or(&portable).to_owned()
+        };
+        Self::renderer_asset_path(&portable)
+    }
+
     /// Resolve a BMD from litmodels.pck into the map-partitioned path used by
     /// the native baked-scenery loader. This is deliberately separate from the
     /// ECM/SMD model queue: BMDs need the scenery material/lighting pipeline.
@@ -1349,8 +1372,8 @@ impl Architect {
     }
 
     fn renderer_bounds_key(&self, asset: &str) -> Option<String> {
-        Self::renderer_asset_path(asset)
-            .or_else(|| Self::renderer_bmd_path(asset, &self.current_map_id))
+        self.renderer_model_asset_path(asset)
+            .or_else(|| self.renderer_bmd_asset_path(asset))
     }
 
     /// Resolve a GFX effect through the world's real effect catalogue. This is
@@ -1382,8 +1405,8 @@ impl Architect {
     /// predicate shared by archive actions and placement validation so the UI
     /// never disables an object type that the renderer can actually consume.
     fn renderer_placeable_asset(&self, asset: &str) -> bool {
-        Self::renderer_asset_path(asset).is_some()
-            || Self::renderer_bmd_path(asset, &self.current_map_id).is_some()
+        self.renderer_model_asset_path(asset).is_some()
+            || self.renderer_bmd_asset_path(asset).is_some()
             || self.renderer_tree_type(asset).is_some()
             || self.renderer_effect_path(asset).is_some()
     }
@@ -1567,7 +1590,7 @@ impl Architect {
             .iter()
             .filter(|object| object.visible)
             .filter_map(|object| {
-                let path = Self::renderer_bmd_path(&object.asset, &self.current_map_id)?;
+                let path = self.renderer_bmd_asset_path(&object.asset)?;
                 if !object.position.iter().all(|value| value.is_finite())
                     || !object.rotation.iter().all(|value| value.is_finite())
                     || !object.scale.is_finite()
@@ -1622,7 +1645,7 @@ impl Architect {
                     return None;
                 }
                 Some(crate::world_models_gpu::EditorPlacement {
-                    path: Self::renderer_asset_path(&object.asset)?,
+                    path: self.renderer_model_asset_path(&object.asset)?,
                     position: object.position,
                     rotation: object.rotation,
                     scale: object.scale,
@@ -1637,7 +1660,7 @@ impl Architect {
             if let (Some(asset), Some(mut position)) = (
                 self.selected_asset
                     .as_deref()
-                    .and_then(Self::renderer_asset_path),
+                    .and_then(|asset| self.renderer_model_asset_path(asset)),
                 self.brush_cursor_position,
             ) {
                 if self.snap == SnapMode::Terrain {
@@ -1654,7 +1677,7 @@ impl Architect {
                     }
                 }
                 let already_committed = self.project.objects.iter().any(|object| {
-                    Self::renderer_asset_path(&object.asset).as_deref() == Some(asset.as_str())
+                    self.renderer_model_asset_path(&object.asset).as_deref() == Some(asset.as_str())
                         && object
                             .position
                             .iter()
@@ -1770,10 +1793,7 @@ impl Architect {
         let before = self.project.objects.clone();
         let mut created = Vec::new();
         for (_, asset, position) in items {
-            if Self::renderer_asset_path(&asset).is_none()
-                && Self::renderer_bmd_path(&asset, &self.current_map_id).is_none()
-                && self.renderer_tree_type(&asset).is_none()
-            {
+            if !self.renderer_placeable_asset(&asset) {
                 continue;
             }
             let portable_asset = self.portable_asset_path(&asset);
@@ -1794,7 +1814,7 @@ impl Architect {
             created.push(index);
         }
         if created.is_empty() {
-            self.status = "The selected client scene items are not supported for editing yet. Only ECM and static SMD models can be copied into the project layer.".into();
+            self.status = "The selected client scene items have no supported native placement adapter.".into();
             return;
         }
 
@@ -1844,10 +1864,7 @@ impl Architect {
                 }
             }
             for (_, asset, position) in scene {
-                if Self::renderer_asset_path(&asset).is_none()
-                    && Self::renderer_bmd_path(&asset, &self.current_map_id).is_none()
-                    && self.renderer_tree_type(&asset).is_none()
-                {
+                if !self.renderer_placeable_asset(&asset) {
                     continue;
                 }
                 let portable_asset = self.portable_asset_path(&asset);
@@ -1903,10 +1920,7 @@ impl Architect {
         let before = self.project.objects.clone();
         let mut pasted = Vec::with_capacity(self.clipboard_objects.len());
         for source in &self.clipboard_objects {
-            if Self::renderer_asset_path(&source.asset).is_none()
-                && Self::renderer_bmd_path(&source.asset, &self.current_map_id).is_none()
-                && self.renderer_tree_type(&source.asset).is_none()
-            {
+            if !self.renderer_placeable_asset(&source.asset) {
                 continue;
             }
             let mut object = source.clone();
@@ -4695,6 +4709,24 @@ mod tests {
         assert!(loaded.objects[0].visible);
         assert!(!loaded.objects[0].locked);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn loose_client_models_resolve_through_the_same_native_handlers() {
+        let editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
+
+        assert_eq!(
+            editor.renderer_model_asset_path("/client/element/models/npc/guard.ecm"),
+            Some("models/npc/guard.ecm".into())
+        );
+        assert_eq!(
+            editor.renderer_model_asset_path("/client/element/gfx/props/stone.smd"),
+            Some("gfx/props/stone.smd".into())
+        );
+        assert_eq!(
+            editor.renderer_bmd_asset_path("/client/element/litmodels/a01/1/litmodel_42.bmd"),
+            Some("litmodels/a01/1/litmodel_42.bmd".into())
+        );
     }
 
     #[test]
