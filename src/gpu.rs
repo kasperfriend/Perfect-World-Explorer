@@ -3103,11 +3103,25 @@ impl Renderer {
             } else {
                 1.
             });
-        // Keep the selected environment fog intact. The no-region fallback
-        // (60..400, blue-grey) is supplied by Environments::endpoints_for;
-        // overriding every active outdoor region here would discard authored
-        // EC-BSD fog. The old residency cap is intentionally not applied.
-        let active_fog = camera.active_fog();
+        // Preserve PR #44's resident-window fog fit. Authored regional fog
+        // can extend far beyond the terrain currently loaded around the camera;
+        // without this cap, the horizon is fogged but nearby terrain stays clear.
+        // Keep the authored colour and clamp only the outdoor distance range.
+        let mut active_fog = camera.active_fog();
+        if active_fog.enabled && camera.underwater_depth <= 0. {
+            if let Some(cap) = self.resident_bounds().and_then(|bounds| {
+                crate::terrain_cutoff::fog_cap(
+                    bounds,
+                    camera.pos.to_array(),
+                    w as f32 / h.max(1) as f32,
+                )
+            }) {
+                let range =
+                    crate::terrain_cutoff::fit_fog(active_fog.start, active_fog.end, cap);
+                active_fog.start = range[0];
+                active_fog.end = range[1];
+            }
+        }
         let (mut fog_range, fog_color) = (active_fog.range(), active_fog.color4());
         // Uniform fog_range.w is the terrain day/night factor; the shader reads
         // it instead of overloading sun.w (the lightmap-availability flag).
