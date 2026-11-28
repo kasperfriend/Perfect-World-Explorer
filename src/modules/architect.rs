@@ -3112,9 +3112,10 @@ impl Architect {
         let asset_pos = Self::dock_position(self.right_dock, screen, 340., 600.);
         let asset_dock_changed = self.right_dock != self.applied_right_dock;
         self.applied_right_dock = self.right_dock;
+        let mut asset_browser_open = self.asset_browser_open;
         let mut asset_panel = egui::Window::new("Asset Browser")
             .id(egui::Id::new("architect_asset_panel"))
-            .open(&mut self.asset_browser_open)
+            .open(&mut asset_browser_open)
             .default_pos(asset_pos)
             .default_size(egui::vec2(340., 600.))
             .min_size(egui::vec2(250., 300.))
@@ -3329,6 +3330,7 @@ impl Architect {
                 }
             });
 
+        self.asset_browser_open = asset_browser_open;
         let asset_panel_hovered = asset_panel_response
             .as_ref()
             .is_some_and(|response| response.response.hovered());
