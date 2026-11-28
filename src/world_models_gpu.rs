@@ -11,6 +11,28 @@ use crate::{
     world_models::Assets,
 };
 use std::{collections::HashMap, fs::File, path::Path};
+
+/// A non-destructive placement supplied by Architect. The same native ECM loader,
+/// animation system, material handling and GPU queues are used as for map models.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorPlacement {
+    pub path: String,
+    pub position: [f32; 3],
+    pub rotation: [f32; 3],
+    pub scale: f32,
+    pub scale_axes: [f32; 3],
+}
+
+/// A project-owned GFX root, synchronized through the same native effect
+/// owner, player and light-publication machinery as authored world effects.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorEffectPlacement {
+    pub key: u64,
+    pub path: String,
+    pub position: [f32; 3],
+    pub rotation: [f32; 3],
+    pub scale: f32,
+}
 #[path = "terrain_cutoff.rs"]
 mod cutoff_residency;
 
@@ -110,6 +132,51 @@ pub struct AlphaStatus {
     pub slots: usize,
 }
 
+fn editor_transform_changed(previous: &EditorPlacement, next: &EditorPlacement) -> bool {
+    previous.position != next.position
+        || previous.rotation != next.rotation
+        || previous.scale != next.scale
+        || previous.scale_axes != next.scale_axes
+}
+
+fn editor_scene_transform(
+    placement: &EditorPlacement,
+    export_id: u32,
+) -> Result<(crate::scene::SceneModel, glam::Mat4), String> {
+    if !placement.position.iter().all(|value| value.is_finite())
+        || !placement.rotation.iter().all(|value| value.is_finite())
+        || !placement.scale.is_finite()
+        || !(0.001..=1000.).contains(&placement.scale)
+        || !placement
+            .scale_axes
+            .iter()
+            .all(|v| v.is_finite() && (0.001..=1000.).contains(v))
+    {
+        return Err("non-finite or out-of-range editor transform".into());
+    }
+    let rotation = glam::Quat::from_euler(
+        glam::EulerRot::XYZ,
+        placement.rotation[0],
+        placement.rotation[1],
+        placement.rotation[2],
+    );
+    let direction = rotation * glam::Vec3::Z;
+    let up = rotation * glam::Vec3::Y;
+    let scene_placement = crate::scene::SceneModel {
+        export_id,
+        position: placement.position,
+        direction: direction.to_array(),
+        up: up.to_array(),
+        path: crate::ecmodel::normalize(&placement.path),
+        action: String::new(),
+    };
+    let transform = crate::world_models::transform(&scene_placement)?
+        * glam::Mat4::from_scale(
+            glam::Vec3::splat(placement.scale) * glam::Vec3::from_array(placement.scale_axes),
+        );
+    Ok((scene_placement, transform))
+}
+
 pub struct World {
     assets: Assets,
     keep_unbounded: bool,
@@ -161,6 +228,11 @@ pub struct World {
     frustum: Option<[[f32; 4]; 6]>,
     scratch_candidates: Vec<model_queue::AlphaCandidate>,
     scratch_failures: Vec<(usize, String)>,
+    native_instance_count: usize,
+    editor_placements: Vec<EditorPlacement>,
+    editor_asset_cache: HashMap<String, usize>,
+    /// Project effect key -> (catalog path, last committed transform, owner id).
+    editor_effects: HashMap<u64, (String, [f32; 16], u64)>,
 }
 
 impl World {
@@ -175,11 +247,42 @@ impl World {
             .into_iter()
             .map(|e| (crate::ecmodel::normalize(&e.name), e))
             .collect();
+        // Architect can also place static SMD meshes referenced by gfx.pck.
+        // Keep this archive independent from the model pack: GFX resources and
+        // their textures are authored under gfx/ and must never be looked up in
+        // models.pck by accident.
+        let mut gfx_pack = File::open(element.join("gfx.pck")).ok();
+        let gfx_entries: HashMap<String, crate::pck::Entry> = gfx_pack
+            .as_mut()
+            .and_then(|pack| crate::pck::directory(pack).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| {
+                let path = crate::ecmodel::normalize(&entry.name);
+                let path = if path.starts_with("gfx/") {
+                    path
+                } else {
+                    format!("gfx/{path}")
+                };
+                (path, entry)
+            })
+            .collect();
         Self::with_reader(device, format, assets, move |path| {
-            let entry = entries
-                .get(path)
-                .ok_or_else(|| format!("missing model texture: {path}"))?;
-            crate::pck::read_entry(&mut pack, entry)
+            let normalized = crate::ecmodel::normalize(path);
+            if normalized.starts_with("gfx/") {
+                let pack = gfx_pack
+                    .as_mut()
+                    .ok_or_else(|| "gfx.pck is unavailable".to_owned())?;
+                let entry = gfx_entries
+                    .get(&normalized)
+                    .ok_or_else(|| format!("missing GFX resource: {normalized}"))?;
+                crate::pck::read_entry(pack, entry)
+            } else {
+                let entry = entries
+                    .get(&normalized)
+                    .ok_or_else(|| format!("missing model texture: {normalized}"))?;
+                crate::pck::read_entry(&mut pack, entry)
+            }
         })
     }
     pub fn with_reader(
@@ -230,6 +333,7 @@ impl World {
             mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let native_instance_count = assets.instances.len();
         Ok(Self {
             assets,
             keep_unbounded: false,
@@ -258,8 +362,191 @@ impl World {
             frustum: None,
             scratch_candidates: Vec::new(),
             scratch_failures: Vec::new(),
+            native_instance_count,
+            editor_placements: Vec::new(),
+            editor_asset_cache: HashMap::new(),
+            editor_effects: HashMap::new(),
         })
     }
+    /// Replace Architect's transient project layer without disturbing native map
+    /// instances. Asset geometry is cached by normalized ECM/SMD path; edits only
+    /// update placement transforms and invalidate only the affected poses.
+    pub fn sync_editor_placements(&mut self, placements: &[EditorPlacement]) {
+        if self.editor_placements == placements {
+            return;
+        }
+
+        // During a transform drag the asset set is unchanged. Update only the
+        // lightweight placement matrices and scene records: rebuilding slots
+        // here would discard draw objects and reinitialize animation playback
+        // on every mouse movement, even though the source geometry is unchanged.
+        let editor_instances = self
+            .assets
+            .instances
+            .len()
+            .saturating_sub(self.native_instance_count);
+        let editor_slots = self.slots.len().saturating_sub(self.native_instance_count);
+        if placements.len() == editor_instances && placements.len() == editor_slots {
+            let updates = placements
+                .iter()
+                .enumerate()
+                .map(|(index, placement)| {
+                    let path = crate::ecmodel::normalize(&placement.path);
+                    if (!path.ends_with(".ecm") && !path.ends_with(".smd"))
+                        || self.assets.instances[self.native_instance_count + index]
+                            .placement
+                            .path
+                            != path
+                    {
+                        return None;
+                    }
+                    if self
+                        .editor_placements
+                        .get(index)
+                        .is_some_and(|previous| !editor_transform_changed(previous, placement))
+                    {
+                        return Some((
+                            self.assets.instances[self.native_instance_count + index]
+                                .placement
+                                .clone(),
+                            self.slots[self.native_instance_count + index]
+                                .transform
+                                .as_ref()
+                                .ok()
+                                .copied()?,
+                        ));
+                    }
+                    editor_scene_transform(placement, u32::try_from(index).unwrap_or(u32::MAX)).ok()
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(updates) = updates {
+                for (index, (scene_placement, transform)) in updates.into_iter().enumerate() {
+                    let unchanged = self.editor_placements.get(index).is_some_and(|previous| {
+                        !editor_transform_changed(previous, &placements[index])
+                    });
+                    if unchanged {
+                        continue;
+                    }
+                    let slot_index = self.native_instance_count + index;
+                    self.assets.instances[slot_index].placement = scene_placement;
+                    self.slots[slot_index].transform = Ok(transform);
+                    // Pose sampling is keyed by animation time, not by world
+                    // transform. Invalidate only the posed geometry so the next
+                    // advance rebuilds vertices with the new matrix while keeping
+                    // the existing playback clock and GPU Draw allocation alive.
+                    self.slots[slot_index].posed = None;
+                    self.slots[slot_index].geometry_dirty = true;
+                }
+                self.editor_placements = placements.to_vec();
+                return;
+            }
+        }
+
+        self.assets.instances.truncate(self.native_instance_count);
+        self.slots.truncate(self.native_instance_count);
+        self.alpha
+            .retain(|candidate| candidate.slot < self.native_instance_count);
+        self.editor_placements.clear();
+
+        let mut random = crate::model_playback::SceneRandom::new(1);
+        for (index, placement) in placements.iter().enumerate() {
+            let path = crate::ecmodel::normalize(&placement.path);
+            if !path.ends_with(".ecm") && !path.ends_with(".smd") {
+                self.reported.push(format!(
+                    "Architect placement {index} is not a supported ECM or static SMD asset: {}",
+                    placement.path
+                ));
+                continue;
+            }
+
+            let asset = if let Some(&asset) = self.editor_asset_cache.get(&path) {
+                asset
+            } else {
+                let loaded = if path.ends_with(".ecm") {
+                    crate::model_asset::ModelAsset::load_with(&path, |dependency| {
+                        (self.read)(dependency)
+                    })
+                } else {
+                    (self.read)(&path)
+                        .and_then(|bytes| crate::ecmodel::parse_smd(&bytes))
+                        .and_then(|smd| {
+                            let parent = path.rsplit_once('/').map_or("", |value| value.0);
+                            let relative = |value: &str| {
+                                let value = crate::ecmodel::normalize(value);
+                                if value.starts_with("gfx/") || value.starts_with("models/") {
+                                    value
+                                } else {
+                                    format!("{parent}/{value}")
+                                }
+                            };
+                            let skeleton = relative(&smd.skeleton);
+                            let skins: Vec<_> =
+                                smd.skins.iter().map(|value| relative(value)).collect();
+                            crate::model_asset::ModelAsset::load_static_skins_with(
+                                &skeleton,
+                                &skins,
+                                |dependency| (self.read)(dependency),
+                            )
+                        })
+                };
+                match loaded {
+                    Ok(asset) => {
+                        let asset_index = self.assets.assets.len();
+                        self.assets.assets.push(asset);
+                        self.editor_asset_cache.insert(path.clone(), asset_index);
+                        asset_index
+                    }
+                    Err(error) => {
+                        self.reported.push(format!(
+                            "Architect asset {} could not be loaded: {error}",
+                            path
+                        ));
+                        continue;
+                    }
+                }
+            };
+
+            let (scene_placement, transform) =
+                match editor_scene_transform(placement, u32::try_from(index).unwrap_or(u32::MAX)) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.reported.push(format!(
+                            "Architect placement {index} has an invalid transform: {error}"
+                        ));
+                        continue;
+                    }
+                };
+            let action = self.assets.assets[asset]
+                .descriptor
+                .scene_action(&scene_placement.action);
+            let mut playback =
+                crate::model_playback::Playback::new(&self.assets.assets[asset], action);
+            if let Ok(clock) = &mut playback {
+                if let Err(error) = clock.tick(random.initial_tick()) {
+                    self.reported.push(format!(
+                        "Architect animation initialization failed for {path}: {error}"
+                    ));
+                }
+            }
+            self.assets.instances.push(crate::world_models::Instance {
+                placement: scene_placement.clone(),
+                asset,
+                action,
+                playback,
+            });
+            self.slots.push(Slot {
+                draw: None,
+                failed: false,
+                transform: Ok(transform),
+                posed: None,
+                geometry_dirty: true,
+                vertex_fog: None,
+                visible: true,
+            });
+        }
+        self.editor_placements = placements.to_vec();
+    }
+
     /// A world with no model assets of its own.
     ///
     /// The animated effect half of this object does not need `models.pck` or a
@@ -405,6 +692,73 @@ impl World {
         self.owners.insert(request)?;
         self.catalog_spawns += 1;
         Ok(identity)
+    }
+
+    /// Reconcile Architect's persistent GFX placements with the native owner
+    /// queue. A changed transform replaces only that project's owner; deleting
+    /// or hiding an object removes its owner and any lights it published.
+    pub fn sync_editor_effects(&mut self, placements: &[EditorEffectPlacement]) {
+        let mut desired = HashMap::new();
+        for placement in placements {
+            if !placement.position.iter().all(|value| value.is_finite())
+                || !placement.rotation.iter().all(|value| value.is_finite())
+                || !placement.scale.is_finite()
+                || !(0.001..=1000.0).contains(&placement.scale)
+            {
+                continue;
+            }
+            let rotation = glam::Quat::from_euler(
+                glam::EulerRot::XYZ,
+                placement.rotation[0],
+                placement.rotation[1],
+                placement.rotation[2],
+            );
+            let direction = (rotation * glam::Vec3::Z).to_array();
+            let up = (rotation * glam::Vec3::Y).to_array();
+            match gfx_owner::placement_transform(placement.position, direction, up, placement.scale)
+            {
+                Ok(transform) => {
+                    desired.insert(placement.key, (placement.path.clone(), transform));
+                }
+                Err(error) => self.reported.push(format!(
+                    "Architect effect {} ({}): {error}",
+                    placement.key, placement.path
+                )),
+            }
+        }
+
+        let stale = self
+            .editor_effects
+            .iter()
+            .filter_map(|(key, (path, transform, identity))| {
+                let unchanged = desired.get(key).is_some_and(|(next_path, next_transform)| {
+                    next_path == path && next_transform == transform
+                });
+                (!unchanged).then_some((*key, *identity))
+            })
+            .collect::<Vec<_>>();
+        for (key, identity) in stale {
+            self.owners.remove(identity, &mut self.publications);
+            self.editor_effects.remove(&key);
+        }
+
+        for (key, (path, transform)) in desired {
+            if self.editor_effects.contains_key(&key) {
+                continue;
+            }
+            let origin = format!("Architect project placement {key}");
+            match self.spawn_catalog_effect(&path, transform, &origin) {
+                Ok(identity) => {
+                    self.editor_effects.insert(key, (path, transform, identity));
+                }
+                Err(error) => {
+                    let message = format!("{origin} ({path}): {error}");
+                    if !self.reported.contains(&message) {
+                        self.reported.push(message);
+                    }
+                }
+            }
+        }
     }
 
     /// Install the actual ECWLD effect placements as scene-light producers.
@@ -1492,7 +1846,7 @@ fn draw_one(
     }
     if let Some(draw) = &slot.draw {
         if slot.geometry_dirty || slot.vertex_fog != Some(f.vertex_fog) {
-            draw.update(queue, asset, &posed.meshes, f)?;
+            draw.update_posed(queue, asset, &posed.meshes, f)?;
             slot.geometry_dirty = false;
             slot.vertex_fog = Some(f.vertex_fog);
         } else {
@@ -1549,6 +1903,73 @@ fn event_milliseconds(event: &crate::ecmodel::EcmEvent, key: &str) -> Result<f32
         return Err(format!("nonfinite GFX event {key}"));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod architect_placement_tests {
+    use super::*;
+
+    #[test]
+    fn transform_change_detection_only_flags_changed_transform_fields() {
+        let original = EditorPlacement {
+            path: "models/test.ecm".into(),
+            position: [1., 2., 3.],
+            rotation: [0., 0., 0.],
+            scale: 1.,
+            scale_axes: [1.; 3],
+        };
+        assert!(!editor_transform_changed(&original, &original));
+        let mut moved = original.clone();
+        moved.position[0] += 1.;
+        assert!(editor_transform_changed(&original, &moved));
+        let mut rotated = original.clone();
+        rotated.rotation[1] = 0.5;
+        assert!(editor_transform_changed(&original, &rotated));
+        let mut scaled = original.clone();
+        scaled.scale = 2.;
+        assert!(editor_transform_changed(&original, &scaled));
+        let mut axis_scaled = original.clone();
+        axis_scaled.scale_axes[0] = 2.0;
+        assert!(editor_transform_changed(&original, &axis_scaled));
+    }
+
+    #[test]
+    fn editor_transform_preserves_position_and_applies_rotation_and_scale() {
+        let placement = EditorPlacement {
+            path: "models/test.ecm".into(),
+            position: [12., 3., -8.],
+            rotation: [0., std::f32::consts::FRAC_PI_2, 0.],
+            scale: 2.5,
+            scale_axes: [2.0, 3.0, 4.0],
+        };
+        let (scene, matrix) = editor_scene_transform(&placement, 7).unwrap();
+        assert_eq!(scene.export_id, 7);
+        assert_eq!(scene.position, placement.position);
+        assert!((scene.direction[0] - 1.).abs() < 1e-5);
+        assert!(scene.direction[2].abs() < 1e-5);
+        assert!((matrix.w_axis.x - 12.).abs() < 1e-5);
+        assert!((matrix.w_axis.y - 3.).abs() < 1e-5);
+        assert!((matrix.w_axis.z + 8.).abs() < 1e-5);
+        assert!((matrix.x_axis.truncate().length() - 5.0).abs() < 1e-5);
+        assert!((matrix.y_axis.truncate().length() - 7.5).abs() < 1e-5);
+        assert!((matrix.z_axis.truncate().length() - 10.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn editor_transform_rejects_non_finite_and_extreme_values() {
+        let mut placement = EditorPlacement {
+            path: "models/test.ecm".into(),
+            position: [0.; 3],
+            rotation: [0.; 3],
+            scale: 1.,
+            scale_axes: [1.; 3],
+        };
+        placement.position[1] = f32::NAN;
+        assert!(editor_scene_transform(&placement, 0).is_err());
+        placement.position = [0.; 3];
+        placement.scale = 1001.;
+        assert!(editor_scene_transform(&placement, 0).is_err());
+    }
 }
 
 #[cfg(test)]

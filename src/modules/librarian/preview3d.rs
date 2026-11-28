@@ -6,7 +6,8 @@ use crate::{
     model_draw_gpu::{Draw, Frame},
     model_material::Lighting,
 };
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3};
+use std::collections::HashMap;
 
 // The model shader blends encoded colors; the window surface may be sRGB.
 const PREVIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -164,7 +165,7 @@ pub fn pan_offset(yaw: f32, radius: f32, zoom: f32, delta: egui::Vec2) -> Vec3 {
 
 /// Dragging right turns the model so its front follows the pointer.
 pub fn orbit_yaw(yaw: f32, horizontal_drag: f32) -> f32 {
-    yaw - horizontal_drag * 0.01
+    yaw + horizontal_drag * 0.01
 }
 
 pub fn orbit_pitch(pitch: f32, vertical_drag: f32) -> f32 {
@@ -388,6 +389,439 @@ impl Target {
         })
     }
 }
+const BMD_PREVIEW_SIDE: u32 = 512;
+
+#[derive(Clone, Copy)]
+struct BmdPreviewVertex {
+    position: Vec3,
+    normal: Vec3,
+    color: Vec3,
+    uv: Vec2,
+}
+
+struct BmdPreviewTriangle {
+    indices: [usize; 3],
+    texture: Option<usize>,
+}
+
+struct BmdPreviewTexture {
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+}
+impl BmdPreviewTexture {
+    fn sample(&self, u: f32, v: f32) -> [f32; 4] {
+        let wrap = |value: i32, size: usize| value.rem_euclid(size as i32) as usize;
+        let x = u.rem_euclid(1.0) * self.width as f32 - 0.5;
+        let y = v.rem_euclid(1.0) * self.height as f32 - 0.5;
+        let x0 = x.floor() as i32;
+        let y0 = y.floor() as i32;
+        let tx = x - x.floor();
+        let ty = y - y.floor();
+        let texel = |x: i32, y: i32| {
+            let offset = (wrap(y, self.height) * self.width + wrap(x, self.width)) * 4;
+            [
+                self.rgba[offset] as f32 / 255.0,
+                self.rgba[offset + 1] as f32 / 255.0,
+                self.rgba[offset + 2] as f32 / 255.0,
+                self.rgba[offset + 3] as f32 / 255.0,
+            ]
+        };
+        let a = texel(x0, y0);
+        let b = texel(x0 + 1, y0);
+        let c = texel(x0, y0 + 1);
+        let d = texel(x0 + 1, y0 + 1);
+        let mut result = [0.0; 4];
+        for channel in 0..4 {
+            let top = a[channel] + (b[channel] - a[channel]) * tx;
+            let bottom = c[channel] + (d[channel] - c[channel]) * tx;
+            result[channel] = top + (bottom - top) * ty;
+        }
+        result
+    }
+}
+
+/// BMD geometry preview with its authored diffuse textures. It uses the same
+/// client archive reader and image decoders as model rendering; the native
+/// world placement still goes through the baked-scenery material/lighting path.
+pub struct BmdPreview {
+    pub path: String,
+    texture: wgpu::Texture,
+    pub texture_id: egui::TextureId,
+    vertices: Vec<BmdPreviewVertex>,
+    triangles: Vec<BmdPreviewTriangle>,
+    textures: Vec<BmdPreviewTexture>,
+    texture_warnings: Vec<String>,
+    center: Vec3,
+    radius: f32,
+    bounds_min: Vec3,
+    bounds_max: Vec3,
+    yaw: f32,
+    pitch: f32,
+    zoom: f32,
+    pan: egui::Vec2,
+    dirty: bool,
+}
+impl BmdPreview {
+    pub fn from_model(
+        device: &wgpu::Device,
+        renderer: &mut egui_wgpu::Renderer,
+        path: String,
+        model: &crate::bmd::Model,
+        assets: &mut super::archive::LibrarianAssets,
+    ) -> Result<Self, String> {
+        let identity = crate::scene::Ornament {
+            export_id: 0,
+            offset: 0,
+            position: [0.0; 3],
+            direction: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            extra: 0,
+            path: path.clone(),
+            map_id: String::new(),
+        };
+        let mut vertices = Vec::new();
+        let mut valid_vertices = Vec::new();
+        let mut triangles = Vec::new();
+        let mut textures = Vec::<BmdPreviewTexture>::new();
+        let mut texture_indices = HashMap::<String, Option<usize>>::new();
+        let mut texture_warnings = Vec::new();
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for mesh in &model.meshes {
+            let base = vertices.len();
+            let material = mesh.material.as_ref().map(|material| material.diffuse);
+            let texture_key = mesh.texture.trim().replace('\\', "/");
+            let texture_index = if texture_key.is_empty() || texture_key.len() <= 4 {
+                None
+            } else if let Some(index) = texture_indices.get(&texture_key) {
+                *index
+            } else {
+                let decoded = assets
+                    .read_bmd_texture(&texture_key)
+                    .and_then(|bytes| crate::model_texture_gpu::decode_preview_rgba(&bytes));
+                let index = match decoded {
+                    Ok(image) => {
+                        let (width, height) = image.dimensions();
+                        if width == 0 || height == 0 {
+                            texture_warnings
+                                .push(format!("{texture_key}: image has zero dimensions"));
+                            None
+                        } else {
+                            let index = textures.len();
+                            textures.push(BmdPreviewTexture {
+                                width: width as usize,
+                                height: height as usize,
+                                rgba: image.into_raw(),
+                            });
+                            Some(index)
+                        }
+                    }
+                    Err(error) => {
+                        texture_warnings.push(format!("{texture_key}: {error}"));
+                        None
+                    }
+                };
+                texture_indices.insert(texture_key.clone(), index);
+                index
+            };
+            for source in &mesh.vertices {
+                let (position, normal) =
+                    crate::gpu::editor_bmd_vertex_transform(model, &identity, source, [1.0; 3]);
+                if !position.is_finite() || !normal.is_finite() {
+                    vertices.push(BmdPreviewVertex {
+                        position: Vec3::ZERO,
+                        normal: Vec3::Y,
+                        color: Vec3::ZERO,
+                        uv: Vec2::ZERO,
+                    });
+                    valid_vertices.push(false);
+                    continue;
+                }
+                min = min.min(position);
+                max = max.max(position);
+                let packed = if source.day_diffuse != 0 {
+                    source.day_diffuse
+                } else if source.diffuse != 0 {
+                    source.diffuse
+                } else {
+                    u32::MAX
+                };
+                let mut color = Vec3::new(
+                    ((packed >> 16) & 0xff) as f32 / 255.0,
+                    ((packed >> 8) & 0xff) as f32 / 255.0,
+                    (packed & 0xff) as f32 / 255.0,
+                );
+                if let Some(diffuse) =
+                    material.filter(|diffuse| diffuse.iter().all(|value| value.is_finite()))
+                {
+                    color *= Vec3::new(diffuse[0], diffuse[1], diffuse[2]).max(Vec3::ZERO);
+                }
+                vertices.push(BmdPreviewVertex {
+                    position,
+                    normal: if normal.length_squared() > 1.0e-8 {
+                        normal.normalize()
+                    } else {
+                        Vec3::Y
+                    },
+                    color,
+                    uv: Vec2::from_array(source.uv),
+                });
+                valid_vertices.push(true);
+            }
+            for face in mesh.indices.chunks_exact(3) {
+                let a = face[0] as usize;
+                let b = face[1] as usize;
+                let c = face[2] as usize;
+                if a < mesh.vertices.len()
+                    && b < mesh.vertices.len()
+                    && c < mesh.vertices.len()
+                    && valid_vertices[base + a]
+                    && valid_vertices[base + b]
+                    && valid_vertices[base + c]
+                {
+                    triangles.push(BmdPreviewTriangle {
+                        indices: [base + a, base + b, base + c],
+                        texture: texture_index,
+                    });
+                }
+            }
+        }
+        if vertices.is_empty() || triangles.is_empty() || !min.is_finite() || !max.is_finite() {
+            return Err("BMD contains no finite indexed triangles for 3D preview".into());
+        }
+        let center = (min + max) * 0.5;
+        let radius = ((max - min).length() * 0.5).max(0.1);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Architect BMD geometry preview"),
+            size: wgpu::Extent3d {
+                width: BMD_PREVIEW_SIDE,
+                height: BMD_PREVIEW_SIDE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PREVIEW_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            ..Default::default()
+        });
+        let texture_id = renderer.register_native_texture(device, &view, wgpu::FilterMode::Linear);
+        Ok(Self {
+            path,
+            texture,
+            texture_id,
+            vertices,
+            triangles,
+            textures,
+            texture_warnings,
+            center,
+            radius,
+            bounds_min: min,
+            bounds_max: max,
+            yaw: 0.65,
+            pitch: 0.2,
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            dirty: true,
+        })
+    }
+
+    pub fn model_bounds(&self) -> ([f32; 3], [f32; 3]) {
+        (self.bounds_min.to_array(), self.bounds_max.to_array())
+    }
+
+    pub fn texture_status(&self) -> String {
+        let textured_triangles = self
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.texture.is_some())
+            .count();
+        if self.texture_warnings.is_empty() {
+            format!(
+                "Diffuse textures loaded: {} · textured triangles: {textured_triangles}",
+                self.textures.len()
+            )
+        } else {
+            format!(
+                "Diffuse textures loaded: {} · {} missing/unsupported",
+                self.textures.len(),
+                self.texture_warnings.len()
+            )
+        }
+    }
+
+    pub fn texture_warnings(&self) -> &[String] {
+        &self.texture_warnings
+    }
+
+    /// Rasterize a small, shaded turntable view only when the camera changes.
+    /// The texture is reused while the preview is idle, so it has no per-frame
+    /// GPU allocations and does not rebuild the main world scenery atlas.
+    pub fn prepare(&mut self, queue: &wgpu::Queue) {
+        if !self.dirty {
+            return;
+        }
+        let side = BMD_PREVIEW_SIDE as usize;
+        let mut pixels = vec![0u8; side * side * 4];
+        let mut depth = vec![f32::INFINITY; side * side];
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[29, 34, 43, 255]);
+        }
+        let rotation =
+            glam::Quat::from_rotation_y(self.yaw) * glam::Quat::from_rotation_x(self.pitch);
+        let distance = self.radius * 3.2 / self.zoom.clamp(0.3, 2.8);
+        let focal = side as f32 * 1.12;
+        let center = side as f32 * 0.5;
+        let pan_scale = self.radius * 2.0 / side as f32;
+        let pan = Vec3::new(self.pan.x * pan_scale, -self.pan.y * pan_scale, 0.0);
+        let light = Vec3::new(-0.45, 0.78, 0.42).normalize();
+        let projected = |vertex: BmdPreviewVertex| {
+            let position = rotation * (vertex.position - self.center) + pan;
+            let z = distance - position.z;
+            if !z.is_finite() || z <= 0.01 {
+                return None;
+            }
+            Some((
+                egui::pos2(
+                    center + position.x * focal / z,
+                    center - position.y * focal / z,
+                ),
+                z,
+                rotation * vertex.normal,
+                vertex.color,
+                vertex.uv,
+            ))
+        };
+        for triangle in &self.triangles {
+            let Some(a) = projected(self.vertices[triangle.indices[0]]) else {
+                continue;
+            };
+            let Some(b) = projected(self.vertices[triangle.indices[1]]) else {
+                continue;
+            };
+            let Some(c) = projected(self.vertices[triangle.indices[2]]) else {
+                continue;
+            };
+            let area = (b.0.x - a.0.x) * (c.0.y - a.0.y) - (b.0.y - a.0.y) * (c.0.x - a.0.x);
+            if !area.is_finite() || area.abs() < 1.0e-5 {
+                continue;
+            }
+            let min_x = a.0.x.min(b.0.x).min(c.0.x).floor().max(0.0) as usize;
+            let max_x = a.0.x.max(b.0.x).max(c.0.x).ceil().min((side - 1) as f32) as usize;
+            let min_y = a.0.y.min(b.0.y).min(c.0.y).floor().max(0.0) as usize;
+            let max_y = a.0.y.max(b.0.y).max(c.0.y).ceil().min((side - 1) as f32) as usize;
+            if min_x > max_x || min_y > max_y {
+                continue;
+            }
+            let inverse_area = 1.0 / area;
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    let point_x = x as f32 + 0.5;
+                    let point_y = y as f32 + 0.5;
+                    let wa = ((b.0.y - c.0.y) * (point_x - c.0.x)
+                        + (c.0.x - b.0.x) * (point_y - c.0.y))
+                        * inverse_area;
+                    let wb = ((c.0.y - a.0.y) * (point_x - c.0.x)
+                        + (a.0.x - c.0.x) * (point_y - c.0.y))
+                        * inverse_area;
+                    let wc = 1.0 - wa - wb;
+                    if wa < -1.0e-4 || wb < -1.0e-4 || wc < -1.0e-4 {
+                        continue;
+                    }
+                    let z = wa * a.1 + wb * b.1 + wc * c.1;
+                    let offset = y * side + x;
+                    if z >= depth[offset] {
+                        continue;
+                    }
+                    let reciprocal_depth = wa / a.1 + wb / b.1 + wc / c.1;
+                    if !reciprocal_depth.is_finite() || reciprocal_depth <= 0.0 {
+                        continue;
+                    }
+                    let uv =
+                        (a.4 * (wa / a.1) + b.4 * (wb / b.1) + c.4 * (wc / c.1)) / reciprocal_depth;
+                    let texel = triangle
+                        .texture
+                        .and_then(|index| self.textures.get(index))
+                        .map(|texture| texture.sample(uv.x, uv.y))
+                        .unwrap_or([1.0; 4]);
+                    if texel[3] <= 0.005 {
+                        continue;
+                    }
+                    depth[offset] = z;
+                    let normal = (a.2 * wa + b.2 * wb + c.2 * wc).normalize_or_zero();
+                    let diffuse = (normal.dot(light).max(0.0) * 0.78 + 0.22).clamp(0.0, 1.0);
+                    let vertex_color = (a.3 * wa + b.3 * wb + c.3 * wc) * diffuse;
+                    let color = vertex_color * Vec3::new(texel[0], texel[1], texel[2]);
+                    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let pixel = &mut pixels[offset * 4..offset * 4 + 4];
+                    let alpha = texel[3].clamp(0.0, 1.0);
+                    let background = Vec3::new(
+                        pixel[0] as f32 / 255.0,
+                        pixel[1] as f32 / 255.0,
+                        pixel[2] as f32 / 255.0,
+                    );
+                    let composited = color * alpha + background * (1.0 - alpha);
+                    pixel.copy_from_slice(&[
+                        byte(composited.x),
+                        byte(composited.y),
+                        byte(composited.z),
+                        255,
+                    ]);
+                }
+            }
+        }
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(BMD_PREVIEW_SIDE * 4),
+                rows_per_image: Some(BMD_PREVIEW_SIDE),
+            },
+            wgpu::Extent3d {
+                width: BMD_PREVIEW_SIDE,
+                height: BMD_PREVIEW_SIDE,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.dirty = false;
+    }
+
+    pub fn show_interactive(&mut self, ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
+        let response =
+            ui.add(egui::Image::new((self.texture_id, size)).sense(egui::Sense::click_and_drag()));
+        if let Some(mode) = drag_mode(&response, ui.input(|input| input.modifiers.shift)) {
+            let delta = ui.input(|input| input.pointer.delta());
+            match mode {
+                Drag::Pan => self.pan += delta,
+                Drag::Orbit => {
+                    self.yaw = orbit_yaw(self.yaw, delta.x);
+                    self.pitch = orbit_pitch(self.pitch, delta.y);
+                }
+            }
+            self.dirty = true;
+        }
+        if response.hovered() {
+            let wheel = ui.input(|input| input.smooth_scroll_delta.y);
+            if wheel.abs() > f32::EPSILON {
+                self.zoom = (self.zoom * (-wheel * 0.002).exp()).clamp(0.3, 2.8);
+                self.dirty = true;
+            }
+        }
+        response
+    }
+}
+
 pub struct Preview {
     pub target: Target,
     asset: Option<ModelAsset>,
@@ -405,6 +839,8 @@ pub struct Preview {
     center: Vec3,
     pub pan: Vec3,
     radius: f32,
+    bounds_min: Vec3,
+    bounds_max: Vec3,
     updated: std::time::Instant,
     elapsed: f32,
     pub action: usize,
@@ -437,6 +873,8 @@ impl Preview {
             center: Vec3::ZERO,
             pan: Vec3::ZERO,
             radius: 1.,
+            bounds_min: Vec3::ZERO,
+            bounds_max: Vec3::ZERO,
             updated: std::time::Instant::now(),
             elapsed: 0.,
             action: 0,
@@ -530,6 +968,8 @@ impl Preview {
                         return Err("Model contains no finite geometry".into());
                     }
                     self.center = (min + max) * 0.5;
+                    self.bounds_min = min;
+                    self.bounds_max = max;
                     self.pan = Vec3::ZERO;
                     self.radius = ((max - min).length() * 0.5).max(0.1);
                     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -644,6 +1084,76 @@ impl Preview {
             }
         }
         queue.submit(Some(encoder.finish()));
+    }
+    /// Local-space geometry bounds from the currently loaded client mesh.
+    /// These are used by Architect for selection outlines, not guessed object sizes.
+    pub fn model_bounds(&self) -> Option<([f32; 3], [f32; 3])> {
+        self.asset
+            .as_ref()
+            .map(|_| (self.bounds_min.to_array(), self.bounds_max.to_array()))
+    }
+
+    /// Draw an interactive preview for compact asset-browser popups.
+    /// Left-drag orbits, Shift+left-drag pans, and the wheel zooms while the
+    /// pointer is over the image. The response is returned so the owning
+    /// floating window can keep the hovered asset alive as the pointer moves
+    /// from the file list into this preview.
+    pub fn show_interactive(&mut self, ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
+        let response = if let Some(error) = &self.error {
+            ui.colored_label(egui::Color32::LIGHT_RED, error)
+        } else {
+            ui.add(
+                egui::Image::new((self.target.texture_id, size))
+                    .sense(egui::Sense::click_and_drag()),
+            )
+        };
+        let shift = ui.input(|input| input.modifiers.shift);
+        if let Some(mode) = drag_mode(&response, shift) {
+            let delta = ui.input(|input| input.pointer.delta());
+            match mode {
+                Drag::Pan => self.pan_by(delta),
+                Drag::Orbit => {
+                    self.yaw = orbit_yaw(self.yaw, delta.x);
+                    self.pitch = orbit_pitch(self.pitch, delta.y);
+                }
+            }
+        }
+        if response.hovered() {
+            let wheel = ui.input(|input| input.smooth_scroll_delta.y);
+            if wheel.abs() > f32::EPSILON {
+                self.zoom = (self.zoom * (-wheel * 0.002).exp()).clamp(0.3, 5.0);
+            }
+        }
+        for warning in &self.warnings {
+            ui.label(egui::RichText::new(warning).small().weak());
+        }
+        if let Some(error) = &self.animation_error {
+            ui.label(
+                egui::RichText::new(error)
+                    .small()
+                    .color(egui::Color32::YELLOW),
+            );
+        }
+        response
+    }
+
+    /// Draw the offscreen model target inside an egui panel.
+    pub fn show(&self, ui: &mut egui::Ui, size: egui::Vec2) {
+        if let Some(error) = &self.error {
+            ui.colored_label(egui::Color32::LIGHT_RED, error);
+        } else {
+            ui.add(egui::Image::new((self.target.texture_id, size)));
+        }
+        for warning in &self.warnings {
+            ui.label(egui::RichText::new(warning).small().weak());
+        }
+        if let Some(error) = &self.animation_error {
+            ui.label(
+                egui::RichText::new(error)
+                    .small()
+                    .color(egui::Color32::YELLOW),
+            );
+        }
     }
     pub fn select_action(&mut self, action: usize) {
         if self.action != action {
@@ -764,6 +1274,26 @@ pub(super) fn camera_matrix(target: Vec3, radius: f32, zoom: f32, yaw: f32, pitc
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dragging_right_rotates_preview_to_the_right() {
+        assert!(orbit_yaw(0.0, 20.0) > 0.0);
+        assert!(orbit_yaw(0.0, -20.0) < 0.0);
+    }
+
+    #[test]
+    fn bmd_preview_texture_sampling_wraps_and_interpolates() {
+        let texture = BmdPreviewTexture {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+            ],
+        };
+        assert_eq!(texture.sample(0.25, 0.25), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(texture.sample(0.75, 0.25), [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(texture.sample(1.25, 0.25), [1.0, 0.0, 0.0, 1.0]);
+    }
+
     #[test]
     fn authentic_client_models_when_available() {
         let Ok(root) = std::env::var("PW_LIBRARIAN_ELEMENT_ROOT") else {
@@ -893,13 +1423,14 @@ mod tests {
         let before = camera_matrix(Vec3::ZERO, 1., 1., 0., 0.) * Vec3::ZERO.extend(1.);
         let after = camera_matrix(delta, 1., 1., 0., 0.) * Vec3::ZERO.extend(1.);
         assert!(after.x / after.w > before.x / before.w);
-        // Orbiting right turns the front toward the right on screen.
+        // Dragging right rotates the camera to the right, so the model's
+        // front moves left on screen. This is the non-mirrored horizontal drag.
         let front = Vec3::new(0., 0., 1.);
         let screen_x = |yaw: f32| {
             let p = camera_matrix(Vec3::ZERO, 1., 1., yaw, 0.) * front.extend(1.);
             p.x / p.w
         };
-        assert!(screen_x(orbit_yaw(0., 10.)) > screen_x(0.));
+        assert!(screen_x(orbit_yaw(0., 10.)) < screen_x(0.));
         assert!(orbit_pitch(0., 10.) > 0.);
         assert_eq!(animation_index(false, 2), None);
         assert_eq!(animation_index(true, 2), Some(2));

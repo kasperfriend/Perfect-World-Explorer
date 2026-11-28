@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
 };
 /// Decoded hot-set budget in bytes when `PW_TERRAIN_RAM_MIB` is unset.
@@ -89,12 +89,17 @@ struct Store {
     width: usize,
     side: usize,
     data: Data,
+    /// Sparse, non-destructive editor overlay shared by all readers.
+    edits: RwLock<Arc<HashMap<usize, (f32, [i8; 3])>>>,
+    revision: AtomicU64,
 }
 #[derive(Clone)]
 pub struct Heights(Arc<Store>);
 pub struct Normals(Arc<Store>);
 pub struct Reader {
     store: Arc<Store>,
+    edits: Arc<HashMap<usize, (f32, [i8; 3])>>,
+    revision: u64,
     current: Option<(usize, Arc<Page>)>,
 }
 impl From<Vec<f32>> for Heights {
@@ -104,17 +109,74 @@ impl From<Vec<f32>> for Heights {
             width: values.len(),
             side: 1,
             data: Data::Memory(values),
+            edits: RwLock::new(Arc::new(HashMap::new())),
+            revision: AtomicU64::new(0),
         }))
     }
 }
 impl Heights {
     pub fn reader(&self) -> Reader {
+        let edits = self.0.edits.read().unwrap();
+        let revision = self.0.revision.load(Ordering::Acquire);
         Reader {
             store: Arc::clone(&self.0),
+            edits: Arc::clone(&edits),
+            revision,
             current: None,
         }
     }
+    /// Grid dimensions in source cells (width, height).
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.0.width, self.0.len / self.0.width.max(1))
+    }
+    /// Monotonically increasing after each successful editor commit.
+    pub fn revision(&self) -> u64 {
+        self.0.revision.load(Ordering::Acquire)
+    }
+    /// Clear all non-destructive editor overrides and publish a new revision.
+    pub fn clear_edits(&self) -> Result<(), String> {
+        let mut edits = self
+            .0
+            .edits
+            .write()
+            .map_err(|_| "terrain edit lock poisoned")?;
+        if !edits.is_empty() {
+            *edits = Arc::new(HashMap::new());
+            self.0.revision.fetch_add(1, Ordering::Release);
+        }
+        Ok(())
+    }
+    /// Atomically publish sparse height/normal overrides shared by all readers.
+    /// All indices and heights are validated before any cell is changed.
+    pub fn apply_cells(&self, cells: &[(usize, f32, [i8; 3])]) -> Result<(), String> {
+        for (index, height, _) in cells {
+            if *index >= self.0.len {
+                return Err(format!("terrain edit cell {index} out of bounds"));
+            }
+            if !height.is_finite() {
+                return Err(format!("terrain edit cell {index} has non-finite height"));
+            }
+        }
+        if cells.is_empty() {
+            return Ok(());
+        }
+        let mut edits = self
+            .0
+            .edits
+            .write()
+            .map_err(|_| "terrain edit lock poisoned")?;
+        let mut next = (**edits).clone();
+        for (index, height, normal) in cells {
+            next.insert(*index, (*height, *normal));
+        }
+        *edits = Arc::new(next);
+        self.0.revision.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
     pub fn at(&self, index: usize) -> f32 {
+        if let Some((height, _)) = self.0.edits.read().unwrap().get(&index) {
+            return *height;
+        }
         match &self.0.data {
             Data::Memory(v) => v[index],
             Data::Resident(grid) => grid.heights[index],
@@ -157,17 +219,28 @@ impl Heights {
 }
 impl Normals {
     pub fn at(&self, index: usize) -> [i8; 3] {
+        if let Some((_, normal)) = self.0.edits.read().unwrap().get(&index) {
+            return *normal;
+        }
         if let Data::Resident(grid) = &self.0.data {
             return grid.normals[index];
         }
+        let edits = self.0.edits.read().unwrap();
+        let revision = self.0.revision.load(Ordering::Acquire);
         Reader {
             store: Arc::clone(&self.0),
+            edits: Arc::clone(&edits),
+            revision,
             current: None,
         }
         .normal(index)
     }
 }
 impl Reader {
+    /// Source revision captured when this reader snapshot was created.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
     fn page(&mut self, index: usize) -> Result<usize, String> {
         if index >= self.store.len {
             return Err(format!("terrain cell {index} out of bounds"));
@@ -240,6 +313,12 @@ impl Reader {
         Ok(local)
     }
     pub fn cell(&mut self, index: usize) -> Result<(f32, [i8; 3]), String> {
+        if index >= self.store.len {
+            return Err(format!("terrain cell {index} out of bounds"));
+        }
+        if let Some(cell) = self.edits.get(&index).copied() {
+            return Ok(cell);
+        }
         match &self.store.data {
             Data::Memory(values) => {
                 return values
@@ -263,6 +342,9 @@ impl Reader {
         Ok((page.heights[local], page.normals[local]))
     }
     pub fn height(&mut self, index: usize) -> f32 {
+        if let Some((height, _)) = self.edits.get(&index) {
+            return *height;
+        }
         match &self.store.data {
             Data::Memory(values) => return values[index],
             Data::Resident(grid) => return grid.heights[index],
@@ -274,6 +356,9 @@ impl Reader {
         self.current.as_ref().unwrap().1.heights[local]
     }
     pub fn normal(&mut self, index: usize) -> [i8; 3] {
+        if let Some((_, normal)) = self.edits.get(&index) {
+            return *normal;
+        }
         match &self.store.data {
             Data::Memory(_) => {
                 assert!(index < self.store.len);
@@ -527,6 +612,8 @@ impl Builder {
                 width: self.width,
                 side: self.side,
                 data: Data::Resident(grid),
+                edits: RwLock::new(Arc::new(HashMap::new())),
+                revision: AtomicU64::new(0),
             });
             return Ok((Heights(Arc::clone(&store)), Normals(store)));
         }
@@ -616,6 +703,8 @@ impl Builder {
                     },
                 },
             })),
+            edits: RwLock::new(Arc::new(HashMap::new())),
+            revision: AtomicU64::new(0),
         });
         Ok((Heights(Arc::clone(&store)), Normals(store)))
     }
@@ -896,6 +985,8 @@ pub fn restore(
                 },
             },
         })),
+        edits: RwLock::new(Arc::new(HashMap::new())),
+        revision: AtomicU64::new(0),
     });
     eprintln!(
         "Terrain cache: warm start, {pages} verified blocks reused from {} (source decode and recompression skipped), decoded hot-set budget {:.2} MiB",
@@ -1268,6 +1359,36 @@ mod tests {
             one
         );
         assert!(source_identity(header, &sub, &["missing".to_string()]).is_err());
+    }
+
+    #[test]
+    fn editor_overlay_is_shared_atomic_and_snapshot_consistent() {
+        let dir = Temp::new();
+        let (heights, normals) = fixture(&dir.0, 224, false);
+        let index = 5 * 32 + 7;
+        let original = height(7, 5);
+        let mut old_reader = heights.reader();
+        assert_eq!(old_reader.revision(), 0);
+
+        heights
+            .apply_cells(&[(index, 123.5, [12, 34, 56])])
+            .unwrap();
+        assert_eq!(heights.revision(), 1);
+        assert_eq!(heights.at(index), 123.5);
+        assert_eq!(normals.at(index), [12, 34, 56]);
+        assert_eq!(old_reader.cell(index).unwrap(), (original, normal(7, 5)));
+
+        let mut new_reader = heights.reader();
+        assert_eq!(new_reader.revision(), 1);
+        assert_eq!(new_reader.cell(index).unwrap(), (123.5, [12, 34, 56]));
+
+        // A bad cell rejects the whole batch; neither the valid first entry nor
+        // the revision is published.
+        assert!(heights
+            .apply_cells(&[(index, 999.0, [1, 2, 3]), (heights.0.len, 1.0, [0, 0, 0])])
+            .is_err());
+        assert_eq!(heights.revision(), 1);
+        assert_eq!(heights.at(index), 123.5);
     }
 
     #[test]

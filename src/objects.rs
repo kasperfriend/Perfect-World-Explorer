@@ -235,6 +235,13 @@ pub struct UnresolvedTexture {
 }
 pub struct Objects {
     pub ornaments: Arc<[Ornament]>,
+    /// Immutable source-map placements; Architect placements are appended to
+    /// a separate transient tail and never written back into EC-BSD data.
+    native_ornaments: Arc<[Ornament]>,
+    /// Uniform scales for the transient Architect tail, keyed by combined
+    /// ornament index. Native EC-BSD ornaments retain their authored scale.
+    editor_scales: HashMap<usize, [f32; 3]>,
+    editor_placements: Vec<crate::scene::EditorSceneryPlacement>,
     /// Canonical in-memory keys built once instead of formatting and lowercasing
     /// the same placement path on every streamed batch.
     model_names: Vec<String>,
@@ -406,7 +413,10 @@ impl Objects {
             element.to_path_buf(),
         );
         Ok(Self {
+            native_ornaments: ornaments.clone(),
             ornaments,
+            editor_scales: HashMap::new(),
+            editor_placements: Vec::new(),
             model_names,
             models: HashMap::new(),
             cache: TextureCache::new(tex_budget_bytes()),
@@ -426,6 +436,77 @@ impl Objects {
             unresolved_seen: HashSet::new(),
         })
     }
+    /// Replace the transient BMD placements while preserving every native
+    /// EC-BSD ornament. The ordinary scenery residency, BMD parser, texture
+    /// resolver, atlas builder and GPU page path then handle both identically.
+    pub fn set_editor_ornaments(
+        &mut self,
+        placements: &[crate::scene::EditorSceneryPlacement],
+    ) -> bool {
+        if self.editor_placements == placements {
+            return false;
+        }
+        self.editor_placements = placements.to_vec();
+        let mut combined = self.native_ornaments.to_vec();
+        let base = combined.len();
+        self.editor_scales.clear();
+        for (offset, placement) in placements.iter().enumerate() {
+            combined.push(Ornament {
+                export_id: u32::MAX.saturating_sub(offset as u32),
+                offset: 0,
+                position: placement.position,
+                direction: placement.direction,
+                up: placement.up,
+                extra: 0,
+                path: placement.path.clone(),
+                map_id: placement.map_id.clone(),
+            });
+            if placement.scale.is_finite()
+                && placement.scale > 0.0
+                && placement
+                    .scale_axes
+                    .iter()
+                    .all(|v| v.is_finite() && (0.001..=1000.0).contains(v))
+            {
+                self.editor_scales.insert(
+                    base + offset,
+                    [
+                        placement.scale * placement.scale_axes[0],
+                        placement.scale * placement.scale_axes[1],
+                        placement.scale * placement.scale_axes[2],
+                    ],
+                );
+            }
+        }
+        self.ornaments = combined.into();
+        self.model_names = self
+            .ornaments
+            .iter()
+            .map(|ornament| litmodel_key(&ornament.path))
+            .collect();
+        if self.native_ornaments.is_empty() {
+            if let Some(placement) = placements.first() {
+                self.litmodel_map_id = placement.map_id.clone();
+            }
+        }
+        true
+    }
+
+    /// Effective geometric-mean scale for compatibility; native map scenery
+    /// defaults to 1 because its transform is authored by EC-BSD direction/up vectors.
+    pub fn placement_scale(&self, index: usize) -> f32 {
+        let axes = self.placement_scale_axes(index);
+        (axes[0] * axes[1] * axes[2]).cbrt()
+    }
+
+    pub fn placement_scale_axes(&self, index: usize) -> [f32; 3] {
+        self.editor_scales.get(&index).copied().unwrap_or([1.0; 3])
+    }
+
+    pub fn native_ornament_count(&self) -> usize {
+        self.native_ornaments.len()
+    }
+
     pub fn update(&mut self, world_x: f32, world_z: f32, range: f32) -> Result<Vec<usize>, String> {
         let ids: Vec<usize> = self
             .ornaments
@@ -1085,6 +1166,39 @@ mod tests {
             map_id: map_id.into(),
         }
     }
+    #[test]
+    fn editor_bmd_ornaments_are_transient_and_keep_native_placements() {
+        let root = fixture_root("editor-bmd-tail");
+        write_pck(&root.join("litmodels.pck"), &[]);
+        write_pck(&root.join("building.pck"), &[]);
+        let mut objects = Objects::open(&root, vec![ornament("a01")]).unwrap();
+        let placement = crate::scene::EditorSceneryPlacement {
+            path: "litmodels/a01/1/editor.bmd".into(),
+            position: [4.0, 5.0, 6.0],
+            direction: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            scale: 2.5,
+            scale_axes: [1.0, 2.0, 3.0],
+            map_id: "a01".into(),
+        };
+
+        assert!(objects.set_editor_ornaments(std::slice::from_ref(&placement)));
+        assert_eq!(objects.native_ornament_count(), 1);
+        assert_eq!(objects.ornaments.len(), 2);
+        assert_eq!(objects.ornaments[0].path, "1/litmodel_1399.bmd");
+        assert_eq!(objects.ornaments[1].path, "litmodels/a01/1/editor.bmd");
+        assert_eq!(objects.placement_scale(0), 1.0);
+        assert!((objects.placement_scale(1) - (2.5_f32 * 5.0 * 7.5).cbrt()).abs() < 1e-5);
+        assert_eq!(objects.placement_scale_axes(1), [2.5, 5.0, 7.5]);
+        assert!(!objects.set_editor_ornaments(std::slice::from_ref(&placement)));
+
+        assert!(objects.set_editor_ornaments(&[]));
+        assert_eq!(objects.ornaments.len(), 1);
+        assert_eq!(objects.ornaments[0].path, "1/litmodel_1399.bmd");
+        assert_eq!(objects.placement_scale(1), 1.0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn map_partitioned_litmodels_load_from_the_selected_instance_namespace() {
         let root = fixture_root("map-scoped-litmodels");

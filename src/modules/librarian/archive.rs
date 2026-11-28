@@ -80,9 +80,11 @@ pub struct LibrarianAssets {
     configs: Option<PckArchive>,
     surfaces: Option<PckArchive>,
     models: Option<Result<PckArchive, String>>,
+    litmodels: Option<Result<PckArchive, String>>,
     gfx: Option<Result<PckArchive, String>>,
     loose_gfx: HashMap<String, PathBuf>,
     textures: Option<Result<PckArchive, String>>,
+    building: Option<Result<PckArchive, String>>,
     facedata: Option<Result<PckArchive, String>>,
 }
 
@@ -95,9 +97,11 @@ impl LibrarianAssets {
             configs,
             surfaces,
             models: None,
+            litmodels: None,
             gfx: None,
             loose_gfx: HashMap::new(),
             textures: None,
+            building: None,
             facedata: None,
         }
     }
@@ -276,6 +280,85 @@ impl LibrarianAssets {
         in_archive || self.loose_resource(path).is_some()
     }
 
+    /// Read one map-partitioned static BMD from litmodels.pck. The caller
+    /// supplies the canonical `litmodels/<map-id>/...` key produced by the
+    /// Architect resolver; archive indexing remains lazy like other assets.
+    pub fn read_litmodel_resource(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        let normalized = normalize_archive_path(path);
+        if !normalized.starts_with("litmodels/")
+            || safe_join(&self.element_root, &path.replace('\\', "/")).is_none()
+        {
+            return Err(format!("invalid litmodel asset path '{path}'"));
+        }
+        if self.litmodels.is_none() {
+            self.litmodels = Some(PckArchive::open(&self.element_root, "litmodels.pck"));
+        }
+        let result = match self.litmodels.as_mut().unwrap() {
+            Ok(archive) => archive.read(&normalized),
+            Err(error) => Err(error.clone()),
+        };
+        result.or_else(|error| {
+            self.loose_resource(path).ok_or_else(|| {
+                format!("{error}; check that litmodels.pck or the matching loose BMD is installed")
+            })
+        })
+    }
+
+    /// Read a BMD-authored diffuse texture. BMD records often include the
+    /// archive namespace ("building/textures/..."), while older records may
+    /// contain only "textures/..."; try both without allowing traversal.
+    pub fn read_bmd_texture(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        let normalized = normalize_archive_path(path);
+        if normalized.is_empty()
+            || Path::new(&normalized)
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(format!("invalid BMD texture path '{path}'"));
+        }
+        let mut candidates = vec![normalized.clone()];
+        if let Some(relative) = normalized.strip_prefix("building/") {
+            candidates.push(relative.to_owned());
+        } else {
+            candidates.push(format!("building/{normalized}"));
+        }
+        candidates.dedup();
+
+        if self.building.is_none() {
+            self.building = Some(PckArchive::open(&self.element_root, "building.pck"));
+        }
+        let archive_result = self
+            .building
+            .as_mut()
+            .expect("building archive initialized");
+        let mut archive_error = None;
+        if let Ok(archive) = archive_result {
+            for candidate in &candidates {
+                if archive.contains(candidate) {
+                    return archive.read(candidate);
+                }
+            }
+        } else if let Err(error) = archive_result {
+            archive_error = Some(error.clone());
+        }
+
+        for candidate in &candidates {
+            let Some(disk) = safe_join(&self.element_root, candidate) else {
+                continue;
+            };
+            if disk.is_file() {
+                return fs::read(&disk)
+                    .map_err(|error| format!("cannot read {}: {error}", disk.display()));
+            }
+        }
+        Err(format!(
+            "BMD texture '{path}' was not found{}; searched building.pck and loose client files",
+            archive_error
+                .map(|error| format!(" ({error})"))
+                .unwrap_or_default()
+        ))
+    }
+
     /// Unified package reader compatible with `ModelAsset` and `model_draw_gpu::Draw`.
     pub fn read_model_resource(&mut self, path: &str) -> Result<Vec<u8>, String> {
         let normalized = normalize_archive_path(path);
@@ -334,6 +417,27 @@ mod tests {
             b"model"
         );
         assert!(assets.read_model_resource("models/../../outside").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bmd_texture_reader_accepts_building_prefix_and_loose_fallback() {
+        let root =
+            std::env::temp_dir().join(format!("librarian-bmd-texture-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("building/textures/test")).unwrap();
+        std::fs::write(root.join("building/textures/test/wall.dds"), b"texture").unwrap();
+        let mut assets = LibrarianAssets::open(&root);
+        assert_eq!(
+            assets
+                .read_bmd_texture("building/textures/test/wall.dds")
+                .unwrap(),
+            b"texture"
+        );
+        assert_eq!(
+            assets.read_bmd_texture("textures/test/wall.dds").unwrap(),
+            b"texture"
+        );
+        assert!(assets.read_bmd_texture("../../outside.dds").is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

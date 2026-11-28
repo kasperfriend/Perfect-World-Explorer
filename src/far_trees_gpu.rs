@@ -5,7 +5,7 @@ mod cutoff_residency;
 use crate::indirect_args::{base_instance, multi_draw, record, DrawIndexedArgs, DRAW_ARGS};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
-/// One instance record: `[position.xyz, 0]`, then `[fraction, mode, 0, 0]`.
+/// One instance record: `[position.xyz, yaw]`, then `[fraction, mode, scale, 0]`.
 ///
 /// Two `vec4`s rather than a `vec3` + `vec2`: WGSL pads a storage-array element
 /// to a 16-byte boundary, so `info` would land at offset 16 there but at 12 in a
@@ -18,16 +18,16 @@ struct Instance {
     data: [f32; 8],
 }
 impl Instance {
-    fn new(position: [f32; 3], info: [f32; 2]) -> Self {
+    fn new(position: [f32; 3], info: [f32; 2], yaw: f32, scale: f32) -> Self {
         Self {
             data: [
                 position[0],
                 position[1],
                 position[2],
-                0.,
+                yaw,
                 info[0],
                 info[1],
-                0.,
+                scale,
                 0.,
             ],
         }
@@ -40,7 +40,9 @@ impl Instance {
 pub(crate) struct Placement {
     pub(crate) pos_height: [f32; 4],
     pub(crate) group: u32,
-    pub(crate) pad: [u32; 3],
+    pub(crate) yaw: f32,
+    pub(crate) scale: f32,
+    pub(crate) pad: u32,
 }
 /// Per-group constants the LOD pass needs, plus where its instances live.
 #[repr(C)]
@@ -80,7 +82,7 @@ pub(crate) struct LodParams {
 /// changes the fade fraction, never whether the tree is drawn.
 pub(crate) const LOD_COMPUTE: &str = r#"
 struct LodParamsGpu {camera:vec4<f32>,bounds:vec4<f32>,counts:vec4<u32>};
-struct Placement {pos_height:vec4<f32>,group:u32,pad0:u32,pad1:u32,pad2:u32};
+struct Placement {pos_height:vec4<f32>,group:u32,yaw:f32,scale:f32,pad:u32};
 struct GroupInfo {height:f32,args_base:u32,first_instance:u32,capacity:u32};
 struct Args {index_count:u32,instance_count:atomic<u32>,first_index:u32,base_vertex:i32,first_instance:u32};
 struct Instance {data0:vec4<f32>,data1:vec4<f32>};
@@ -117,7 +119,7 @@ fn select_level(distance:f32,height:f32,scale:f32)->vec4<f32> {
  if distance<a {primary=0.;} else if distance<b {primary=1.;}
  return vec4<f32>(primary,3.,0.,0.);
 }
-fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>) {
+fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>,yaw:f32,scale:f32) {
  let g=groups[group_index];
  if level>2u {return;}
  // A group whose cache carries fewer than three levels has no records of its
@@ -126,7 +128,7 @@ fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>) {
  if g.capacity==0u {return;}
  let slot=atomicAdd(&args[g.args_base+level].instance_count,1u);
  if slot>=g.capacity {return;}
- instances[g.first_instance+level*g.capacity+slot]=Instance(vec4<f32>(position,0.),vec4<f32>(info,0.,1.));
+ instances[g.first_instance+level*g.capacity+slot]=Instance(vec4<f32>(position,yaw),vec4<f32>(info,scale,0.));
 }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id:vec3<u32>) {
@@ -142,12 +144,12 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {
  let constants=groups[placement.group];
  let distance=client_distance(position,p.camera.xyz);
  if distance<0. {return;}
- let selection=select_level(distance,constants.height,p.camera.w);
+ let selection=select_level(distance,constants.height*placement.scale,p.camera.w);
  let fraction=selection.z;
  let secondary=selection.w>0.5;
- append(placement.group,u32(selection.x),position,vec2<f32>(fraction,select(0.,1.,secondary)));
+ append(placement.group,u32(selection.x),position,vec2<f32>(fraction,select(0.,1.,secondary)),placement.yaw,placement.scale);
  if secondary {
-  append(placement.group,u32(selection.y),position,vec2<f32>(fraction,2.));
+  append(placement.group,u32(selection.y),position,vec2<f32>(fraction,2.),placement.yaw,placement.scale);
  }
 }
 "#;
@@ -156,7 +158,10 @@ struct Batch {
     instances: std::ops::Range<u32>,
 }
 struct Group {
+    tree_type: usize,
     positions: Vec<[f32; 3]>,
+    transforms: Vec<[f32; 2]>,
+    native_count: usize,
     height: f32,
     first_batch: usize,
 }
@@ -221,6 +226,7 @@ pub struct FarTrees {
     /// The LOD selection pass: a camera move dispatches this instead of walking
     /// every placement on the CPU and re-uploading the instance buffer.
     lod_pipeline: wgpu::ComputePipeline,
+    lod_layout: wgpu::BindGroupLayout,
     lod_bind: wgpu::BindGroup,
     lod_params: wgpu::Buffer,
     placements: u32,
@@ -228,6 +234,7 @@ pub struct FarTrees {
     /// static part of each record with `instance_count` zeroed.
     lod_args: wgpu::Buffer,
     lod_args_reset: Vec<u8>,
+    editor_placements: Vec<crate::scene::EditorTreePlacement>,
     /// `multi_draw_indexed_indirect` + `first_instance` are optional device
     /// features; when they are present the whole batch list is one call.
     multi_draw: bool,
@@ -252,11 +259,12 @@ fn fogged(linear:vec3<f32>, reciprocal_w:f32)->vec3<f32> {
  let v=mix(encoded,camera.fog_color.rgb,f);
  return select(v/12.92,pow((max(v,vec3<f32>(0.))+0.055)/1.055,vec3<f32>(2.4)),v>vec3<f32>(0.04045));
 }
-struct In {@builtin(vertex_index) vertex_id:u32,@location(0) pos:vec3<f32>,@location(1) normal:vec3<f32>,@location(2) uv:vec2<f32>,@location(3) color:vec4<f32>,@location(4) kind:f32,@location(5) instance:vec3<f32>,@location(6) info:vec2<f32>,@location(7) tex_h:u32,@location(8) alpha_ref:u32};
+struct In {@builtin(vertex_index) vertex_id:u32,@location(0) pos:vec3<f32>,@location(1) normal:vec3<f32>,@location(2) uv:vec2<f32>,@location(3) color:vec4<f32>,@location(4) kind:f32,@location(5) instance:vec4<f32>,@location(6) info:vec4<f32>,@location(7) tex_h:u32,@location(8) alpha_ref:u32};
 struct Out {@builtin(position) pos:vec4<f32>,@location(0) normal:vec3<f32>,@location(1) uv:vec2<f32>,@location(2) color:vec4<f32>,@location(3) @interpolate(flat) kind:f32,@location(4) world:vec3<f32>,@location(5) @interpolate(flat) tree:vec3<f32>,@location(6) @interpolate(flat) tex_h:f32,@location(7) @interpolate(flat) fade:vec2<f32>,@location(8) @interpolate(flat) alpha_ref:u32};
-@vertex fn vs(i:In)->Out {var o:Out;var pos=i.pos+i.instance;var norm=i.normal;
- if i.kind>4.5 {let d=normalize(camera.direction.xyz);let az=atan2(d.z,d.x);let el=asin(clamp(d.y,-1.,1.));let rho=i.color.w;var corner=i.normal;let rock_index=i.tex_h>>8u;if rock_index>0u {corner=mix(corner,rock_sample(rock_index-1u,camera.tree_bounds.w),clamp(camera.tree_bounds.z,0.,1.));}let q=vec3<f32>(cos(el)*corner.x-sin(el)*corner.z,corner.y,sin(el)*corner.x+cos(el)*corner.z);let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. {v=corner;}pos+=vec3<f32>(v.x,v.z,v.y);norm=vec3<f32>(0.,1.,0.);if i.vertex_id<arrayLength(&leaf_normals) {let n=leaf_normals[i.vertex_id];if n.w>0.5 {norm=n.xyz;}}}
- o.pos=camera.matrix*vec4<f32>(pos,1.);o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.tree=i.instance;o.tex_h=f32(i.tex_h & 127u)*select(128./8192.,128./2048.,(i.tex_h & 128u)!=0u);o.fade=i.info;o.alpha_ref=i.alpha_ref;return o;}
+fn rotate_y(v:vec3<f32>,yaw:f32)->vec3<f32>{let c=cos(yaw);let s=sin(yaw);return vec3<f32>(c*v.x-s*v.z,v.y,s*v.x+c*v.z);}
+@vertex fn vs(i:In)->Out {var o:Out;var pos=rotate_y(i.pos*i.info.z,i.instance.w)+i.instance.xyz;var norm=rotate_y(i.normal,i.instance.w);
+ if i.kind>4.5 {let d=normalize(camera.direction.xyz);let az=atan2(d.z,d.x);let el=asin(clamp(d.y,-1.,1.));let rho=i.color.w;var corner=rotate_y(i.normal,i.instance.w);let rock_index=i.tex_h>>8u;if rock_index>0u {corner=mix(corner,rotate_y(rock_sample(rock_index-1u,camera.tree_bounds.w),i.instance.w),clamp(camera.tree_bounds.z,0.,1.));}let q=vec3<f32>(cos(el)*corner.x-sin(el)*corner.z,corner.y,sin(el)*corner.x+cos(el)*corner.z);let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. {v=corner;}pos+=vec3<f32>(v.x,v.z,v.y)*i.info.z;norm=vec3<f32>(0.,1.,0.);if i.vertex_id<arrayLength(&leaf_normals) {let n=leaf_normals[i.vertex_id];if n.w>0.5 {norm=rotate_y(n.xyz,i.instance.w);}}}
+ o.pos=camera.matrix*vec4<f32>(pos,1.);o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.tree=i.instance.xyz;o.tex_h=f32(i.tex_h & 127u)*select(128./8192.,128./2048.,(i.tex_h & 128u)!=0u);o.fade=i.info.xy;o.alpha_ref=i.alpha_ref;return o;}
 @fragment fn fs(i:Out)->@location(0) vec4<f32>{if camera.clip.y!=0. && (i.world.y-camera.clip.x)*camera.clip.y<0. {discard;}
 
  let scale=vec2<f32>(i.color.z,i.tex_h);var dx=dpdx(i.uv);var dy=dpdy(i.uv);let lod_bias=exp2(camera.lod.x);dx*=lod_bias;dy*=lod_bias;let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(dx*dims),length(dy*dims)),1.)),0.,7.);let halfpixel=min(vec2<f32>(0.5*exp2(mip))/dims,scale*0.499);let uv=i.color.xy+clamp(fract((i.uv-i.color.xy)/scale)*scale,halfpixel,scale-halfpixel);let tex=textureSampleGrad(atlas,atlas_sampler,uv,dx,dy);if i.alpha_ref!=0xffffffffu {let threshold=bitcast<f32>(i.alpha_ref);if tex.a<=threshold {discard;}}else if i.kind>3.5 && tex.a<0.5 {discard;}
@@ -351,9 +359,7 @@ impl FarTrees {
                 .filter(|p| p.tree_type as usize == id)
                 .map(|p| p.position)
                 .collect();
-            if positions.is_empty() {
-                continue;
-            }
+            let transforms = vec![[0.0, 1.0]; positions.len()];
             let height = tree.lods[0]
                 .branch
                 .vertices
@@ -437,11 +443,11 @@ impl FarTrees {
                 let rocking_base = rocking_samples.len() / 64;
                 rocking_samples.extend(lod.rocking.iter().map(|v| [v[0], v[1], v[2], 0.]));
                 let start_inst = instances.len() as u32;
-                instances.extend(
-                    positions
-                        .iter()
-                        .map(|&position| Instance::new(position, [0., 0.])),
-                );
+                instances.extend(positions.iter().zip(&transforms).map(
+                    |(&position, transform)| {
+                        Instance::new(position, [0., 0.], transform[0], transform[1])
+                    },
+                ));
                 let end_inst = instances.len() as u32;
                 let start_idx = indices.len() as u32;
                 for (part, slot_id, kind, native_alpha) in [
@@ -522,7 +528,10 @@ impl FarTrees {
                 });
             }
             groups.push(Group {
+                tree_type: id,
+                native_count: positions.len(),
                 positions,
+                transforms,
                 height,
                 first_batch,
             });
@@ -763,16 +772,16 @@ impl FarTrees {
             push_constant_ranges: &[],
         });
         const ATTR: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x2,3=>Float32x4,4=>Float32,7=>Uint32,8=>Uint32];
-        // `Instance` is two `vec4`s (see its doc): position at 0, transition
-        // info at 16. `vertex_attr_array!` would pack them at 0 and 12.
+        // `Instance` is two `vec4`s (see its doc): position/yaw at 0,
+        // fade/scale at 16. `vertex_attr_array!` would pack them at 0 and 12.
         const INST: [wgpu::VertexAttribute; 2] = [
             wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Float32x3,
+                format: wgpu::VertexFormat::Float32x4,
                 offset: 0,
                 shader_location: 5,
             },
             wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Float32x2,
+                format: wgpu::VertexFormat::Float32x4,
                 offset: 16,
                 shader_location: 6,
             },
@@ -851,21 +860,26 @@ impl FarTrees {
         // dispatches `LOD_COMPUTE` over the placement table.
         let mut placement_data = Vec::new();
         for (index, group) in groups.iter().enumerate() {
-            for &position in &group.positions {
+            for (&position, transform) in group.positions.iter().zip(&group.transforms) {
                 placement_data.push(Placement {
                     pos_height: [position[0], position[1], position[2], 0.],
                     group: index as u32,
-                    pad: [0; 3],
+                    yaw: transform[0],
+                    scale: transform[1],
+                    pad: 0,
                 });
             }
         }
+        let placement_count = placement_data.len() as u32;
         // `args_base` is a batch index (`first_batch + level`), not a group index.
         let mut group_data = group_table(&groups, &batches);
         if placement_data.is_empty() {
             placement_data.push(Placement {
                 pos_height: [0.; 4],
                 group: 0,
-                pad: [0; 3],
+                yaw: 0.0,
+                scale: 1.0,
+                pad: 0,
             });
         }
         if group_data.is_empty() {
@@ -876,7 +890,6 @@ impl FarTrees {
                 capacity: 0,
             });
         }
-        let placement_count = placement_data.len() as u32;
         let placement_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tree placements"),
             contents: bytemuck::cast_slice(&placement_data),
@@ -1046,14 +1059,170 @@ impl FarTrees {
             capacity,
             last_resident_update: None,
             lod_pipeline,
+            lod_layout,
             lod_bind,
             lod_params,
             placements: placement_count,
             lod_args,
             lod_args_reset,
+            editor_placements: Vec::new(),
             multi_draw: one_call,
         }
     }
+    /// Replace Architect's transient tree placements without rebuilding
+    /// the cached SpeedTree geometry, atlas, or material pipeline.
+    pub fn sync_editor_placements(
+        &mut self,
+        device: &wgpu::Device,
+        placements: &[crate::scene::EditorTreePlacement],
+    ) {
+        if self.editor_placements == placements {
+            return;
+        }
+        self.editor_placements = placements.to_vec();
+        for group in &mut self.groups {
+            group.positions.truncate(group.native_count);
+            group.transforms.truncate(group.native_count);
+        }
+        for placement in placements {
+            if !placement.position.iter().all(|value| value.is_finite())
+                || !placement.yaw.is_finite()
+                || !placement.scale.is_finite()
+                || !(0.05..=20.0).contains(&placement.scale)
+            {
+                continue;
+            }
+            if let Some(group) = self
+                .groups
+                .iter_mut()
+                .find(|group| group.tree_type == placement.tree_type as usize)
+            {
+                group.positions.push(placement.position);
+                group.transforms.push([placement.yaw, placement.scale]);
+            } else {
+                eprintln!(
+                    "Architect tree type {} is unavailable: its SpeedTree cache entry was not loaded",
+                    placement.tree_type
+                );
+            }
+        }
+
+        // Each type owns exactly three adjacent LOD batches. Re-pack their
+        // instance slices so the compute pass can write the updated population.
+        let mut instance_cursor = 0u32;
+        for group in &self.groups {
+            let count = group.positions.len() as u32;
+            for level in 0..3 {
+                if let Some(batch) = self.batches.get_mut(group.first_batch + level) {
+                    batch.instances = instance_cursor..instance_cursor + count;
+                    instance_cursor += count;
+                }
+            }
+        }
+
+        let mut placement_data = Vec::new();
+        for (group_index, group) in self.groups.iter().enumerate() {
+            for (&position, transform) in group.positions.iter().zip(&group.transforms) {
+                placement_data.push(Placement {
+                    pos_height: [position[0], position[1], position[2], 0.0],
+                    group: group_index as u32,
+                    yaw: transform[0],
+                    scale: transform[1],
+                    pad: 0,
+                });
+            }
+        }
+        self.placements = placement_data.len() as u32;
+        if placement_data.is_empty() {
+            placement_data.push(Placement {
+                pos_height: [0.0; 4],
+                group: 0,
+                yaw: 0.0,
+                scale: 1.0,
+                pad: 0,
+            });
+        }
+        let mut group_data = group_table(&self.groups, &self.batches);
+        if group_data.is_empty() {
+            group_data.push(GroupInfo {
+                height: 5.0,
+                args_base: 0,
+                first_instance: 0,
+                capacity: 0,
+            });
+        }
+
+        let seed = vec![Instance::zeroed(); instance_cursor.max(1) as usize];
+        self.capacity = seed.len();
+        self.instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Architect tree instances (LOD compute target)"),
+            contents: bytemuck::cast_slice(&seed),
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+        let placement_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Architect tree placements"),
+            contents: bytemuck::cast_slice(&placement_data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let group_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Architect tree LOD groups"),
+            contents: bytemuck::cast_slice(&group_data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let mut args = Vec::with_capacity(self.batches.len().max(1));
+        for batch in &self.batches {
+            let mut record = record(batch.indices.clone(), batch.instances.clone());
+            record.instance_count = 0;
+            if !self.multi_draw {
+                record.first_instance = 0;
+            }
+            args.push(record);
+        }
+        if args.is_empty() {
+            args.push(record(0..0, 0..0));
+        }
+        self.lod_args_reset = bytemuck::cast_slice::<DrawIndexedArgs, u8>(&args).to_vec();
+        self.lod_args = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Architect tree LOD indirect args"),
+            contents: &self.lod_args_reset,
+            usage: wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+        self.lod_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Architect tree LOD bindings"),
+            layout: &self.lod_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.lod_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: placement_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: group_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.instances.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.lod_args.as_entire_binding(),
+                },
+            ],
+        });
+        self.last_resident_update = None;
+    }
+
     /// Select every placement's LOD on the GPU.
     ///
     /// The CPU used to walk the whole placement table here — distance, LOD
@@ -1121,7 +1290,7 @@ impl FarTrees {
         let mut args = self.lod_args_reset.clone();
         for group in &self.groups {
             let mut counts = [0u32; 3];
-            for &p in &group.positions {
+            for (position_index, &p) in group.positions.iter().enumerate() {
                 let Some(dist) = crate::tree_lod::client_distance(p, camera) else {
                     continue;
                 };
@@ -1146,7 +1315,8 @@ impl FarTrees {
                     }
                     let batch = &self.batches[group.first_batch + level];
                     let index = (batch.instances.start + counts[level]) as usize;
-                    staging[index] = Instance::new(p, info);
+                    let transform = group.transforms[position_index];
+                    staging[index] = Instance::new(p, info, transform[0], transform[1]);
                     counts[level] += 1;
                 }
             }
@@ -1280,6 +1450,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn instance_records_preserve_editor_yaw_and_uniform_scale() {
+        let instance = Instance::new([1.0, 2.0, 3.0], [0.25, 2.0], 1.5, 2.5);
+        assert_eq!(instance.data, [1.0, 2.0, 3.0, 1.5, 0.25, 2.0, 2.5, 0.0]);
+    }
+
+    #[test]
     fn legacy_cutout_still_covers_fronds_and_leaves_without_native_refs() {
         assert!(super::SHADER.contains("else if i.kind>3.5 && tex.a<0.5 {discard;}"));
     }
@@ -1302,7 +1478,10 @@ mod tests {
                 });
             }
             groups.push(Group {
+                tree_type: group,
+                native_count: 4,
                 positions: vec![[0.; 3]; 4],
+                transforms: vec![[0.0, 1.0]; 4],
                 height: 5. * (group as f32 + 1.),
                 first_batch,
             });
@@ -1359,12 +1538,18 @@ mod tests {
         ];
         let groups = vec![
             Group {
+                tree_type: 0,
+                native_count: 2,
                 positions: vec![[0.; 3]; 2],
+                transforms: vec![[0.0, 1.0]; 2],
                 height: 5.,
                 first_batch: 0,
             },
             Group {
+                tree_type: 1,
+                native_count: 2,
                 positions: vec![[0.; 3]; 2],
+                transforms: vec![[0.0, 1.0]; 2],
                 height: 9.,
                 first_batch: 3,
             },

@@ -2,6 +2,7 @@
 //! GPU resources. The host only supplies narrow input/camera, terrain and draw
 //! hooks; a disabled module has no effect on core features.
 
+mod architect;
 mod designer;
 mod librarian;
 mod package;
@@ -31,14 +32,13 @@ fn extend_fonts(ctx: &egui::Context, extend: impl FnOnce(&mut egui::FontDefiniti
 pub struct Modules {
     walker: Walker,
     librarian: librarian::Librarian,
+    architect: architect::Architect,
     populator: Populator,
     packages: Registry,
     selected: usize,
     /// The world's effect catalogue, handed over by the host when the GFX
-    /// archive attaches. Modules read it to find an effect by group, name or
-    /// search; playing one in the world goes through the host's
-    /// `World::spawn_catalog_effect`, which this handle deliberately does not
-    /// reach yet — access first, wiring later.
+    /// archive attaches. Architect resolves project-owned .gfx placements
+    /// against this index; WorldModels remains the owner of playback and lights.
     effect_catalog: Option<crate::gfx_catalog::Catalog>,
 }
 
@@ -47,6 +47,7 @@ impl Default for Modules {
         Self {
             walker: Walker::default(),
             librarian: librarian::Librarian::new(PathBuf::new()),
+            architect: architect::Architect::new(PathBuf::new(), None, String::new()),
             populator: Populator::default(),
             packages: Registry::discover(package::default_root()),
             selected: 0,
@@ -66,15 +67,93 @@ impl Modules {
     ) -> Self {
         // The add-ons each own their state; the host only clones the two
         // handles they need (client root and the loaded world space).
+        let current_map_id = map_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
         let populator = Populator::new(element.clone(), map.clone(), map_dir);
+        let architect =
+            architect::Architect::new(element.clone(), Some(map.clone()), current_map_id);
         Self {
             walker: Walker::with_host(element.clone(), map, water, scene, ornaments),
-            librarian: librarian::Librarian::new(element),
+            librarian: librarian::Librarian::new(element.clone()),
+            architect,
             populator,
             packages: Registry::discover(package::default_root()),
             selected: 0,
             effect_catalog: None,
         }
+    }
+
+    /// Placements authored by Architect that can be submitted to the native
+    /// ECM renderer. Empty while the module is disabled.
+    pub fn architect_placements(&self) -> Vec<crate::world_models_gpu::EditorPlacement> {
+        self.architect.renderer_placements()
+    }
+
+    /// Transient BMD scenery instances for the native baked-scenery renderer.
+    pub fn architect_scenery_placements(&self) -> Vec<crate::scene::EditorSceneryPlacement> {
+        self.architect.renderer_scenery_placements()
+    }
+
+    /// Transient SpeedTree instances for the native vegetation renderer.
+    pub fn architect_tree_placements(&self) -> Vec<crate::scene::EditorTreePlacement> {
+        self.architect.renderer_tree_placements()
+    }
+
+    /// Project-owned GFX roots for the world's native effect owner queue.
+    pub fn architect_effect_placements(
+        &self,
+    ) -> Vec<crate::world_models_gpu::EditorEffectPlacement> {
+        self.architect.renderer_effect_placements()
+    }
+
+    pub fn architect_object_dragging(&self) -> bool {
+        self.architect.is_dragging_object()
+    }
+
+    pub fn prepare_architect_preview(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut egui_wgpu::Renderer,
+        format: wgpu::TextureFormat,
+    ) {
+        self.architect.free_pending_preview_textures(renderer);
+        if self.architect.active() {
+            self.architect
+                .prepare_preview(device, queue, renderer, format);
+        }
+    }
+
+    pub fn architect_active(&self) -> bool {
+        self.architect.active()
+    }
+
+    pub fn set_architect_active(&mut self, enabled: bool) {
+        self.architect.set_active(enabled);
+    }
+
+    pub fn architect_ui(
+        &mut self,
+        ctx: &egui::Context,
+        catalog: &crate::world_catalog::Catalog,
+        current_map: &crate::world_catalog::WorldMap,
+        scene: &crate::scene::Scene,
+        ornaments: &[crate::scene::Ornament],
+        camera: Vec3,
+        view_projection: glam::Mat4,
+    ) -> Option<String> {
+        self.architect.ui(
+            ctx,
+            catalog,
+            current_map,
+            scene,
+            ornaments,
+            camera,
+            view_projection,
+        )
     }
 
     pub fn prepare_librarian_preview(
@@ -96,6 +175,7 @@ impl Modules {
             "walker" => self.walker.is_active(),
             "populator" => self.populator.is_active(),
             "librarian" => self.librarian.active(),
+            "architect" => self.architect.active(),
             _ => false,
         }
     }
@@ -260,6 +340,20 @@ impl Modules {
         match installed.id.as_str() {
             "walker" => self.walker_module_ui(ui, spawn, yaw),
             "populator" => self.populator_module_ui(ui, spawn),
+            "architect" => {
+                let active = self.architect.active();
+                if ui
+                    .button(if active {
+                        "Disable Architect"
+                    } else {
+                        "Enable Architect"
+                    })
+                    .clicked()
+                {
+                    self.architect.set_active(!active);
+                }
+                ui.label("Full-screen world authoring workspace with separate, non-destructive projects.");
+            }
             "librarian" => {
                 let active = self.librarian.active();
                 if ui
@@ -520,6 +614,7 @@ impl Modules {
     /// Hand the world's catalogue to the add-ons. Replaces any previous one,
     /// which is what a world reload wants.
     pub fn set_effect_catalog(&mut self, catalog: crate::gfx_catalog::Catalog) {
+        self.architect.set_effect_catalog(catalog.clone());
         self.effect_catalog = Some(catalog);
     }
 

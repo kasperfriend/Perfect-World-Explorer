@@ -524,6 +524,8 @@ struct MeshData {
     tree_center: (f32, f32),
     detail: DetailSettings,
     lod: LodState,
+    /// Source height/normal revision captured by this mesh build.
+    terrain_revision: u64,
     /// Resident terrain blocks and the index range each occupies.
     spans: Vec<crate::terrain_residency::Span>,
     terrain_end: u32,
@@ -590,6 +592,92 @@ fn basis(v: [f32; 3]) -> Vec3 {
         Vec3::Y
     } else {
         v.normalize()
+    }
+}
+
+/// Compose a BMD's local transform with an Architect scene-instance transform.
+/// Native map scenery keeps its recovered legacy path; only the editor-owned
+/// tail uses this function so project position/yaw/scale replace the source
+/// object's placement while preserving the BMD's own local pivot and axes.
+pub(crate) fn editor_bmd_vertex_transform(
+    model: &crate::bmd::Model,
+    ornament: &crate::scene::Ornament,
+    vertex: &crate::bmd::Vertex,
+    instance_scale: [f32; 3],
+) -> (Vec3, Vec3) {
+    let model_z = basis(model.direction);
+    let model_y = basis(model.up);
+    let model_x = model_y.cross(model_z).normalize_or_zero();
+    let instance_z = basis(ornament.direction);
+    let instance_y = basis(ornament.up);
+    let instance_x = instance_y.cross(instance_z).normalize_or_zero();
+
+    let local_position = Vec3::from_array(model.position)
+        + model_x * (vertex.position[0] * model.scale[0])
+        + model_y * (vertex.position[1] * model.scale[1])
+        + model_z * (vertex.position[2] * model.scale[2]);
+    let world_position = Vec3::from_array(ornament.position)
+        + instance_x * (local_position.x * instance_scale[0])
+        + instance_y * (local_position.y * instance_scale[1])
+        + instance_z * (local_position.z * instance_scale[2]);
+
+    let local_normal =
+        (model_x * vertex.normal[0] + model_y * vertex.normal[1] + model_z * vertex.normal[2])
+            .normalize_or_zero();
+    let world_normal = (instance_x * (local_normal.x / instance_scale[0].max(1e-4))
+        + instance_y * (local_normal.y / instance_scale[1].max(1e-4))
+        + instance_z * (local_normal.z / instance_scale[2].max(1e-4)))
+    .normalize_or_zero();
+    (world_position, world_normal)
+}
+
+#[cfg(test)]
+mod editor_bmd_transform_tests {
+    use super::*;
+
+    #[test]
+    fn editor_bmd_transform_applies_instance_position_yaw_and_scale() {
+        let model = crate::bmd::Model {
+            scale: [1.0; 3],
+            direction: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            position: [0.0; 3],
+            meshes: Vec::new(),
+            collision: Vec::new(),
+        };
+        let ornament = crate::scene::Ornament {
+            export_id: 1,
+            offset: 0,
+            position: [10.0, 20.0, 30.0],
+            direction: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            extra: 0,
+            path: "litmodels/a01/1/test.bmd".into(),
+            map_id: "a01".into(),
+        };
+        let vertex = crate::bmd::Vertex {
+            position: [1.0, 0.0, 0.0],
+            uv: [0.0; 2],
+            normal: [1.0, 0.0, 0.0],
+            diffuse: 0,
+            day_diffuse: 0,
+            night_diffuse: 0,
+        };
+        let (position, normal) =
+            editor_bmd_vertex_transform(&model, &ornament, &vertex, [2.0, 3.0, 4.0]);
+        assert!((position.x - 10.0).abs() < 0.0001);
+        assert!((position.y - 20.0).abs() < 0.0001);
+        assert!((position.z - 28.0).abs() < 0.0001);
+        assert!((normal.x - 0.0).abs() < 0.0001);
+        assert!((normal.z + 1.0).abs() < 0.0001);
+        let y_vertex = crate::bmd::Vertex {
+            position: [0.0, 1.0, 0.0],
+            normal: [0.0, 1.0, 0.0],
+            ..vertex.clone()
+        };
+        let (y_position, _) =
+            editor_bmd_vertex_transform(&model, &ornament, &y_vertex, [2.0, 3.0, 4.0]);
+        assert!((y_position.y - 23.0).abs() < 0.0001);
     }
 }
 fn push_quad(v: &mut Vec<Vertex>, i: &mut Vec<u32>, points: [[f32; 3]; 4], color: [f32; 4]) {
@@ -855,6 +943,14 @@ fn build(
     // meshed at the level `0x77e360` picked, blocks whose level changed are
     // re-meshed, and blocks the window leaves release their geometry.
     let mut terrain_reader = t.heights.reader();
+    let terrain_revision = terrain_reader.revision();
+    if t.terrain_material_window
+        .is_some_and(|(_, previous_revision)| previous_revision != terrain_revision)
+    {
+        // Every cached near block and the whole-world LOD depend on heights and
+        // normals. Discard the old CPU block meshes before rebuilding them.
+        *residency = crate::terrain_residency::Residency::default();
+    }
     let census = residency.update_stitched(
         &win,
         |x, y| {
@@ -1228,7 +1324,10 @@ fn build(
     // are what the local draw reads; nothing else consumes them, and the
     // whole-world pages were selected from the map's own records.
     let nearby = if skip_local_scenery {
-        Vec::new()
+        // Whole-world pages own native map scenery, but transient Architect
+        // BMDs are not part of that immutable preload. Build only the editor
+        // tail locally so it remains visible without duplicating native props.
+        (t.objects.native_ornament_count()..t.objects.ornaments.len()).collect()
     } else {
         // Built once for the map and kept: the list covers the whole scene, and
         // the camera cannot change any entry in it. Cloning the `Arc` out of the
@@ -1382,10 +1481,13 @@ fn build(
         // EC-BSD +36 flags, recovered at 0x489f0b/0x489f12. Keep them on the
         // page's index ranges; a hidden placement must not be submitted in a
         // secondary view just because the page itself is resident.
-        let visibility = Visibility::from_extra(t.objects.ornaments[id].extra);
+        let ornament = &t.objects.ornaments[id];
+        let editor_owned = id >= t.objects.native_ornament_count();
+        let visibility = Visibility::from_extra(ornament.extra);
         let z = basis(model.direction);
         let y = basis(model.up);
         let x = y.cross(z).normalize_or_zero();
+        let instance_scale = t.objects.placement_scale_axes(id);
         for mesh in &model.meshes {
             let key = mesh.texture.to_lowercase();
             let Some((page_id, slot)) = texture_slots.get(&key).copied() else {
@@ -1418,12 +1520,17 @@ fn build(
             let sx = slot.w as f32 / ATLAS as f32;
             let sy = slot.h as f32 / ATLAS as f32;
             for vert in &mesh.vertices {
-                let p = Vec3::from_array(model.position)
-                    + x * (vert.position[0] * model.scale[0])
-                    + y * (vert.position[1] * model.scale[1])
-                    + z * (vert.position[2] * model.scale[2]);
-                let n = (x * vert.normal[0] + y * vert.normal[1] + z * vert.normal[2])
-                    .normalize_or_zero();
+                let (p, n) = if editor_owned {
+                    editor_bmd_vertex_transform(model, ornament, vert, instance_scale)
+                } else {
+                    let position = Vec3::from_array(model.position)
+                        + x * (vert.position[0] * model.scale[0] * instance_scale[0])
+                        + y * (vert.position[1] * model.scale[1] * instance_scale[1])
+                        + z * (vert.position[2] * model.scale[2] * instance_scale[2]);
+                    let normal = (x * vert.normal[0] + y * vert.normal[1] + z * vert.normal[2])
+                        .normalize_or_zero();
+                    (position, normal)
+                };
                 page.vertices.push(Vertex {
                     pos: p.to_array(),
                     normal: n.to_array(),
@@ -1614,7 +1721,7 @@ fn build(
             t.height / t.materials.mask_grid,
         )
     });
-    let terrain_upload = if t.terrain_material_window != Some(mask_window) {
+    let terrain_upload = if t.terrain_material_window != Some((mask_window, terrain_revision)) {
         let materials = if t.terrain_material_window.is_none() {
             t.materials.take_window(mask_window)
         } else {
@@ -1637,7 +1744,7 @@ fn build(
         } else {
             Some(crate::terrain_gpu::world_mesh(t, 4)?)
         };
-        t.terrain_material_window = Some(mask_window);
+        t.terrain_material_window = Some((mask_window, terrain_revision));
         Some(crate::terrain_gpu::TerrainUpload { materials, far })
     } else {
         None
@@ -1656,6 +1763,7 @@ fn build(
         tree_center: (cx, cz),
         detail,
         lod: lod_state,
+        terrain_revision,
         spans,
         terrain_end,
         object_start,
@@ -1733,6 +1841,8 @@ struct Renderer {
     detail: DetailSettings,
     /// Window/levels the current terrain mesh was built for.
     lod: LodState,
+    /// Height/normal edit revision represented by the current GPU terrain mesh.
+    terrain_revision: u64,
     /// Resident terrain blocks (`0x77e250`) and the runs submitted last frame.
     spans: Vec<crate::terrain_residency::Span>,
     terrain_runs: Vec<(u32, u32)>,
@@ -2551,6 +2661,7 @@ impl Renderer {
             object_mv_view,
             center: m.center,
             lod: m.lod,
+            terrain_revision: m.terrain_revision,
             spans: m.spans,
             terrain_runs: Vec::new(),
             far_terrain_runs: Vec::new(),
@@ -2878,6 +2989,9 @@ impl Renderer {
             self.sky
                 .update(&self.queue, direction, w, h, frame, reflected_sets, true);
         }
+        let editor_tree_placements = self.modules.architect_tree_placements();
+        self.far_trees
+            .sync_editor_placements(&self.device, &editor_tree_placements);
         let resident_bounds = self.resident_bounds();
         self.far_trees.update_resident_lods(
             &self.device,
@@ -3005,6 +3119,7 @@ impl Renderer {
             upload.materials.release_gpu_source();
         }
         self.grass.update(&self.device, &self.queue, m.grass);
+        self.terrain_revision = m.terrain_revision;
         // A streamed scenery page is a deterministic function of the textures it
         // packs and the ornaments it places, so most pages of a crossing are the
         // pages the renderer already holds. Reusing them saves a 4096² atlas
@@ -3263,10 +3378,11 @@ impl Renderer {
         p.set_vertex_buffer(0, self.vertex.slice(..));
         p.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
         p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
-        if !self.world_done {
-            for page in &self.local_pages {
-                page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, true);
-            }
+        // Local pages are normally the streamed map scenery. When the
+        // whole-world preload is active they contain only Architect's transient
+        // BMD placements, so they must still be drawn alongside world pages.
+        for page in &self.local_pages {
+            page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, true);
         }
         if self.world_done {
             let slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
@@ -3294,6 +3410,29 @@ impl Renderer {
         // camera's real motion and not the sub-pixel jitter of the frame.
         unjittered_vp: Mat4,
     ) {
+        // Architect shares the native receiving-model pipeline. Synchronize its
+        // project layer before any main/reflection/refraction class gate so
+        // disabling the module also removes its transient placements promptly.
+        // The main view is the single advancing pass. Reflection and
+        // refraction reuse the same scene snapshot, so rebuilding the editor
+        // placement vector and comparing it in those passes is redundant CPU
+        // work (and used to happen up to three times per frame).
+        if advance {
+            let editor_placements = self.modules.architect_placements();
+            if let Some(models) = &mut self.models {
+                models.sync_editor_placements(&editor_placements);
+            }
+
+            // Effects use their native owner/player pipeline. Keep the last
+            // committed transform while a gizmo drag is in progress; on release
+            // the changed placement is reconciled once, not reloaded every frame.
+            if !self.modules.architect_object_dragging() {
+                let editor_effects = self.modules.architect_effect_placements();
+                if let Some(models) = &mut self.models {
+                    models.sync_editor_effects(&editor_effects);
+                }
+            }
+        }
         // WaterEffect 0 (shipped default) hides EC models and home ornaments
         // in reflection/refraction (0x5b2015, 0x5b2336). RenderContext carries
         // the recovered level-2 / underwater class gates; per-placement flags
@@ -5064,6 +5203,7 @@ fn spawn_world_handoff(
     client_root: &std::path::Path,
     map_id: &str,
     focused: bool,
+    reopen_architect: bool,
 ) -> Result<
     (
         crate::world_handoff::Files,
@@ -5078,6 +5218,11 @@ fn spawn_world_handoff(
     files.set_focused(focused);
     let mut command = std::process::Command::new(exe);
     command.arg(client_root).arg("--world").arg(&id);
+    if reopen_architect {
+        command.env("PWE_START_ARCHITECT", "1");
+    } else {
+        command.env_remove("PWE_START_ARCHITECT");
+    }
     files.configure(&mut command);
     #[cfg(windows)]
     {
@@ -5544,6 +5689,9 @@ pub fn run(
         &t.scene,
         whole_ornaments.to_vec(),
     );
+    if std::env::var_os("PWE_START_ARCHITECT").is_some() {
+        renderer.modules.set_architect_active(true);
+    }
     // Add-ons get read access to the world's effect catalogue the moment the
     // world has one: the same grouped index the World tab's census uses, so a
     // module can look up what the map ships without opening the archive
@@ -5598,6 +5746,7 @@ pub fn run(
     let mut world_status = String::from("Off");
     let mut world_last_log_at = std::time::Instant::now();
     let mut world_last_logged_pages = 0usize;
+    let mut last_architect_scenery = Vec::<crate::scene::EditorSceneryPlacement>::new();
     let world_upload_budget_ms = std::env::var("PW_WORLD_UPLOAD_BUDGET_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -5613,15 +5762,29 @@ pub fn run(
     // almost never changes them.
     // The last element says whether the whole-world preload owns the scenery, so
     // the worker can leave the local half of the mesh out (see `build`).
-    let (request_tx, request_rx) =
-        std::sync::mpsc::channel::<(f32, f32, DetailSettings, u64, bool)>();
+    let architect_scene = t.scene.clone();
+    let architect_ornaments = t.objects.ornaments.clone();
+    let (request_tx, request_rx) = std::sync::mpsc::channel::<(
+        f32,
+        f32,
+        DetailSettings,
+        u64,
+        bool,
+        Vec<crate::scene::EditorSceneryPlacement>,
+    )>();
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<MeshData, String>>(1);
     std::thread::Builder::new()
         .name("world-streaming".into())
         .spawn(move || {
             let mut residency = crate::terrain_residency::Residency::default();
-            while let Ok((x, z, detail, grass_atlas_key, skip_local_scenery)) = request_rx.recv() {
+            while let Ok((x, z, detail, grass_atlas_key, skip_local_scenery, editor_scenery)) =
+                request_rx.recv()
+            {
                 let started = Instant::now();
+                if t.objects.set_editor_ornaments(&editor_scenery) {
+                    t.scenery_placements = None;
+                    t.scenery_residency.reset();
+                }
                 let result = build(
                     &mut t,
                     x,
@@ -5753,6 +5916,9 @@ pub fn run(
     let mut streaming = false;
     let mut keys = HashSet::new();
     let mut captured = false;
+    // Architect uses a hold-to-look gesture so ordinary left clicks remain
+    // available to egui panels and viewport tools.
+    let mut architect_looking = false;
     // Winit sends Focused(true) when the visible window actually gains focus.
     // Start conservatively so input cannot move the camera before that event.
     let mut window_focused = false;
@@ -5786,6 +5952,7 @@ pub fn run(
                     if event.physical_key == PhysicalKey::Code(KeyCode::Escape) && event.state == ElementState::Pressed && !event.repeat && !world_loading_active {
                         menu_page=menu_page.escape();keys.clear();
                         if captured {let _=window.set_cursor_grab(CursorGrabMode::None);window.set_cursor_visible(true);captured=false;}
+                        architect_looking = false;
                         if input_debug() {eprintln!("Escape menu: {:?}",menu_page);}
                         return;
                     }
@@ -5803,6 +5970,7 @@ pub fn run(
                         menu_page=if menu_page==MenuPage::WorldMap {MenuPage::Closed} else {MenuPage::WorldMap};
                         keys.clear(); map_refresh=Instant::now()-std::time::Duration::from_secs(10);
                         if captured {let _=window.set_cursor_grab(CursorGrabMode::None);window.set_cursor_visible(true);captured=false;}
+                        architect_looking = false;
                         return;
                     }
                 }
@@ -5824,9 +5992,19 @@ pub fn run(
                 }
                 // egui must receive focus changes even while the menu is closed;
                 // otherwise it believes the window is unfocused and ignores clicks.
-                if menu_page.is_open() || matches!(event,WindowEvent::Focused(_)) {
+                if menu_page.is_open() || renderer.modules.architect_active() || matches!(event,WindowEvent::Focused(_)) {
                     let response=egui_state.on_window_event(&window,&event);
-                    if menu_page.is_open() && (response.consumed || matches!(event,WindowEvent::KeyboardInput{..})) && !matches!(event, WindowEvent::RedrawRequested | WindowEvent::Resized(_) | WindowEvent::CloseRequested | WindowEvent::Focused(_)) {return;}
+                    // Always release a hold-to-look capture, even if egui reports
+                    // the release as consumed because it happened over a panel.
+                    if architect_looking && matches!(&event, WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Right, .. }) {
+                        let _ = window.set_cursor_grab(CursorGrabMode::None);
+                        window.set_cursor_visible(true);
+                        captured = false;
+                        architect_looking = false;
+                    }
+                    if (menu_page.is_open() || renderer.modules.architect_active())
+                        && (response.consumed || matches!(event,WindowEvent::KeyboardInput{..}))
+                        && !matches!(event, WindowEvent::RedrawRequested | WindowEvent::Resized(_) | WindowEvent::CloseRequested | WindowEvent::Focused(_)) {return;}
                 }
                 match event {
                 WindowEvent::CloseRequested => { if let Err(e)=settings.save(){eprintln!("Settings save: {e}");} target.exit(); },
@@ -5840,9 +6018,23 @@ pub fn run(
                 }
                 WindowEvent::MouseInput {
                     state: ElementState::Pressed,
+                    button: MouseButton::Right,
+                    ..
+                } if normal_input_allowed(window_focused, menu_page.is_open(), world_loading_active) && renderer.modules.architect_active() && !captured => {
+                    let result = window
+                        .set_cursor_grab(CursorGrabMode::Locked)
+                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+                    if result.is_ok() {
+                        window.set_cursor_visible(false);
+                        captured = true;
+                        architect_looking = true;
+                    }
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
                     button: MouseButton::Left,
                     ..
-                } if normal_input_allowed(window_focused, menu_page.is_open(), world_loading_active) && !captured => {
+                } if normal_input_allowed(window_focused, menu_page.is_open(), world_loading_active) && !captured && !renderer.modules.architect_active() => {
                     let result = window
                         .set_cursor_grab(CursorGrabMode::Locked)
                         .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
@@ -5865,6 +6057,7 @@ pub fn run(
                         let _ = window.set_cursor_grab(CursorGrabMode::None);
                         window.set_cursor_visible(true);
                         captured = false;
+                        architect_looking = false;
                     }
                     if let Some(files) = &handoff_files {
                         files.set_focused(focused);
@@ -6528,11 +6721,14 @@ pub fn run(
                     // state changes what the mesh should contain, so it is part
                     // of the staleness test and not just of the request.
                     let skip_local_scenery = renderer.world_done;
+                    let architect_scenery = renderer.modules.architect_scenery_placements();
                     let stale = match &aim {
                         Some(aim) => {
                             aim != &renderer.lod
                                 || renderer.detail != settings.detail
                                 || renderer.local_scenery_skipped != skip_local_scenery
+                                || renderer.terrain_revision != map_space.heights.revision()
+                                || architect_scenery != last_architect_scenery
                         }
                         None => false,
                     };
@@ -6543,12 +6739,14 @@ pub fn run(
                             settings.detail,
                             renderer.grass_atlas_key,
                             skip_local_scenery,
+                            architect_scenery.clone(),
                         );
                         if request_tx.send(request).is_err() {
                             eprintln!("World streaming worker exited");
                             target.exit();
                             return;
                         }
+                        last_architect_scenery = architect_scenery;
                         streaming = true;
                     }
                     music.update(settings.music_enabled,settings.music_volume,camera.pos.x,camera.pos.z);
@@ -7113,7 +7311,9 @@ pub fn run(
                                 renderer.render_minimap(&full_map_view,&full_map_depth,&camera,0.,true);
                                 map_refresh=Instant::now();
                             }
-                            renderer.modules.prepare_librarian_preview(&renderer.device, &renderer.queue, &mut egui_renderer, format, menu_page==MenuPage::Modules);
+                            let show_librarian_preview = menu_page==MenuPage::Modules && !renderer.modules.architect_active();
+                            renderer.modules.prepare_librarian_preview(&renderer.device, &renderer.queue, &mut egui_renderer, format, show_librarian_preview);
+                            renderer.modules.prepare_architect_preview(&renderer.device, &renderer.queue, &mut egui_renderer, format);
                             // On-screen mark: the active upscaler / frame-generation
                             // path, so a player can see it is really on. Shown even
                             // with the menu closed (the egui pass runs for it too).
@@ -7284,7 +7484,8 @@ pub fn run(
                                 || fg_failed
                                 || xess_fg_failed
                                 || dlss_fg_failed;
-                            if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
+                            if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || renderer.modules.architect_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
+                                let mut architect_map_request: Option<String> = None;
                                 let input=egui_state.take_egui_input(&window);
                                 let output=egui_ctx.run(input,|ctx| {
                                     // A replacement-process handoff leaves this
@@ -7347,6 +7548,7 @@ pub fn run(
                                     // Clone the message before the window closure: the
                                     // Dismiss button needs a mutable borrow of the
                                     // Option while the label is displayed.
+                                    if !renderer.modules.architect_active() {
                                     if let Some(reason) = world_change_error.clone() {
                                         egui::Window::new("WORLD CHANGE FAILED")
                                             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
@@ -7464,7 +7666,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                 if selected_world_ui.eq_ignore_ascii_case(&current_map.id) {
                                                     world_change_error = Some(format!("{} is already the active world.", current_map.display_name));
                                                 } else {
-                                                    match spawn_world_handoff(&client_root, &selected_world_ui, window_focused) {
+                                                    match spawn_world_handoff(&client_root, &selected_world_ui, window_focused, false) {
                                                         Ok((files, rx)) => {
                                                             settings.selected_world = selected_world_ui.to_ascii_lowercase();
                                                             if let Err(error) = settings.save() {
@@ -7523,6 +7725,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                                 window.set_cursor_visible(true);
                                                                 captured = false;
                                                             }
+                                                            architect_looking = false;
                                                         }
                                                         Err(error) => {
                                                             settings.selected_world = current_map.id.clone();
@@ -7598,7 +7801,75 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         );
                                     }
                                     if settings.show_zone_entry {if let Some((name,started))=&zone_banner {let elapsed=started.elapsed().as_secs_f32();if elapsed<4. {let alpha=(elapsed.min(4.-elapsed)*2.).clamp(0.,1.);egui::Area::new(egui::Id::new("zone-entry")).anchor(egui::Align2::CENTER_TOP,egui::vec2(0.,65.)).interactable(false).show(ctx,|ui|{ui.label(egui::RichText::new(format!("Entering {name}")).size(24.).color(egui::Color32::from_white_alpha((alpha*255.) as u8)));});}}}
+                                    } else {
+                                        menu_page = MenuPage::Closed;
+                                        architect_map_request = renderer.modules.architect_ui(ctx, &catalog, &current_map, &architect_scene, &architect_ornaments, camera.pos, camera.matrix(config.width, config.height, camera.far));
+                                    }
                                 });
+                                // Enabling Architect can happen on the same left-click
+                                // that the normal viewer used to capture the mouse. Drop
+                                // that stale capture before the editor takes ownership.
+                                // Also release an Architect look capture if the user
+                                // disables the editor from its own toolbar.
+                                if captured
+                                    && ((renderer.modules.architect_active() && !architect_looking)
+                                        || (!renderer.modules.architect_active() && architect_looking))
+                                {
+                                    let _ = window.set_cursor_grab(CursorGrabMode::None);
+                                    window.set_cursor_visible(true);
+                                    captured = false;
+                                    architect_looking = false;
+                                }
+                                if let Some(requested) = architect_map_request {
+                                    selected_world_ui = requested.clone();
+                                    if requested.eq_ignore_ascii_case(&current_map.id) {
+                                        world_change_error = Some(format!("{} is already the active world.", current_map.display_name));
+                                    } else {
+                                        match spawn_world_handoff(&client_root, &requested, window_focused, true) {
+                                            Ok((files, rx)) => {
+                                                settings.selected_world = requested.to_ascii_lowercase();
+                                                if let Err(error) = settings.save() {
+                                                    eprintln!("Settings save before Architect world handoff: {error}");
+                                                } else {
+                                                    saved_settings = settings.clone();
+                                                }
+                                                handoff_files = Some(files);
+                                                handoff_rx = Some(rx);
+                                                world_loading_active = true;
+                                                world_change_error = None;
+                                                world_change_notice = None;
+                                                world_loading_sampler = ThroughputSampler::new();
+                                                if let Some(destination) = catalog.maps.iter().find(|map| map.id.eq_ignore_ascii_case(&requested)) {
+                                                    let size = (window.inner_size().width, window.inner_size().height);
+                                                    let (overlay, status) = build_world_loading_overlay(&egui_ctx, &destination.element, destination, size);
+                                                    world_loading_overlay = Some(overlay);
+                                                    world_loading_status = status;
+                                                } else {
+                                                    world_loading_overlay = None;
+                                                    world_loading_status = format!("Starting {requested}...");
+                                                }
+                                                renderer.modules.set_architect_active(false);
+                                                keys.clear();
+                                                architect_looking = false;
+                                                if captured {
+                                                    let _ = window.set_cursor_grab(CursorGrabMode::None);
+                                                    window.set_cursor_visible(true);
+                                                    captured = false;
+                                                }
+                                            }
+                                            Err(error) => {
+                                                settings.selected_world = current_map.id.clone();
+                                                if let Err(save_error) = settings.save() {
+                                                    eprintln!("Settings save after Architect world handoff failure: {save_error}");
+                                                } else {
+                                                    saved_settings = settings.clone();
+                                                }
+                                                selected_world_ui = current_map.id.clone();
+                                                world_change_error = Some(error);
+                                            }
+                                        }
+                                    }
+                                }
                                 egui_state.handle_platform_output(&window,output.platform_output);
                                 let jobs=egui_ctx.tessellate(output.shapes,output.pixels_per_point);
                                 let screen=egui_wgpu::ScreenDescriptor{size_in_pixels:[config.width,config.height],pixels_per_point:output.pixels_per_point};
@@ -9019,7 +9290,7 @@ mod handoff_exit_tests {
         // Only the code above the tests, or these assertions would match
         // themselves.
         let src = include_str!("gpu.rs");
-        let code = &src[..src.find("#[cfg(test)]").expect("the test module")];
+        let code = &src[..src.rfind("#[cfg(test)]").expect("the final test module")];
         // One definition, used by both the `Failed` and `Disconnected` arms.
         assert_eq!(code.matches("fn restore_old_window(").count(), 1);
         assert_eq!(code.matches("restore_old_window(&window);").count(), 2);

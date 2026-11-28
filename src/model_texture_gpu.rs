@@ -115,6 +115,35 @@ fn decode_rgba(bytes: &[u8]) -> Result<(image::RgbaImage, bool), String> {
     Ok((image.into_rgba8(), alpha_texture))
 }
 
+/// Decode a single client-authored image for the lightweight Architect
+/// preview. DDS goes through the same DXT1/DXT3/DXT5 and uncompressed BGRA /
+/// RGB565 decoding as native model uploads; TGA/PNG/JPEG use the normal image
+/// decoder. Keeping this helper shared prevents the editor preview from
+/// substituting an untextured white/vertex-colour model on common game DDS files.
+pub(crate) fn decode_preview_rgba(bytes: &[u8]) -> Result<image::RgbaImage, String> {
+    if bytes.starts_with(b"DDS ") {
+        let dds = Dds::parse(bytes)?;
+        let mip = dds.mips.first().ok_or("DDS has no base mip")?;
+        let pixel_count = (mip.width as u64)
+            .checked_mul(mip.height as u64)
+            .ok_or("DDS preview dimensions overflow")?;
+        if mip.width == 0 || mip.height == 0 || pixel_count > 64 * 1024 * 1024 {
+            return Err("DDS preview dimensions exceed the safety limit".into());
+        }
+        let capacity = usize::try_from(
+            pixel_count
+                .checked_mul(4)
+                .ok_or("DDS preview byte size overflow")?,
+        )
+        .map_err(|_| "DDS preview byte size overflow")?;
+        let mut rgba = Vec::with_capacity(capacity);
+        append_mip(bytes, dds.format, mip, &mut rgba)?;
+        return image::RgbaImage::from_raw(mip.width, mip.height, rgba)
+            .ok_or_else(|| "DDS preview decoder returned an invalid pixel buffer".into());
+    }
+    decode_rgba(bytes).map(|(image, _)| image)
+}
+
 fn upload_image(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -274,6 +303,32 @@ mod tests {
         let (image, alpha) = decode_rgba(&tga(24, &[3, 2, 1])).unwrap();
         assert!(!alpha);
         assert_eq!(image.into_raw(), [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn preview_decoder_reads_uncompressed_bgra_dds_pixels() {
+        let mut bytes = vec![0; 128];
+        bytes[..4].copy_from_slice(b"DDS ");
+        for (offset, value) in [
+            (4, 124u32),
+            (12, 1),
+            (16, 2),
+            (28, 1),
+            (76, 32),
+            (80, 0x41),
+            (88, 32),
+            (92, 0xff0000),
+            (96, 0xff00),
+            (100, 0xff),
+            (104, 0xff000000),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        // Two BGRA pixels: opaque red and half-transparent green.
+        bytes.extend_from_slice(&[0, 0, 255, 255, 0, 255, 0, 128]);
+        let image = decode_preview_rgba(&bytes).unwrap();
+        assert_eq!(image.dimensions(), (2, 1));
+        assert_eq!(image.into_raw(), [255, 0, 0, 255, 0, 255, 0, 128]);
     }
 
     #[test]
