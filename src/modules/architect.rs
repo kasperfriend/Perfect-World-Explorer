@@ -3936,7 +3936,7 @@ impl Architect {
                     self.selected_scene_object.and_then(|_| {
                         self.selected_scene_transform
                             .zip(self.selected_asset.clone())
-                            .filter(|(asset, _)| self.renderer_placeable_asset(asset))
+                            .filter(|(_, asset)| self.renderer_placeable_asset(asset))
                             .map(|(position, asset)| (Vec3::from_array(position), asset))
                     })
                 });
@@ -4764,7 +4764,7 @@ impl Architect {
                 self.selected_scene_object.and_then(|_| {
                     self.selected_scene_transform
                         .zip(self.selected_asset.clone())
-                        .filter(|(asset, _)| self.renderer_placeable_asset(asset))
+                        .filter(|(_, asset)| self.renderer_placeable_asset(asset))
                         .map(|(position, asset)| (asset, position))
                 })
             });
