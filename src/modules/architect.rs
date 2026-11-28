@@ -3576,6 +3576,81 @@ impl Architect {
                             }
                         });
                     }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Distribute evenly:");
+                        for (axis, label) in [(0usize, "X"), (1, "Y"), (2, "Z")] {
+                            if ui.small_button(label).clicked() {
+                                let mut ordered = self
+                                    .selected_placements
+                                    .iter()
+                                    .copied()
+                                    .filter(|index| *index < self.project.objects.len())
+                                    .collect::<Vec<_>>();
+                                ordered.sort_by(|left, right| {
+                                    self.project.objects[*left].position[axis]
+                                        .total_cmp(&self.project.objects[*right].position[axis])
+                                });
+                                if ordered.len() >= 3 {
+                                    let first = self.project.objects[ordered[0]].position[axis];
+                                    let last = self.project.objects[*ordered.last().unwrap()]
+                                        .position[axis];
+                                    let denominator = (ordered.len() - 1) as f32;
+                                    for (slot, index) in ordered
+                                        .iter()
+                                        .copied()
+                                        .enumerate()
+                                        .skip(1)
+                                        .take(ordered.len() - 2)
+                                    {
+                                        if let Some(object) = self.project.objects.get_mut(index) {
+                                            object.position[axis] = first
+                                                + (last - first) * (slot as f32 / denominator);
+                                        }
+                                    }
+                                    self.status = format!(
+                                        "Distributed {} placements evenly along {label}.",
+                                        ordered.len()
+                                    );
+                                } else {
+                                    self.status =
+                                        "Select at least three placements to distribute.".into();
+                                }
+                            }
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Ground selected").clicked() {
+                            if let Some(map) = &self.map {
+                                for index in &self.selected_placements {
+                                    if let Some(object) = self.project.objects.get_mut(*index) {
+                                        object.position[1] =
+                                            map.ground(object.position[0], object.position[2]) + 0.5;
+                                    }
+                                }
+                                self.status = format!(
+                                    "Placed {} selected objects on the terrain.",
+                                    self.selected_placements.len()
+                                );
+                            } else {
+                                self.status = "No terrain is loaded for grounding.".into();
+                            }
+                        }
+                        if ui.button("Reset rotation").clicked() {
+                            for index in &self.selected_placements {
+                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                    object.rotation = [0.0; 3];
+                                }
+                            }
+                        }
+                        if ui.button("Reset scale").clicked() {
+                            for index in &self.selected_placements {
+                                if let Some(object) = self.project.objects.get_mut(*index) {
+                                    object.scale = 1.0;
+                                    object.scale_axes = [1.0; 3];
+                                }
+                            }
+                        }
+                    });
                 }
                 let mut delete_placement = None;
                 let mut duplicate_placement = None;
