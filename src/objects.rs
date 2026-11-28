@@ -485,8 +485,8 @@ impl Objects {
         true
     }
 
-    /// Uniform instance scale for a BMD placement; native map scenery defaults
-    /// to 1 because its transform is authored by EC-BSD direction/up vectors.
+    /// Effective geometric-mean scale for compatibility; native map scenery
+    /// defaults to 1 because its transform is authored by EC-BSD direction/up vectors.
     pub fn placement_scale(&self, index: usize) -> f32 {
         let axes = self.placement_scale_axes(index);
         (axes[0] * axes[1] * axes[2]).cbrt()
@@ -1181,7 +1181,7 @@ mod tests {
         assert_eq!(objects.ornaments[0].path, "1/litmodel_1399.bmd");
         assert_eq!(objects.ornaments[1].path, "litmodels/a01/1/editor.bmd");
         assert_eq!(objects.placement_scale(0), 1.0);
-        assert_eq!(objects.placement_scale(1), 2.5);
+        assert!((objects.placement_scale(1) - (2.5_f32 * 5.0 * 7.5).cbrt()).abs() < 1e-5);
         assert_eq!(objects.placement_scale_axes(1), [2.5, 5.0, 7.5]);
         assert!(!objects.set_editor_ornaments(std::slice::from_ref(&placement)));
 
