@@ -1391,14 +1391,29 @@ impl World {
         // Hook parents need their off-screen pose. Otherwise skinning can be
         // deferred outside the current view while their playback clocks advance.
         let defer_offscreen_poses = self.pose_culling
-            && !self.producers.iter().any(|producer| producer.hook.is_some());
-        let Self { assets, slots, pending_static_pose_slots, animated_pose_slots, .. } = self;
+            && !self
+                .producers
+                .iter()
+                .any(|producer| producer.hook.is_some());
+        let Self {
+            assets,
+            slots,
+            pending_static_pose_slots,
+            animated_pose_slots,
+            ..
+        } = self;
 
         // Static props are evaluated once when they first become resident.
         for index in pending_static_pose_slots.drain(..) {
-            let Some(instance) = assets.instances.get(index) else { continue; };
-            let Some(slot) = slots.get_mut(index) else { continue; };
-            if !slot.static_pose_pending { continue; }
+            let Some(instance) = assets.instances.get(index) else {
+                continue;
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                continue;
+            };
+            if !slot.static_pose_pending {
+                continue;
+            }
             if !cutoff_residency::contains(bounds, instance.placement.position) || slot.failed {
                 slot.static_pose_pending = false;
                 continue;
@@ -1408,7 +1423,11 @@ impl World {
                 let transform = *slot.transform.as_ref().map_err(Clone::clone)?;
                 let pose = asset.bind_pose(transform)?;
                 let meshes = asset.meshes_from_pose(&pose)?;
-                Ok(SlotPose { sample: None, pose, meshes })
+                Ok(SlotPose {
+                    sample: None,
+                    pose,
+                    meshes,
+                })
             })();
             slot.geometry_dirty = true;
             slot.pose_stale = false;
@@ -1418,8 +1437,12 @@ impl World {
 
         // Only placements with an action clock are visited every frame.
         for &index in animated_pose_slots.iter() {
-            let Some(instance) = assets.instances.get_mut(index) else { continue; };
-            let Some(slot) = slots.get_mut(index) else { continue; };
+            let Some(instance) = assets.instances.get_mut(index) else {
+                continue;
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                continue;
+            };
             if !cutoff_residency::contains(bounds, instance.placement.position) || slot.failed {
                 continue;
             }
@@ -1439,13 +1462,17 @@ impl World {
                     continue;
                 }
             };
-            if defer_offscreen_poses && frustum.is_some_and(|planes| {
-                !sphere_in_frustum(&planes, &plane_lengths, instance.placement.position, 128.0)
-            }) {
+            if defer_offscreen_poses
+                && frustum.is_some_and(|planes| {
+                    !sphere_in_frustum(&planes, &plane_lengths, instance.placement.position, 128.0)
+                })
+            {
                 slot.pose_stale = true;
                 continue;
             }
-            if !slot.pose_stale && matches!(&slot.posed, Some(Ok(previous)) if previous.sample == sample) {
+            if !slot.pose_stale
+                && matches!(&slot.posed, Some(Ok(previous)) if previous.sample == sample)
+            {
                 continue;
             }
             let result = (|| -> Result<SlotPose, String> {
@@ -1455,7 +1482,11 @@ impl World {
                     None => asset.bind_pose(transform)?,
                 };
                 let meshes = asset.meshes_from_pose(&pose)?;
-                Ok(SlotPose { sample, pose, meshes })
+                Ok(SlotPose {
+                    sample,
+                    pose,
+                    meshes,
+                })
             })();
             slot.geometry_dirty = true;
             slot.pose_stale = false;
@@ -1926,8 +1957,15 @@ fn normalize_frustum_planes(mut planes: [[f32; 4]; 6]) -> [[f32; 4]; 6] {
         let len_squared = a * a + b * b + c * c;
         if len_squared.is_finite() && len_squared > 1.0e-12 {
             let inverse_len = len_squared.sqrt().recip();
-            *plane = [a * inverse_len, b * inverse_len, c * inverse_len, d * inverse_len];
-        } else { *plane = [0.0; 4]; }
+            *plane = [
+                a * inverse_len,
+                b * inverse_len,
+                c * inverse_len,
+                d * inverse_len,
+            ];
+        } else {
+            *plane = [0.0; 4];
+        }
     }
     planes
 }
@@ -1937,9 +1975,16 @@ fn frustum_plane_lengths(planes: [[f32; 4]; 6]) -> [f32; 6] {
     planes.map(|[a, b, c, _]| (a * a + b * b + c * c).sqrt())
 }
 
-fn sphere_in_frustum(planes: &[[f32; 4]; 6], plane_lengths: &[f32; 6], center: [f32; 3], radius: f32) -> bool {
+fn sphere_in_frustum(
+    planes: &[[f32; 4]; 6],
+    plane_lengths: &[f32; 6],
+    center: [f32; 3],
+    radius: f32,
+) -> bool {
     for (&[a, b, c, d], &len) in planes.iter().zip(plane_lengths) {
-        if len > 0.0 && a * center[0] + b * center[1] + c * center[2] + d < -radius * len { return false; }
+        if len > 0.0 && a * center[0] + b * center[1] + c * center[2] + d < -radius * len {
+            return false;
+        }
     }
     true
 }

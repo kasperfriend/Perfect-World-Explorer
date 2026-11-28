@@ -2169,7 +2169,11 @@ type AtlasThumb = Arc<(usize, usize, Vec<u8>)>;
 
 fn atlas_thumb_for_page(page: &Page) -> AtlasThumb {
     if let Some(mip2) = page.mips.get(1) {
-        Arc::new(((SIDE / 4).max(1), (page.used_height / 4).max(1), mip2.clone()))
+        Arc::new((
+            (SIDE / 4).max(1),
+            (page.used_height / 4).max(1),
+            mip2.clone(),
+        ))
     } else {
         Arc::new((SIDE, page.used_height, page.atlas.clone()))
     }
@@ -2178,13 +2182,26 @@ fn atlas_thumb_for_page(page: &Page) -> AtlasThumb {
 fn extract_page_rt(page: &Page, atlas_thumb: &AtlasThumb) -> (Arc<[RtMeshTriangle]>, RtPageDiag) {
     let (triangles, diag) = if !page.atlas.is_empty() {
         let atlas_h = page.atlas.len() / (SIDE * 4);
-        extract_rt_triangles(&page.vertices, &page.indices, &page.atlas, SIDE, atlas_h, false)
+        extract_rt_triangles(
+            &page.vertices,
+            &page.indices,
+            &page.atlas,
+            SIDE,
+            atlas_h,
+            false,
+        )
     } else {
-        extract_rt_triangles(&page.vertices, &page.indices, &atlas_thumb.2, atlas_thumb.0, atlas_thumb.1, true)
+        extract_rt_triangles(
+            &page.vertices,
+            &page.indices,
+            &atlas_thumb.2,
+            atlas_thumb.0,
+            atlas_thumb.1,
+            true,
+        )
     };
     (triangles.into(), diag)
 }
-
 
 /// Append-only storage shared by streamed whole-world pages.
 pub struct WorldGeometryArena {
@@ -2551,8 +2568,16 @@ impl GpuPage {
             };
             (Arc::new(make(normal)), Arc::new(make(reflected)))
         };
-        let atlas_thumb = page.shared_atlas
-            .map(|source| Arc::clone(&existing.get(source).expect("shared atlas must precede its geometry").atlas_thumb))
+        let atlas_thumb = page
+            .shared_atlas
+            .map(|source| {
+                Arc::clone(
+                    &existing
+                        .get(source)
+                        .expect("shared atlas must precede its geometry")
+                        .atlas_thumb,
+                )
+            })
             .unwrap_or_else(|| atlas_thumb_for_page(page));
         let (rt_triangles, rt_diag) = extract_page_rt(page, &atlas_thumb);
         let vertex_data = bytemuck::cast_slice(&page.vertices);
@@ -2669,8 +2694,16 @@ impl GpuPage {
             (Arc::new(make(normal)), Arc::new(make(reflected)))
         };
 
-        let atlas_thumb = page.shared_atlas
-            .map(|source| Arc::clone(&existing.get(source).expect("shared atlas must precede its geometry").atlas_thumb))
+        let atlas_thumb = page
+            .shared_atlas
+            .map(|source| {
+                Arc::clone(
+                    &existing
+                        .get(source)
+                        .expect("shared atlas must precede its geometry")
+                        .atlas_thumb,
+                )
+            })
             .unwrap_or_else(|| atlas_thumb_for_page(page));
         let (rt_triangles, rt_diag) = extract_page_rt(page, &atlas_thumb);
         let vertex_data = bytemuck::cast_slice(&page.vertices);

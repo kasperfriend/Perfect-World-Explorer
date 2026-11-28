@@ -518,7 +518,11 @@ impl Draw {
 
     /// Cached dominant linear emissive RGB colour of a loaded effect texture.
     pub fn texture_emissive_color(&self, texture: &str) -> [f32; 3] {
-        self.texture_ids.get(texture).and_then(|id| self.textures.get(id)).map(|entry| entry.emissive_color).unwrap_or([1.0, 1.0, 1.0])
+        self.texture_ids
+            .get(texture)
+            .and_then(|id| self.textures.get(id))
+            .map(|entry| entry.emissive_color)
+            .unwrap_or([1.0, 1.0, 1.0])
     }
 
     pub fn vertex_count(&self) -> usize {
@@ -536,7 +540,14 @@ impl Draw {
     }
 
     /// Restore effect frame constants for a secondary view without changing the main motion snapshot.
-    pub fn update_params(&mut self, queue: &wgpu::Queue, matrix: [[f32; 4]; 4], clip_plane: [f32; 4], camera: [f32; 4], light: Option<EffectLight>) -> Result<(), String> {
+    pub fn update_params(
+        &mut self,
+        queue: &wgpu::Queue,
+        matrix: [[f32; 4]; 4],
+        clip_plane: [f32; 4],
+        camera: [f32; 4],
+        light: Option<EffectLight>,
+    ) -> Result<(), String> {
         self.write_frame(queue, matrix, clip_plane, camera, light, false)
     }
 
@@ -616,12 +627,16 @@ impl Draw {
             prev_matrix: matrix,
             mv_size: [0.; 4],
         };
-        let changed = self.uniform_params.map_or(true, |previous| bytemuck::bytes_of(&previous) != bytemuck::bytes_of(&params));
+        let changed = self.uniform_params.map_or(true, |previous| {
+            bytemuck::bytes_of(&previous) != bytemuck::bytes_of(&params)
+        });
         if changed {
             queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
             self.uniform_params = Some(params);
         }
-        if remember_motion { self.last_params = Some(params); }
+        if remember_motion {
+            self.last_params = Some(params);
+        }
         Ok(())
     }
 
@@ -779,7 +794,11 @@ impl Draw {
                                 let emissive_color = model_texture_gpu::sample_emissive_rgb(&bytes);
                                 self.textures.insert(
                                     key.texture,
-                                    TextureEntry { texture, view, emissive_color },
+                                    TextureEntry {
+                                        texture,
+                                        view,
+                                        emissive_color,
+                                    },
                                 );
                                 self.failed_textures.remove(&key.texture);
                             }

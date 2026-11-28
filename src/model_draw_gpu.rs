@@ -560,19 +560,38 @@ impl Draw {
         let mut constants = self.constant_scratch.borrow_mut();
         constants.clear();
         for (index, gpu) in self.meshes.iter().enumerate() {
-            let Some(gpu) = gpu else { continue; };
-            let pose = self.pose_of.get(index).and_then(|&pose| poses.get(pose))
+            let Some(gpu) = gpu else {
+                continue;
+            };
+            let pose = self
+                .pose_of
+                .get(index)
+                .and_then(|&pose| poses.get(pose))
                 .ok_or("model pose does not cover every retained mesh")?;
             if (pose.skin, pose.mesh) != gpu.key || pose.vertices.len() != gpu.vertices {
                 return Err("model pose no longer matches the retained draw".into());
             }
             let skin = asset.skins.get(pose.skin).ok_or("missing retained skin")?;
-            let source = skin.data.meshes.get(pose.mesh).ok_or("missing retained mesh")?;
-            let material = usize::try_from(source.material).ok()
-                .and_then(|i| skin.data.materials.get(i)).ok_or("missing retained material")?;
-            let color = if gpu.face_shader.is_some() { u32::MAX }
-                else { asset.mesh_color(pose.skin, pose.mesh, original) };
-            constants.push(frame.params(material, color, gpu.diffuse_alpha_only, gpu.face_shader.as_ref())?);
+            let source = skin
+                .data
+                .meshes
+                .get(pose.mesh)
+                .ok_or("missing retained mesh")?;
+            let material = usize::try_from(source.material)
+                .ok()
+                .and_then(|i| skin.data.materials.get(i))
+                .ok_or("missing retained material")?;
+            let color = if gpu.face_shader.is_some() {
+                u32::MAX
+            } else {
+                asset.mesh_color(pose.skin, pose.mesh, original)
+            };
+            constants.push(frame.params(
+                material,
+                color,
+                gpu.diffuse_alpha_only,
+                gpu.face_shader.as_ref(),
+            )?);
         }
 
         // Queue writes copy their bytes before returning, so one vertex staging
@@ -580,18 +599,28 @@ impl Draw {
         let mut params_index = 0usize;
         let scratch = &mut self.scratch_vertices;
         for (index, gpu) in self.meshes.iter().enumerate() {
-            let Some(gpu) = gpu else { continue; };
+            let Some(gpu) = gpu else {
+                continue;
+            };
             let pose = &poses[self.pose_of[index]];
             let source = &asset.skins[pose.skin].data.meshes[pose.mesh];
             scratch.clear();
-            scratch.extend(source.vertices.iter().zip(&pose.vertices).map(|(source, posed)| raster::Vertex {
-                position: posed.position,
-                normal: posed.normal,
-                uv: source.uv,
-                fog: frame.vertex_fog,
-            }));
+            scratch.extend(
+                source
+                    .vertices
+                    .iter()
+                    .zip(&pose.vertices)
+                    .map(|(source, posed)| raster::Vertex {
+                        position: posed.position,
+                        normal: posed.normal,
+                        uv: source.uv,
+                        fog: frame.vertex_fog,
+                    }),
+            );
             gpu.mesh.update(queue, scratch)?;
-            let params = constants.get(params_index).ok_or("missing validated model constants")?;
+            let params = constants
+                .get(params_index)
+                .ok_or("missing validated model constants")?;
             gpu.binding.update(queue, params)?;
             params_index += 1;
         }
