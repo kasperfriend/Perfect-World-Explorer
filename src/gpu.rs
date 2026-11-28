@@ -6844,7 +6844,11 @@ fn receiving_model_frame_with(
         water_fog: [
             uniform.clip[0],
             0.075,
-            if uniform.clip[1] < -0.5 && camera.pos.y > uniform.clip[0] { 1. } else { 0. },
+            if uniform.clip[1] < -0.5 && camera.pos.y > uniform.clip[0] {
+                1.
+            } else {
+                0.
+            },
             0.,
         ],
         clip_plane: [0., uniform.clip[1], 0., -uniform.clip[0] * uniform.clip[1]],
