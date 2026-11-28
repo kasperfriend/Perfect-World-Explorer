@@ -1783,6 +1783,6 @@ mod fog_shader_contract_tests {
         assert!(src.contains("fog_view_depth(i.world)"));
         assert!(src.contains("let builtin_depth=1./max(i.pos.w,0.0000001);"));
         assert!(src.contains("camera.lod.z>0.5"));
-        assert!(!src.contains("terrain_pass_fog(linear:vec3<f32>,reciprocal_w:f32"));
+        assert!(src.contains("fn terrain_pass_fog(linear:vec3<f32>,world:vec3<f32>,transmittance:f32)"));
     }
 }
