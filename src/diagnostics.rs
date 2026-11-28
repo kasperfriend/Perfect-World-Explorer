@@ -203,9 +203,11 @@ pub enum Channel {
     TimingCamera = 34,
     /// Audio: zone track, ambience, effect sounds.
     AudioState = 35,
+    /// Complete outdoor-fog diagnostic snapshot: source, selected, active and uploaded state.
+    FogCheck = 36,
 }
 
-pub const CHANNELS: usize = 36;
+pub const CHANNELS: usize = 37;
 
 impl Channel {
     pub const ALL: [Channel; CHANNELS] = [
@@ -245,6 +247,7 @@ impl Channel {
         Self::TimingMemory,
         Self::TimingCamera,
         Self::AudioState,
+        Self::FogCheck,
     ];
 
     pub fn index(self) -> usize {
@@ -288,6 +291,7 @@ impl Channel {
             | Self::TimingMemory
             | Self::TimingCamera
             | Self::AudioState => Page::Timing,
+            Self::FogCheck => Page::Render,
         }
     }
 
@@ -318,7 +322,7 @@ impl Channel {
             Self::ModelMaterials => "Shading",
             Self::ModelAnimation => "Animation",
             Self::RenderEffects | Self::RenderWorld | Self::RenderWater => "Batches",
-            Self::RenderPost | Self::RenderTextures => "Post and uploads",
+            Self::RenderPost | Self::RenderTextures | Self::FogCheck => "Post and uploads",
             Self::TimingFrame | Self::TimingCamera => "Frame and camera",
             Self::TimingLoad | Self::TimingMemory => "Load and memory",
             Self::AudioState => "Audio",
@@ -365,6 +369,7 @@ impl Channel {
             Self::TimingMemory => "timing-memory",
             Self::TimingCamera => "timing-camera",
             Self::AudioState => "audio-state",
+            Self::FogCheck => "fog-check",
         }
     }
 
@@ -406,6 +411,7 @@ impl Channel {
             Self::TimingMemory => "Resident bytes",
             Self::TimingCamera => "Camera and input state",
             Self::AudioState => "Audio state",
+            Self::FogCheck => "Fog check: source → active → GPU uniforms",
         }
     }
 
@@ -576,6 +582,7 @@ impl Channel {
                  speed, and which menu page is open."
             }
             Self::AudioState => "Zone music, ambience and effect sounds.",
+            Self::FogCheck => "One line per second with region-authored air/underwater fog, the atmospheric-fog switch, camera pose, projection/view-projection matrix, selected and active fog ranges/colours, exact terrain uniform values, render-pass choice, viewport, terrain residency counts and water/post state. Use this capture to diagnose fog that appears only at the horizon.",
         }
     }
 
@@ -610,6 +617,7 @@ impl Channel {
                 | Self::RenderWater
                 | Self::TimingFrame
                 | Self::TimingLoad
+                | Self::FogCheck
         )
     }
 
@@ -657,7 +665,7 @@ impl Channel {
             | Self::RenderWater
             | Self::RenderPost
             | Self::RenderTextures => 500,
-            Self::TimingFrame | Self::TimingMemory | Self::TimingCamera | Self::AudioState => 1000,
+            Self::TimingFrame | Self::TimingMemory | Self::TimingCamera | Self::AudioState | Self::FogCheck => 1000,
         }
     }
 }
@@ -727,7 +735,9 @@ const SCENE: &[Channel] = &[
     Channel::EffectProblems,
 ];
 
-pub const PRESETS: [Preset; 5] = [
+const FOG_CHECK: &[Channel] = &[Channel::FogCheck];
+
+pub const PRESETS: [Preset; 6] = [
     Preset {
         name: "Placement",
         help: "Where each root is, how it was built, the basis its elements are \
@@ -758,6 +768,12 @@ pub const PRESETS: [Preset; 5] = [
                what reached the GPU, the model queue and every non-fatal failure.",
         all: false,
         channels: SCENE,
+    },
+    Preset {
+        name: "Fog check",
+        help: "A focused one-click capture for outdoor fog. Records the selected region's authored fog, active camera fog, exact main-scene GPU uniforms, camera/projection state and visible terrain/pass counts once per second. Enable it, reproduce the edge-only fog, then turn it off and send fog-check.log plus session.log.",
+        all: false,
+        channels: FOG_CHECK,
     },
     Preset {
         name: "Everything",
