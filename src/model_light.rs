@@ -109,6 +109,24 @@ pub fn directional_specular(
     let spec = nh.powf(power.clamp(-128., 128.));
     coefficient.map(|c| (c * spec).min(1.))
 }
+/// Water transmission for geometry below a horizontal water plane.
+///
+/// This is the same eye-ray law used by the native grass/BMD refraction
+/// shaders: exp2(-density * depth * ray_length / ray_vertical). Callers gate
+/// it to the above-water clipped refraction pass.
+pub fn water_transmittance(world: [f32; 3], eye: [f32; 3], water_height: f32, density: f32) -> f32 {
+    let depth = (water_height - world[1]).max(0.);
+    if depth <= 0. || density <= 0. {
+        return 1.;
+    }
+    let delta = [eye[0] - world[0], eye[1] - world[1], eye[2] - world[2]];
+    let distance = delta.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if delta[1] <= 1e-6 || distance <= 1e-6 {
+        return 0.;
+    }
+    (-density * depth * distance / delta[1]).exp2()
+}
+
 /// Reusable WGSL equivalent, ready for the animated skin vertex path.
 pub const WGSL: &str = r#"
 fn model_vertex_light(pos:vec3<f32>, normal:vec3<f32>, direction:vec3<f32>, light_pos:vec3<f32>, att:vec3<f32>, ambient:vec3<f32>, dir_diff:vec3<f32>, point_diff:vec3<f32>, point_ambient:vec3<f32>, enabled:f32)->vec3<f32> {
@@ -139,6 +157,14 @@ fn model_directional_specular(normal:vec3<f32>,direction:vec3<f32>,eye_direction
  if nl<=0.000001 || hl<=0.000001 || dot(normal,-direction)<=0. {return vec3<f32>(0.);}
  let nh=max(dot(normal,h)/(nl*hl),0.);
  return min(coefficient*pow(nh,clamp(power,-128.,128.)),vec3<f32>(1.));
+}
+fn model_water_transmittance(world:vec3<f32>,eye:vec3<f32>,water_height:f32,density:f32)->f32 {
+ let depth=max(water_height-world.y,0.);
+ if depth<=0. || density<=0. {return 1.;}
+ let delta=eye-world;
+ let distance=length(delta);
+ if delta.y<=0.000001 || distance<=0.000001 {return 0.;}
+ return exp2(-density*depth*distance/delta.y);
 }
 
 "#;
@@ -239,6 +265,20 @@ mod tests {
         assert!(vertex_light(p)[0] > d[0]);
         p.normal = [0., -1., 0.];
         assert!((specular_variant_diffuse(p, [0.1, 0.6, 0.2])[3] - 0.7).abs() < 1e-6);
+    }
+    #[test]
+    fn water_transmission_matches_the_recovered_base_two_eye_ray_law() {
+        let transmission = water_transmittance([0., -10., 0.], [0., 10., 0.], 0., 0.075);
+        assert!((transmission - (-0.75f32).exp2()).abs() < 1e-6);
+        assert_eq!(
+            water_transmittance([0., 1., 0.], [0., 10., 0.], 0., 0.075),
+            1.
+        );
+        assert_eq!(
+            water_transmittance([0., -1., 0.], [1., -1., 0.], 0., 0.075),
+            0.
+        );
+        assert!(water_transmittance([0., -10., 0.], [10., 10., 0.], 0., 0.075) < transmission);
     }
     #[test]
     fn directional_specular_uses_camera_forward_and_lit_frontface_gate() {

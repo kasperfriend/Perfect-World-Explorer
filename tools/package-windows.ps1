@@ -104,11 +104,11 @@ if (-not (Test-Path -LiteralPath (Join-Path $packageRoot 'THIRD_PARTY_NOTICES.md
 #     every GPU and used by the Graphics -> Latency -> XeLL mode). Intel
 #     Simplified Software License; see sdk/Intel_XeSS-SDK-3.0.2-LICENSE.txt and
 #     sdk/Intel_XeSS-SDK-3.0.2-third-party-programs.txt.
-#   * NVIDIA DLSS / NGX: nvngx_dlss.dll (super resolution) and nvngx_dlssg.dll
-#     (frame generation), from the official NVIDIA/DLSS repository
-#     (lib/Windows_x86_64/rel/). NVIDIA RTX SDKs License; see
-#     sdk/NVIDIA_DLSS-SDK-LICENSE.txt. No other NVIDIA binary (Streamline's
-#     sl.*.dll included) is ever staged.
+#   * NVIDIA DLSS / NGX: nvngx_dlss.dll (super resolution), nvngx_dlssg.dll
+#     (frame generation) and nvngx_dlssd.dll (ray reconstruction), from the
+#     official NVIDIA/DLSS repository (lib/Windows_x86_64/rel/). NVIDIA RTX
+#     SDKs License; see sdk/NVIDIA_DLSS-SDK-LICENSE.txt. No other NVIDIA
+#     binary (Streamline's sl.*.dll included) is ever staged.
 # They are staged into every package by default unless the caller passes
 # -SdkDirectory (an explicit folder then takes precedence) or a file is absent.
 $vendoredSdk = Join-Path $repoRoot 'sdk'
@@ -117,11 +117,13 @@ if ([string]::IsNullOrWhiteSpace($SdkDirectory) -and (Test-Path -LiteralPath $ve
         'amd_fidelityfx_loader_dx12.dll',
         'amd_fidelityfx_upscaler_dx12.dll',
         'amd_fidelityfx_framegeneration_dx12.dll',
+        'amd_fidelityfx_denoiser_dx12.dll',
         'libxess.dll',
         'libxess_fg.dll',
         'libxell.dll',
         'nvngx_dlss.dll',
-        'nvngx_dlssg.dll'
+        'nvngx_dlssg.dll',
+        'nvngx_dlssd.dll'
     )
     $sdkTarget = Join-Path $packageRoot 'sdk'
     New-Item -ItemType Directory -Force -Path $sdkTarget | Out-Null
@@ -184,7 +186,9 @@ if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
     $amdNames = @(
         'amd_fidelityfx_loader_dx12.dll',
         'amd_fidelityfx_upscaler_dx12.dll',
-        'amd_fidelityfx_framegeneration_dx12.dll'
+        'amd_fidelityfx_framegeneration_dx12.dll',
+        # The FFX denoiser behind Raywatcher's FSR Ray Regeneration option.
+        'amd_fidelityfx_denoiser_dx12.dll'
     )
     $intelNames = @(
         'libxess.dll',
@@ -193,13 +197,16 @@ if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
     )
     $nvidiaNames = @(
         'nvngx_dlss.dll',
-        'nvngx_dlssg.dll'
+        'nvngx_dlssg.dll',
+        # Ray reconstruction (`nvngx_dlssd.dll`): the NGX snippet Core loads for
+        # Raywatcher's DLSS Ray Reconstruction option.
+        'nvngx_dlssd.dll'
     )
     $forbidden = @(Get-ChildItem -LiteralPath $sdkRoot -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '(?i)^(nvngx.*|sl\..*)\.dll$' -and ($_.Name -notin $nvidiaNames) })
     if ($forbidden.Count -gt 0) {
         $names = ($forbidden | ForEach-Object { $_.Name } | Sort-Object) -join ', '
-        throw "The SDK folder contains NVIDIA DLLs this script never stages ($names). Only nvngx_dlss.dll and nvngx_dlssg.dll are allowed, under the NVIDIA RTX SDKs License (see THIRD_PARTY_NOTICES.md)."
+        throw "The SDK folder contains NVIDIA DLLs this script never stages ($names). Only nvngx_dlss.dll, nvngx_dlssg.dll and nvngx_dlssd.dll are allowed, under the NVIDIA RTX SDKs License (see THIRD_PARTY_NOTICES.md)."
     }
     $sdkTarget = Join-Path $packageRoot 'sdk'
     New-Item -ItemType Directory -Force -Path $sdkTarget | Out-Null
@@ -264,7 +271,7 @@ if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
 
 # Hard stop regardless of staging mode: no NVIDIA binary other than the two
 # vendored DLSS DLLs may enter the package (Streamline's sl.*.dll included).
-$nvidiaAllowed = @('nvngx_dlss.dll', 'nvngx_dlssg.dll')
+$nvidiaAllowed = @('nvngx_dlss.dll', 'nvngx_dlssg.dll', 'nvngx_dlssd.dll')
 $nvidiaBinaries = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -File |
     Where-Object { $_.Name -match '(?i)^(nvngx.*|sl\..*)\.dll$' -and ($_.Name -notin $nvidiaAllowed) })
 if ($nvidiaBinaries.Count -gt 0) {

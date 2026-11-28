@@ -833,17 +833,365 @@ fn run(
     });
     Ok(())
 }
+/// Compact world-space triangle extracted from a `Page` for Raywatcher's
+/// near-camera real-mesh ray tracing (preserving actual geometry normals and
+/// baked diffuse albedo).
+#[derive(Clone, Copy, Debug)]
+pub struct RtMeshTriangle {
+    pub a: [f32; 3],
+    pub b: [f32; 3],
+    pub c: [f32; 3],
+    pub normal: [f32; 3],
+    pub albedo: [f32; 3],
+    /// Material opacity in `[0, 1]` derived from the game's vertex alpha byte
+    /// and blend/cutout draw band (solid = 1.0, alpha-blended leaf/banner cards
+    /// and cutout foliage < 1.0).
+    pub opacity: f32,
+    /// Real 7x7 (49-bit) texture-sampled alpha cutout mask (`0` = opaque/unmasked).
+    pub alpha_mask: u64,
+}
+
+/// Hard per-page cap on retained CPU triangles so whole-world preloads across
+/// hundreds of pages stay within a few megabytes of RAM while near-camera
+/// buildings and props retain real mesh silhouettes for shadows & reflections.
+const MAX_RT_TRIS_PER_PAGE: usize = 262_144;
+
+#[inline]
+fn srgb_to_linear_u8(v: u8) -> f32 {
+    let s = v as f32 / 255.0;
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn sample_atlas_rgba(
+    atlas: &[u8],
+    atlas_w: usize,
+    atlas_h: usize,
+    v_color: [f32; 4],
+    kind: f32,
+    uv: [f32; 2],
+) -> Option<([f32; 3], f32)> {
+    if atlas.is_empty() || atlas_w == 0 || atlas_h == 0 || kind <= 1.5 {
+        return None;
+    }
+    let scale_u = v_color[2];
+    // `Page::finish` scales `v.color[3]` by `SIDE / used_height` for all trimmed pages;
+    // always prefer `v_color[3]` when populated so `kind >= 2.5` never samples the wrong V row.
+    let scale_v = if v_color[3] > 1e-5 {
+        v_color[3]
+    } else {
+        v_color[2]
+    };
+    if scale_u <= 1e-5 || scale_v <= 1e-5 {
+        return None;
+    }
+    let lu = ((uv[0] - v_color[0]) / scale_u).rem_euclid(1.0) * scale_u;
+    let lv = ((uv[1] - v_color[1]) / scale_v).rem_euclid(1.0) * scale_v;
+    let au = (v_color[0] + lu).clamp(0.0, 0.9999);
+    let av = (v_color[1] + lv).clamp(0.0, 0.9999);
+    let x = ((au * atlas_w as f32) as usize).min(atlas_w - 1);
+    let y = ((av * atlas_h as f32) as usize).min(atlas_h - 1);
+    let idx = (y * atlas_w + x) * 4;
+    if idx + 3 >= atlas.len() {
+        return None;
+    }
+    let r = srgb_to_linear_u8(atlas[idx]);
+    let g = srgb_to_linear_u8(atlas[idx + 1]);
+    let b = srgb_to_linear_u8(atlas[idx + 2]);
+    let a = atlas[idx + 3] as f32 / 255.0;
+    Some(([r, g, b], a))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RtPageDiag {
+    pub used_thumb_atlas: bool,
+    pub total_tris: usize,
+    pub opaque_tris: usize,
+    pub masked_tris: usize,
+    pub semi_unmasked_tris: usize,
+    pub dropped_transparent_tris: usize,
+    pub degenerate_tris: usize,
+    pub untextured_tris: usize,
+}
+
+fn extract_rt_triangles(
+    vertices: &[Vertex],
+    indices: &[u32],
+    atlas: &[u8],
+    atlas_w: usize,
+    atlas_h: usize,
+    used_thumb_atlas: bool,
+) -> (Vec<RtMeshTriangle>, RtPageDiag) {
+    let mut diag = RtPageDiag {
+        used_thumb_atlas,
+        ..Default::default()
+    };
+    let tri_count = indices.len() / 3;
+    if tri_count == 0 {
+        return (Vec::new(), diag);
+    }
+    // Never stride individual triangles (step > 1 deletes every 2nd triangle of quads!).
+    let mut out = Vec::with_capacity(tri_count.min(MAX_RT_TRIS_PER_PAGE));
+    let mut t = 0usize;
+    while t < tri_count && out.len() < MAX_RT_TRIS_PER_PAGE {
+        let i0 = indices[t * 3] as usize;
+        let i1 = indices[t * 3 + 1] as usize;
+        let i2 = indices[t * 3 + 2] as usize;
+        if let (Some(v0), Some(v1), Some(v2)) =
+            (vertices.get(i0), vertices.get(i1), vertices.get(i2))
+        {
+            let a = v0.pos;
+            let b = v1.pos;
+            let c = v2.pos;
+            let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let nx = e1[1] * e2[2] - e1[2] * e2[1];
+            let ny = e1[2] * e2[0] - e1[0] * e2[2];
+            let nz = e1[0] * e2[1] - e1[1] * e2[0];
+            let len2 = nx * nx + ny * ny + nz * nz;
+            if len2 > 1e-8 {
+                let inv = len2.sqrt().recip();
+                let geo_n = [nx * inv, ny * inv, nz * inv];
+                // Preserve smooth artist-authored BMD vertex normals instead of
+                // flat geometric triangle normals so curved roofs, pillars, and
+                // trunks reflect smoothly without triangle faceting.
+                let sx = v0.normal[0] + v1.normal[0] + v2.normal[0];
+                let sy = v0.normal[1] + v1.normal[1] + v2.normal[1];
+                let sz = v0.normal[2] + v1.normal[2] + v2.normal[2];
+                let slen2 = sx * sx + sy * sy + sz * sz;
+                let smooth_n = if slen2 > 1e-4 && sx.is_finite() && sy.is_finite() && sz.is_finite()
+                {
+                    let sinv = slen2.sqrt().recip();
+                    let mut n = [sx * sinv, sy * sinv, sz * sinv];
+                    if n[0] * geo_n[0] + n[1] * geo_n[1] + n[2] * geo_n[2] < 0.0 {
+                        n = [-n[0], -n[1], -n[2]];
+                    }
+                    n
+                } else {
+                    geo_n
+                };
+                // Average baked vertex diffuse RGB (0xAARRGGBB) into linear albedo.
+                let decode = |d: u32| -> [f32; 3] {
+                    [
+                        srgb_to_linear_u8(((d >> 16) & 0xff) as u8),
+                        srgb_to_linear_u8(((d >> 8) & 0xff) as u8),
+                        srgb_to_linear_u8((d & 0xff) as u8),
+                    ]
+                };
+                let kind = v0.kind;
+                let is_sdr_blend = (kind > 2.01 && kind < 2.03) || (kind > 2.11 && kind < 2.13);
+                // Sample real RGBA8 texture atlas at 7 triangle points (centroid + 3 corners
+                // + 3 mid-edges). Checking the 3 corners catches leaf cards whose opaque
+                // cluster covers the interior while transparent margins live near corners.
+                let uv_c = [
+                    (v0.uv[0] + v1.uv[0] + v2.uv[0]) / 3.0,
+                    (v0.uv[1] + v1.uv[1] + v2.uv[1]) / 3.0,
+                ];
+                let mut tex_rgb = [0.0f32; 3];
+                let mut tex_rgb_w = 0.0f32;
+                let mut tex_alpha_sum = 0.0f32;
+                let mut tex_alpha_min = 1.0f32;
+                let mut tex_samples = 0u32;
+                for uv in [
+                    uv_c,
+                    v0.uv,
+                    v1.uv,
+                    v2.uv,
+                    [(uv_c[0] + v0.uv[0]) * 0.5, (uv_c[1] + v0.uv[1]) * 0.5],
+                    [(uv_c[0] + v1.uv[0]) * 0.5, (uv_c[1] + v1.uv[1]) * 0.5],
+                    [(uv_c[0] + v2.uv[0]) * 0.5, (uv_c[1] + v2.uv[1]) * 0.5],
+                ] {
+                    if let Some((rgb, a)) =
+                        sample_atlas_rgba(atlas, atlas_w, atlas_h, v0.color, kind, uv)
+                    {
+                        tex_samples += 1;
+                        tex_alpha_sum += a;
+                        if a < tex_alpha_min {
+                            tex_alpha_min = a;
+                        }
+                        if a >= 0.20 {
+                            tex_rgb[0] += rgb[0] * a;
+                            tex_rgb[1] += rgb[1] * a;
+                            tex_rgb[2] += rgb[2] * a;
+                            tex_rgb_w += a;
+                        }
+                    }
+                }
+                let tex_alpha = if tex_samples > 0 {
+                    Some(tex_alpha_sum / tex_samples as f32)
+                } else {
+                    diag.untextured_tris += 1;
+                    None
+                };
+                // For any BMD triangle whose texture is not solidly opaque (`ta < 0.96`
+                // or any corner/edge sample below 0.95), sample the exact 7x7 (49-bit)
+                // texture alpha cutout mask so leaf cards never degrade to solid quads.
+                let mut alpha_mask = 0u64;
+                let mut mask_albedo = None;
+                let mut mask_opacity = None;
+                if let Some(ta) = tex_alpha {
+                    if ta < 0.99 || tex_alpha_min < 0.98 {
+                        let mut m_bits = 0u64;
+                        let mut m_rgb = [0.0f32; 3];
+                        let mut m_w = 0.0f32;
+                        let mut m_hits = 0u32;
+                        let mut m_max_a = 0.0f32;
+                        for iy in 0..7u32 {
+                            let tv = (iy as f32 + 0.5) / 7.0;
+                            for ix in 0..7u32 {
+                                let sv = (ix as f32 + 0.5) / 7.0;
+                                let bx = sv;
+                                let by = tv * (1.0 - sv);
+                                let bw = 1.0 - bx - by;
+                                let su = [
+                                    v0.uv[0] * bw + v1.uv[0] * bx + v2.uv[0] * by,
+                                    v0.uv[1] * bw + v1.uv[1] * bx + v2.uv[1] * by,
+                                ];
+                                if let Some((c, a)) =
+                                    sample_atlas_rgba(atlas, atlas_w, atlas_h, v0.color, kind, su)
+                                {
+                                    if a > m_max_a {
+                                        m_max_a = a;
+                                    }
+                                    if a >= 0.48 {
+                                        m_bits |= 1u64 << (iy * 7 + ix);
+                                        m_hits += 1;
+                                        m_rgb[0] += c[0] * a;
+                                        m_rgb[1] += c[1] * a;
+                                        m_rgb[2] += c[2] * a;
+                                        m_w += a;
+                                    }
+                                }
+                            }
+                        }
+                        if m_hits == 0 && (!is_sdr_blend || m_max_a < 0.12) {
+                            // Raster alpha-test (`tex.a < 0.5`) discards 100% of this triangle;
+                            // drop it instead of emitting an unmasked speckled quad.
+                            diag.dropped_transparent_tris += 1;
+                            t += 1;
+                            continue;
+                        }
+                        if m_hits > 0 && m_hits < 49 {
+                            alpha_mask = m_bits;
+                            mask_opacity =
+                                Some((0.45 + 0.48 * (m_hits as f32 / 49.0)).clamp(0.45, 0.92));
+                            if m_w > 1e-4 {
+                                mask_albedo = Some([
+                                    (m_rgb[0] / m_w).clamp(0.06, 0.95),
+                                    (m_rgb[1] / m_w).clamp(0.06, 0.95),
+                                    (m_rgb[2] / m_w).clamp(0.06, 0.95),
+                                ]);
+                            }
+                        } else if m_hits == 49 && !is_sdr_blend {
+                            // All 49 samples pass alpha-test: solid opaque leaf interior.
+                            mask_opacity = Some(1.0);
+                        }
+                    }
+                }
+                let albedo = mask_albedo.unwrap_or_else(|| {
+                    if tex_rgb_w > 1e-4 {
+                        [
+                            (tex_rgb[0] / tex_rgb_w).clamp(0.06, 0.95),
+                            (tex_rgb[1] / tex_rgb_w).clamp(0.06, 0.95),
+                            (tex_rgb[2] / tex_rgb_w).clamp(0.06, 0.95),
+                        ]
+                    } else {
+                        let has_rgb = ((v0.diffuse | v1.diffuse | v2.diffuse) & 0x00ff_ffff) != 0;
+                        if has_rgb {
+                            let c0 = decode(v0.diffuse);
+                            let c1 = decode(v1.diffuse);
+                            let c2 = decode(v2.diffuse);
+                            [
+                                ((c0[0] + c1[0] + c2[0]) / 3.0).clamp(0.12, 0.92),
+                                ((c0[1] + c1[1] + c2[1]) / 3.0).clamp(0.12, 0.92),
+                                ((c0[2] + c1[2] + c2[2]) / 3.0).clamp(0.12, 0.92),
+                            ]
+                        } else {
+                            [0.42, 0.40, 0.37]
+                        }
+                    }
+                });
+                let a0 = ((v0.diffuse >> 24) & 0xff) as f32 / 255.0;
+                let a1 = ((v1.diffuse >> 24) & 0xff) as f32 / 255.0;
+                let a2 = ((v2.diffuse >> 24) & 0xff) as f32 / 255.0;
+                let v_alpha = ((a0 + a1 + a2) / 3.0).clamp(0.0, 1.0);
+                let opacity = if let Some(mo) = mask_opacity {
+                    mo
+                } else if let Some(ta) = tex_alpha {
+                    if ta < 0.92 {
+                        (ta * 0.80).clamp(0.28, 0.86)
+                    } else if is_sdr_blend {
+                        if v_alpha > 0.01 {
+                            (v_alpha * 0.65).clamp(0.25, 0.85)
+                        } else {
+                            0.55
+                        }
+                    } else {
+                        1.0
+                    }
+                } else if is_sdr_blend {
+                    if v_alpha > 0.01 {
+                        (v_alpha * 0.65).clamp(0.25, 0.85)
+                    } else {
+                        0.55
+                    }
+                } else if kind > 3.5 {
+                    if v_alpha > 0.01 {
+                        (v_alpha * 0.75).clamp(0.35, 0.90)
+                    } else {
+                        0.65
+                    }
+                } else {
+                    1.0
+                };
+                diag.total_tris += 1;
+                if alpha_mask != 0 {
+                    diag.masked_tris += 1;
+                } else if opacity >= 0.99 {
+                    diag.opaque_tris += 1;
+                } else {
+                    diag.semi_unmasked_tris += 1;
+                }
+                out.push(RtMeshTriangle {
+                    a,
+                    b,
+                    c,
+                    normal: smooth_n,
+                    albedo,
+                    opacity,
+                    alpha_mask,
+                });
+            } else {
+                diag.degenerate_tris += 1;
+            }
+        }
+        t += 1;
+    }
+    (out, diag)
+}
+
+/// Compact downsampled RGBA8 atlas thumbnail (`(width, height, rgba)`) kept on
+/// `GpuPage` and shared via `Arc` across `shared_atlas` pages so deduplicated
+/// scenery still extracts true textured RGB albedo and alpha cutouts for RT.
+type AtlasThumb = Arc<(usize, usize, Vec<u8>)>;
+
 pub struct GpuPage {
     vertex: wgpu::Buffer,
     index: wgpu::Buffer,
     count: u32,
     normal: Arc<wgpu::BindGroup>,
     reflected: Arc<wgpu::BindGroup>,
+    atlas_thumb: AtlasThumb,
     placements: Vec<PlacementRange>,
     bounds: Vec<PlacementBounds>,
     page_min: [f32; 3],
     page_max: [f32; 3],
     page_has_sdr: bool,
+    rt_triangles: Arc<[RtMeshTriangle]>,
+    rt_diag: RtPageDiag,
 }
 #[derive(Clone)]
 struct WorldPageMeta {
@@ -967,7 +1315,20 @@ impl GpuPage {
         };
         let normal = Arc::new(make(normal));
         let reflected = Arc::new(make(reflected));
-        Self::geometry(device, page, normal, reflected)
+        // Retain mip 2 (1024 x used_height/4, 32x32 px per 128px leaf tile) for
+        // shared-atlas RT texture & 7x7 alpha cutout extraction. Only ~22 base atlases
+        // exist across the whole world, so mip 2 keeps foliage cutouts razor-sharp
+        // instead of smearing transparent leaf margins into solid quads at mip 4.
+        let atlas_thumb: AtlasThumb = if let Some(mip2) = page.mips.get(1) {
+            Arc::new((
+                (SIDE / 4).max(1),
+                (page.used_height / 4).max(1),
+                mip2.clone(),
+            ))
+        } else {
+            Arc::new((SIDE, page.used_height, page.atlas.clone()))
+        };
+        Self::geometry(device, page, normal, reflected, atlas_thumb)
     }
     /// Upload only geometry for a reused atlas. Bind groups keep the exact
     /// original texture/view alive; no second allocation or texture upload.
@@ -990,18 +1351,59 @@ impl GpuPage {
                 page,
                 Arc::clone(&source.normal),
                 Arc::clone(&source.reflected),
+                Arc::clone(&source.atlas_thumb),
             )
         } else {
             Self::upload(device, queue, layout, sampler, normal, reflected, page)
         }
     }
+    pub fn rt_triangles(&self) -> &[RtMeshTriangle] {
+        &self.rt_triangles
+    }
+    pub fn rt_triangles_arc(&self) -> Arc<[RtMeshTriangle]> {
+        Arc::clone(&self.rt_triangles)
+    }
+    pub fn rt_diag(&self) -> RtPageDiag {
+        self.rt_diag
+    }
+
+    pub fn page_bounds(&self) -> ([f32; 3], [f32; 3]) {
+        (self.page_min, self.page_max)
+    }
+
+    pub fn placement_bounds(&self) -> &[PlacementBounds] {
+        &self.bounds
+    }
+
     fn geometry(
         device: &wgpu::Device,
         page: Page,
         normal: Arc<wgpu::BindGroup>,
         reflected: Arc<wgpu::BindGroup>,
+        atlas_thumb: AtlasThumb,
     ) -> Self {
         use wgpu::util::DeviceExt;
+        let (rt_vec, rt_diag) = if !page.atlas.is_empty() {
+            let atlas_h = page.atlas.len() / (SIDE * 4);
+            extract_rt_triangles(
+                &page.vertices,
+                &page.indices,
+                &page.atlas,
+                SIDE,
+                atlas_h,
+                false,
+            )
+        } else {
+            extract_rt_triangles(
+                &page.vertices,
+                &page.indices,
+                &atlas_thumb.2,
+                atlas_thumb.0,
+                atlas_thumb.1,
+                true,
+            )
+        };
+        let rt_triangles: Arc<[RtMeshTriangle]> = rt_vec.into();
         let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("whole-world object vertices"),
             contents: bytemuck::cast_slice(&page.vertices),
@@ -1018,11 +1420,14 @@ impl GpuPage {
             count: page.indices.len() as u32,
             normal,
             reflected,
+            atlas_thumb,
             placements: page.placements,
             bounds: page.bounds,
             page_min: page.page_min,
             page_max: page.page_max,
             page_has_sdr: page.page_has_sdr,
+            rt_triangles,
+            rt_diag,
         }
     }
     /// Submits only the placements the recovered EC-BSD flags admit in this
@@ -1726,5 +2131,49 @@ mod page_tests {
             assert!(cmds.iter().all(|c| c.start <= c.end));
             assert!(cmds.len() <= order.len());
         }
+    }
+}
+
+#[cfg(test)]
+mod raywatcher_extract_tests {
+    use super::*;
+
+    #[test]
+    fn opaque_bmd_triangles_with_zero_vertex_alpha_remain_fully_opaque() {
+        let v = |pos: [f32; 3], diffuse: u32, kind: f32| Vertex {
+            pos,
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0, 0.0],
+            color: [1.0, 1.0, 1.0, 1.0],
+            kind,
+            diffuse,
+            night_diffuse: diffuse,
+        };
+        let verts = vec![
+            v([0.0, 0.0, 0.0], 0x0080_7060, 2.0),
+            v([4.0, 0.0, 0.0], 0x0080_7060, 2.0),
+            v([0.0, 4.0, 0.0], 0x0080_7060, 2.0),
+            // Unbaked day_diffuse == 0
+            v([0.0, 0.0, 0.0], 0x0000_0000, 2.0),
+            v([4.0, 0.0, 0.0], 0x0000_0000, 2.0),
+            v([0.0, 4.0, 0.0], 0x0000_0000, 2.0),
+        ];
+        let (tris, _diag) = extract_rt_triangles(&verts, &[0, 1, 2, 3, 4, 5], &[], 0, 0, false);
+        assert_eq!(tris.len(), 2);
+        assert!(
+            (tris[0].opacity - 1.0).abs() < 1e-5,
+            "opaque building with 0x00 alpha must stay opacity=1.0, got {}",
+            tris[0].opacity
+        );
+        assert!(
+            (tris[1].opacity - 1.0).abs() < 1e-5,
+            "unbaked opaque building with diffuse=0 must stay opacity=1.0, got {}",
+            tris[1].opacity
+        );
+        assert!(
+            tris[1].albedo[0] >= 0.35,
+            "unbaked opaque building should use neutral midtone albedo, got {:?}",
+            tris[1].albedo
+        );
     }
 }

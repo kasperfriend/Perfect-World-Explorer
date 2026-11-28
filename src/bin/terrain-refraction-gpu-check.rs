@@ -70,7 +70,7 @@ fn main() {
 }
 @fragment fn test_fs(i:Out)->@location(0) vec4<f32> {
  let rgb=to_linear(vec3<f32>(0.5,0.25,0.75)*i.refraction.y);
- return vec4<f32>(terrain_pass_fog(rgb,i.pos.w,i.refraction.x),1.);
+ return vec4<f32>(terrain_pass_fog(rgb,i.world,i.refraction.x),1.);
 }
 
 "#

@@ -146,11 +146,11 @@ mod fg;
 #[cfg(windows)]
 mod imp;
 #[cfg(windows)]
-mod loader;
+pub(crate) mod loader;
 // The parameter table is plain Rust and unit-tested on every platform; only
 // the Windows build drives it.
 #[cfg_attr(not(windows), allow(dead_code))]
-mod params;
+pub(crate) mod params;
 #[cfg(windows)]
 pub use fg::*;
 #[cfg(windows)]

@@ -201,23 +201,31 @@ fn terrain_vertex(world:vec3<f32>,normal:vec3<f32>,distant:f32)->Out {
 // D3D8 filters authored texture bytes in encoded space. The texture arrays
 // use UNORM views; return linear RGB to the viewer's sRGB render target.
 fn to_linear(c:vec3<f32>)->vec3<f32>{return select(c/12.92,pow((max(c,vec3<f32>(0.))+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));}
-fn fogged(linear:vec3<f32>, reciprocal_w:f32)->vec3<f32> {
- if camera.fog_range.z<0.5 {return linear;}
- let view_z=1./max(reciprocal_w,0.0000001);
+fn fog_view_depth(world:vec3<f32>)->f32 {
+ // Re-evaluate clip-space W from the perspective-correct world position.
+ // This is the camera-space forward depth, independent of fragment builtin W.
+ return max((camera.matrix*vec4<f32>(world,1.)).w,0.);
+}
+fn fog_factor(view_z:f32)->f32 {
+ if camera.fog_range.z<0.5 {return 0.;}
  let span=camera.fog_range.y-camera.fog_range.x;
- let f=select(clamp((view_z-camera.fog_range.x)/select(span,0.001,abs(span)<0.001),0.,1.),select(0.,1.,view_z>=camera.fog_range.y),abs(span)<0.001);
+ return select(clamp((view_z-camera.fog_range.x)/select(span,0.001,abs(span)<0.001),0.,1.),select(0.,1.,view_z>=camera.fog_range.y),abs(span)<0.001);
+}
+fn fogged(linear:vec3<f32>,world:vec3<f32>)->vec3<f32> {
+ let f=fog_factor(fog_view_depth(world));
  let c=max(linear,vec3<f32>(0.));let encoded=select(c*12.92,1.055*pow(c,vec3<f32>(1./2.4))-0.055,c>vec3<f32>(0.0031308));
  let v=mix(encoded,camera.fog_color.rgb,f);
  return select(v/12.92,pow((max(v,vec3<f32>(0.))+0.055)/1.055,vec3<f32>(2.4)),v>vec3<f32>(0.04045));
 }
-fn terrain_pass_fog(linear:vec3<f32>,reciprocal_w:f32,transmittance:f32)->vec3<f32> {
- if camera.clip.y>=0. || camera.fog_range.z<0.5 {return fogged(linear,reciprocal_w);}
+fn terrain_pass_fog(linear:vec3<f32>,world:vec3<f32>,transmittance:f32)->vec3<f32> {
+ if camera.clip.y>=0. || camera.fog_range.z<0.5 {return fogged(linear,world);}
  let c=max(linear,vec3<f32>(0.));let encoded=select(c*12.92,1.055*pow(c,vec3<f32>(1./2.4))-0.055,c>vec3<f32>(0.0031308));
  let v=mix(camera.fog_color.rgb,encoded,clamp(transmittance,0.,1.));return to_linear(v);
 }
 @fragment fn fs(i:Out)->@location(0) vec4<f32> {
  if camera.clip.y>0. && i.world.y<camera.clip.x {discard;}
  if i.distant>0.5 && i.world.x>=camera.bounds.x && i.world.x<camera.bounds.y && i.world.z>=camera.bounds.z && i.world.z<camera.bounds.w {discard;}
+
  let gx=clamp(i.world.x/settings.params.z+settings.params.x*0.5,0.,settings.params.x-1.);
  let gy=clamp(settings.params.y*0.5-i.world.z/settings.params.z,0.,settings.params.y-1.);
  let coord=vec2<f32>(gx,gy)/settings.params.w;
@@ -261,11 +269,11 @@ fn terrain_pass_fog(linear:vec3<f32>,reciprocal_w:f32,transmittance:f32)->vec3<f
  // t2_3layer_batch_14 composite: `mul r0, r0, v0` with v0 = c0.x = 1.0 and
  // `mul_x2 r0, r0, r5`. There is no ambient term, no normal term and no scene
  // light: the lightmap is the only lighting, so terrain is never lit twice.
- if lightmapped {return vec4<f32>(terrain_pass_fog(to_linear(clamp(color*baked*i.refraction.y,vec3<f32>(0.),vec3<f32>(1.))),i.pos.w,i.refraction.x),1.);}
+ if lightmapped {return vec4<f32>(terrain_pass_fog(to_linear(clamp(color*baked*i.refraction.y,vec3<f32>(0.),vec3<f32>(1.))),i.world,i.refraction.x),1.);}
  // Viewer-only fallback for a session with no authored pair (the client's
  // fixed-function paths, which this lane has not integrated). Registered gap.
  let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);
- return vec4<f32>(terrain_pass_fog(color*light*camera.light.zww,i.pos.w,i.refraction.x),1.);
+ return vec4<f32>(terrain_pass_fog(color*light*camera.light.zww,i.world,i.refraction.x),1.);
 }
 "#;
 impl TerrainGpu {
@@ -1763,5 +1771,20 @@ mod tests {
         assert!(empty_gpu.layer_buffer.size() >= std::mem::size_of::<Layer>() as u64);
         device.poll(wgpu::Maintain::Wait);
         assert!(pollster::block_on(device.pop_error_scope()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod fog_shader_contract_tests {
+    #[test]
+    fn terrain_fog_uses_camera_matrix_world_depth_without_a_visual_overlay() {
+        let src = include_str!("terrain_gpu.rs");
+        assert!(src.contains("return max((camera.matrix*vec4<f32>(world,1.)).w,0.);"));
+        assert!(src.contains("fog_view_depth(i.world)"));
+        let debug_gate = ["camera.lod.z", ">0.5"].concat();
+        assert!(!src.contains(&debug_gate));
+        assert!(
+            src.contains("fn terrain_pass_fog(linear:vec3<f32>,world:vec3<f32>,transmittance:f32)")
+        );
     }
 }
