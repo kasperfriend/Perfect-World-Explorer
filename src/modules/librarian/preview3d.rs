@@ -730,7 +730,6 @@ impl BmdPreview {
                     if z >= depth[offset] {
                         continue;
                     }
-                    depth[offset] = z;
                     let reciprocal_depth = wa / a.1 + wb / b.1 + wc / c.1;
                     if !reciprocal_depth.is_finite() || reciprocal_depth <= 0.0 {
                         continue;
@@ -745,6 +744,7 @@ impl BmdPreview {
                     if texel[3] <= 0.005 {
                         continue;
                     }
+                    depth[offset] = z;
                     let normal = (a.2 * wa + b.2 * wb + c.2 * wc).normalize_or_zero();
                     let diffuse = (normal.dot(light).max(0.0) * 0.78 + 0.22).clamp(0.0, 1.0);
                     let vertex_color = (a.3 * wa + b.3 * wb + c.3 * wc) * diffuse;
