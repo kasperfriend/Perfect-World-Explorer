@@ -595,7 +595,7 @@ impl FrameBudget {
             let mut stages = String::new();
             for (name, ms) in STAGE_NAMES.iter().zip(self.stage_ms) {
                 write!(stages, "; {name} {:.2} ms", ms / self.frames as f64)
-                .expect("writing diagnostic text to String is infallible");
+                    .expect("writing diagnostic text to String is infallible");
             }
             // Only mentioned when it happened, so the line stays the same shape
             // for a view with no water in it.

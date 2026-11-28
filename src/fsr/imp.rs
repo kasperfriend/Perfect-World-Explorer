@@ -1248,9 +1248,7 @@ impl NativeCommandRing {
         slot.retired = self.fence_value;
         let signal_hr = queue.signal(&self.fence, self.fence_value);
         if signal_hr < 0 {
-            eprintln!(
-                "[FSR] D3D12 fence signal failed (HRESULT 0x{signal_hr:08x})"
-            );
+            eprintln!("[FSR] D3D12 fence signal failed (HRESULT 0x{signal_hr:08x})");
         }
         Ok(())
     }
@@ -1264,9 +1262,7 @@ impl NativeCommandRing {
             .fence
             .set_event_on_completion(self.fence_event, self.fence_value);
         if wait_hr < 0 {
-            eprintln!(
-                "[FSR] D3D12 fence wait registration failed (HRESULT 0x{wait_hr:08x})"
-            );
+            eprintln!("[FSR] D3D12 fence wait registration failed (HRESULT 0x{wait_hr:08x})");
         }
         self.fence_event.wait(5_000);
     }
