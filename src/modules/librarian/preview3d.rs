@@ -6,7 +6,8 @@ use crate::{
     model_draw_gpu::{Draw, Frame},
     model_material::Lighting,
 };
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3};
+use std::collections::HashMap;
 
 // The model shader blends encoded colors; the window surface may be sRGB.
 const PREVIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -164,7 +165,7 @@ pub fn pan_offset(yaw: f32, radius: f32, zoom: f32, delta: egui::Vec2) -> Vec3 {
 
 /// Dragging right turns the model so its front follows the pointer.
 pub fn orbit_yaw(yaw: f32, horizontal_drag: f32) -> f32 {
-    yaw - horizontal_drag * 0.01
+    yaw + horizontal_drag * 0.01
 }
 
 pub fn orbit_pitch(pitch: f32, vertical_drag: f32) -> f32 {
@@ -395,18 +396,62 @@ struct BmdPreviewVertex {
     position: Vec3,
     normal: Vec3,
     color: Vec3,
+    uv: Vec2,
 }
 
-/// Static BMD geometry preview used by Architect's asset browser. The actual
-/// world placement still uses the baked-scenery pipeline; this compact preview
-/// uses BMD vertices, indices and day-light vertex colors to show the real
-/// silhouette without pretending to reproduce the full native material stack.
+struct BmdPreviewTriangle {
+    indices: [usize; 3],
+    texture: Option<usize>,
+}
+
+struct BmdPreviewTexture {
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+}
+impl BmdPreviewTexture {
+    fn sample(&self, u: f32, v: f32) -> [f32; 4] {
+        let wrap = |value: i32, size: usize| value.rem_euclid(size as i32) as usize;
+        let x = u.rem_euclid(1.0) * self.width as f32 - 0.5;
+        let y = v.rem_euclid(1.0) * self.height as f32 - 0.5;
+        let x0 = x.floor() as i32;
+        let y0 = y.floor() as i32;
+        let tx = x - x.floor();
+        let ty = y - y.floor();
+        let texel = |x: i32, y: i32| {
+            let offset = (wrap(y, self.height) * self.width + wrap(x, self.width)) * 4;
+            [
+                self.rgba[offset] as f32 / 255.0,
+                self.rgba[offset + 1] as f32 / 255.0,
+                self.rgba[offset + 2] as f32 / 255.0,
+                self.rgba[offset + 3] as f32 / 255.0,
+            ]
+        };
+        let a = texel(x0, y0);
+        let b = texel(x0 + 1, y0);
+        let c = texel(x0, y0 + 1);
+        let d = texel(x0 + 1, y0 + 1);
+        let mut result = [0.0; 4];
+        for channel in 0..4 {
+            let top = a[channel] + (b[channel] - a[channel]) * tx;
+            let bottom = c[channel] + (d[channel] - c[channel]) * tx;
+            result[channel] = top + (bottom - top) * ty;
+        }
+        result
+    }
+}
+
+/// BMD geometry preview with its authored diffuse textures. It uses the same
+/// client archive reader and image decoders as model rendering; the native
+/// world placement still goes through the baked-scenery material/lighting path.
 pub struct BmdPreview {
     pub path: String,
     texture: wgpu::Texture,
     pub texture_id: egui::TextureId,
     vertices: Vec<BmdPreviewVertex>,
-    triangles: Vec<[usize; 3]>,
+    triangles: Vec<BmdPreviewTriangle>,
+    textures: Vec<BmdPreviewTexture>,
+    texture_warnings: Vec<String>,
     center: Vec3,
     radius: f32,
     bounds_min: Vec3,
@@ -423,6 +468,7 @@ impl BmdPreview {
         renderer: &mut egui_wgpu::Renderer,
         path: String,
         model: &crate::bmd::Model,
+        assets: &mut super::archive::LibrarianAssets,
     ) -> Result<Self, String> {
         let identity = crate::scene::Ornament {
             export_id: 0,
@@ -437,11 +483,47 @@ impl BmdPreview {
         let mut vertices = Vec::new();
         let mut valid_vertices = Vec::new();
         let mut triangles = Vec::new();
+        let mut textures = Vec::<BmdPreviewTexture>::new();
+        let mut texture_indices = HashMap::<String, Option<usize>>::new();
+        let mut texture_warnings = Vec::new();
         let mut min = Vec3::splat(f32::INFINITY);
         let mut max = Vec3::splat(f32::NEG_INFINITY);
         for mesh in &model.meshes {
             let base = vertices.len();
             let material = mesh.material.as_ref().map(|material| material.diffuse);
+            let texture_key = mesh.texture.trim().replace('\\', "/");
+            let texture_index = if texture_key.is_empty() || texture_key.len() <= 4 {
+                None
+            } else if let Some(index) = texture_indices.get(&texture_key) {
+                *index
+            } else {
+                let decoded = assets
+                    .read_bmd_texture(&texture_key)
+                    .and_then(|bytes| crate::model_texture_gpu::decode_preview_rgba(&bytes));
+                let index = match decoded {
+                    Ok(image) => {
+                        let (width, height) = image.dimensions();
+                        if width == 0 || height == 0 {
+                            texture_warnings.push(format!("{texture_key}: image has zero dimensions"));
+                            None
+                        } else {
+                            let index = textures.len();
+                            textures.push(BmdPreviewTexture {
+                                width: width as usize,
+                                height: height as usize,
+                                rgba: image.into_raw(),
+                            });
+                            Some(index)
+                        }
+                    }
+                    Err(error) => {
+                        texture_warnings.push(format!("{texture_key}: {error}"));
+                        None
+                    }
+                };
+                texture_indices.insert(texture_key.clone(), index);
+                index
+            };
             for source in &mesh.vertices {
                 let (position, normal) =
                     crate::gpu::editor_bmd_vertex_transform(model, &identity, source, [1.0; 3]);
@@ -450,6 +532,7 @@ impl BmdPreview {
                         position: Vec3::ZERO,
                         normal: Vec3::Y,
                         color: Vec3::ZERO,
+                        uv: Vec2::ZERO,
                     });
                     valid_vertices.push(false);
                     continue;
@@ -481,6 +564,7 @@ impl BmdPreview {
                         Vec3::Y
                     },
                     color,
+                    uv: Vec2::from_array(source.uv),
                 });
                 valid_vertices.push(true);
             }
@@ -495,7 +579,10 @@ impl BmdPreview {
                     && valid_vertices[base + b]
                     && valid_vertices[base + c]
                 {
-                    triangles.push([base + a, base + b, base + c]);
+                    triangles.push(BmdPreviewTriangle {
+                        indices: [base + a, base + b, base + c],
+                        texture: texture_index,
+                    });
                 }
             }
         }
@@ -529,6 +616,8 @@ impl BmdPreview {
             texture_id,
             vertices,
             triangles,
+            textures,
+            texture_warnings,
             center,
             radius,
             bounds_min: min,
@@ -543,6 +632,23 @@ impl BmdPreview {
 
     pub fn model_bounds(&self) -> ([f32; 3], [f32; 3]) {
         (self.bounds_min.to_array(), self.bounds_max.to_array())
+    }
+
+    pub fn texture_status(&self) -> String {
+        let textured_triangles = self.triangles.iter().filter(|triangle| triangle.texture.is_some()).count();
+        if self.texture_warnings.is_empty() {
+            format!("Diffuse textures loaded: {} · textured triangles: {textured_triangles}", self.textures.len())
+        } else {
+            format!(
+                "Diffuse textures loaded: {} · {} missing/unsupported",
+                self.textures.len(),
+                self.texture_warnings.len()
+            )
+        }
+    }
+
+    pub fn texture_warnings(&self) -> &[String] {
+        &self.texture_warnings
     }
 
     /// Rasterize a small, shaded turntable view only when the camera changes.
@@ -580,16 +686,17 @@ impl BmdPreview {
                 z,
                 rotation * vertex.normal,
                 vertex.color,
+                vertex.uv,
             ))
         };
         for triangle in &self.triangles {
-            let Some(a) = projected(self.vertices[triangle[0]]) else {
+            let Some(a) = projected(self.vertices[triangle.indices[0]]) else {
                 continue;
             };
-            let Some(b) = projected(self.vertices[triangle[1]]) else {
+            let Some(b) = projected(self.vertices[triangle.indices[1]]) else {
                 continue;
             };
-            let Some(c) = projected(self.vertices[triangle[2]]) else {
+            let Some(c) = projected(self.vertices[triangle.indices[2]]) else {
                 continue;
             };
             let area = (b.0.x - a.0.x) * (c.0.y - a.0.y) - (b.0.y - a.0.y) * (c.0.x - a.0.x);
@@ -624,12 +731,39 @@ impl BmdPreview {
                         continue;
                     }
                     depth[offset] = z;
+                    let reciprocal_depth = wa / a.1 + wb / b.1 + wc / c.1;
+                    if !reciprocal_depth.is_finite() || reciprocal_depth <= 0.0 {
+                        continue;
+                    }
+                    let uv = (a.4 * (wa / a.1) + b.4 * (wb / b.1) + c.4 * (wc / c.1))
+                        / reciprocal_depth;
+                    let texel = triangle
+                        .texture
+                        .and_then(|index| self.textures.get(index))
+                        .map(|texture| texture.sample(uv.x, uv.y))
+                        .unwrap_or([1.0; 4]);
+                    if texel[3] <= 0.005 {
+                        continue;
+                    }
                     let normal = (a.2 * wa + b.2 * wb + c.2 * wc).normalize_or_zero();
                     let diffuse = (normal.dot(light).max(0.0) * 0.78 + 0.22).clamp(0.0, 1.0);
-                    let color = (a.3 * wa + b.3 * wb + c.3 * wc) * diffuse;
+                    let vertex_color = (a.3 * wa + b.3 * wb + c.3 * wc) * diffuse;
+                    let color = vertex_color * Vec3::new(texel[0], texel[1], texel[2]);
                     let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
                     let pixel = &mut pixels[offset * 4..offset * 4 + 4];
-                    pixel.copy_from_slice(&[byte(color.x), byte(color.y), byte(color.z), 255]);
+                    let alpha = texel[3].clamp(0.0, 1.0);
+                    let background = Vec3::new(
+                        pixel[0] as f32 / 255.0,
+                        pixel[1] as f32 / 255.0,
+                        pixel[2] as f32 / 255.0,
+                    );
+                    let composited = color * alpha + background * (1.0 - alpha);
+                    pixel.copy_from_slice(&[
+                        byte(composited.x),
+                        byte(composited.y),
+                        byte(composited.z),
+                        255,
+                    ]);
                 }
             }
         }
@@ -1132,6 +1266,27 @@ pub(super) fn camera_matrix(target: Vec3, radius: f32, zoom: f32, yaw: f32, pitc
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dragging_right_rotates_preview_to_the_right() {
+        assert!(orbit_yaw(0.0, 20.0) > 0.0);
+        assert!(orbit_yaw(0.0, -20.0) < 0.0);
+    }
+
+    #[test]
+    fn bmd_preview_texture_sampling_wraps_and_interpolates() {
+        let texture = BmdPreviewTexture {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                255, 0, 0, 255, 0, 255, 0, 255,
+                0, 0, 255, 255, 255, 255, 255, 255,
+            ],
+        };
+        assert_eq!(texture.sample(0.25, 0.25), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(texture.sample(0.75, 0.25), [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(texture.sample(1.25, 0.25), [1.0, 0.0, 0.0, 1.0]);
+    }
+
     #[test]
     fn authentic_client_models_when_available() {
         let Ok(root) = std::env::var("PW_LIBRARIAN_ELEMENT_ROOT") else {
