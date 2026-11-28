@@ -3102,25 +3102,20 @@ impl Renderer {
             } else {
                 1.
             });
-        // Fit authored air fog to the finite resident terrain window when the
-        // original-game cutoff is enabled. Without this, the fog start can sit
-        // beyond nearly all resident geometry and the transition appears only
-        // at the window edge. Keep the same fitted state for every render pass.
-        let mut active_fog = camera.active_fog();
-        if active_fog.enabled && camera.underwater_depth <= 0. {
-            if let Some(cap) = self.resident_bounds().and_then(|bounds| {
-                crate::terrain_cutoff::fog_cap(
-                    bounds,
-                    camera.pos.to_array(),
-                    w as f32 / h.max(1) as f32,
-                )
-            }) {
-                let [start, end] =
-                    crate::terrain_cutoff::fit_fog(active_fog.start, active_fog.end, cap);
-                active_fog.start = start;
-                active_fog.end = end;
-            }
-        }
+        // Fit authored outdoor fog to the terrain window used by this frame.
+        // The bounds value is always the uploaded LOD window, independent of
+        // the optional memory-saving terrain-cutoff setting. Tying fog fitting
+        // to that setting made edge-only fog return when cutoff was disabled.
+        let (active_fog, _fog_window_cap) = if camera.underwater_depth <= 0. {
+            crate::fog_matrix::fit_to_terrain_window(
+                camera.active_fog(),
+                bounds,
+                camera.pos.to_array(),
+                w as f32 / h.max(1) as f32,
+            )
+        } else {
+            (camera.active_fog(), None)
+        };
         let (mut fog_range, fog_color) = (active_fog.range(), active_fog.color4());
         // Uniform fog_range.w is the terrain day/night factor; the shader reads
         // it instead of overloading sun.w (the lightmap-availability flag).
@@ -5195,13 +5190,23 @@ impl Renderer {
                 0.,
             ],
         );
+        let fog_window_cap = crate::terrain_cutoff::fog_cap(
+            frame.bounds,
+            camera.pos.to_array(),
+            w as f32 / h.max(1) as f32,
+        );
+        let fog_fit_expected = camera.active_fog().enabled
+            && camera.underwater_depth <= 0.
+            && fog_window_cap.is_some();
+        let fog_fit_changed = (frame.active_fog_range[0] - camera.active_fog().start).abs() > 0.01
+            || (frame.active_fog_range[1] - camera.active_fog().end).abs() > 0.01;
         // A focused capture for the long-standing outdoor-fog regression. Keep
         // the authored source, camera-selected result and bytes sent to the
         // terrain shader in one timestamped record so they can be compared
         // without guessing which stage changed the values.
         crate::diag!(
             FogCheck,
-            "camera=({:.3},{:.3},{:.3}) yaw={:.6} pitch={:.6} far={:.3} viewport={}x{} underwater_depth={:.3} atmospheric_fog={} air_authored=(start={:.3},end={:.3},color={:?},density={:.6}) underwater_authored=(start={:.3},end={:.3},color={:?},density={:.6}) active_camera=(enabled={},start={:.3},end={:.3},color={:?}) frame_fog_range={:?} frame_active_fog_range={:?} frame_fog_color={:?} frame_active_fog_color={:?} gpu_uniform_fog_range={:?} gpu_uniform_fog_color={:?} main_pass_fogged={} matrix_cols={:?} daylight={:.4} bounds={:?} terrain_runs={} far_terrain_runs={} spans={} water_batches={} use_post={} water_reflections={} bloom={} sharpen={} reset_history={} depth_contract=terrain_fs_uses_inverse_interpolated_builtin_position_w",
+            "camera=({:.3},{:.3},{:.3}) yaw={:.6} pitch={:.6} far={:.3} viewport={}x{} underwater_depth={:.3} atmospheric_fog={} air_authored=(start={:.3},end={:.3},color={:?},density={:.6}) underwater_authored=(start={:.3},end={:.3},color={:?},density={:.6}) active_camera=(enabled={},start={:.3},end={:.3},color={:?}) frame_fog_range={:?} frame_active_fog_range={:?} frame_fog_color={:?} frame_active_fog_color={:?} gpu_uniform_fog_range={:?} gpu_uniform_fog_color={:?} main_pass_fogged={} matrix_cols={:?} daylight={:.4} terrain_cutoff={} fog_window_cap={:?} fog_fit_expected={} fog_fit_changed={} bounds={:?} terrain_runs={} far_terrain_runs={} spans={} water_batches={} use_post={} water_reflections={} bloom={} sharpen={} reset_history={} depth_contract=terrain_fs_uses_inverse_interpolated_builtin_position_w",
             camera.pos.x, camera.pos.y, camera.pos.z, camera.yaw, camera.pitch,
             camera.far, w, h, camera.underwater_depth, camera.atmospheric_fog,
             camera.air_fog.start, camera.air_fog.end, camera.air_fog.color, camera.air_fog.density,
@@ -5209,7 +5214,7 @@ impl Renderer {
             camera.active_fog().enabled, camera.active_fog().start, camera.active_fog().end, camera.active_fog().color,
             frame.fog_range, frame.active_fog_range, frame.fog_color, frame.active_fog_color,
             normal.fog_range, normal.fog_color, camera.active_fog().enabled, matrix.to_cols_array(),
-            daylight, frame.bounds, terrain_run_count, far_terrain_run_count, span_count,
+            daylight, self.detail.terrain_cutoff, fog_window_cap, fog_fit_expected, fog_fit_changed, frame.bounds, terrain_run_count, far_terrain_run_count, span_count,
             self.water_batches.len(), use_post, camera.water_reflections, camera.bloom,
             camera.sharpen, reset_history
         );
