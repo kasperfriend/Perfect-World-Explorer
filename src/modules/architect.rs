@@ -185,9 +185,13 @@ impl Architect {
             .join("PerfectWorldExplorer")
             .join("Architect")
             .join("Worlds");
+        // The browser is rooted at the client directory, but PCK readers must
+        // be rooted at the actual `element` directory. Passing client_root here
+        // silently made every models.pck/gfx.pck preview look one directory too
+        // high (client/models.pck instead of client/element/models.pck).
         let client_root = element.parent().unwrap_or(&element).to_path_buf();
         let preview_assets =
-            crate::modules::librarian::archive::LibrarianAssets::open(&client_root);
+            crate::modules::librarian::archive::LibrarianAssets::open(&element);
         let mut editor = Self {
             enabled: false,
             client_root,
@@ -1568,7 +1572,11 @@ impl Architect {
         self.selected_placements.insert(index);
         self.selected_scene_object = None;
         self.selected_scene_transform = None;
-        self.status = "Game model placed in the live Architect viewport.".into();
+        // A committed placement is now an editable project object. Return to
+        // Select so the just-created object can immediately be picked and
+        // transformed with the gizmo; Place remains an explicit repeat action.
+        self.cursor = CursorMode::Select;
+        self.status = "Game model placed in the live Architect viewport. Selected for editing.".into();
     }
 
     fn duplicate_selected_scene_item(&mut self) {
@@ -1899,9 +1907,16 @@ impl Architect {
                 self.selected_scene_object = Some(index);
                 self.multi_selection.clear();
                 self.multi_scene_items.clear();
+                // A single click on a supported source-scene item arms a
+                // terrain-snapped viewport placement. Previously the click only
+                // changed selected_asset; viewport clicks stayed in Select mode,
+                // so users saw a name highlight but could not place the item.
+                if self.renderer_placeable_asset(asset) {
+                    self.cursor = CursorMode::Place;
+                    self.snap = SnapMode::Terrain;
+                    self.status = "Source item selected. Click the world to create an editable copy.".into();
+                }
             }
-            // Selecting a source-scene row only changes the active asset/target.
-            // Placement is an explicit viewport click or a dedicated Place action.
         }
     }
 
@@ -2406,6 +2421,14 @@ impl Architect {
                                 if response.hovered() { self.hovered_asset = Some(asset.clone()); }
                                 if response.clicked() {
                                     self.selected_asset = Some(asset.clone());
+                                    // Selecting a supported archive model should
+                                    // be a direct placement workflow: preview it,
+                                    // then click the viewport to place it.
+                                    if self.renderer_placeable_asset(&asset) {
+                                        self.cursor = CursorMode::Place;
+                                        self.snap = SnapMode::Terrain;
+                                        self.status = "Asset selected. Click the world to place it.".into();
+                                    }
                                 }
                                 response.context_menu(|ui| {
                                     if ui.button("Pin archive entry to quick bar").clicked() {
