@@ -104,6 +104,17 @@ impl Modules {
         self.architect.renderer_tree_placements()
     }
 
+    /// Project-owned GFX roots for the world's native effect owner queue.
+    pub fn architect_effect_placements(
+        &self,
+    ) -> Vec<crate::world_models_gpu::EditorEffectPlacement> {
+        self.architect.renderer_effect_placements()
+    }
+
+    pub fn architect_object_dragging(&self) -> bool {
+        self.architect.is_dragging_object()
+    }
+
     pub fn prepare_architect_preview(
         &mut self,
         device: &wgpu::Device,
@@ -604,6 +615,7 @@ impl Modules {
     /// Hand the world's catalogue to the add-ons. Replaces any previous one,
     /// which is what a world reload wants.
     pub fn set_effect_catalog(&mut self, catalog: crate::gfx_catalog::Catalog) {
+        self.architect.set_effect_catalog(catalog.clone());
         self.effect_catalog = Some(catalog);
     }
 
