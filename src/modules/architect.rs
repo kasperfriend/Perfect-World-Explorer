@@ -836,6 +836,135 @@ impl Architect {
         inside
     }
 
+    /// Project transformed object bounds for viewport selection. Marquee and
+    /// lasso operate on visible geometry rather than just the object origin.
+    fn projected_bounds_rect(
+        &self,
+        asset: &str,
+        position: [f32; 3],
+        euler: [f32; 3],
+        scale: f32,
+        scale_axes: [f32; 3],
+        screen: egui::Rect,
+        view_projection: glam::Mat4,
+    ) -> Option<egui::Rect> {
+        let (min, max) = self
+            .renderer_bounds_key(asset)
+            .and_then(|key| self.preview_bounds.get(&key).copied())
+            .unwrap_or_else(|| Self::fallback_selection_bounds(asset));
+        let center = Vec3::from_array(position);
+        let rotation = glam::Quat::from_euler(
+            glam::EulerRot::XYZ,
+            euler[0],
+            euler[1],
+            euler[2],
+        );
+        let scale = scale.max(0.01) * Vec3::from_array(scale_axes);
+        let min = Vec3::from_array(min);
+        let max = Vec3::from_array(max);
+        let mut rect = egui::Rect::NOTHING;
+        let mut count = 0usize;
+        for bits in 0..8 {
+            let local = Vec3::new(
+                if bits & 1 == 0 { min.x } else { max.x },
+                if bits & 2 == 0 { min.y } else { max.y },
+                if bits & 4 == 0 { min.z } else { max.z },
+            ) * scale;
+            let clip = view_projection.project_point3(center + rotation * local);
+            if clip.is_finite() && (0.0..=1.0).contains(&clip.z) {
+                rect.extend_with(egui::pos2(
+                    screen.left() + (clip.x + 1.0) * 0.5 * screen.width(),
+                    screen.top() + (1.0 - clip.y) * 0.5 * screen.height(),
+                ));
+                count += 1;
+            }
+        }
+        if count == 0 {
+            let clip = view_projection.project_point3(center);
+            if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
+                return None;
+            }
+            let point = egui::pos2(
+                screen.left() + (clip.x + 1.0) * 0.5 * screen.width(),
+                screen.top() + (1.0 - clip.y) * 0.5 * screen.height(),
+            );
+            rect = egui::Rect::from_center_size(point, egui::vec2(12.0, 12.0));
+        }
+        Some(rect.expand(8.0))
+    }
+
+    fn lasso_intersects_rect(points: &[egui::Pos2], rect: egui::Rect) -> bool {
+        if points.len() < 3 {
+            return false;
+        }
+        if points.iter().any(|point| rect.contains(*point)) {
+            return true;
+        }
+        let corners = [
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+        ];
+        if corners
+            .iter()
+            .any(|corner| Self::lasso_contains(points, *corner))
+        {
+            return true;
+        }
+        let orientation = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
+            (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+        };
+        let intersects = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2, d: egui::Pos2| {
+            let ab_c = orientation(a, b, c);
+            let ab_d = orientation(a, b, d);
+            let cd_a = orientation(c, d, a);
+            let cd_b = orientation(c, d, b);
+            (ab_c == 0.0 || ab_d == 0.0 || ab_c.is_sign_positive() != ab_d.is_sign_positive())
+                && (cd_a == 0.0
+                    || cd_b == 0.0
+                    || cd_a.is_sign_positive() != cd_b.is_sign_positive())
+        };
+        let edges = [
+            (corners[0], corners[1]),
+            (corners[1], corners[2]),
+            (corners[2], corners[3]),
+            (corners[3], corners[0]),
+        ];
+        (0..points.len()).any(|index| {
+            let a = points[index];
+            let b = points[(index + 1) % points.len()];
+            edges.iter().any(|(c, d)| intersects(a, b, *c, *d))
+        })
+    }
+
+    fn source_scene_items(
+        scene: &crate::scene::Scene,
+        ornaments: &[crate::scene::Ornament],
+    ) -> Vec<(String, [f32; 3])> {
+        let mut items = Vec::new();
+        for block in &scene.blocks {
+            for model in &block.models {
+                items.push((model.path.clone(), model.position));
+            }
+            for tree in &block.trees {
+                if let Some(kind) = scene.tree_types.get(tree.tree_type as usize) {
+                    items.push((kind.tree.clone(), tree.position));
+                    if !kind.composite.is_empty() {
+                        items.push((kind.composite.clone(), tree.position));
+                    }
+                }
+            }
+            for effect in &block.effects {
+                items.push((effect.path.clone(), effect.position));
+            }
+        }
+        for ornament in ornaments {
+            items.push((ornament.path.clone(), ornament.position));
+        }
+        items
+    }
+
     fn cancel_object_drag(&mut self) {
         self.object_dragging = false;
         self.object_drag_axis = None;
@@ -2174,22 +2303,36 @@ impl Architect {
         if ui.selectable_label(selected, label).clicked() {
             self.selected_scene_transform = Some(position);
             if self.cursor == CursorMode::MultiSelect {
-                self.selected_scene_object = None;
                 if self.multi_selection.insert(index) {
                     self.multi_scene_items
                         .insert(index, (asset.to_string(), position));
+                    self.selected_scene_object = Some(index);
+                    self.selected_asset = Some(asset.to_string());
                 } else {
                     self.multi_scene_items.remove(&index);
+                    self.selected_scene_object =
+                        self.multi_selection.iter().copied().min();
+                    if let Some(active) = self.selected_scene_object {
+                        if let Some((active_asset, active_position)) =
+                            self.multi_scene_items.get(&active)
+                        {
+                            self.selected_asset = Some(active_asset.clone());
+                            self.selected_scene_transform = Some(*active_position);
+                        }
+                    } else {
+                        self.selected_scene_transform = None;
+                    }
                 }
             } else {
+                self.clear_object_selection();
                 self.selected_scene_object = Some(index);
                 self.multi_selection.clear();
                 self.multi_scene_items.clear();
-                // A single click on a supported source-scene item arms a
-                // terrain-snapped viewport placement. Previously the click only
-                // changed selected_asset; viewport clicks stayed in Select mode,
-                // so users saw a name highlight but could not place the item.
-                self.select_asset_for_placement(asset.to_string());
+                self.selected_asset = Some(asset.to_string());
+                self.cursor = CursorMode::Select;
+                self.status =
+                    "Source object selected. Its gizmo creates an editable project copy; the client map stays unchanged."
+                        .into();
             }
         }
     }
@@ -3042,8 +3185,13 @@ impl Architect {
             .show(ctx, |ui| {
                 if let Some(index) = self.selected_scene_object {
                     ui.label(format!(
-                        "Client scene item {index} selected. Native placements are read-only."
+                        "Client scene item {index} selected. The source map is read-only; its gizmo creates an editable project copy."
                     ));
+                    if ui.button("Make editable project copy").clicked() {
+                        if let Some(position) = self.selected_scene_transform {
+                            self.add_selected_asset_at_position(position);
+                        }
+                    }
                 } else {
                     ui.label("Select a client scene item or a custom placement.");
                 }
@@ -3073,7 +3221,10 @@ impl Architect {
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} selected", self.selected_placements.len()));
+                    ui.label(format!(
+                        "{} selected",
+                        self.selected_placements.len() + self.multi_selection.len()
+                    ));
                     if ui.button("Select all").clicked() {
                         self.selected_placements = (0..self.project.objects.len()).collect();
                         self.selected_placement = self.selected_placements.iter().copied().min();
@@ -3533,7 +3684,7 @@ impl Architect {
                 input.pointer.button_released(egui::PointerButton::Primary),
             )
         });
-        let over_ui = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
+        let over_ui = ctx.is_pointer_over_area();
         let terrain_hit = if matches!(
             self.cursor,
             CursorMode::Sculpt
@@ -3606,15 +3757,22 @@ impl Architect {
             && !over_ui
         {
             let mut axis_pick = None;
-            if let (Some(index), Some(pointer)) = (
-                self.selected_placement
-                    .filter(|_| self.cursor == CursorMode::Select),
-                pointer,
-            ) {
-                if let Some(object) = self.project.objects.get(index) {
-                    let origin = Vec3::from_array(object.position);
+            let gizmo_target = self
+                .selected_placement
+                .and_then(|index| self.project.objects.get(index))
+                .map(|object| (Vec3::from_array(object.position), object.asset.clone()))
+                .or_else(|| {
+                    self.selected_scene_object.and_then(|_| {
+                        self.selected_scene_transform
+                            .zip(self.selected_asset.clone())
+                            .filter(|(asset, _)| self.renderer_placeable_asset(asset))
+                            .map(|(position, asset)| (Vec3::from_array(position), asset))
+                    })
+                });
+            if let (Some((origin, asset)), Some(pointer)) = (gizmo_target, pointer) {
+                if self.cursor == CursorMode::Select {
                     let axis_scale_supported = {
-                        let path = object.asset.to_ascii_lowercase();
+                        let path = asset.to_ascii_lowercase();
                         path.ends_with(".ecm") || path.ends_with(".smd") || path.ends_with(".bmd")
                     };
                     let project_point = |point: Vec3| {
@@ -3705,6 +3863,16 @@ impl Architect {
                             }
                         }
                     }
+                }
+            }
+            // Source-scene instances are immutable. The first transform-handle
+            // drag promotes the selection into a project-owned copy.
+            if axis_pick.is_some()
+                && self.cursor == CursorMode::Select
+                && self.selected_placement.is_none()
+            {
+                if let Some(position) = self.selected_scene_transform {
+                    self.add_selected_asset_at_position(position);
                 }
             }
             let mut nearest: Option<(usize, f32, f32)> = None;
@@ -3982,14 +4150,10 @@ impl Architect {
                 None
             };
         }
-        if self.marquee_start.is_some()
-            && down
-            && self.cursor == CursorMode::MultiSelect
-            && !over_ui
-        {
-            self.marquee_current = pointer;
+        if self.marquee_start.is_some() && down && self.cursor == CursorMode::MultiSelect {
+            self.marquee_current = pointer.or(self.marquee_current);
         }
-        if !self.lasso_points.is_empty() && down && self.cursor == CursorMode::Lasso && !over_ui {
+        if !self.lasso_points.is_empty() && down && self.cursor == CursorMode::Lasso {
             if let Some(position) = pointer {
                 if self
                     .lasso_points
@@ -4001,15 +4165,13 @@ impl Architect {
             }
         }
         if !self.lasso_points.is_empty() && (released || !down) {
-            if !over_ui {
-                if let Some(position) = pointer {
-                    if self
-                        .lasso_points
-                        .last()
-                        .is_none_or(|last| last.distance(position) >= 1.0)
-                    {
-                        self.lasso_points.push(position);
-                    }
+            if let Some(position) = pointer {
+                if self
+                    .lasso_points
+                    .last()
+                    .is_none_or(|last| last.distance(position) >= 1.0)
+                {
+                    self.lasso_points.push(position);
                 }
             }
             if self.lasso_points.len() >= 3 {
@@ -4017,32 +4179,61 @@ impl Architect {
                     if !object.visible {
                         continue;
                     }
-                    let clip = view_projection.project_point3(Vec3::from_array(object.position));
-                    if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
-                        continue;
-                    }
-                    let projected = egui::pos2(
-                        screen.left() + (clip.x + 1.0) * 0.5 * screen.width(),
-                        screen.top() + (1.0 - clip.y) * 0.5 * screen.height(),
-                    );
-                    if Self::lasso_contains(&self.lasso_points, projected) {
+                    if self
+                        .projected_bounds_rect(
+                            &object.asset,
+                            object.position,
+                            object.rotation,
+                            object.scale,
+                            object.scale_axes,
+                            screen,
+                            view_projection,
+                        )
+                        .is_some_and(|rect| Self::lasso_intersects_rect(&self.lasso_points, rect))
+                    {
                         self.selected_placements.insert(index);
+                    }
+                }
+                for (index, (asset, position)) in
+                    Self::source_scene_items(scene, ornaments).into_iter().enumerate()
+                {
+                    if self
+                        .projected_bounds_rect(
+                            &asset,
+                            position,
+                            [0.0; 3],
+                            1.0,
+                            [1.0; 3],
+                            screen,
+                            view_projection,
+                        )
+                        .is_some_and(|rect| Self::lasso_intersects_rect(&self.lasso_points, rect))
+                    {
+                        self.multi_selection.insert(index);
+                        self.multi_scene_items.insert(index, (asset, position));
                     }
                 }
                 self.selected_placement = self
                     .selected_placement
                     .filter(|index| self.selected_placements.contains(index))
                     .or_else(|| self.selected_placements.iter().copied().min());
-                self.status = format!("Selected {} placements.", self.selected_placements.len());
+                if let Some(index) = self.multi_selection.iter().copied().min() {
+                    self.selected_scene_object = Some(index);
+                    if let Some((asset, position)) = self.multi_scene_items.get(&index) {
+                        self.selected_asset = Some(asset.clone());
+                        self.selected_scene_transform = Some(*position);
+                    }
+                }
+                self.status = format!(
+                    "Selected {} project placements and {} source-scene objects.",
+                    self.selected_placements.len(),
+                    self.multi_selection.len()
+                );
             }
             self.lasso_points.clear();
         }
         if self.marquee_start.is_some() && (released || !down) {
-            let release_position = if over_ui {
-                self.marquee_current
-            } else {
-                pointer.or(self.marquee_current)
-            };
+            let release_position = pointer.or(self.marquee_current);
             if let (Some(start), Some(current)) = (self.marquee_start, release_position) {
                 let rect = Self::marquee_rect(start, current);
                 if rect.width() >= 4.0 || rect.height() >= 4.0 {
@@ -4050,25 +4241,56 @@ impl Architect {
                         if !object.visible {
                             continue;
                         }
-                        let clip =
-                            view_projection.project_point3(Vec3::from_array(object.position));
-                        if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
-                            continue;
-                        }
-                        let projected = egui::pos2(
-                            screen.left() + (clip.x + 1.0) * 0.5 * screen.width(),
-                            screen.top() + (1.0 - clip.y) * 0.5 * screen.height(),
-                        );
-                        if rect.contains(projected) {
+                        if self
+                            .projected_bounds_rect(
+                                &object.asset,
+                                object.position,
+                                object.rotation,
+                                object.scale,
+                                object.scale_axes,
+                                screen,
+                                view_projection,
+                            )
+                            .is_some_and(|bounds| bounds.intersects(rect))
+                        {
                             self.selected_placements.insert(index);
+                        }
+                    }
+                    for (index, (asset, position)) in
+                        Self::source_scene_items(scene, ornaments).into_iter().enumerate()
+                    {
+                        if self
+                            .projected_bounds_rect(
+                                &asset,
+                                position,
+                                [0.0; 3],
+                                1.0,
+                                [1.0; 3],
+                                screen,
+                                view_projection,
+                            )
+                            .is_some_and(|bounds| bounds.intersects(rect))
+                        {
+                            self.multi_selection.insert(index);
+                            self.multi_scene_items.insert(index, (asset, position));
                         }
                     }
                     self.selected_placement = self
                         .selected_placement
                         .filter(|index| self.selected_placements.contains(index))
                         .or_else(|| self.selected_placements.iter().copied().min());
-                    self.status =
-                        format!("Selected {} placements.", self.selected_placements.len());
+                    if let Some(index) = self.multi_selection.iter().copied().min() {
+                        self.selected_scene_object = Some(index);
+                        if let Some((asset, position)) = self.multi_scene_items.get(&index) {
+                            self.selected_asset = Some(asset.clone());
+                            self.selected_scene_transform = Some(*position);
+                        }
+                    }
+                    self.status = format!(
+                        "Selected {} project placements and {} source-scene objects.",
+                        self.selected_placements.len(),
+                        self.multi_selection.len()
+                    );
                 }
             }
             self.marquee_start = None;
@@ -4363,12 +4585,20 @@ impl Architect {
                 egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 210, 175)),
             ));
         }
-        if let Some(index) = self
+        let gizmo_object = self
             .selected_placement
-            .filter(|index| *index < self.project.objects.len())
-        {
-            let object = &self.project.objects[index];
-            let origin = Vec3::from_array(object.position);
+            .and_then(|index| self.project.objects.get(index))
+            .map(|object| (object.asset.clone(), object.position))
+            .or_else(|| {
+                self.selected_scene_object.and_then(|_| {
+                    self.selected_scene_transform
+                        .zip(self.selected_asset.clone())
+                        .filter(|(asset, _)| self.renderer_placeable_asset(asset))
+                        .map(|(position, asset)| (asset, position))
+                })
+            });
+        if let Some((asset, position)) = gizmo_object {
+            let origin = Vec3::from_array(position);
             let project_point = |point: Vec3| -> Option<egui::Pos2> {
                 let clip = view_projection.project_point3(point);
                 (clip.is_finite() && (0.0..=1.0).contains(&clip.z)).then(|| {
@@ -4389,7 +4619,7 @@ impl Architect {
             };
             if let Some(center) = project_point(origin) {
                 let axis_scale_supported = {
-                    let path = object.asset.to_ascii_lowercase();
+                    let path = asset.to_ascii_lowercase();
                     path.ends_with(".ecm") || path.ends_with(".smd") || path.ends_with(".bmd")
                 };
                 let painter = ctx.layer_painter(egui::LayerId::new(
