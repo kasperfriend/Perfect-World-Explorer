@@ -1639,6 +1639,7 @@ impl Architect {
                     || !object.rotation.iter().all(|value| value.is_finite())
                     || !object.scale.is_finite()
                     || !(0.001..=1000.0).contains(&object.scale)
+                    || !object.scale_axes.iter().all(|v| v.is_finite() && (0.001..=1000.0).contains(v))
                 {
                     return None;
                 }
@@ -4450,6 +4451,15 @@ mod tests {
             && picked_placement.is_none()
             && !source_is_frontmost;
         assert!(!begin_marquee);
+    }
+
+    #[test]
+    fn fallback_selection_bounds_keep_buildings_pickable_before_mesh_load() {
+        let building = Architect::fallback_selection_bounds("litmodels/a01/castle.bmd");
+        let ordinary = Architect::fallback_selection_bounds("models/props/barrel.ecm");
+        let tree = Architect::fallback_selection_bounds("trees/forest/oak.ecm");
+        assert!(building.1[0] - building.0[0] > ordinary.1[0] - ordinary.0[0]);
+        assert!(tree.1[1] - tree.0[1] > ordinary.1[1] - ordinary.0[1]);
     }
 
     #[test]
