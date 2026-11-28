@@ -313,6 +313,8 @@ impl Architect {
             self.cancel_object_drag();
             self.brush_dragging = false;
             self.last_brush_position = None;
+            self.discard_native_preview();
+            self.discard_bmd_preview();
         }
     }
 
@@ -1306,6 +1308,12 @@ impl Architect {
         self.bmd_preview_path = None;
     }
 
+    pub fn free_pending_preview_textures(&mut self, renderer: &mut egui_wgpu::Renderer) {
+        for texture_id in self.pending_preview_free.drain(..) {
+            renderer.free_texture(&texture_id);
+        }
+    }
+
     pub fn prepare_preview(
         &mut self,
         device: &wgpu::Device,
@@ -1313,9 +1321,7 @@ impl Architect {
         renderer: &mut egui_wgpu::Renderer,
         format: wgpu::TextureFormat,
     ) {
-        for texture_id in self.pending_preview_free.drain(..) {
-            renderer.free_texture(&texture_id);
-        }
+        self.free_pending_preview_textures(renderer);
         let asset = self
             .hovered_asset
             .as_deref()
@@ -1340,6 +1346,7 @@ impl Architect {
             self.discard_native_preview();
             let needs_load = self.bmd_preview_path.as_deref() != Some(path.as_str());
             if needs_load {
+                self.discard_bmd_preview();
                 self.bmd_preview_path = Some(path.clone());
                 let loaded = self
                     .preview_assets
