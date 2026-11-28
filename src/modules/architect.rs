@@ -190,8 +190,7 @@ impl Architect {
         // silently made every models.pck/gfx.pck preview look one directory too
         // high (client/models.pck instead of client/element/models.pck).
         let client_root = element.parent().unwrap_or(&element).to_path_buf();
-        let preview_assets =
-            crate::modules::librarian::archive::LibrarianAssets::open(&element);
+        let preview_assets = crate::modules::librarian::archive::LibrarianAssets::open(&element);
         let mut editor = Self {
             enabled: false,
             client_root,
@@ -1356,7 +1355,10 @@ impl Architect {
             self.snap = SnapMode::Terrain;
             self.status = "Asset selected. Move over the world and click to place it.".into();
         } else {
-            self.status = "Asset selected. This format is browse-only until a native placement adapter is available.".into();
+            self.cursor = CursorMode::Select;
+            self.status =
+                "Asset selected. This format is browse-only until a native placement adapter is available."
+                    .into();
         }
     }
 
@@ -1646,7 +1648,8 @@ impl Architect {
         // Select so the just-created object can immediately be picked and
         // transformed with the gizmo; Place remains an explicit repeat action.
         self.cursor = CursorMode::Select;
-        self.status = "Game model placed in the live Architect viewport. Selected for editing.".into();
+        self.status =
+            "Game model placed in the live Architect viewport. Selected for editing.".into();
     }
 
     fn duplicate_selected_scene_item(&mut self) {
@@ -4633,10 +4636,16 @@ mod tests {
 
         editor.select_asset_for_placement("element/trees.pck::trees/oak.dds".into());
 
-        assert_eq!(editor.selected_asset.as_deref(), Some("element/trees.pck::trees/oak.dds"));
+        assert_eq!(
+            editor.selected_asset.as_deref(),
+            Some("element/trees.pck::trees/oak.dds")
+        );
         assert_eq!(editor.cursor, CursorMode::Place);
         assert_eq!(editor.snap, SnapMode::Terrain);
-        assert_eq!(editor.renderer_tree_type("element/trees.pck::trees/oak.dds"), Some(0));
+        assert_eq!(
+            editor.renderer_tree_type("element/trees.pck::trees/oak.dds"),
+            Some(0)
+        );
     }
 
     #[test]
@@ -4665,6 +4674,27 @@ mod tests {
         assert_eq!(placements[0].position, [10.0, 20.0, 30.0]);
         assert!((placements[0].yaw - 1.25).abs() < 0.0001);
         assert!((placements[0].scale - 1.75).abs() < 0.0001);
+    }
+
+    #[test]
+    fn renderer_tree_placements_include_the_native_cursor_ghost() {
+        let mut editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
+        editor.enabled = true;
+        editor.project.source_map = "a01".into();
+        editor.tree_types = vec![crate::scene::TreeType {
+            tree: "trees/oak.spt".into(),
+            composite: "trees/oak.dds".into(),
+        }];
+        editor.selected_asset = Some("element/trees.pck::trees/oak.dds".into());
+        editor.cursor = CursorMode::Place;
+        editor.brush_cursor_position = Some([4.0, 5.0, 6.0]);
+
+        let placements = editor.renderer_tree_placements();
+
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].tree_type, 0);
+        assert_eq!(placements[0].position, [4.0, 5.0, 6.0]);
+        assert_eq!(placements[0].scale, 1.0);
     }
 
     #[test]
