@@ -154,6 +154,8 @@ fn main() {
                         face_color: [1.; 4],
                         face_skin: [1.; 4],
                         lod: [0.; 4],
+                        eye_position: [0.; 4],
+                        water_fog: [0.; 4],
                     };
                     let vertices: Vec<_> = positions
                         .iter()
@@ -354,6 +356,8 @@ fn main() {
         face_color: brow,
         face_skin: skin,
         lod: [0.; 4],
+        eye_position: [0.; 4],
+        water_fog: [0.; 4],
     };
     let vertices: Vec<_> = positions
         .iter()

@@ -7,25 +7,23 @@
 //!   (`D3DFOG_LINEAR`) over view-space z with the camera's active region fog:
 //!   air above water, the interpolated regional underwater fog below it.
 //! * The clipped refraction pass (camera above a water plane, geometry below it
-//!   clipped at `0x7cc6ac`) replaces the table fog for grass, baked models and
-//!   terrain with the recovered eye-ray exponential:
+//!   clipped at `0x7cc6ac`) uses the recovered eye-ray exponential for grass,
+//!   baked models and terrain:
 //!   `exp2(-density * depth * length(eye - original) / (eye.y - original.y))`
 //!   with density `0.075` (`0x651319` grass, `0x7a91dd` BMD, `0x7c26e0`
 //!   terrain). Grass measures submerged depth from the *displaced* vertex,
 //!   baked models and terrain clamp above-plane depth to zero, and terrain also
 //!   emits depth-only darkness `exp2(-2 * density * depth)`.
-//! * Models, trees and shoreline geometry keep table fog in that pass – the
-//!   shaders never receive the exponential inputs.
+//! * Ordinary model meshes, animated GFX effects and far-tree LOD geometry
+//!   combine plane-relative table fog with the same base-two water transmission.
+//!   The small shoreline edge band retains its separate coverage/alpha path.
 //! * The below-surface scene (`0x7cca50`) is rendered with the *air* fog while
 //!   the camera is underwater; the underwater fog is restored afterwards.
-//! * The water surface and the shoreline waves keep table fog too. The client
-//!   refreshes the surface object's fog fields from the active region fog on
-//!   every update (`0x6bfa34`/`0x6bfa47` through the setters at `0x780990` and
-//!   `0x7809c0`) and rebinds them right before the draw
-//!   (`0x7ca9d9`/`0x7ca9e8`/`0x7ca9f7`, plus `0x7cb444`/`0x7cb502`/`0x7cb94e`
-//!   for the edge and refraction passes). Neither water shader carries fog
-//!   math: `wavevs.txt` writes `oFog = 1.0` and `waveblend.txt` has no fog
-//!   constants, so the pass state applies unchanged.
+//! * The water surface, alternate-water areas and shoreline waves use the same
+//!   effective main-view fog range as terrain, including the terrain-window fit.
+//!   Their shaders re-project world position with the main camera matrix and
+//!   apply the same linear view-Z start/end ramp; they do not use fragment
+//!   builtin W or the unfitted authored range.
 //!
 //! Transparent/alpha-tested variants inherit their class row: the recovered
 //! shaders return encoded material color and the client applied fog after the
@@ -130,6 +128,8 @@ pub enum Material {
     Model,
     /// Alpha-tested/transparent model variant; shares the model row.
     TransparentModel,
+    /// Animated GFX quads and element-160 meshes.
+    GfxEffect,
     Tree,
     Shore,
     Sky,
@@ -159,6 +159,8 @@ pub enum Quantity {
     TableFogViewZ,
     /// Recovered refraction vertex exponential (`exp2`, base two).
     EyeRayExponential,
+    /// Table fog multiplied by the recovered water eye-ray transmission.
+    TableFogWithWaterAbsorption,
     /// Material is not fogged in this pass.
     None,
 }
@@ -166,7 +168,8 @@ pub enum Quantity {
 /// Which range/color pair the pass binds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RangeColor {
-    /// The camera's active regional fog (air or underwater).
+    /// The camera's effective regional fog (air or underwater), including
+    /// the main-view terrain-window fit.
     Camera,
     /// The air fog explicitly (below-surface scene while underwater).
     Air,
@@ -208,11 +211,11 @@ const fn row_of(
 pub fn row(material: Material, pass: Pass) -> Row {
     // Fully qualified on purpose: `None` exists in both enums.
     use Material::{
-        BakedModel, CloudSurface, Grass, Model, Precipitation, Shore, Sky, Terrain,
+        BakedModel, CloudSurface, GfxEffect, Grass, Model, Precipitation, Shore, Sky, Terrain,
         TransparentModel, Tree, WaterSurface,
     };
     use Pass::{BelowSurface, Main, Reflection, Refraction};
-    use Quantity::{EyeRayExponential, TableFogViewZ};
+    use Quantity::{EyeRayExponential, TableFogViewZ, TableFogWithWaterAbsorption};
     use RangeColor::{Air, Camera, WaterRefraction};
     match (material, pass) {
         // Sky is authored without the world fog state in every pass.
@@ -268,17 +271,15 @@ pub fn row(material: Material, pass: Pass) -> Row {
             true,
             "cloud_gpu receives the above-water secondary view's air fog",
         ),
-        // The water surface gap is described in the module documentation.
-        // The surface rebinds the object's fog fields right before its draw
-        // (0x7ca9d9..0x7ca9f7) and those fields hold the region fog
-        // (0x6bfa47); the shaders carry no fog math and water_vs writes no oFog,
-        // so the quantity is the engine table fog.
+        // WaterSurface uses the same effective/fitted camera range as terrain.
+        // The water fragment re-projects its interpolated world point through
+        // the shared view-projection matrix, just as terrain_gpu does.
         (WaterSurface, Main) => row_of(
             TableFogViewZ,
             Camera,
             false,
             true,
-            "0x6bfa47 refresh; 0x7cb502/0x7ca9f9 bind before the draw",
+            "water_gpu uses the terrain-fitted range and matrix * world view-Z",
         ),
         (WaterSurface, _) => row_of(
             Quantity::None,
@@ -287,16 +288,14 @@ pub fn row(material: Material, pass: Pass) -> Row {
             true,
             "water surface not submitted in this pass",
         ),
-        // Shoreline waves are drawn only into the main scene target.
-        // wavevs.txt writes oFog = c0.x = 1.0 ("set no fog") and waveblend.txt
-        // has no fog constants, so the waves add no fog of their own; they are
-        // drawn in the water pass under the same bound fog state.
+        // Shoreline waves are drawn only into the main scene target and use
+        // the same terrain-fitted fog range and matrix * world view-Z.
         (Shore, Main) => row_of(
             TableFogViewZ,
             Camera,
             false,
             true,
-            "wavevs.txt oFog=1.0; waveblend.txt has no fog; pass state shared",
+            "shore_gpu uses the terrain-fitted range and matrix * world view-Z",
         ),
         (Shore, _) => row_of(
             Quantity::None,
@@ -327,19 +326,17 @@ pub fn row(material: Material, pass: Pass) -> Row {
             true,
             "bmd fogged() (0x7a91dd main path)",
         ),
-        (Model, Main) | (Model, Reflection) => row_of(
+        (Model, Main)
+        | (Model, Reflection)
+        | (TransparentModel, Main)
+        | (TransparentModel, Reflection)
+        | (GfxEffect, Main)
+        | (GfxEffect, Reflection) => row_of(
             TableFogViewZ,
             Camera,
             false,
             true,
-            "model_receiver table fog (fog_range.z)",
-        ),
-        (TransparentModel, Main) | (TransparentModel, Reflection) => row_of(
-            TableFogViewZ,
-            Camera,
-            false,
-            true,
-            "same shader/fog as the model row",
+            "model/effect receiver table fog (fog_range.z)",
         ),
         (Tree, Main) | (Tree, Reflection) => {
             row_of(TableFogViewZ, Camera, false, true, "far_trees_gpu fogged()")
@@ -366,19 +363,19 @@ pub fn row(material: Material, pass: Pass) -> Row {
             true,
             "terrain_refract_vs 0x7c26e0 (+depth darkness)",
         ),
-        (Model, Refraction) | (TransparentModel, Refraction) => row_of(
-            TableFogViewZ,
+        (Model, Refraction) | (TransparentModel, Refraction) | (GfxEffect, Refraction) => row_of(
+            TableFogWithWaterAbsorption,
             WaterRefraction,
             false,
             true,
-            "model passes receive the refraction range/color only",
+            "receiver table fog multiplied by model_water_transmittance",
         ),
         (Tree, Refraction) => row_of(
-            TableFogViewZ,
+            TableFogWithWaterAbsorption,
             WaterRefraction,
             false,
             true,
-            "tree shader has no refraction exponential inputs",
+            "far_trees_gpu combines table fog with the shared eye-ray water law",
         ),
         // Below-surface scene while the camera is underwater.
         (Terrain, BelowSurface)
@@ -386,6 +383,7 @@ pub fn row(material: Material, pass: Pass) -> Row {
         | (BakedModel, BelowSurface)
         | (Model, BelowSurface)
         | (TransparentModel, BelowSurface)
+        | (GfxEffect, BelowSurface)
         | (Tree, BelowSurface) => row_of(
             TableFogViewZ,
             Air,
@@ -404,12 +402,13 @@ pub const MODEL_VERTEX_FOG: f32 = 1.;
 mod tests {
     use super::*;
 
-    const MATERIALS: [Material; 11] = [
+    const MATERIALS: [Material; 12] = [
         Material::Terrain,
         Material::Grass,
         Material::BakedModel,
         Material::Model,
         Material::TransparentModel,
+        Material::GfxEffect,
         Material::Tree,
         Material::Shore,
         Material::Sky,
@@ -528,6 +527,34 @@ mod tests {
                 Quantity::TableFogViewZ
             );
         }
+    }
+
+    #[test]
+    fn receiving_models_and_gfx_effects_absorb_water_only_in_clipped_refraction() {
+        for material in [
+            Material::Model,
+            Material::TransparentModel,
+            Material::GfxEffect,
+            Material::Tree,
+        ] {
+            assert_eq!(
+                row(material, Pass::Refraction).quantity,
+                Quantity::TableFogWithWaterAbsorption,
+                "{material:?}"
+            );
+            assert_eq!(
+                row(material, Pass::Main).quantity,
+                Quantity::TableFogViewZ,
+                "{material:?}"
+            );
+            assert_eq!(
+                row(material, Pass::Reflection).quantity,
+                Quantity::TableFogViewZ,
+                "{material:?}"
+            );
+            assert_eq!(row(material, Pass::BelowSurface).range, RangeColor::Air);
+        }
+        // Far-tree LOD uses the shared refraction water-transmission law.
     }
 
     #[test]

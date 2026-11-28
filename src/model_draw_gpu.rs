@@ -22,11 +22,14 @@ pub struct Frame {
     pub point_position: [f32; 3],
     pub attenuation: [f32; 3],
     pub eye_direction: [f32; 3],
+    pub eye_position: [f32; 3],
     pub directional_specular: [f32; 4],
     pub specular_variant: bool,
     pub vertex_fog: f32,
     pub fog_color: [f32; 4],
     pub fog_range: [f32; 4],
+    /// Water plane Y, absorption density, enabled for clipped refraction, reserved.
+    pub water_fog: [f32; 4],
     pub clip_plane: [f32; 4],
     pub reverse_front: bool,
     /// Zero disables alpha testing; 1..8 are the source D3DCMPFUNC values.
@@ -141,6 +144,8 @@ impl Frame {
             ],
             fog_color: self.fog_color,
             fog_range: self.fog_range,
+            eye_position: vector(self.eye_position),
+            water_fog: self.water_fog,
             clip_plane: self.clip_plane,
             raster: [
                 u32::from(material.two_sided) as f32,
@@ -205,10 +210,10 @@ pub struct Draw {
     /// [`Self::update_posed`] convert vertices without re-running it.
     pose_of: Vec<usize>,
     alpha_meshes: Vec<usize>,
-    /// Reused per-mesh uniform payloads. Camera turns update every visible
-    /// receiver's constants, but the payload scratch must not allocate or
-    /// recompute material constants twice on each frame.
+    /// Reused uniform payloads avoid per-frame allocations on camera turns.
     constant_scratch: std::cell::RefCell<Vec<raster::Params>>,
+    // Queue writes copy the bytes, so one vertex Vec can serve every submesh/frame.
+    scratch_vertices: Vec<raster::Vertex>,
     // Keep authored textures alive and share repeated per-skin texture slots.
     textures: Vec<std::sync::Arc<wgpu::Texture>>,
 }
@@ -485,6 +490,7 @@ impl Draw {
             pose_of,
             alpha_meshes,
             constant_scratch: std::cell::RefCell::new(Vec::new()),
+            scratch_vertices: Vec::new(),
             textures,
         })
     }
@@ -538,7 +544,7 @@ impl Draw {
     /// constants. A pose that no longer matches the retained mesh is an explicit
     /// error, never a silently different draw.
     pub fn update_posed(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         asset: &ModelAsset,
         poses: &[PosedMesh],
@@ -548,79 +554,49 @@ impl Draw {
             return Err("model pass blending changed; rebuild its pipeline".into());
         }
         let original = asset.descriptor.render_settings().original_color;
-        // Validate every mesh before mutating GPU buffers so partial uploads
-        // never occur, while reusing one scratch vertex buffer across all meshes.
-        let mut max_verts = 0usize;
+
+        // Validate every retained pose and cache all material parameters before
+        // the first GPU write. Constant scratch is reused across camera turns.
+        let mut constants = self.constant_scratch.borrow_mut();
+        constants.clear();
         for (index, gpu) in self.meshes.iter().enumerate() {
-            let Some(gpu) = gpu else {
-                continue;
-            };
-            let pose = self
-                .pose_of
-                .get(index)
-                .and_then(|&pose| poses.get(pose))
+            let Some(gpu) = gpu else { continue; };
+            let pose = self.pose_of.get(index).and_then(|&pose| poses.get(pose))
                 .ok_or("model pose does not cover every retained mesh")?;
             if (pose.skin, pose.mesh) != gpu.key || pose.vertices.len() != gpu.vertices {
                 return Err("model pose no longer matches the retained draw".into());
             }
             let skin = asset.skins.get(pose.skin).ok_or("missing retained skin")?;
-            let source = skin
-                .data
-                .meshes
-                .get(pose.mesh)
-                .ok_or("missing retained mesh")?;
-            let material = usize::try_from(source.material)
-                .ok()
-                .and_then(|i| skin.data.materials.get(i))
-                .ok_or("missing retained material")?;
-            let color = if gpu.face_shader.is_some() {
-                u32::MAX
-            } else {
-                asset.mesh_color(pose.skin, pose.mesh, original)
-            };
-            let _ = frame.params(
-                material,
-                color,
-                gpu.diffuse_alpha_only,
-                gpu.face_shader.as_ref(),
-            )?;
-            max_verts = max_verts.max(pose.vertices.len());
+            let source = skin.data.meshes.get(pose.mesh).ok_or("missing retained mesh")?;
+            let material = usize::try_from(source.material).ok()
+                .and_then(|i| skin.data.materials.get(i)).ok_or("missing retained material")?;
+            let color = if gpu.face_shader.is_some() { u32::MAX }
+                else { asset.mesh_color(pose.skin, pose.mesh, original) };
+            constants.push(frame.params(material, color, gpu.diffuse_alpha_only, gpu.face_shader.as_ref())?);
         }
-        let mut vertices = Vec::with_capacity(max_verts);
+
+        // Queue writes copy their bytes before returning, so one vertex staging
+        // Vec can serve every mesh without allocating a Vec per submesh.
+        let mut params_index = 0usize;
+        let scratch = &mut self.scratch_vertices;
         for (index, gpu) in self.meshes.iter().enumerate() {
-            let Some(gpu) = gpu else {
-                continue;
-            };
+            let Some(gpu) = gpu else { continue; };
             let pose = &poses[self.pose_of[index]];
-            let skin = &asset.skins[pose.skin];
-            let source = &skin.data.meshes[pose.mesh];
-            let material = &skin.data.materials[source.material as usize];
-            let color = if gpu.face_shader.is_some() {
-                u32::MAX
-            } else {
-                asset.mesh_color(pose.skin, pose.mesh, original)
-            };
-            let params = frame.params(
-                material,
-                color,
-                gpu.diffuse_alpha_only,
-                gpu.face_shader.as_ref(),
-            )?;
-            vertices.clear();
-            vertices.extend(source.vertices.iter().zip(&pose.vertices).map(|(s, p)| {
-                raster::Vertex {
-                    position: p.position,
-                    normal: p.normal,
-                    uv: s.uv,
-                    fog: frame.vertex_fog,
-                }
+            let source = &asset.skins[pose.skin].data.meshes[pose.mesh];
+            scratch.clear();
+            scratch.extend(source.vertices.iter().zip(&pose.vertices).map(|(source, posed)| raster::Vertex {
+                position: posed.position,
+                normal: posed.normal,
+                uv: source.uv,
+                fog: frame.vertex_fog,
             }));
-            gpu.mesh.update(queue, &vertices)?;
-            gpu.binding.update(queue, &params)?;
+            gpu.mesh.update(queue, scratch)?;
+            let params = constants.get(params_index).ok_or("missing validated model constants")?;
+            gpu.binding.update(queue, params)?;
+            params_index += 1;
         }
         Ok(())
     }
-
     /// World-owned immutable topology: pass changes only require constants,
     /// not another prepare/copy/upload of the exact same posed vertices.
     pub fn update_constants(

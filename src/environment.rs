@@ -596,8 +596,7 @@ impl Environments {
         // AutoFamily fog is a scene-level fallback only. EC-BSD area fog stays
         // authoritative whenever an area is selected.
         let auto_fog = (|| -> Result<crate::sky_config::AutoFogConfig, String> {
-            let mut file =
-                fs::File::open(element_root(dir).join("configs.pck")).map_err(|e| e.to_string())?;
+            let mut file = fs::File::open(dir.join("configs.pck")).map_err(|e| e.to_string())?;
             // `configs.pck` is an Angelica File Package, not the retail v2 PCK
             // `textures.pck` uses. The retail reader rejects its guard, which
             // silently disabled the AutoFamily fog fallback.
@@ -624,8 +623,11 @@ impl Environments {
     pub fn streaming(&self) -> Option<RegionStreaming> {
         self.streaming.clone().map(RegionStreaming::new)
     }
+    /// The AutoFamily flag is authoritative when present. Older clients/maps may
+    /// omit configs.pck or autoscene.cfg while still carrying valid EC-BSD
+    /// regional fog; absence is not an instruction to disable that fog.
     pub fn auto_fog_enabled(&self) -> bool {
-        self.auto_fog.is_some_and(|fog| fog.enabled)
+        self.auto_fog.map(|fog| fog.enabled).unwrap_or(true)
     }
     pub fn underwater(&self, p: [f32; 3], hour: f32) -> Fog {
         self.sample(p, hour, true)
@@ -762,6 +764,39 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn missing_autofamily_config_does_not_disable_regional_fog_by_default() {
+        let env = Environments::default();
+        assert!(env.auto_fog_enabled());
+        let mut disabled = Environments::default();
+        disabled.auto_fog = Some(crate::sky_config::AutoFogConfig {
+            enabled: false,
+            day_start: 2500.,
+            day_end: 12000.,
+            day_color: [0.1, 0.2, 0.3],
+            night_start: 1800.,
+            night_end: 8000.,
+            night_color: [0.4, 0.5, 0.6],
+            water_color: [0.02, 0.04, 0.08],
+        });
+        assert!(!disabled.auto_fog_enabled());
+    }
+
+    #[test]
+    fn missing_autoscene_uses_the_pr44_outdoor_fog_fallback() {
+        // The user's client has no autoscene.cfg. In that case the no-region
+        // environment must keep PR #44's 60..400 blue-grey outdoor fallback.
+        let env = Environments::default();
+        let (_, fallback, _) = env.endpoints_for(None);
+        assert_eq!(fallback.air_day.start, 60.);
+        assert_eq!(fallback.air_day.end, 400.);
+        assert_eq!(fallback.air_night.start, 60.);
+        assert_eq!(fallback.air_night.end, 400.);
+        assert_eq!(fallback.air_day.color, [70. / 255., 77. / 255., 91. / 255.]);
+        assert_eq!(fallback.air_night.color, fallback.air_day.color);
+    }
+
     #[test]
     fn autofamily_fog_is_used_only_as_the_no_area_fallback() {
         let mut env = Environments::default();

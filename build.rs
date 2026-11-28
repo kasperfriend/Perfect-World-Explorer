@@ -1,16 +1,98 @@
-use std::{env, path::PathBuf, process::Command};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+fn find_dxc() -> Option<PathBuf> {
+    if let Some(explicit) = env::var_os("DXC_PATH") {
+        let p = PathBuf::from(explicit);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if Command::new("dxc.exe")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Some(PathBuf::from("dxc.exe"));
+    }
+    let mut roots = Vec::new();
+    if let Some(sdk) = env::var_os("WindowsSdkDir") {
+        roots.push(PathBuf::from(sdk).join("bin"));
+    }
+    roots.push(PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin"));
+    roots.push(PathBuf::from(r"C:\Program Files\Windows Kits\10\bin"));
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dxc = entry.path().join("x64").join("dxc.exe");
+            if dxc.is_file() {
+                candidates.push(dxc);
+            }
+        }
+        let direct = root.join("x64").join("dxc.exe");
+        if direct.is_file() {
+            candidates.push(direct);
+        }
+    }
+    candidates.sort();
+    candidates.pop()
+}
+
+fn compile_dxr_shader(manifest_dir: &Path, out: &Path) {
+    let hlsl = manifest_dir.join("src/modules/raywatcher/dxr_trace.hlsl");
+    if !hlsl.is_file() {
+        return;
+    }
+    let Some(dxc) = find_dxc() else {
+        println!(
+            "cargo:warning=dxc.exe not found; Raywatcher DXR 1.1 hardware ray tracing shader skipped (Software mode will be used)"
+        );
+        return;
+    };
+    let dxil = out.join("dxr_trace.dxil");
+    let status = Command::new(&dxc)
+        .args(["-T", "cs_6_5", "-E", "trace_pass", "-O3", "-Fo"])
+        .arg(&dxil)
+        .arg(&hlsl)
+        .status()
+        .expect("failed to invoke dxc.exe");
+    assert!(
+        status.success(),
+        "dxc.exe failed to compile src/modules/raywatcher/dxr_trace.hlsl"
+    );
+    println!("cargo:rustc-cfg=pwe_dxr_shader");
+}
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(pwe_directstorage)");
+    println!("cargo:rustc-check-cfg=cfg(pwe_dxr_shader)");
     println!("cargo:rerun-if-env-changed=DIRECTSTORAGE_SDK_DIR");
+    println!("cargo:rerun-if-env-changed=DXC_PATH");
     println!("cargo:rerun-if-changed=src/directstorage_shim.cpp");
+    println!("cargo:rerun-if-changed=src/modules/raywatcher/dxr_trace.hlsl");
 
     let target = env::var("TARGET").unwrap_or_default();
-    if !target.contains("windows-msvc") {
+    if !target.contains("windows-msvc") || !cfg!(target_os = "windows") {
         return;
     }
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+
+    // Compile the DXR 1.1 RayQuery shader on Windows MSVC hosts so Hardware RT
+    // mode executes directly on RT cores (RTX, RDNA2+, Arc).
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") && cfg!(target_os = "windows") {
+        compile_dxr_shader(&manifest_dir, &out);
+    }
+
     let sdk = env::var_os("DIRECTSTORAGE_SDK_DIR")
         .map(PathBuf::from)
         .map(|path| {
@@ -40,7 +122,6 @@ fn main() {
         header_dir.join("dstorage.h").display()
     );
 
-    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let object = out.join("directstorage_shim.obj");
     let library = out.join("pwe_directstorage_shim.lib");
     let source = manifest_dir.join("src/directstorage_shim.cpp");

@@ -45,8 +45,15 @@ EXPECTED_DLLS = {
     "amd_fidelityfx_loader_dx12.dll": "AMD_FidelityFX-SDK-2.4.0-LICENSE.md",
     "amd_fidelityfx_upscaler_dx12.dll": "AMD_FidelityFX-SDK-2.4.0-LICENSE.md",
     "amd_fidelityfx_framegeneration_dx12.dll": "AMD_FidelityFX-SDK-2.4.0-LICENSE.md",
+    # The FFX denoiser: "AMD FSR Ray Regeneration" in the SDK's own docs, and
+    # what Raywatcher's FSR Ray Regeneration option loads. Same SDK, same
+    # license text, staged beside the loader like the other FFX effects.
+    "amd_fidelityfx_denoiser_dx12.dll": "AMD_FidelityFX-SDK-2.4.0-LICENSE.md",
     "nvngx_dlss.dll": "NVIDIA_DLSS-SDK-LICENSE.txt",
     "nvngx_dlssg.dll": "NVIDIA_DLSS-SDK-LICENSE.txt",
+    # Ray reconstruction (`NVSDK_NGX_Feature_RayReconstruction`), loaded by NGX
+    # Core for Raywatcher's DLSS Ray Reconstruction option.
+    "nvngx_dlssd.dll": "NVIDIA_DLSS-SDK-LICENSE.txt",
 }
 
 # DLLs the viewer names in `src/` but that are not vendored: they are installed
@@ -71,6 +78,10 @@ KNOWN_SHA256 = {
     # NVIDIA/DLSS, lib/Windows_x86_64/rel/ (git blobs 23c4672e…, 71b8070c…).
     "nvngx_dlss.dll": "d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e",
     "nvngx_dlssg.dll": "8d59d49b36410dd6b62fef2503a5871d347415bd85d943fa0848563a95dd50c7",
+    # Same repository and release; git blob 36efb7890a7f5754935647c6b3510e21a096512f.
+    "nvngx_dlssd.dll": "b49435ae346f227feafe7bbe937d88277ea0ee7323975ec06488f377fdb46cee",
+    # AMD FidelityFX SDK 2.4.0, Kits/FidelityFX/signedbin/.
+    "amd_fidelityfx_denoiser_dx12.dll": "4ca5182d5c8a855441e0c82673716e4776f9afcfadfdb4225d2fc6113b0f853c",
 }
 
 # --- PE export table ------------------------------------------------------

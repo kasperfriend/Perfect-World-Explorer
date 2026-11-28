@@ -180,6 +180,90 @@ pub fn upload(
     upload_with_alpha(device, queue, bytes, mode).map(|(texture, _)| texture)
 }
 
+/// Extract the dominant linear emissive RGB colour of an effect texture (DDS or
+/// TGA/BMP/PNG) once at load time so white-tinted glowing effects (beams,
+/// portals, rings, wandering lights) cast light matching their real texture hue.
+pub fn sample_emissive_rgb(bytes: &[u8]) -> [f32; 3] {
+    let (w, h, rgba): (usize, usize, Vec<u8>) = if bytes.starts_with(b"DDS ") {
+        let Ok(d) = Dds::parse(bytes) else {
+            return [1.0, 1.0, 1.0];
+        };
+        if d.mips.is_empty() {
+            return [1.0, 1.0, 1.0];
+        }
+        // Pick a compact mip (~16x16..64x64) when available for fast O(1) color extraction.
+        let mip = d
+            .mips
+            .iter()
+            .rev()
+            .find(|m| m.width >= 8 && m.height >= 8)
+            .unwrap_or(&d.mips[0]);
+        let mut out = Vec::with_capacity((mip.width as usize) * (mip.height as usize) * 4);
+        if append_mip(bytes, d.format, mip, &mut out).is_err() {
+            return [1.0, 1.0, 1.0];
+        }
+        (mip.width as usize, mip.height as usize, out)
+    } else {
+        let Ok((img, _)) = decode_rgba(bytes) else {
+            return [1.0, 1.0, 1.0];
+        };
+        let (iw, ih) = img.dimensions();
+        (iw as usize, ih as usize, img.into_raw())
+    };
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return [1.0, 1.0, 1.0];
+    }
+    let step_x = (w / 16).max(1);
+    let step_y = (h / 16).max(1);
+    let mut sum = [0.0f32; 3];
+    let mut w_sum = 0.0f32;
+    let mut y = 0usize;
+    while y < h {
+        let mut x = 0usize;
+        while x < w {
+            let idx = (y * w + x) * 4;
+            let sr = rgba[idx] as f32 / 255.0;
+            let sg = rgba[idx + 1] as f32 / 255.0;
+            let sb = rgba[idx + 2] as f32 / 255.0;
+            let a = rgba[idx + 3] as f32 / 255.0;
+            // Approximate linear RGB (gamma 2.2 -> square).
+            let r = sr * sr;
+            let g = sg * sg;
+            let b = sb * sb;
+            let lum = r * 0.2126 + g * 0.7152 + b * 0.0722;
+            // Weight bright pixels strongly so black/transparent backgrounds
+            // around glowing rings, beams, and orbs never wash out the hue.
+            let weight = lum * a.max(lum);
+            if weight > 1e-4 {
+                sum[0] += r * weight;
+                sum[1] += g * weight;
+                sum[2] += b * weight;
+                w_sum += weight;
+            }
+            x += step_x;
+        }
+        y += step_y;
+    }
+    if w_sum <= 1e-5 {
+        return [1.0, 1.0, 1.0];
+    }
+    let mut rgb = [sum[0] / w_sum, sum[1] / w_sum, sum[2] / w_sum];
+    // Normalize peak channel toward 1.0 and preserve vivid hue saturation.
+    let peak = rgb[0].max(rgb[1]).max(rgb[2]).max(1e-4);
+    if peak < 0.85 {
+        let lift = (0.85 / peak).min(3.0);
+        rgb[0] *= lift;
+        rgb[1] *= lift;
+        rgb[2] *= lift;
+    }
+    let avg = (rgb[0] + rgb[1] + rgb[2]) / 3.0;
+    [
+        (avg + (rgb[0] - avg) * 1.25).clamp(0.02, 1.0),
+        (avg + (rgb[1] - avg) * 1.25).clamp(0.02, 1.0),
+        (avg + (rgb[2] - avg) * 1.25).clamp(0.02, 1.0),
+    ]
+}
+
 fn upload_dds(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -303,5 +387,37 @@ mod tests {
         append_mip(&bytes, d.format, &d.mips[0], &mut rgba).unwrap();
         assert_eq!(rgba.len(), 4);
         assert_eq!(rgba[3], 0);
+    }
+}
+
+#[cfg(test)]
+mod emissive_color_tests {
+    use super::sample_emissive_rgb;
+
+    #[test]
+    fn extracts_dominant_hue_from_colored_glow_on_black_background() {
+        let mut img = image::RgbaImage::from_pixel(16, 16, image::Rgba([0, 0, 0, 0]));
+        for y in 4..12 {
+            for x in 4..12 {
+                // Bright golden-orange ring/beam pixel on transparent black background.
+                img.put_pixel(x, y, image::Rgba([255, 180, 40, 255]));
+            }
+        }
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let rgb = sample_emissive_rgb(&bytes);
+        assert!(
+            rgb[0] > rgb[1] && rgb[1] > rgb[2],
+            "expected warm gold hue, got {rgb:?}"
+        );
+        assert!(
+            rgb[0] > 0.75 && rgb[2] < 0.25,
+            "expected saturated gold, got {rgb:?}"
+        );
     }
 }

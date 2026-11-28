@@ -30,7 +30,9 @@ it, not this page, is authoritative for your copy.
    to see what was detected.
 4. `.gitignore` ignores `*.dll` and `/sdk/`, then un-ignores exactly the
    vendored sets described below (AMD FidelityFX, Intel XeSS/XeSS-FG/XeLL and
-   NVIDIA `nvngx_dlss.dll` / `nvngx_dlssg.dll`) plus the headers and licenses
+   NVIDIA `nvngx_dlss.dll` / `nvngx_dlssg.dll` / `nvngx_dlssd.dll` and the
+   AMD denoiser `amd_fidelityfx_denoiser_dx12.dll` Raywatcher's
+   reconstruction providers load) plus the headers and licenses
    that go with them. Nothing else under `sdk/` can be committed — in
    particular no Streamline `sl.*.dll`.
    `tools/package-windows.ps1` stages only those allowlisted files, and
@@ -45,10 +47,12 @@ print exactly which names were found):
 |---|---|
 | DLSS Super Resolution | `nvngx_dlss.dll` |
 | DLSS Frame Generation | `nvngx_dlssg.dll` |
+| DLSS Ray Reconstruction (Raywatcher) | `nvngx_dlssd.dll` |
 | NVIDIA Streamline (host) | `sl.interposer.dll` |
 | AMD FSR API loader (DX12) | `amd_fidelityfx_loader_dx12.dll` |
 | AMD FSR upscaler (FSR Upscaling 4 / FSR 3 / FSR 2) | `amd_fidelityfx_upscaler_dx12.dll` |
 | AMD FSR Frame Generation (FG 4 / FG Swapchain 4 / FSR 3 FG) | `amd_fidelityfx_framegeneration_dx12.dll` |
+| AMD FSR Ray Regeneration (FFX denoiser; Raywatcher) | `amd_fidelityfx_denoiser_dx12.dll` |
 | Intel XeSS | `libxess.dll` |
 | Intel XeSS Frame Generation | `libxess_fg.dll` |
 | Intel XeLL (low latency, mandatory for XeSS Frame Generation) | `libxell.dll` |
@@ -77,11 +81,12 @@ print exactly which names were found):
   |---|---|---|---|
   | `nvngx_dlss.dll` | `NVIDIA/DLSS` `lib/Windows_x86_64/rel/` (git blob `23c4672e…`) | 58,956,912 B | `d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e` |
   | `nvngx_dlssg.dll` | `NVIDIA/DLSS` `lib/Windows_x86_64/rel/` (git blob `71b8070c…`) | 7,506,544 B | `8d59d49b36410dd6b62fef2503a5871d347415bd85d943fa0848563a95dd50c7` |
+  | `nvngx_dlssd.dll` | `NVIDIA/DLSS` `lib/Windows_x86_64/rel/` (git blob `36efb789…`), ray reconstruction | 48,343,664 B | `b49435ae346f227feafe7bbe937d88277ea0ee7323975ec06488f377fdb46cee` |
 
   The matching SDK headers (`nvsdk_ngx*.h`, NGX API version `0x15` = 1.5.0)
-  are vendored under `sdk/include/nvidia/` for review; the viewer loads the two
-  DLLs directly with `LoadLibraryW` and uses NGX's snippet ABI, so no NVIDIA
-  SDK library is linked in.
+  are vendored under `sdk/include/nvidia/` for review; the viewer names the
+  DLLs and lets NGX Core load them, driving them through NGX's snippet ABI, so
+  no NVIDIA SDK library is linked in.
 - **Attribution:** "NVIDIA", "DLSS", "DLSS Super Resolution", "DLSS Frame
   Generation", "DLAA" and the NVIDIA logo are trademarks and/or registered
   trademarks of NVIDIA Corporation. "DLSS" technology is powered by NVIDIA RTX.
@@ -127,6 +132,7 @@ print exactly which names were found):
   | `sdk/amd_fidelityfx_loader_dx12.dll` | `e2191d3c0828be45eb8affd4e3ec0378f2293adc345b772a7170edcf3b021ecb` | 39,184 bytes |
   | `sdk/amd_fidelityfx_upscaler_dx12.dll` | `aad4fccccb29084a655f9a4f9f613bd22c8c03fb4a0f8840148cc6543b4ccace` | 57,664,272 bytes |
   | `sdk/amd_fidelityfx_framegeneration_dx12.dll` | `e6843252f58b0341a0d80f6a20bc0d840643ee95bc48c22cac08745344577bb6` | 29,679,376 bytes |
+  | `sdk/amd_fidelityfx_denoiser_dx12.dll` | `4ca5182d5c8a855441e0c82673716e4776f9afcfadfdb4225d2fc6113b0f853c` | 8,993,552 bytes |
 
   They are signed by AMD and are MIT-style licensed, so committing and
   redistributing them with this notice is permitted. The loader DLL is

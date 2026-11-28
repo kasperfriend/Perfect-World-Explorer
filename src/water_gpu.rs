@@ -16,7 +16,7 @@ pub struct WaterUniform {
     /// x: original-style rasterized edge alpha is available in refraction.
     pub edge_mode: [f32; 4],
     /// x: water-surface fog start; y: fog end; z: 1 when fog applies;
-    /// w: unused. Appended after `edge_mode`, so earlier offsets are unchanged.
+    /// w: Raywatcher owns the reflection (disable only the native mirror term).
     pub fog: [f32; 4],
     /// The water-surface fog colour bound right before the water draw.
     pub fog_color: [f32; 4],
@@ -37,6 +37,18 @@ pub fn normal_offset_angle(elapsed_seconds: f64) -> f32 {
         return 0.;
     }
     (elapsed_seconds * (25.0_f64.to_radians())).rem_euclid(std::f64::consts::TAU) as f32
+}
+
+/// Main-view water fog uses the same fitted range as terrain, not the
+/// unfitted authored range. The fourth component is reserved by WaterGpu for
+/// the Raywatcher reflection override and is therefore set at the call site.
+pub fn surface_fog_range(terrain_fog_range: [f32; 4], suppress_reflection: bool) -> [f32; 4] {
+    [
+        terrain_fog_range[0],
+        terrain_fog_range[1],
+        terrain_fog_range[2],
+        if suppress_reflection { 1. } else { 0. },
+    ]
 }
 
 /// Fog range set for the per-plane clipped refraction render at 0x7cc6e0.
@@ -74,18 +86,14 @@ fn present_encoded(c:vec3<f32>)->vec3<f32>{
  let v=max(c,vec3<f32>(0.));
  return select(v/12.92,pow((v+0.055)/1.055,vec3<f32>(2.4)),v>vec3<f32>(0.04045));
 }
-// The client binds its water-surface fog triple with D3DRS_FOGSTART/END/COLOR
-// right before the water draw (0x7cb444, 0x7cb502, 0x7cb94e) and D3D applies
-// the fixed-function fog stage to the source colour. The water shaders carry
-// no fog arithmetic of their own, so this is that stage, not a shader mix.
-fn surface_fog(c:vec3<f32>, reciprocal_w:f32)->vec3<f32>{
- // Fragment position.w is 1/clip.w, not view depth. The viewer's
- // perspective matrix has clip.w = positive view Z (also in reversed Z).
- let depth=1.0/max(reciprocal_w,0.0000001);
+// Match terrain_gpu's fog depth exactly: re-project the interpolated world
+// position with the same camera matrix instead of relying on fragment builtin W.
+fn surface_fog(c:vec3<f32>, world:vec3<f32>)->vec3<f32>{
+ let depth=max((w.matrix*vec4<f32>(world,1.)).w,0.);
  if w.fog.z<0.5 {return c;}
  let span=w.fog.y-w.fog.x;
- let f=select(clamp((w.fog.y-depth)/select(span,0.001,abs(span)<0.001),0.0,1.0),select(1.,0.,depth>=w.fog.y),abs(span)<0.001);
- return mix(w.fog_color.rgb,c,f);
+ let f=select(clamp((depth-w.fog.x)/select(span,0.001,abs(span)<0.001),0.0,1.0),select(0.,1.,depth>=w.fog.y),abs(span)<0.001);
+ return mix(c,w.fog_color.rgb,f);
 }
 @fragment fn water_fs(i:Out)->@location(0) vec4<f32> {
  // Default client texture layer 1: 2x base-cell UV with a rotating
@@ -111,7 +119,7 @@ fn surface_fog(c:vec3<f32>, reciprocal_w:f32)->vec3<f32>{
    let facing=clamp(dot(w.eye_time.xyz-i.world,-n),0.0,1.0);
    let fresnel=pow(1.0-facing,5.0);
    let tint=mix(vec3<f32>(1.0),vec3<f32>(0.0,0.3,0.3),fresnel);
-   return vec4<f32>(present_encoded(surface_fog(refr*0.85*tint,i.pos.w)),1.0);
+   return vec4<f32>(present_encoded(surface_fog(refr*0.85*tint,i.world)),1.0);
  }
  let z=textureLoad(terrain_depth,vec2<i32>(i.pos.xy),0);
  // The client edge pass uses saturate((waterY - terrainY)/0.66).
@@ -129,7 +137,9 @@ fn surface_fog(c:vec3<f32>, reciprocal_w:f32)->vec3<f32>{
  let bump=n.xz*edge*edge;
  let mirrored=textureSample(reflection,screen_sampler,clamp(screen+bump*0.25,vec2<f32>(0.001),vec2<f32>(0.999))).rgb;
  let fallback=textureSample(scene_color,screen_sampler,screen).rgb*vec3<f32>(0.75,0.85,0.95);
- let reflect_color=select(fallback,mirrored,w.size.w>0.5);
+ let raster_reflect_color=select(fallback,mirrored,w.size.w>0.5);
+ // Keep the existing surface and refraction, but avoid combining two mirror sources.
+ let reflect_color=select(raster_reflect_color,vec3<f32>(0.0),w.fog.w>0.5);
  // Reject displaced samples in front of the water plane. Without this,
  // shore objects smear across the water even when they should occlude it.
  let refr_uv=clamp(screen-bump*0.15,vec2<f32>(0.001),vec2<f32>(0.999));
@@ -159,7 +169,7 @@ fn surface_fog(c:vec3<f32>, reciprocal_w:f32)->vec3<f32>{
  let background=textureSample(scene_color,screen_sampler,screen).rgb;
  // Fog is the draw's own state and covers the whole surface, including the
  // edge-alpha blend with the already-fogged scene behind it.
- return vec4<f32>(present_encoded(surface_fog(mix(background,color,edge),i.pos.w)),1.0);
+ return vec4<f32>(present_encoded(surface_fog(mix(background,color,edge),i.world)),1.0);
 }
 struct FSOut { @builtin(position) pos:vec4<f32>, @location(0) uv:vec2<f32> };
 @vertex fn blit_vs(@builtin(vertex_index) id:u32)->FSOut { var o:FSOut;let x=f32((id<<1u)&2u);let y=f32(id&2u);o.uv=vec2<f32>(x,y);o.pos=vec4<f32>(x*2.0-1.0,1.0-y*2.0,0.0,1.0);return o;}
@@ -994,7 +1004,7 @@ impl WaterGpu {
     /// alpha after the clipped scene, preserving color and scene depth.
     pub fn render_edge(
         &self,
-        device: &wgpu::Device,
+        e: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
         matrix: glam::Mat4,
         plane: f32,
@@ -1016,7 +1026,6 @@ impl WaterGpu {
             params: [plane, 1. / 0.66, 0., 0.],
         };
         queue.write_buffer(&self.edge_uniform, 0, bytemuck::bytes_of(&params));
-        let mut e = device.create_command_encoder(&Default::default());
         let target = self.refraction();
         {
             let mut pass = e.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1061,7 +1070,6 @@ impl WaterGpu {
                 }
             }
         }
-        queue.submit(Some(e.finish()));
     }
     pub fn draw_water(
         &self,
@@ -1127,6 +1135,23 @@ mod animation_tests {
         // A component at either end of the byte range is a full unit.
         let extreme = RgbaImage::from_pixel(2, 2, image::Rgba([0, 128, 255, 255]));
         assert!((super::normal_extent(&[vec![extreme]]) - 1.).abs() < 1e-6);
+    }
+
+    #[test]
+    #[test]
+    fn surface_fog_binding_reuses_the_effective_terrain_range() {
+        let fitted_terrain_range = [18., 63., 1., 0.42];
+        let water = super::surface_fog_range(fitted_terrain_range, false);
+        assert_eq!(water, [18., 63., 1., 0.]);
+        let reflection_override = super::surface_fog_range(fitted_terrain_range, true);
+        assert_eq!(reflection_override, [18., 63., 1., 1.]);
+    }
+
+    #[test]
+    fn surface_fog_depth_is_reprojected_from_world_position_like_terrain() {
+        assert!(super::WATER_SHADER.contains("w.matrix*vec4<f32>(world,1.)"));
+        assert!(super::WATER_SHADER.contains("surface_fog(refr*0.85*tint,i.world)"));
+        assert!(super::WATER_SHADER.contains("surface_fog(mix(background,color,edge),i.world)"));
     }
 
     #[test]

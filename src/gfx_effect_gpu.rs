@@ -65,6 +65,8 @@ pub struct EffectLight {
     pub fog_range: [f32; 4],
     /// Linear fog colour, `rgb` only.
     pub fog_color: [f32; 4],
+    /// Water plane Y, absorption density, enabled for clipped refraction, reserved.
+    pub water_fog: [f32; 4],
     /// The frame's `directional_specular`: the light's specular colour, which
     /// `bind_specular` binds against each material's own specular colour.
     pub directional_specular: [f32; 4],
@@ -91,6 +93,7 @@ struct Params {
     /// `fog_range` the scenery model shader reads.
     fog_range: [f32; 4],
     fog_color: [f32; 4],
+    water_fog: [f32; 4],
     /// `xyz` is the camera's forward direction for the model Blinn term.
     eye: [f32; 4],
     /// The unjittered view-projection the sheet motion pass reprojects with, and
@@ -150,6 +153,8 @@ struct TextureEntry {
     #[allow(dead_code)]
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    /// Dominant linear emissive RGB extracted once at load time for RT effect lighting.
+    emissive_color: [f32; 3],
 }
 
 struct Bucket {
@@ -211,6 +216,8 @@ pub struct Draw {
     /// own matrices without re-deriving them from the mirror or refraction view
     /// that has overwritten the uniform in between.
     last_params: Option<Params>,
+    /// Last bytes physically sent to the uniform, distinct from the main motion snapshot.
+    uniform_params: Option<Params>,
     /// The view-projection the previous sheet-motion pass used.
     prev_motion_vp: Option<[[f32; 4]; 4]>,
     /// This frame's groups in draw order: `(key, first_vertex, vertex_count)`.
@@ -350,6 +357,7 @@ impl Draw {
                 light: [0.; 4],
                 fog_range: [0.; 4],
                 fog_color: [0.; 4],
+                water_fog: [0.; 4],
                 eye: [0.; 4],
                 mv_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
                 prev_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
@@ -448,7 +456,11 @@ impl Draw {
                 },
             );
             let view = texture.create_view(&Default::default());
-            TextureEntry { texture, view }
+            TextureEntry {
+                texture,
+                view,
+                emissive_color: [1.0, 1.0, 1.0],
+            }
         };
         const INITIAL_SHARED_VERTICES: usize = 1024;
         let shared_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -476,6 +488,7 @@ impl Draw {
             staging_vertices: Vec::with_capacity(INITIAL_SHARED_VERTICES),
             uniform,
             last_params: None,
+            uniform_params: None,
             prev_motion_vp: None,
             sampler_repeat,
             sampler_clamp,
@@ -503,6 +516,11 @@ impl Draw {
         self.textures.len()
     }
 
+    /// Cached dominant linear emissive RGB colour of a loaded effect texture.
+    pub fn texture_emissive_color(&self, texture: &str) -> [f32; 3] {
+        self.texture_ids.get(texture).and_then(|id| self.textures.get(id)).map(|entry| entry.emissive_color).unwrap_or([1.0, 1.0, 1.0])
+    }
+
     pub fn vertex_count(&self) -> usize {
         self.order.iter().map(|(_, _, count)| *count as usize).sum()
     }
@@ -517,17 +535,45 @@ impl Draw {
         id
     }
 
-    /// Refresh only the uniform frame constants (`matrix`, `clip_plane`,
-    /// `camera`, `light`) without re-bucketing or re-uploading vertices.
-    /// Used to restore the main-view camera after water reflection/refraction
-    /// passes without redoing all CPU/GPU quad work.
-    pub fn update_params(
+    /// Restore effect frame constants for a secondary view without changing the main motion snapshot.
+    pub fn update_params(&mut self, queue: &wgpu::Queue, matrix: [[f32; 4]; 4], clip_plane: [f32; 4], camera: [f32; 4], light: Option<EffectLight>) -> Result<(), String> {
+        self.write_frame(queue, matrix, clip_plane, camera, light, false)
+    }
+
+    /// Update only view-dependent constants. Secondary views call this instead
+    /// of advancing their effect graph or rebuilding its vertex buffers.
+    /// Update a normal/main view and retain its constants for draw_motion.
+    pub fn update_frame(
         &mut self,
         queue: &wgpu::Queue,
         matrix: [[f32; 4]; 4],
         clip_plane: [f32; 4],
         camera: [f32; 4],
         light: Option<EffectLight>,
+    ) -> Result<(), String> {
+        self.write_frame(queue, matrix, clip_plane, camera, light, true)
+    }
+
+    /// Update a secondary view without replacing the main-view motion snapshot.
+    pub fn update_view_frame(
+        &mut self,
+        queue: &wgpu::Queue,
+        matrix: [[f32; 4]; 4],
+        clip_plane: [f32; 4],
+        camera: [f32; 4],
+        light: Option<EffectLight>,
+    ) -> Result<(), String> {
+        self.write_frame(queue, matrix, clip_plane, camera, light, false)
+    }
+
+    fn write_frame(
+        &mut self,
+        queue: &wgpu::Queue,
+        matrix: [[f32; 4]; 4],
+        clip_plane: [f32; 4],
+        camera: [f32; 4],
+        light: Option<EffectLight>,
+        remember_motion: bool,
     ) -> Result<(), String> {
         if matrix
             .iter()
@@ -539,15 +585,22 @@ impl Draw {
             return Err("non-finite GFX effect frame constants".into());
         }
         let direction = light.map_or([0.; 3], |light| light.direction);
-        if direction.iter().any(|value| !value.is_finite()) {
-            return Err("non-finite GFX effect light direction".into());
-        }
-        let (fog_range, fog_color) = light.map_or(([0.; 4], [0.; 4]), |light| {
-            (light.fog_range, light.fog_color)
-        });
         let eye = light.map_or([0.; 3], |light| light.eye_direction);
-        if eye.iter().any(|value| !value.is_finite()) {
-            return Err("non-finite GFX effect eye direction".into());
+        let (fog_range, fog_color, water_fog) = light
+            .map_or(([0.; 4], [0.; 4], [0.; 4]), |light| {
+                (light.fog_range, light.fog_color, light.water_fog)
+            });
+        if direction
+            .iter()
+            .chain(eye.iter())
+            .any(|value| !value.is_finite())
+            || fog_range
+                .iter()
+                .chain(fog_color.iter())
+                .chain(water_fog.iter())
+                .any(|value| !value.is_finite())
+        {
+            return Err("non-finite GFX effect lighting/fog constants".into());
         }
         let params = Params {
             matrix,
@@ -556,23 +609,22 @@ impl Draw {
             light: [direction[0], direction[1], direction[2], 0.],
             fog_range,
             fog_color,
+            water_fog,
             eye: [eye[0], eye[1], eye[2], 0.],
+            // Filled in by `draw_motion`, which is the only reader.
             mv_matrix: matrix,
             prev_matrix: matrix,
             mv_size: [0.; 4],
         };
-        let changed = self.last_params.map_or(true, |prev| {
-            bytemuck::bytes_of(&prev) != bytemuck::bytes_of(&params)
-        });
+        let changed = self.uniform_params.map_or(true, |previous| bytemuck::bytes_of(&previous) != bytemuck::bytes_of(&params));
         if changed {
             queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
-            self.last_params = Some(params);
+            self.uniform_params = Some(params);
         }
+        if remember_motion { self.last_params = Some(params); }
         Ok(())
     }
 
-    /// Refill every group from this frame's quads. `read` resolves an archive
-    /// path to bytes and is only called for textures the pass has not seen.
     pub fn update(
         &mut self,
         device: &wgpu::Device,
@@ -585,48 +637,7 @@ impl Draw {
         read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
     ) -> Result<(), String> {
         self.frame_index = self.frame_index.wrapping_add(1);
-        if matrix
-            .iter()
-            .flatten()
-            .chain(clip_plane.iter())
-            .chain(camera.iter())
-            .any(|value| !value.is_finite())
-        {
-            return Err("non-finite GFX effect frame constants".into());
-        }
-        let direction = light.map_or([0.; 3], |light| light.direction);
-        if direction.iter().any(|value| !value.is_finite()) {
-            return Err("non-finite GFX effect light direction".into());
-        }
-        // No light means no fog either: both come from the same frame.
-        let (fog_range, fog_color) = light.map_or(([0.; 4], [0.; 4]), |light| {
-            (light.fog_range, light.fog_color)
-        });
-        let eye = light.map_or([0.; 3], |light| light.eye_direction);
-        if eye.iter().any(|value| !value.is_finite()) {
-            return Err("non-finite GFX effect eye direction".into());
-        }
-        let params = Params {
-            matrix,
-            clip_plane,
-            camera,
-            light: [direction[0], direction[1], direction[2], 0.],
-            fog_range,
-            fog_color,
-            eye: [eye[0], eye[1], eye[2], 0.],
-            // Filled in by `draw_motion`, which is the only reader.
-            mv_matrix: matrix,
-            prev_matrix: matrix,
-            mv_size: [0.; 4],
-        };
-        let changed = self.last_params.map_or(true, |prev| {
-            bytemuck::bytes_of(&prev) != bytemuck::bytes_of(&params)
-        });
-        if changed {
-            queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
-            self.last_params = Some(params);
-        }
-
+        self.update_frame(queue, matrix, clip_plane, camera, light)?;
         // No sheets this frame — switched off, none admitted yet, nothing
         // visible — means the previous vector has no successor. Dropping it makes
         // the first frame back publish a still sheet's zero motion instead of
@@ -909,6 +920,306 @@ impl Draw {
         }
     }
 
+
+    /// Refill every group from this frame's quads. `read` resolves an archive
+    /// path to bytes and is only called for textures the pass has not seen.
+    pub fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        quads: &[EffectQuad],
+        matrix: [[f32; 4]; 4],
+        clip_plane: [f32; 4],
+        camera: [f32; 4],
+        light: Option<EffectLight>,
+        read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+    ) -> Result<(), String> {
+        self.update_frame(queue, matrix, clip_plane, camera, light)?;
+
+        // No sheets this frame — switched off, none admitted yet, nothing
+        // visible — means the previous vector has no successor. Dropping it makes
+        // the first frame back publish a still sheet's zero motion instead of
+        // reprojecting against a view from before the gap.
+        if quads.is_empty() {
+            self.prev_motion_vp = None;
+        }
+        // Group and order: `RenderLayer` first, then depth-tested quads, then
+        // the blend pair and the texture so a group reuses one pipeline.
+        let mut groups = std::mem::take(&mut self.group_scratch);
+        groups.clear();
+        groups.reserve(self.order.len().max(8));
+        self.scratch_index.clear();
+        let mut last_tex: Option<(&str, u32)> = None;
+        for quad in quads {
+            let pipeline = PipelineKey {
+                source: quad.source_blend,
+                destination: quad.destination_blend,
+                depth_test: quad.depth_test,
+                write_depth: quad.mesh.as_ref().is_some_and(|mesh| mesh.write_depth),
+                motion: false,
+            };
+            let tex_id = match last_tex {
+                Some((prev_name, prev_id)) if prev_name == quad.texture.as_str() => prev_id,
+                _ => {
+                    let id = self.intern_texture(&quad.texture);
+                    last_tex = Some((quad.texture.as_str(), id));
+                    id
+                }
+            };
+            let key = BucketKey {
+                layer: quad.layer,
+                pipeline,
+                priority: quad.priority,
+                tile: quad.tile,
+                texture: tex_id,
+            };
+            let position = if groups.last().is_some_and(|(last_key, _)| *last_key == key) {
+                groups.len() - 1
+            } else if let Some(&pos) = self.scratch_index.get(&key) {
+                pos
+            } else {
+                let mut verts = if let Some(verts) = self.scratch_pool.pop() {
+                    self.scratch_pool_vertices =
+                        self.scratch_pool_vertices.saturating_sub(verts.capacity());
+                    verts
+                } else {
+                    Vec::new()
+                };
+                verts.clear();
+                let pos = groups.len();
+                self.scratch_index.insert(key, pos);
+                groups.push((key, verts));
+                pos
+            };
+            let vertices = &mut groups[position].1;
+            if let Some(mesh) = &quad.mesh {
+                // A model element arrives as a triangle soup already in world
+                // space, so it needs no corner expansion and no winding order.
+                let (lit, directional, specular) = shade(mesh, quad.color, light);
+                for vertex in &mesh.vertices {
+                    vertices.push(Vertex {
+                        position: vertex.position,
+                        uv: vertex.uv,
+                        lit,
+                        directional,
+                        normal: vertex.normal,
+                        specular,
+                        fog: 1.,
+                    });
+                }
+                continue;
+            }
+            // Two triangles per quad, in the client's corner order. A quad is
+            // not lit: `A3DGFXRenderSlot` draws it with lighting off, exactly as
+            // the element's colour says.
+            //
+            // Its fog colour is the slot's, not a choice of whether to fog:
+            // `m_enumFogFlag` is `GFX_FOG_ZERO` only for `DestBlend ==
+            // A3DBLEND_ONE` (code 2 in `model_queue::blend_factor`), which is the
+            // client's additive slot.
+            let fog = if quad.destination_blend == 2 { 2. } else { 1. };
+            for slot in [0usize, 1, 3, 0, 3, 2] {
+                vertices.push(Vertex {
+                    position: quad.positions[slot],
+                    uv: quad.uv[slot],
+                    // A grid carries one authored colour per corner and the
+                    // pipeline interpolates it across the cell; every other
+                    // class paints the whole quad with `color`.
+                    lit: quad.vertex_colors.map_or(quad.color, |colors| colors[slot]),
+                    directional: [0.; 4],
+                    normal: [0.; 3],
+                    specular: [0.; 4],
+                    fog,
+                });
+            }
+        }
+        if groups.len() > 1 {
+            let names = &self.texture_names;
+            groups.sort_unstable_by(|(a, _), (b, _)| {
+                a.layer
+                    .cmp(&b.layer)
+                    .then_with(|| b.pipeline.write_depth.cmp(&a.pipeline.write_depth))
+                    .then_with(|| a.priority.cmp(&b.priority))
+                    .then_with(|| a.pipeline.depth_test.cmp(&b.pipeline.depth_test).reverse())
+                    .then_with(|| a.pipeline.source.cmp(&b.pipeline.source))
+                    .then_with(|| a.pipeline.destination.cmp(&b.pipeline.destination))
+                    .then_with(|| names[a.texture as usize].cmp(&names[b.texture as usize]))
+                    .then_with(|| a.tile.cmp(&b.tile))
+            });
+        }
+
+        if self.buckets.len() + groups.len() > BUCKET_CACHE_LIMIT {
+            self.buckets.clear();
+        }
+        self.order.clear();
+        self.order.reserve(groups.len());
+        self.staging_vertices.clear();
+        for (key, vertices) in &groups {
+            if vertices.is_empty() {
+                continue;
+            }
+            let retry_due = self
+                .failed_textures
+                .get(&key.texture)
+                .map_or(true, |next_frame| self.frame_index >= *next_frame);
+            if !self.textures.contains_key(&key.texture) && retry_due {
+                let tex_name = self.texture_names[key.texture as usize].clone();
+                match read(&tex_name) {
+                    Ok(bytes) => {
+                        match model_texture_gpu::upload(
+                            device,
+                            queue,
+                            &bytes,
+                            model_texture_gpu::UploadMode::Auto,
+                        ) {
+                            Ok(texture) => {
+                                let view = texture.create_view(&Default::default());
+                                let emissive_color = model_texture_gpu::sample_emissive_rgb(&bytes);
+                                self.textures.insert(key.texture, TextureEntry { texture, view, emissive_color });
+                                self.failed_textures.remove(&key.texture);
+                            }
+                            Err(error) => {
+                                self.failed_textures.insert(
+                                    key.texture,
+                                    self.frame_index
+                                        .saturating_add(TEXTURE_RETRY_INTERVAL_FRAMES),
+                                );
+                                self.note_failure(&tex_name, &error);
+                            }
+                        }
+                    }
+                    // The element still draws, with the white stand-in: the
+                    // quads and their authored colour survive (the NOTEX
+                    // vertex-colour law), only the map is lost. Back off the
+                    // retry: the archive may become available later, but a
+                    // missing member must not trigger a read on every frame.
+                    Err(error) => {
+                        self.failed_textures.insert(
+                            key.texture,
+                            self.frame_index
+                                .saturating_add(TEXTURE_RETRY_INTERVAL_FRAMES),
+                        );
+                        self.note_failure(&tex_name, &error);
+                    }
+                }
+            }
+            let (entry, loaded) = match self.textures.get(&key.texture) {
+                Some(e) => (e, true),
+                None => (&self.fallback, false),
+            };
+            if !self.pipelines.contains_key(&key.pipeline) {
+                let pipeline = self.pipeline(device, key.pipeline)?;
+                self.pipelines.insert(key.pipeline, pipeline);
+            }
+            // The motion twin, for a sheet that may not write depth while it is
+            // being coloured and must not write it afterwards either.
+            if !key.pipeline.write_depth {
+                let motion = PipelineKey {
+                    motion: true,
+                    ..key.pipeline
+                };
+                if !self.pipelines.contains_key(&motion) {
+                    let pipeline = self.pipeline(device, motion)?;
+                    self.pipelines.insert(motion, pipeline);
+                }
+            }
+            let was_fallback = self.buckets.get(key).is_some_and(|b| b.bound_fallback);
+            if !self.buckets.contains_key(key) {
+                let binding = self.binding_for(device, entry, key.tile);
+                self.buckets.insert(
+                    *key,
+                    Bucket {
+                        pipeline: key.pipeline,
+                        binding,
+                        bound_fallback: !loaded,
+                    },
+                );
+            } else if loaded && was_fallback {
+                // Fail-then-succeed: the first frames bound the placeholder
+                // because the texture would not load, and now it has. The
+                // bucket survives (same key), so its binding must be rebuilt
+                // against the real view or the element draws the placeholder
+                // for the rest of the session.
+                let binding = self.binding_for(device, entry, key.tile);
+                if let Some(bucket) = self.buckets.get_mut(key) {
+                    bucket.binding = binding;
+                    bucket.bound_fallback = false;
+                }
+            }
+            let first_vertex = self.staging_vertices.len() as u32;
+            self.staging_vertices.extend_from_slice(vertices);
+            self.order.push((*key, first_vertex, vertices.len() as u32));
+        }
+        let vert_len = self.staging_vertices.len();
+        if vert_len > self.shared_vertex_capacity {
+            self.shared_vertex_capacity = vert_len.next_power_of_two();
+            self.shared_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GFX effect shared vertex buffer"),
+                size: (self.shared_vertex_capacity * std::mem::size_of::<Vertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.low_usage_frames = 0;
+        } else if self.shared_vertex_capacity > 65_536 && vert_len < self.shared_vertex_capacity / 8
+        {
+            self.low_usage_frames = self.low_usage_frames.saturating_add(1);
+            if self.low_usage_frames >= 120 {
+                self.shared_vertex_capacity = vert_len.max(32_768).next_power_of_two();
+                self.shared_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("GFX effect shared vertex buffer"),
+                    size: (self.shared_vertex_capacity * std::mem::size_of::<Vertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.low_usage_frames = 0;
+            }
+        } else {
+            self.low_usage_frames = 0;
+        }
+        if vert_len > 0 {
+            queue.write_buffer(
+                &self.shared_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&self.staging_vertices),
+            );
+        }
+        // Release burst high-water marks so effect spikes do not permanently
+        // pin megabytes of unused staging/scratch RAM.
+        const STAGING_TRIM_THRESHOLD: usize = 32_768;
+        if self.staging_vertices.capacity() > STAGING_TRIM_THRESHOLD
+            && self.staging_vertices.len() < self.staging_vertices.capacity() / 8
+        {
+            self.staging_vertices.shrink_to(STAGING_TRIM_THRESHOLD);
+        }
+        const MAX_SCRATCH_VERTS: usize = 8_192;
+        for (_, mut verts) in groups.drain(..) {
+            verts.clear();
+            if verts.capacity() > MAX_SCRATCH_VERTS {
+                verts.shrink_to(MAX_SCRATCH_VERTS);
+            }
+            let capacity = verts.capacity();
+            if self.scratch_pool.len() < BUCKET_CACHE_LIMIT
+                && self.scratch_pool_vertices.saturating_add(capacity) <= MAX_SCRATCH_POOL_VERTICES
+            {
+                self.scratch_pool_vertices += capacity;
+                self.scratch_pool.push(verts);
+            }
+        }
+        self.group_scratch = groups;
+        Ok(())
+    }
+
+    fn note_failure(&mut self, texture: &str, error: &str) {
+        const MAX_FAILED_DIAGNOSTICS: usize = 512;
+        if self.failed.len() >= MAX_FAILED_DIAGNOSTICS {
+            return;
+        }
+        let message = format!("{texture}: {error}");
+        if self.failed_set.insert(message.clone()) {
+            self.failed.push(message);
+        }
+    }
+
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         if self.order.is_empty() {
             return;
@@ -991,6 +1302,8 @@ impl Draw {
                 ..params
             }),
         );
+        self.uniform_params = None; // motion constants replaced the cached frame block.
+
         pass.set_vertex_buffer(0, self.shared_vertex_buffer.slice(..));
         let mut last = None;
         let mut last_binding: Option<(u32, bool)> = None;
@@ -1136,7 +1449,7 @@ impl Draw {
 }
 
 const WGSL: &str = r#"
-struct Params { matrix:mat4x4<f32>, clip_plane:vec4<f32>, camera:vec4<f32>, light:vec4<f32>, fog_range:vec4<f32>, fog_color:vec4<f32>, eye:vec4<f32>, mv_matrix:mat4x4<f32>, prev_matrix:mat4x4<f32>, mv_size:vec4<f32> };
+struct Params { matrix:mat4x4<f32>, clip_plane:vec4<f32>, camera:vec4<f32>, light:vec4<f32>, fog_range:vec4<f32>, fog_color:vec4<f32>, water_fog:vec4<f32>, eye:vec4<f32>, mv_matrix:mat4x4<f32>, prev_matrix:mat4x4<f32>, mv_size:vec4<f32> };
 @group(0) @binding(0) var<uniform> p:Params;
 @group(0) @binding(1) var image:texture_2d<f32>;
 @group(0) @binding(2) var image_sampler:sampler;
@@ -1189,15 +1502,18 @@ struct Output {
  // near plane, the same formula a scenery skin model uses. `m_enumFogFlag`
  // selects the colour rather than the yes/no: `GFX_FOG_CURRENT` (1) fades to the
  // frame's fog colour and `GFX_FOG_ZERO` (2, additive slots) fades to black.
+ var keep=1.;
  if p.fog_range.z>0.5 && v.fog>0.5 {
   let depth=1./max(v.position.w,0.0000001);
   let span=p.fog_range.y-p.fog_range.x;
-  var keep:f32;
   if abs(span)<0.001 {keep=select(1.,0.,depth>=p.fog_range.y);}
   else {keep=clamp((p.fog_range.y-depth)/span,0.,1.);}
-  let fog_rgb=select(p.fog_color.rgb,vec3<f32>(0.),v.fog>1.5);
-  rgb=mix(fog_rgb,rgb,keep);
  }
+ let fog_rgb=select(p.fog_color.rgb,vec3<f32>(0.),v.fog>1.5);
+ if p.water_fog.z>0.5 && v.fog>0.5 {
+  keep*=model_water_transmittance(v.world,p.camera.xyz,p.water_fog.x,p.water_fog.y);
+ }
+ rgb=mix(fog_rgb,rgb,keep);
  return vec4<f32>(rgb,opacity);
 }
 // The sheet's own motion, for the shared motion-vector pass, written into the
@@ -1297,6 +1613,7 @@ mod tests {
             // Fog off, so the shading assertions read the light alone.
             fog_range: [0.; 4],
             fog_color: [0.; 4],
+            water_fog: [0.; 4],
             // No specular light, so the diffuse assertions stay exact; the
             // specular test raises this itself.
             directional_specular: [0.; 4],
@@ -1401,13 +1718,33 @@ mod tests {
         light: Option<EffectLight>,
         read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
     ) -> [f32; 4] {
+        render_with_camera(
+            draw,
+            harness,
+            background,
+            quads,
+            [0., 0., 0., 100.],
+            light,
+            read,
+        )
+    }
+
+    fn render_with_camera(
+        draw: &mut Draw,
+        harness: &Harness,
+        background: f64,
+        quads: &[EffectQuad],
+        camera: [f32; 4],
+        light: Option<EffectLight>,
+        read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+    ) -> [f32; 4] {
         draw.update(
             &harness.device,
             &harness.queue,
             quads,
             glam::Mat4::IDENTITY.to_cols_array_2d(),
             [0.; 4],
-            [0., 0., 0., 100.],
+            camera,
             light,
             read,
         )
@@ -1946,6 +2283,45 @@ mod tests {
         assert!(
             (current[0] - 0.625).abs() <= 0.02 && (current[1] - 0.125).abs() <= 0.02,
             "a non-additive quad must fade to the current fog colour: {current:?}"
+        );
+
+        // The whole test sheet is below y=2 while the eye is above it at y=3.
+        // A deliberately strong density makes water absorption visible in this
+        // tiny GPU fixture without changing the production density of 0.075.
+        let mut water_light = effect_light();
+        water_light.fog_range = [0., 100., 1., 0.];
+        water_light.fog_color = [0.; 4];
+        let sheet = quad("a.png", 5, 6, 0, false, [1.; 4]);
+        let dry = {
+            let png = grey_png();
+            let mut read = |_: &str| Ok(png.clone());
+            render_with_camera(
+                &mut draw,
+                &harness,
+                0.,
+                &[sheet.clone()],
+                [0., 3., 0., 100.],
+                Some(water_light),
+                &mut read,
+            )
+        };
+        water_light.water_fog = [2., 2., 1., 0.];
+        let absorbed = {
+            let png = grey_png();
+            let mut read = |_: &str| Ok(png.clone());
+            render_with_camera(
+                &mut draw,
+                &harness,
+                0.,
+                &[sheet],
+                [0., 3., 0., 100.],
+                Some(water_light),
+                &mut read,
+            )
+        };
+        assert!(
+            absorbed[0] < dry[0] * 0.5,
+            "submerged effect did not absorb through water: dry={dry:?}, absorbed={absorbed:?}"
         );
     }
 
