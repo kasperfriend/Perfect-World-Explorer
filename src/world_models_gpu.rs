@@ -20,6 +20,7 @@ pub struct EditorPlacement {
     pub position: [f32; 3],
     pub rotation: [f32; 3],
     pub scale: f32,
+    pub scale_axes: [f32; 3],
 }
 
 /// A project-owned GFX root, synchronized through the same native effect
@@ -145,6 +146,7 @@ fn editor_scene_transform(
         || !placement.rotation.iter().all(|value| value.is_finite())
         || !placement.scale.is_finite()
         || !(0.001..=1000.).contains(&placement.scale)
+        || !placement.scale_axes.iter().all(|v| v.is_finite() && (0.001..=1000.).contains(v))
     {
         return Err("non-finite or out-of-range editor transform".into());
     }
@@ -165,7 +167,7 @@ fn editor_scene_transform(
         action: String::new(),
     };
     let transform = crate::world_models::transform(&scene_placement)?
-        * glam::Mat4::from_scale(glam::Vec3::splat(placement.scale));
+        * glam::Mat4::from_scale(glam::Vec3::splat(placement.scale) * glam::Vec3::from_array(placement.scale_axes));
     Ok((scene_placement, transform))
 }
 
@@ -1908,6 +1910,7 @@ mod architect_placement_tests {
             position: [1., 2., 3.],
             rotation: [0., 0., 0.],
             scale: 1.,
+            scale_axes: [1.; 3],
         };
         assert!(!editor_transform_changed(&original, &original));
         let mut moved = original.clone();
@@ -1949,6 +1952,7 @@ mod architect_placement_tests {
             position: [0.; 3],
             rotation: [0.; 3],
             scale: 1.,
+            scale_axes: [1.; 3],
         };
         placement.position[1] = f32::NAN;
         assert!(editor_scene_transform(&placement, 0).is_err());
