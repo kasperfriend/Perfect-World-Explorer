@@ -5100,6 +5100,14 @@ impl Renderer {
             s.spawn(|| crate::terrain_residency::visible_runs_into(spans, matrix, terrain_runs));
             s.spawn(|| terrain_gpu.visible_far_runs_into(matrix, far_terrain_runs));
         });
+        // Snapshot counts before releasing the disjoint field borrows; the
+        // renderer's following &mut self calls must not overlap these borrows.
+        let terrain_run_count = terrain_runs.len();
+        let far_terrain_run_count = far_terrain_runs.len();
+        let span_count = spans.len();
+        drop(terrain_runs);
+        drop(far_terrain_runs);
+        drop(spans);
         // One indirect record per run, so the terrain itself is one call per mesh
         // instead of one call per run.
         self.queue_main_runs();
@@ -5187,7 +5195,7 @@ impl Renderer {
             camera.active_fog().enabled, camera.active_fog().start, camera.active_fog().end, camera.active_fog().color,
             frame.fog_range, frame.active_fog_range, frame.fog_color, frame.active_fog_color,
             normal.fog_range, normal.fog_color, camera.active_fog().enabled, matrix.to_cols_array(),
-            daylight, frame.bounds, terrain_runs.len(), far_terrain_runs.len(), spans.len(),
+            daylight, frame.bounds, terrain_run_count, far_terrain_run_count, span_count,
             self.water_batches.len(), use_post, camera.water_reflections, camera.bloom,
             camera.sharpen, reset_history
         );
