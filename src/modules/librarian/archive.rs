@@ -297,9 +297,7 @@ impl LibrarianAssets {
         };
         result.or_else(|error| {
             self.loose_resource(path).ok_or_else(|| {
-                format!(
-                    "{error}; check that litmodels.pck or the matching loose BMD is installed"
-                )
+                format!("{error}; check that litmodels.pck or the matching loose BMD is installed")
             })
         })
     }
