@@ -1923,6 +1923,9 @@ mod architect_placement_tests {
         let mut scaled = original.clone();
         scaled.scale = 2.;
         assert!(editor_transform_changed(&original, &scaled));
+        let mut axis_scaled = original.clone();
+        axis_scaled.scale_axes[0] = 2.0;
+        assert!(editor_transform_changed(&original, &axis_scaled));
     }
 
     #[test]
@@ -1932,7 +1935,7 @@ mod architect_placement_tests {
             position: [12., 3., -8.],
             rotation: [0., std::f32::consts::FRAC_PI_2, 0.],
             scale: 2.5,
-            scale_axes: [1.; 3],
+            scale_axes: [2.0, 3.0, 4.0],
         };
         let (scene, matrix) = editor_scene_transform(&placement, 7).unwrap();
         assert_eq!(scene.export_id, 7);
@@ -1942,9 +1945,9 @@ mod architect_placement_tests {
         assert!((matrix.w_axis.x - 12.).abs() < 1e-5);
         assert!((matrix.w_axis.y - 3.).abs() < 1e-5);
         assert!((matrix.w_axis.z + 8.).abs() < 1e-5);
-        assert!((matrix.x_axis.truncate().length() - 2.5).abs() < 1e-5);
-        assert!((matrix.y_axis.truncate().length() - 2.5).abs() < 1e-5);
-        assert!((matrix.z_axis.truncate().length() - 2.5).abs() < 1e-5);
+        assert!((matrix.x_axis.truncate().length() - 5.0).abs() < 1e-5);
+        assert!((matrix.y_axis.truncate().length() - 7.5).abs() < 1e-5);
+        assert!((matrix.z_axis.truncate().length() - 10.0).abs() < 1e-5);
     }
 
     #[test]
