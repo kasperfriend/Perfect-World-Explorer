@@ -388,6 +388,298 @@ impl Target {
         })
     }
 }
+const BMD_PREVIEW_SIDE: u32 = 512;
+
+#[derive(Clone, Copy)]
+struct BmdPreviewVertex {
+    position: Vec3,
+    normal: Vec3,
+    color: Vec3,
+}
+
+/// Static BMD geometry preview used by Architect's asset browser. The actual
+/// world placement still uses the baked-scenery pipeline; this compact preview
+/// uses BMD vertices, indices and day-light vertex colors to show the real
+/// silhouette without pretending to reproduce the full native material stack.
+pub struct BmdPreview {
+    pub path: String,
+    texture: wgpu::Texture,
+    pub texture_id: egui::TextureId,
+    vertices: Vec<BmdPreviewVertex>,
+    triangles: Vec<[usize; 3]>,
+    center: Vec3,
+    radius: f32,
+    bounds_min: Vec3,
+    bounds_max: Vec3,
+    yaw: f32,
+    pitch: f32,
+    zoom: f32,
+    pan: egui::Vec2,
+    dirty: bool,
+}
+impl BmdPreview {
+    pub fn from_model(
+        device: &wgpu::Device,
+        renderer: &mut egui_wgpu::Renderer,
+        path: String,
+        model: &crate::bmd::Model,
+    ) -> Result<Self, String> {
+        let identity = crate::scene::Ornament {
+            export_id: 0,
+            offset: 0,
+            position: [0.0; 3],
+            direction: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            extra: 0,
+            path: path.clone(),
+            map_id: String::new(),
+        };
+        let mut vertices = Vec::new();
+        let mut triangles = Vec::new();
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for mesh in &model.meshes {
+            let base = vertices.len();
+            let material = mesh.material.as_ref().map(|material| material.diffuse);
+            for source in &mesh.vertices {
+                let (position, normal) =
+                    crate::gpu::editor_bmd_vertex_transform(model, &identity, source, [1.0; 3]);
+                if !position.is_finite() || !normal.is_finite() {
+                    vertices.push(BmdPreviewVertex {
+                        position: Vec3::ZERO,
+                        normal: Vec3::Y,
+                        color: Vec3::ZERO,
+                    });
+                    continue;
+                }
+                min = min.min(position);
+                max = max.max(position);
+                let packed = if source.day_diffuse != 0 {
+                    source.day_diffuse
+                } else if source.diffuse != 0 {
+                    source.diffuse
+                } else {
+                    u32::MAX
+                };
+                let mut color = Vec3::new(
+                    ((packed >> 16) & 0xff) as f32 / 255.0,
+                    ((packed >> 8) & 0xff) as f32 / 255.0,
+                    (packed & 0xff) as f32 / 255.0,
+                );
+                if let Some(diffuse) = material.filter(|diffuse| {
+                    diffuse.iter().all(|value| value.is_finite())
+                }) {
+                    color *= Vec3::new(diffuse[0], diffuse[1], diffuse[2]).max(Vec3::ZERO);
+                }
+                vertices.push(BmdPreviewVertex {
+                    position,
+                    normal: if normal.length_squared() > 1.0e-8 {
+                        normal.normalize()
+                    } else {
+                        Vec3::Y
+                    },
+                    color,
+                });
+            }
+            for face in mesh.indices.chunks_exact(3) {
+                let a = face[0] as usize;
+                let b = face[1] as usize;
+                let c = face[2] as usize;
+                if a < mesh.vertices.len()
+                    && b < mesh.vertices.len()
+                    && c < mesh.vertices.len()
+                {
+                    triangles.push([base + a, base + b, base + c]);
+                }
+            }
+        }
+        if vertices.is_empty() || triangles.is_empty() || !min.is_finite() || !max.is_finite() {
+            return Err("BMD contains no finite indexed triangles for 3D preview".into());
+        }
+        let center = (min + max) * 0.5;
+        let radius = ((max - min).length() * 0.5).max(0.1);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Architect BMD geometry preview"),
+            size: wgpu::Extent3d {
+                width: BMD_PREVIEW_SIDE,
+                height: BMD_PREVIEW_SIDE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PREVIEW_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            ..Default::default()
+        });
+        let texture_id = renderer.register_native_texture(device, &view, wgpu::FilterMode::Linear);
+        Ok(Self {
+            path,
+            texture,
+            texture_id,
+            vertices,
+            triangles,
+            center,
+            radius,
+            bounds_min: min,
+            bounds_max: max,
+            yaw: 0.65,
+            pitch: 0.2,
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            dirty: true,
+        })
+    }
+
+    pub fn model_bounds(&self) -> ([f32; 3], [f32; 3]) {
+        (self.bounds_min.to_array(), self.bounds_max.to_array())
+    }
+
+    /// Rasterize a small, shaded turntable view only when the camera changes.
+    /// The texture is reused while the preview is idle, so it has no per-frame
+    /// GPU allocations and does not rebuild the main world scenery atlas.
+    pub fn prepare(&mut self, queue: &wgpu::Queue) {
+        if !self.dirty {
+            return;
+        }
+        let side = BMD_PREVIEW_SIDE as usize;
+        let mut pixels = vec![0u8; side * side * 4];
+        let mut depth = vec![f32::INFINITY; side * side];
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[29, 34, 43, 255]);
+        }
+        let rotation =
+            glam::Quat::from_rotation_y(self.yaw) * glam::Quat::from_rotation_x(self.pitch);
+        let distance = self.radius * 3.2 / self.zoom.clamp(0.3, 5.0);
+        let focal = side as f32 * 1.12;
+        let center = side as f32 * 0.5;
+        let pan_scale = self.radius * 2.0 / side as f32;
+        let pan = Vec3::new(
+            self.pan.x * pan_scale,
+            -self.pan.y * pan_scale,
+            0.0,
+        );
+        let light = Vec3::new(-0.45, 0.78, 0.42).normalize();
+        let projected = |vertex: BmdPreviewVertex| {
+            let position = rotation * (vertex.position - self.center) + pan;
+            let z = distance - position.z;
+            if !z.is_finite() || z <= 0.01 {
+                return None;
+            }
+            Some((
+                egui::pos2(
+                    center + position.x * focal / z,
+                    center - position.y * focal / z,
+                ),
+                z,
+                rotation * vertex.normal,
+                vertex.color,
+            ))
+        };
+        for triangle in &self.triangles {
+            let Some(a) = projected(self.vertices[triangle[0]]) else {
+                continue;
+            };
+            let Some(b) = projected(self.vertices[triangle[1]]) else {
+                continue;
+            };
+            let Some(c) = projected(self.vertices[triangle[2]]) else {
+                continue;
+            };
+            let area = (b.0.x - a.0.x) * (c.0.y - a.0.y)
+                - (b.0.y - a.0.y) * (c.0.x - a.0.x);
+            if !area.is_finite() || area.abs() < 1.0e-5 {
+                continue;
+            }
+            let min_x = a.0.x.min(b.0.x).min(c.0.x).floor().max(0.0) as usize;
+            let max_x = a.0.x.max(b.0.x).max(c.0.x).ceil().min((side - 1) as f32) as usize;
+            let min_y = a.0.y.min(b.0.y).min(c.0.y).floor().max(0.0) as usize;
+            let max_y = a.0.y.max(b.0.y).max(c.0.y).ceil().min((side - 1) as f32) as usize;
+            if min_x > max_x || min_y > max_y {
+                continue;
+            }
+            let inverse_area = 1.0 / area;
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    let point_x = x as f32 + 0.5;
+                    let point_y = y as f32 + 0.5;
+                    let wa = ((b.0.y - c.0.y) * (point_x - c.0.x)
+                        + (c.0.x - b.0.x) * (point_y - c.0.y))
+                        * inverse_area;
+                    let wb = ((c.0.y - a.0.y) * (point_x - c.0.x)
+                        + (a.0.x - c.0.x) * (point_y - c.0.y))
+                        * inverse_area;
+                    let wc = 1.0 - wa - wb;
+                    if wa < -1.0e-4 || wb < -1.0e-4 || wc < -1.0e-4 {
+                        continue;
+                    }
+                    let z = wa * a.1 + wb * b.1 + wc * c.1;
+                    let offset = y * side + x;
+                    if z >= depth[offset] {
+                        continue;
+                    }
+                    depth[offset] = z;
+                    let normal = (a.2 * wa + b.2 * wb + c.2 * wc).normalize_or_zero();
+                    let diffuse = (normal.dot(light).max(0.0) * 0.78 + 0.22).clamp(0.0, 1.0);
+                    let color = (a.3 * wa + b.3 * wb + c.3 * wc) * diffuse;
+                    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let pixel = &mut pixels[offset * 4..offset * 4 + 4];
+                    pixel.copy_from_slice(&[byte(color.x), byte(color.y), byte(color.z), 255]);
+                }
+            }
+        }
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(BMD_PREVIEW_SIDE * 4),
+                rows_per_image: Some(BMD_PREVIEW_SIDE),
+            },
+            wgpu::Extent3d {
+                width: BMD_PREVIEW_SIDE,
+                height: BMD_PREVIEW_SIDE,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.dirty = false;
+    }
+
+    pub fn show_interactive(&mut self, ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
+        let response = ui.add(
+            egui::Image::new((self.texture_id, size)).sense(egui::Sense::click_and_drag()),
+        );
+        if let Some(mode) = drag_mode(&response, ui.input(|input| input.modifiers.shift)) {
+            let delta = ui.input(|input| input.pointer.delta());
+            match mode {
+                Drag::Pan => self.pan += delta,
+                Drag::Orbit => {
+                    self.yaw = orbit_yaw(self.yaw, delta.x);
+                    self.pitch = orbit_pitch(self.pitch, delta.y);
+                }
+            }
+            self.dirty = true;
+        }
+        if response.hovered() {
+            let wheel = ui.input(|input| input.smooth_scroll_delta.y);
+            if wheel.abs() > f32::EPSILON {
+                self.zoom = (self.zoom * (-wheel * 0.002).exp()).clamp(0.3, 5.0);
+                self.dirty = true;
+            }
+        }
+        response
+    }
+}
+
 pub struct Preview {
     pub target: Target,
     asset: Option<ModelAsset>,
