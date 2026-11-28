@@ -120,6 +120,7 @@ impl Modules {
         renderer: &mut egui_wgpu::Renderer,
         format: wgpu::TextureFormat,
     ) {
+        self.architect.free_pending_preview_textures(renderer);
         if self.architect.active() {
             self.architect
                 .prepare_preview(device, queue, renderer, format);
