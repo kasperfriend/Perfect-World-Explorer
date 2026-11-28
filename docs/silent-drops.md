@@ -60,8 +60,8 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/fsr/fg.rs` | 568 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
 | `src/fsr/fg.rs` | 578 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
 | `src/fsr/imp.rs` | 1179 | `let-underscore` | **unreachable** | `let _ = self` |
-| `src/fsr/imp.rs` | 1315 | `let-underscore` | **unreachable** | `let _ = queue;` |
-| `src/fsr/imp.rs` | 1440 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
+| `src/fsr/imp.rs` | 1320 | `let-underscore` | **unreachable** | `let _ = queue;` |
+| `src/fsr/imp.rs` | 1445 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
 | `src/gfx_effect_gpu.rs` | 621 | `unwrap_or_default` | **unreachable** | `let mut verts = self.scratch_pool.pop().unwrap_or_default();` |
 | `src/gfx_effect_gpu.rs` | 819 | `else-continue` | **named** | `else {` |
 | `src/gfx_effect_gpu.rs` | 899 | `else-continue` | **named** | `else {` |
