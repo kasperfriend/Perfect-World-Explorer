@@ -119,6 +119,7 @@ pub struct Architect {
     preview_assets: crate::modules::librarian::archive::LibrarianAssets,
     effect_catalog: Option<crate::gfx_catalog::Catalog>,
     preview: Option<crate::modules::librarian::preview3d::Preview>,
+    bmd_preview: Option<crate::modules::librarian::preview3d::BmdPreview>,
     /// Exact local-space bounds cached per loaded client mesh. Never substitute
     /// guessed class dimensions for an object's actual geometry.
     preview_bounds: HashMap<String, ([f32; 3], [f32; 3])>,
@@ -228,6 +229,7 @@ impl Architect {
             preview_assets,
             effect_catalog: None,
             preview: None,
+            bmd_preview: None,
             preview_bounds: HashMap::new(),
             tree_types: Vec::new(),
             preview_message: "Hover or select an ECM/SMD model to preview it.".into(),
@@ -1272,10 +1274,13 @@ impl Architect {
             self.preview_message =
                 "Select a client asset to preview it or place it with its native world handler."
                     .into();
+            self.preview = None;
+            self.bmd_preview = None;
             return;
         };
         if self.renderer_effect_path(asset).is_some() {
             self.preview = None;
+            self.bmd_preview = None;
             self.preview_message =
                 "GFX effect uses the native world effect handler and appears after placement."
                     .into();
@@ -1283,50 +1288,50 @@ impl Architect {
         }
         if let Some(path) = self.renderer_bmd_asset_path(asset) {
             self.preview = None;
-            let loaded = self
-                .preview_assets
-                .read_litmodel_resource(&path)
-                .and_then(|bytes| crate::bmd::Model::parse(&bytes));
-            match loaded {
-                Ok(model) => {
-                    let identity = crate::scene::Ornament {
-                        export_id: 0,
-                        offset: 0,
-                        position: [0.0; 3],
-                        direction: [0.0, 0.0, 1.0],
-                        up: [0.0, 1.0, 0.0],
-                        extra: 0,
-                        path: path.clone(),
-                        map_id: self.current_map_id.to_ascii_lowercase(),
-                    };
-                    let mut min = Vec3::splat(f32::INFINITY);
-                    let mut max = Vec3::splat(f32::NEG_INFINITY);
-                    for vertex in model.meshes.iter().flat_map(|mesh| &mesh.vertices) {
-                        let (position, _) = crate::gpu::editor_bmd_vertex_transform(
-                            &model, &identity, vertex, [1.0; 3],
-                        );
-                        if position.is_finite() {
-                            min = min.min(position);
-                            max = max.max(position);
+            let needs_load = self
+                .bmd_preview
+                .as_ref()
+                .is_none_or(|preview| preview.path != path);
+            if needs_load {
+                let loaded = self
+                    .preview_assets
+                    .read_litmodel_resource(&path)
+                    .and_then(|bytes| crate::bmd::Model::parse(&bytes));
+                match loaded {
+                    Ok(model) => {
+                        match crate::modules::librarian::preview3d::BmdPreview::from_model(
+                            device,
+                            renderer,
+                            path.clone(),
+                            &model,
+                        ) {
+                            Ok(preview) => {
+                                self.preview_bounds
+                                    .insert(path.clone(), preview.model_bounds());
+                                self.bmd_preview = Some(preview);
+                                self.preview_message.clear();
+                            }
+                            Err(error) => {
+                                self.bmd_preview = None;
+                                self.preview_message =
+                                    format!("Could not build BMD 3D preview: {error}");
+                            }
                         }
                     }
-                    if min.is_finite() && max.is_finite() {
-                        self.preview_bounds
-                            .insert(path.clone(), (min.to_array(), max.to_array()));
-                        self.preview_message =
-                            "BMD mesh bounds loaded. Its native materials appear in the world viewport after placement.".into();
-                    } else {
-                        self.preview_message =
-                            "This BMD contains no finite mesh geometry for selection bounds."
-                                .into();
+                    Err(error) => {
+                        self.bmd_preview = None;
+                        self.preview_message = format!("Could not load BMD 3D preview: {error}");
                     }
                 }
-                Err(error) => {
-                    self.preview_message = format!("Could not load BMD selection bounds: {error}");
+            }
+            if self.preview_message.is_empty() {
+                if let Some(preview) = self.bmd_preview.as_mut() {
+                    preview.prepare(queue);
                 }
             }
             return;
         }
+        self.bmd_preview = None;
         if self.renderer_tree_type(asset).is_some() {
             self.preview = None;
             self.preview_message = "SpeedTree uses the native vegetation renderer. Select Place to see its live LOD/material/wind preview in the world.".into();
@@ -3263,6 +3268,21 @@ impl Architect {
                                     preview.select_action(selected_action);
                                 }
                             }
+                        } else if let Some(preview) = &mut self.bmd_preview {
+                            preview.show_interactive(
+                                ui,
+                                egui::vec2(
+                                    ui.available_width().min(280.),
+                                    ui.available_width().min(280.),
+                                ),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "BMD geometry preview · native materials are used after placement",
+                                )
+                                .small()
+                                .weak(),
+                            );
                         }
                     } else {
                         ui.label(egui::RichText::new(&self.preview_message).small().weak());
