@@ -4624,6 +4624,22 @@ mod tests {
     }
 
     #[test]
+    fn selecting_a_tree_composite_arms_the_existing_tree_placement_handler() {
+        let mut editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
+        editor.tree_types = vec![crate::scene::TreeType {
+            tree: "trees/oak.spt".into(),
+            composite: "trees/oak.dds".into(),
+        }];
+
+        editor.select_asset_for_placement("element/trees.pck::trees/oak.dds".into());
+
+        assert_eq!(editor.selected_asset.as_deref(), Some("element/trees.pck::trees/oak.dds"));
+        assert_eq!(editor.cursor, CursorMode::Place);
+        assert_eq!(editor.snap, SnapMode::Terrain);
+        assert_eq!(editor.renderer_tree_type("element/trees.pck::trees/oak.dds"), Some(0));
+    }
+
+    #[test]
     fn renderer_tree_placements_export_tree_type_yaw_and_scale() {
         let mut editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
         editor.enabled = true;
