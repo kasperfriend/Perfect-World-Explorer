@@ -965,15 +965,25 @@ impl Architect {
         let orientation = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
             (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
         };
+        let on_segment = |a: egui::Pos2, b: egui::Pos2, point: egui::Pos2| {
+            orientation(a, b, point).abs() <= 1.0e-4
+                && point.x >= a.x.min(b.x) - 1.0e-4
+                && point.x <= a.x.max(b.x) + 1.0e-4
+                && point.y >= a.y.min(b.y) - 1.0e-4
+                && point.y <= a.y.max(b.y) + 1.0e-4
+        };
         let intersects = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2, d: egui::Pos2| {
             let ab_c = orientation(a, b, c);
             let ab_d = orientation(a, b, d);
             let cd_a = orientation(c, d, a);
             let cd_b = orientation(c, d, b);
-            (ab_c == 0.0 || ab_d == 0.0 || ab_c.is_sign_positive() != ab_d.is_sign_positive())
-                && (cd_a == 0.0
-                    || cd_b == 0.0
-                    || cd_a.is_sign_positive() != cd_b.is_sign_positive())
+            if ab_c.signum() != ab_d.signum() && cd_a.signum() != cd_b.signum() {
+                return true;
+            }
+            (ab_c.abs() <= 1.0e-4 && on_segment(a, b, c))
+                || (ab_d.abs() <= 1.0e-4 && on_segment(a, b, d))
+                || (cd_a.abs() <= 1.0e-4 && on_segment(c, d, a))
+                || (cd_b.abs() <= 1.0e-4 && on_segment(c, d, b))
         };
         let edges = [
             (corners[0], corners[1]),
@@ -5176,6 +5186,51 @@ mod tests {
             glam::Mat4::IDENTITY,
         )
         .is_none());
+    }
+
+    #[test]
+    fn lasso_selects_object_bounds_even_when_origin_is_outside() {
+        let polygon = [
+            egui::pos2(0.0, 0.0),
+            egui::pos2(10.0, 0.0),
+            egui::pos2(10.0, 10.0),
+            egui::pos2(0.0, 10.0),
+        ];
+        let bounds_inside = egui::Rect::from_min_size(
+            egui::pos2(3.0, 3.0),
+            egui::vec2(2.0, 2.0),
+        );
+        assert!(Architect::lasso_intersects_rect(&polygon, bounds_inside));
+    }
+
+    #[test]
+    fn lasso_selects_bounds_crossed_by_polygon_edge() {
+        let polygon = [
+            egui::pos2(0.0, 0.0),
+            egui::pos2(10.0, 0.0),
+            egui::pos2(10.0, 10.0),
+            egui::pos2(0.0, 10.0),
+        ];
+        let crossing = egui::Rect::from_min_size(
+            egui::pos2(9.0, 4.0),
+            egui::vec2(4.0, 2.0),
+        );
+        assert!(Architect::lasso_intersects_rect(&polygon, crossing));
+    }
+
+    #[test]
+    fn lasso_does_not_select_bounds_outside_polygon() {
+        let polygon = [
+            egui::pos2(0.0, 0.0),
+            egui::pos2(10.0, 0.0),
+            egui::pos2(10.0, 10.0),
+            egui::pos2(0.0, 10.0),
+        ];
+        let outside = egui::Rect::from_min_size(
+            egui::pos2(20.0, 4.0),
+            egui::vec2(2.0, 2.0),
+        );
+        assert!(!Architect::lasso_intersects_rect(&polygon, outside));
     }
 
     #[test]
