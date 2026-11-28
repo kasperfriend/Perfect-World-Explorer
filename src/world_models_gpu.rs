@@ -726,14 +726,14 @@ impl World {
         let stale = self
             .editor_effects
             .iter()
-            .filter(|(key, (path, transform, _))| {
-                desired
+            .filter_map(|(key, (path, transform, identity))| {
+                let unchanged = desired
                     .get(key)
-                    .is_none_or(|(next_path, next_transform)| {
-                        next_path != path || next_transform != transform
-                    })
+                    .is_some_and(|(next_path, next_transform)| {
+                        next_path == path && next_transform == transform
+                    });
+                (!unchanged).then_some((*key, *identity))
             })
-            .map(|(key, (_, _, identity))| (*key, *identity))
             .collect::<Vec<_>>();
         for (key, identity) in stale {
             self.owners.remove(identity, &mut self.publications);
