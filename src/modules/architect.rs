@@ -1654,6 +1654,7 @@ impl Architect {
                     direction: (rotation * Vec3::Z).to_array(),
                     up: (rotation * Vec3::Y).to_array(),
                     scale: object.scale,
+                    scale_axes: object.scale_axes,
                     map_id: self.current_map_id.to_ascii_lowercase(),
                 })
             })
@@ -1693,6 +1694,7 @@ impl Architect {
                     position: object.position,
                     rotation: object.rotation,
                     scale: object.scale,
+                    scale_axes: object.scale_axes,
                 })
             })
             .collect::<Vec<_>>();
@@ -1734,6 +1736,7 @@ impl Architect {
                         position,
                         rotation: [0.; 3],
                         scale: 1.,
+                        scale_axes: [1.; 3],
                     });
                 }
             }
@@ -3321,8 +3324,17 @@ impl Architect {
                         ui.add(
                             egui::Slider::new(&mut object.scale, 0.01..=100.0)
                                 .logarithmic(true)
-                                .text("Scale"),
+                                .text("Uniform scale"),
                         );
+                        ui.horizontal(|ui| {
+                            ui.label("Scale XYZ");
+                            for axis in 0..3 {
+                                ui.add(egui::DragValue::new(&mut object.scale_axes[axis])
+                                    .speed(0.02)
+                                    .clamp_range(0.01..=100.0)
+                                    .prefix(["X ", "Y ", "Z "][axis]));
+                            }
+                        });
                         if ui.button("Duplicate custom placement").clicked() {
                             duplicate_placement = Some(object.clone());
                         }
@@ -3632,7 +3644,7 @@ impl Architect {
                                         if bits & 1 == 0 { min[0] } else { max[0] },
                                         if bits & 2 == 0 { min[1] } else { max[1] },
                                         if bits & 4 == 0 { min[2] } else { max[2] },
-                                    ) * object.scale.max(0.01);
+                                    ) * (object.scale.max(0.01) * Vec3::from_array(object.scale_axes));
                                     let world = center + rotation * local;
                                     let projected = view_projection.project_point3(world);
                                     if projected.is_finite() && (0.0..=1.0).contains(&projected.z) {
@@ -4284,6 +4296,7 @@ impl Architect {
                     object.asset.clone(),
                     object.position,
                     object.scale,
+                    object.scale_axes,
                     object.rotation,
                 )
             })
@@ -4295,14 +4308,14 @@ impl Architect {
                     .filter(|_| self.selected_scene_object.is_some()),
                 self.selected_scene_transform,
             ) {
-                outline_items.push((asset.clone(), position, 1.0, [0.; 3]));
+                outline_items.push((asset.clone(), position, 1.0, [1.; 3], [0.; 3]));
             }
         }
         let outline_painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("architect_selected_object_bounds"),
         ));
-        for (asset, position, scale, euler) in outline_items {
+        for (asset, position, scale, scale_axes, euler) in outline_items {
             // Use the exact mesh bounds for this asset. If the mesh has not
             // been loaded yet, omit the outline rather than draw a misleading
             // guessed-size box that can be wildly wrong for PW models.
@@ -4333,7 +4346,7 @@ impl Architect {
                     } else {
                         local_max.z
                     },
-                ) * scale.max(0.01);
+                ) * (scale.max(0.01) * Vec3::from_array(scale_axes));
                 let point = center + rotation * local;
                 if let Some(projected) = project_outline_point(point) {
                     corners[bits] = projected;
