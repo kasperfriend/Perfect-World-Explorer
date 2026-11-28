@@ -503,11 +503,14 @@ impl Draw {
         }
         let direction = light.map_or([0.; 3], |light| light.direction);
         let eye = light.map_or([0.; 3], |light| light.eye_direction);
-        let (fog_range, fog_color, water_fog) = light.map_or(
-            ([0.; 4], [0.; 4], [0.; 4]),
-            |light| (light.fog_range, light.fog_color, light.water_fog),
-        );
-        if direction.iter().chain(eye.iter()).any(|value| !value.is_finite())
+        let (fog_range, fog_color, water_fog) = light
+            .map_or(([0.; 4], [0.; 4], [0.; 4]), |light| {
+                (light.fog_range, light.fog_color, light.water_fog)
+            });
+        if direction
+            .iter()
+            .chain(eye.iter())
+            .any(|value| !value.is_finite())
             || fog_range
                 .iter()
                 .chain(fog_color.iter())
@@ -1838,8 +1841,13 @@ mod tests {
             let png = grey_png();
             let mut read = |_: &str| Ok(png.clone());
             render_with_camera(
-                &mut draw, &harness, 0., &[sheet.clone()], [0., 3., 0., 100.],
-                Some(water_light), &mut read,
+                &mut draw,
+                &harness,
+                0.,
+                &[sheet.clone()],
+                [0., 3., 0., 100.],
+                Some(water_light),
+                &mut read,
             )
         };
         water_light.water_fog = [2., 2., 1., 0.];
@@ -1847,8 +1855,13 @@ mod tests {
             let png = grey_png();
             let mut read = |_: &str| Ok(png.clone());
             render_with_camera(
-                &mut draw, &harness, 0., &[sheet], [0., 3., 0., 100.],
-                Some(water_light), &mut read,
+                &mut draw,
+                &harness,
+                0.,
+                &[sheet],
+                [0., 3., 0., 100.],
+                Some(water_light),
+                &mut read,
             )
         };
         assert!(

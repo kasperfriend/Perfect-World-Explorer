@@ -270,8 +270,14 @@ mod tests {
     fn water_transmission_matches_the_recovered_base_two_eye_ray_law() {
         let transmission = water_transmittance([0., -10., 0.], [0., 10., 0.], 0., 0.075);
         assert!((transmission - (-0.75f32).exp2()).abs() < 1e-6);
-        assert_eq!(water_transmittance([0., 1., 0.], [0., 10., 0.], 0., 0.075), 1.);
-        assert_eq!(water_transmittance([0., -1., 0.], [1., -1., 0.], 0., 0.075), 0.);
+        assert_eq!(
+            water_transmittance([0., 1., 0.], [0., 10., 0.], 0., 0.075),
+            1.
+        );
+        assert_eq!(
+            water_transmittance([0., -1., 0.], [1., -1., 0.], 0., 0.075),
+            0.
+        );
         assert!(water_transmittance([0., -10., 0.], [10., 10., 0.], 0., 0.075) < transmission);
     }
     #[test]

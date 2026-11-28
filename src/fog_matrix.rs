@@ -332,9 +332,12 @@ pub fn row(material: Material, pass: Pass) -> Row {
             true,
             "bmd fogged() (0x7a91dd main path)",
         ),
-        (Model, Main) | (Model, Reflection)
-        | (TransparentModel, Main) | (TransparentModel, Reflection)
-        | (GfxEffect, Main) | (GfxEffect, Reflection) => row_of(
+        (Model, Main)
+        | (Model, Reflection)
+        | (TransparentModel, Main)
+        | (TransparentModel, Reflection)
+        | (GfxEffect, Main)
+        | (GfxEffect, Reflection) => row_of(
             TableFogViewZ,
             Camera,
             false,
@@ -534,7 +537,12 @@ mod tests {
 
     #[test]
     fn receiving_models_and_gfx_effects_absorb_water_only_in_clipped_refraction() {
-        for material in [Material::Model, Material::TransparentModel, Material::GfxEffect, Material::Tree] {
+        for material in [
+            Material::Model,
+            Material::TransparentModel,
+            Material::GfxEffect,
+            Material::Tree,
+        ] {
             assert_eq!(
                 row(material, Pass::Refraction).quantity,
                 Quantity::TableFogWithWaterAbsorption,
