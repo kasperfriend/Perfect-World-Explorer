@@ -829,6 +829,28 @@ impl Architect {
         self.selected_placements.clear();
     }
 
+    /// Keep the active source-scene item, transform target and asset path in
+    /// sync after multi-selection toggles and area-selection updates.
+    fn sync_source_selection(&mut self) {
+        let active = self
+            .multi_selection
+            .iter()
+            .filter_map(|index| {
+                self.multi_scene_items
+                    .get(index)
+                    .map(|(asset, position)| (*index, asset.clone(), *position))
+            })
+            .min_by_key(|(index, _, _)| *index);
+        if let Some((index, asset, position)) = active {
+            self.selected_scene_object = Some(index);
+            self.selected_scene_transform = Some(position);
+            self.selected_asset = Some(asset);
+        } else {
+            self.selected_scene_object = None;
+            self.selected_scene_transform = None;
+        }
+    }
+
     fn marquee_rect(start: egui::Pos2, current: egui::Pos2) -> egui::Rect {
         egui::Rect::from_two_pos(start, current)
     }
@@ -2444,23 +2466,10 @@ impl Architect {
                 if self.multi_selection.insert(index) {
                     self.multi_scene_items
                         .insert(index, (asset.to_string(), position));
-                    self.selected_scene_object = Some(index);
-                    self.selected_asset = Some(asset.to_string());
                 } else {
                     self.multi_scene_items.remove(&index);
-                    self.selected_scene_object =
-                        self.multi_selection.iter().copied().min();
-                    if let Some(active) = self.selected_scene_object {
-                        if let Some((active_asset, active_position)) =
-                            self.multi_scene_items.get(&active)
-                        {
-                            self.selected_asset = Some(active_asset.clone());
-                            self.selected_scene_transform = Some(*active_position);
-                        }
-                    } else {
-                        self.selected_scene_transform = None;
-                    }
                 }
+                self.sync_source_selection();
             } else {
                 self.clear_object_selection();
                 self.selected_scene_object = Some(index);
@@ -3549,13 +3558,28 @@ impl Architect {
                         "{} selected",
                         self.selected_placements.len() + self.multi_selection.len()
                     ));
-                    if ui.button("Select all").clicked() {
+                    if ui.button("Select all placements").clicked() {
                         self.selected_placements = (0..self.project.objects.len()).collect();
                         self.selected_placement = self.selected_placements.iter().copied().min();
+                        self.multi_selection.clear();
+                        self.multi_scene_items.clear();
+                        self.sync_source_selection();
+                    }
+                    if ui.button("Select all scene objects").clicked() {
+                        let items = Self::source_scene_items(scene, ornaments);
+                        self.multi_scene_items = items.into_iter().enumerate().collect();
+                        self.multi_selection = self.multi_scene_items.keys().copied().collect();
+                        self.selected_placements.clear();
+                        self.selected_placement = None;
+                        self.cursor = CursorMode::MultiSelect;
+                        self.sync_source_selection();
                     }
                     if ui.button("Clear selection").clicked() {
                         self.selected_placements.clear();
                         self.selected_placement = None;
+                        self.multi_selection.clear();
+                        self.multi_scene_items.clear();
+                        self.sync_source_selection();
                     }
                 });
                 ui.horizontal(|ui| {
@@ -4431,13 +4455,11 @@ impl Architect {
                         if self.cursor == CursorMode::MultiSelect {
                             if self.multi_selection.insert(index) {
                                 self.multi_scene_items.insert(index, (asset, position));
-                                self.selected_scene_object = Some(index);
                             } else {
                                 self.multi_selection.remove(&index);
                                 self.multi_scene_items.remove(&index);
-                                self.selected_scene_object =
-                                    self.multi_selection.iter().copied().min();
                             }
+                            self.sync_source_selection();
                         } else {
                             self.multi_selection.clear();
                             self.multi_scene_items.clear();
@@ -4589,13 +4611,7 @@ impl Architect {
                     .selected_placement
                     .filter(|index| self.selected_placements.contains(index))
                     .or_else(|| self.selected_placements.iter().copied().min());
-                if let Some(index) = self.multi_selection.iter().copied().min() {
-                    self.selected_scene_object = Some(index);
-                    if let Some((asset, position)) = self.multi_scene_items.get(&index) {
-                        self.selected_asset = Some(asset.clone());
-                        self.selected_scene_transform = Some(*position);
-                    }
-                }
+                self.sync_source_selection();
                 self.status = format!(
                     "Selected {} project placements and {} source-scene objects.",
                     self.selected_placements.len(),
@@ -4651,13 +4667,7 @@ impl Architect {
                         .selected_placement
                         .filter(|index| self.selected_placements.contains(index))
                         .or_else(|| self.selected_placements.iter().copied().min());
-                    if let Some(index) = self.multi_selection.iter().copied().min() {
-                        self.selected_scene_object = Some(index);
-                        if let Some((asset, position)) = self.multi_scene_items.get(&index) {
-                            self.selected_asset = Some(asset.clone());
-                            self.selected_scene_transform = Some(*position);
-                        }
-                    }
+                    self.sync_source_selection();
                     self.status = format!(
                         "Selected {} project placements and {} source-scene objects.",
                         self.selected_placements.len(),
