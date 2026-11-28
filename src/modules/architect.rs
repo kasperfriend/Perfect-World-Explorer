@@ -1332,6 +1332,15 @@ impl Architect {
             .or_else(|| Self::renderer_bmd_path(asset, &self.current_map_id))
     }
 
+    /// Every asset family with a native placement adapter. Keep this
+    /// predicate shared by archive actions and placement validation so the UI
+    /// never disables an object type that the renderer can actually consume.
+    fn renderer_placeable_asset(&self, asset: &str) -> bool {
+        Self::renderer_asset_path(asset).is_some()
+            || Self::renderer_bmd_path(asset, &self.current_map_id).is_some()
+            || self.renderer_tree_type(asset).is_some()
+    }
+
     fn renderer_tree_type(&self, asset: &str) -> Option<usize> {
         let candidate = asset.split_once("::").map_or(asset, |(_, entry)| entry);
         let candidate = crate::ecmodel::normalize(candidate);
@@ -1531,10 +1540,7 @@ impl Architect {
                 "Choose a placeable game model from the client assets before placing it.".into();
             return;
         };
-        if Self::renderer_asset_path(&asset).is_none()
-            && Self::renderer_bmd_path(&asset, &self.current_map_id).is_none()
-            && self.renderer_tree_type(&asset).is_none()
-        {
+        if !self.renderer_placeable_asset(&asset) {
             self.status = "This file is indexed but not yet placeable. Live placement supports ECM, static SMD, BMD scenery, and loaded SpeedTree types.".into();
             return;
         }
@@ -2407,7 +2413,7 @@ impl Architect {
                                     }
                                     if ui
                                         .add_enabled(
-                                            Self::renderer_asset_path(&asset).is_some(),
+                                            self.renderer_placeable_asset(&asset),
                                             egui::Button::new("Place at camera"),
                                         )
                                         .clicked()
@@ -4518,6 +4524,25 @@ mod tests {
         assert!(loaded.objects[0].visible);
         assert!(!loaded.objects[0].locked);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn placeable_asset_gate_accepts_every_native_adapter() {
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element"),
+            None,
+            "a01".into(),
+        );
+        editor.tree_types = vec![crate::scene::TreeType {
+            tree: "trees/oak.spt".into(),
+            composite: "trees/oak.dds".into(),
+        }];
+        assert!(editor.renderer_placeable_asset("models.pck::models/building.ecm"));
+        assert!(editor.renderer_placeable_asset(
+            "litmodels.pck::litmodels/a01/1/litmodel_42.bmd"
+        ));
+        assert!(editor.renderer_placeable_asset("trees.pck::trees/oak.spt"));
+        assert!(!editor.renderer_placeable_asset("gfx.pck::textures/oak.dds"));
     }
 
     #[test]
