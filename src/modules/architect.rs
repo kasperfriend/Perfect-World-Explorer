@@ -120,6 +120,7 @@ pub struct Architect {
     effect_catalog: Option<crate::gfx_catalog::Catalog>,
     preview: Option<crate::modules::librarian::preview3d::Preview>,
     bmd_preview: Option<crate::modules::librarian::preview3d::BmdPreview>,
+    bmd_preview_path: Option<String>,
     /// Exact local-space bounds cached per loaded client mesh. Never substitute
     /// guessed class dimensions for an object's actual geometry.
     preview_bounds: HashMap<String, ([f32; 3], [f32; 3])>,
@@ -230,6 +231,7 @@ impl Architect {
             effect_catalog: None,
             preview: None,
             bmd_preview: None,
+            bmd_preview_path: None,
             preview_bounds: HashMap::new(),
             tree_types: Vec::new(),
             preview_message: "Hover or select an ECM/SMD model to preview it.".into(),
@@ -1288,11 +1290,9 @@ impl Architect {
         }
         if let Some(path) = self.renderer_bmd_asset_path(asset) {
             self.preview = None;
-            let needs_load = self
-                .bmd_preview
-                .as_ref()
-                .is_none_or(|preview| preview.path != path);
+            let needs_load = self.bmd_preview_path.as_deref() != Some(path.as_str());
             if needs_load {
+                self.bmd_preview_path = Some(path.clone());
                 let loaded = self
                     .preview_assets
                     .read_litmodel_resource(&path)
