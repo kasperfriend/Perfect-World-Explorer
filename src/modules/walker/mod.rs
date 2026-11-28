@@ -1186,11 +1186,11 @@ impl Walker {
         if !self.is_active() || self.gpu_failed {
             return;
         }
-        // Walker armor/fashion uses the ordinary diffuse skin path. Do not add
-        // the directional Blinn highlight that made these materials reflective.
-        // GFX effects keep their independent native specular behavior.
-        let frame = model_draw_gpu::Frame {
-            specular_variant: false,
+        // Walker equipment must keep its specular-variant diffuse/alpha path,
+        // but not the added directional Blinn reflection. Zero only the model
+        // coefficient; attached GFX effects retain their independent lighting.
+        let model_frame = model_draw_gpu::Frame {
+            directional_specular: [0.; 4],
             ..frame
         };
         if self.gpu.is_none() {
@@ -1289,11 +1289,11 @@ impl Walker {
             let mut quads = None;
             if pose_uploaded {
                 for (index, model) in models.iter().enumerate() {
-                    gpu.draws[index].update_constants(queue, model.asset, frame)?;
+                    gpu.draws[index].update_constants(queue, model.asset, model_frame)?;
                 }
             } else {
                 for (index, model) in models.into_iter().enumerate() {
-                    gpu.draws[index].update_posed(queue, model.asset, model.poses, frame)?;
+                    gpu.draws[index].update_posed(queue, model.asset, model.poses, model_frame)?;
                 }
                 quads = Some(
                     character
