@@ -1518,9 +1518,9 @@ fn build(
                     editor_bmd_vertex_transform(model, ornament, vert, instance_scale)
                 } else {
                     let position = Vec3::from_array(model.position)
-                        + x * (vert.position[0] * model.scale[0] * instance_scale)
-                        + y * (vert.position[1] * model.scale[1] * instance_scale)
-                        + z * (vert.position[2] * model.scale[2] * instance_scale);
+                        + x * (vert.position[0] * model.scale[0] * instance_scale[0])
+                        + y * (vert.position[1] * model.scale[1] * instance_scale[1])
+                        + z * (vert.position[2] * model.scale[2] * instance_scale[2]);
                     let normal = (x * vert.normal[0] + y * vert.normal[1] + z * vert.normal[2])
                         .normalize_or_zero();
                     (position, normal)
