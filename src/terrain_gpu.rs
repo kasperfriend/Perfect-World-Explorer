@@ -1777,11 +1777,12 @@ mod tests {
 #[cfg(test)]
 mod fog_shader_contract_tests {
     #[test]
-    fn terrain_fog_uses_camera_matrix_world_depth_and_exposes_comparison() {
+    fn terrain_fog_uses_camera_matrix_world_depth_without_a_visual_overlay() {
         let src = include_str!("terrain_gpu.rs");
         assert!(src.contains("return max((camera.matrix*vec4<f32>(world,1.)).w,0.);"));
         assert!(src.contains("fog_view_depth(i.world)"));
-        assert!(!src.contains("camera.lod.z>0.5"));
+        let debug_gate = ["camera.lod.z", ">0.5"].concat();
+        assert!(!src.contains(&debug_gate));
         assert!(
             src.contains("fn terrain_pass_fog(linear:vec3<f32>,world:vec3<f32>,transmittance:f32)")
         );
