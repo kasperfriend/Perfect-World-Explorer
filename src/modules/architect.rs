@@ -1284,7 +1284,10 @@ impl Architect {
         let portable = if portable.contains("::") {
             portable
         } else {
-            portable.strip_prefix("element/").unwrap_or(&portable).to_owned()
+            portable
+                .strip_prefix("element/")
+                .unwrap_or(&portable)
+                .to_owned()
         };
         Self::renderer_bmd_path(&portable, &self.current_map_id)
     }
@@ -1721,11 +1724,11 @@ impl Architect {
         }
         let Some(asset) = self.selected_asset.clone() else {
             self.status =
-                "Choose a placeable game model from the client assets before placing it.".into();
+                "Choose a placeable game object from the client assets before placing it.".into();
             return;
         };
         if !self.renderer_placeable_asset(&asset) {
-            self.status = "This file is indexed but not yet placeable. Live placement supports ECM, static SMD, BMD scenery, and loaded SpeedTree types.".into();
+            self.status = "This file is indexed but not yet placeable. Live placement supports ECM, static SMD, BMD scenery, SpeedTree and catalogue-backed GFX effects.".into();
             return;
         }
         let before = self.project.objects.clone();
@@ -1756,7 +1759,7 @@ impl Architect {
         // transformed with the gizmo; Place remains an explicit repeat action.
         self.cursor = CursorMode::Select;
         self.status =
-            "Game model placed in the live Architect viewport. Selected for editing.".into();
+            "Game object placed in the live Architect viewport. Selected for editing.".into();
     }
 
     fn duplicate_selected_scene_item(&mut self) {
@@ -1814,7 +1817,9 @@ impl Architect {
             created.push(index);
         }
         if created.is_empty() {
-            self.status = "The selected client scene items have no supported native placement adapter.".into();
+            self.status =
+                "The selected client scene items have no supported native placement adapter."
+                    .into();
             return;
         }
 
