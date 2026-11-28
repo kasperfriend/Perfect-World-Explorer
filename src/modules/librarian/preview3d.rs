@@ -468,9 +468,9 @@ impl BmdPreview {
                     ((packed >> 8) & 0xff) as f32 / 255.0,
                     (packed & 0xff) as f32 / 255.0,
                 );
-                if let Some(diffuse) = material.filter(|diffuse| {
-                    diffuse.iter().all(|value| value.is_finite())
-                }) {
+                if let Some(diffuse) =
+                    material.filter(|diffuse| diffuse.iter().all(|value| value.is_finite()))
+                {
                     color *= Vec3::new(diffuse[0], diffuse[1], diffuse[2]).max(Vec3::ZERO);
                 }
                 vertices.push(BmdPreviewVertex {
@@ -564,11 +564,7 @@ impl BmdPreview {
         let focal = side as f32 * 1.12;
         let center = side as f32 * 0.5;
         let pan_scale = self.radius * 2.0 / side as f32;
-        let pan = Vec3::new(
-            self.pan.x * pan_scale,
-            -self.pan.y * pan_scale,
-            0.0,
-        );
+        let pan = Vec3::new(self.pan.x * pan_scale, -self.pan.y * pan_scale, 0.0);
         let light = Vec3::new(-0.45, 0.78, 0.42).normalize();
         let projected = |vertex: BmdPreviewVertex| {
             let position = rotation * (vertex.position - self.center) + pan;
@@ -596,8 +592,7 @@ impl BmdPreview {
             let Some(c) = projected(self.vertices[triangle[2]]) else {
                 continue;
             };
-            let area = (b.0.x - a.0.x) * (c.0.y - a.0.y)
-                - (b.0.y - a.0.y) * (c.0.x - a.0.x);
+            let area = (b.0.x - a.0.x) * (c.0.y - a.0.y) - (b.0.y - a.0.y) * (c.0.x - a.0.x);
             if !area.is_finite() || area.abs() < 1.0e-5 {
                 continue;
             }
@@ -661,9 +656,8 @@ impl BmdPreview {
     }
 
     pub fn show_interactive(&mut self, ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
-        let response = ui.add(
-            egui::Image::new((self.texture_id, size)).sense(egui::Sense::click_and_drag()),
-        );
+        let response =
+            ui.add(egui::Image::new((self.texture_id, size)).sense(egui::Sense::click_and_drag()));
         if let Some(mode) = drag_mode(&response, ui.input(|input| input.modifiers.shift)) {
             let delta = ui.input(|input| input.pointer.delta());
             match mode {

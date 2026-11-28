@@ -921,8 +921,7 @@ impl Architect {
         };
         let a = to_screen(a);
         let b = to_screen(b);
-        (a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite())
-            .then_some([a, b])
+        (a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite()).then_some([a, b])
     }
 
     /// Project transformed object bounds for viewport selection. Marquee and
@@ -942,12 +941,7 @@ impl Architect {
             .and_then(|key| self.preview_bounds.get(&key).copied())
             .unwrap_or_else(|| Self::fallback_selection_bounds(asset));
         let center = Vec3::from_array(position);
-        let rotation = glam::Quat::from_euler(
-            glam::EulerRot::XYZ,
-            euler[0],
-            euler[1],
-            euler[2],
-        );
+        let rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, euler[0], euler[1], euler[2]);
         let scale = scale.max(0.01) * Vec3::from_array(scale_axes);
         let min = Vec3::from_array(min);
         let max = Vec3::from_array(max);
@@ -1038,9 +1032,8 @@ impl Architect {
             let ab_d = orientation(a, b, d);
             let cd_a = orientation(c, d, a);
             let cd_b = orientation(c, d, b);
-            let opposite = |left: f32, right: f32| {
-                (left > 0.0 && right < 0.0) || (left < 0.0 && right > 0.0)
-            };
+            let opposite =
+                |left: f32, right: f32| (left > 0.0 && right < 0.0) || (left < 0.0 && right > 0.0);
             if opposite(ab_c, ab_d) && opposite(cd_a, cd_b) {
                 return true;
             }
@@ -4289,8 +4282,7 @@ impl Architect {
                     }
                 }
             }
-            let source_gizmo_position =
-                axis_pick.and_then(|_| self.selected_scene_transform);
+            let source_gizmo_position = axis_pick.and_then(|_| self.selected_scene_transform);
             // Source-scene instances are immutable. The first transform-handle
             // drag promotes the selection into a project-owned copy.
             if axis_pick.is_some()
@@ -4589,8 +4581,9 @@ impl Architect {
                         self.selected_placements.insert(index);
                     }
                 }
-                for (index, (asset, position)) in
-                    Self::source_scene_items(scene, ornaments).into_iter().enumerate()
+                for (index, (asset, position)) in Self::source_scene_items(scene, ornaments)
+                    .into_iter()
+                    .enumerate()
                 {
                     if self
                         .projected_bounds_rect(
@@ -4645,8 +4638,9 @@ impl Architect {
                             self.selected_placements.insert(index);
                         }
                     }
-                    for (index, (asset, position)) in
-                        Self::source_scene_items(scene, ornaments).into_iter().enumerate()
+                    for (index, (asset, position)) in Self::source_scene_items(scene, ornaments)
+                        .into_iter()
+                        .enumerate()
                     {
                         if self
                             .projected_bounds_rect(
@@ -5122,7 +5116,12 @@ impl Architect {
             .selected_placement
             .filter(|index| !self.selected_placements.contains(index))
         {
-            if let Some(object) = self.project.objects.get(index).filter(|object| object.visible) {
+            if let Some(object) = self
+                .project
+                .objects
+                .get(index)
+                .filter(|object| object.visible)
+            {
                 outline_items.push((
                     object.asset.clone(),
                     object.position,
@@ -5200,10 +5199,8 @@ impl Architect {
                             screen,
                             view_projection,
                         ) {
-                            outline_painter.line_segment(
-                                edge,
-                                egui::Stroke::new(1.8, egui::Color32::WHITE),
-                            );
+                            outline_painter
+                                .line_segment(edge, egui::Stroke::new(1.8, egui::Color32::WHITE));
                         }
                     }
                 }
@@ -5352,11 +5349,7 @@ mod tests {
 
     #[test]
     fn source_multiselect_keeps_active_gizmo_target_synchronized() {
-        let mut editor = Architect::new(
-            PathBuf::from("/client/element"),
-            None,
-            "a01".into(),
-        );
+        let mut editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
         editor.multi_selection.extend([2, 4]);
         editor
             .multi_scene_items
@@ -5387,10 +5380,7 @@ mod tests {
 
     #[test]
     fn selected_bounds_clip_edges_instead_of_dropping_them_at_depth_planes() {
-        let viewport = egui::Rect::from_min_size(
-            egui::pos2(10.0, 20.0),
-            egui::vec2(200.0, 100.0),
-        );
+        let viewport = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 100.0));
         let edge = Architect::project_clipped_edge(
             Vec3::new(-0.5, 0.0, -1.0),
             Vec3::new(0.5, 0.0, 2.0),
@@ -5406,10 +5396,7 @@ mod tests {
 
     #[test]
     fn selected_bounds_skip_edges_entirely_outside_depth_range() {
-        let viewport = egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(100.0, 100.0),
-        );
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
         assert!(Architect::project_clipped_edge(
             Vec3::new(-0.5, 0.0, -3.0),
             Vec3::new(0.5, 0.0, -1.0),
@@ -5427,10 +5414,7 @@ mod tests {
             egui::pos2(10.0, 10.0),
             egui::pos2(0.0, 10.0),
         ];
-        let bounds_inside = egui::Rect::from_min_size(
-            egui::pos2(3.0, 3.0),
-            egui::vec2(2.0, 2.0),
-        );
+        let bounds_inside = egui::Rect::from_min_size(egui::pos2(3.0, 3.0), egui::vec2(2.0, 2.0));
         assert!(Architect::lasso_intersects_rect(&polygon, bounds_inside));
     }
 
@@ -5442,10 +5426,7 @@ mod tests {
             egui::pos2(10.0, 10.0),
             egui::pos2(0.0, 10.0),
         ];
-        let crossing = egui::Rect::from_min_size(
-            egui::pos2(9.0, 4.0),
-            egui::vec2(4.0, 2.0),
-        );
+        let crossing = egui::Rect::from_min_size(egui::pos2(9.0, 4.0), egui::vec2(4.0, 2.0));
         assert!(Architect::lasso_intersects_rect(&polygon, crossing));
     }
 
@@ -5457,10 +5438,7 @@ mod tests {
             egui::pos2(10.0, 10.0),
             egui::pos2(0.0, 10.0),
         ];
-        let outside = egui::Rect::from_min_size(
-            egui::pos2(20.0, 4.0),
-            egui::vec2(2.0, 2.0),
-        );
+        let outside = egui::Rect::from_min_size(egui::pos2(20.0, 4.0), egui::vec2(2.0, 2.0));
         assert!(!Architect::lasso_intersects_rect(&polygon, outside));
     }
 
