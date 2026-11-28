@@ -99,6 +99,8 @@ pub(crate) const NGX_VERSION_API: i32 = 0x0000_0015;
 pub(crate) const NGX_FEATURE_SUPER_SAMPLING: i32 = 1;
 /// `NVSDK_NGX_Feature_FrameGeneration`.
 pub(crate) const NGX_FEATURE_FRAME_GENERATION: i32 = 11;
+/// `NVSDK_NGX_Feature_RayReconstruction`.
+pub(crate) const NGX_FEATURE_RAY_RECONSTRUCTION: i32 = 13;
 
 /// `NVSDK_NGX_ENGINE_TYPE_CUSTOM`.
 const NGX_ENGINE_TYPE_CUSTOM: i32 = 0;

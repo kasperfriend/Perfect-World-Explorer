@@ -43,6 +43,10 @@ pub struct Params {
     pub face_skin: [f32; 4],
     /// `x`: LOD bias for the object atlas (see `crate::render_scale::mip_bias`).
     pub lod: [f32; 4],
+    /// World-space eye position used by the water absorption ray.
+    pub eye_position: [f32; 4],
+    /// Water plane Y, absorption density, enabled for clipped refraction, reserved.
+    pub water_fog: [f32; 4],
 }
 pub struct Mesh {
     vertex: wgpu::Buffer,
@@ -313,7 +317,7 @@ struct Params {
  matrix:mat4x4<f32>,ambient:vec4<f32>,diffuse:vec4<f32>,point_ambient:vec4<f32>,point_diffuse:vec4<f32>,
  direction:vec4<f32>,point_position:vec4<f32>,attenuation:vec4<f32>,eye_direction:vec4<f32>,specular:vec4<f32>,lighting:vec4<f32>,
  fog_color:vec4<f32>,fog_range:vec4<f32>,clip_plane:vec4<f32>,raster:vec4<f32>,alpha:vec4<f32>,
- face_color:vec4<f32>,face_skin:vec4<f32>,lod:vec4<f32>
+ face_color:vec4<f32>,face_skin:vec4<f32>,lod:vec4<f32>,eye_position:vec4<f32>,water_fog:vec4<f32>
 };
 @group(0) @binding(0) var<uniform> p:Params;
 @group(0) @binding(1) var image:texture_2d<f32>;
@@ -400,6 +404,10 @@ struct Output {@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,@
   let span=p.fog_range.y-p.fog_range.x;
   if abs(span)<0.001 {fog=select(1.,0.,depth>=p.fog_range.y);}
   else {fog=clamp((p.fog_range.y-depth)/span,0.,1.);}
+ }
+ // Clipped refraction combines plane-relative table fog with water absorption.
+ if p.water_fog.z>0.5 {
+  fog*=model_water_transmittance(v.world,p.eye_position.xyz,p.water_fog.x,p.water_fog.y);
  }
  return vec4<f32>(mix(p.fog_color.rgb,encoded,fog),alpha);
 }

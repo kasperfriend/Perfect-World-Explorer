@@ -110,9 +110,14 @@ fn target_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
+        // `COPY_DST` is what lets Raywatcher replace this target's contents with
+        // its filtered ray image after the raster pass: the upscaler reads this
+        // texture, so the ray image must land in it rather than in a second
+        // target the upscaler would not know about.
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_SRC,
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: if format.is_srgb() { &alternate } else { &[] },
     })
 }

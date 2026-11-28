@@ -67,6 +67,15 @@ pub(crate) struct Uniform {
 /// exactly once; reflection, refraction, minimap and full-map views reuse this
 /// snapshot instead of advancing time or consuming a second publication.
 #[derive(Clone, Copy)]
+struct CachedEffectLight {
+    pos: glam::Vec3,
+    colour: glam::Vec3,
+    radius: f32,
+    intensity: f32,
+    miss_frames: u32,
+}
+
+#[derive(Clone, Copy)]
 struct FrameSnapshot {
     elapsed: f32,
     elapsed64: f64,
@@ -95,6 +104,10 @@ struct FrameSnapshot {
     celestial: [f32; 3],
     time_advances: u32,
     light_publications: u32,
+    /// Raywatcher's raster overrides for this frame. Carried on the snapshot
+    /// rather than read from the renderer so the uniform builder stays a pure
+    /// function of its inputs and the tests can build one without a device.
+    overrides: crate::modules::raywatcher::frame::RasterOverrides,
 }
 impl Default for FrameSnapshot {
     fn default() -> Self {
@@ -126,6 +139,7 @@ impl Default for FrameSnapshot {
             celestial: [0.; 3],
             time_advances: 0,
             light_publications: 0,
+            overrides: crate::modules::raywatcher::frame::RasterOverrides::NONE,
         }
     }
 }
@@ -139,6 +153,32 @@ impl FrameSnapshot {
         fog_color: [f32; 4],
         lod: [f32; 4],
     ) -> Uniform {
+        // Raywatcher's overrides are applied here, at the single place every
+        // view's uniform is built, because that is the only point that covers the
+        // main view, the water's mirrored view and the above-water pass at once.
+        //
+        // The mesh shader computes `light.x + light.y * max(dot(n, sun.xyz), 0)`
+        // and multiplies the result by `light.zww`. Zeroing `x` and `y` is
+        // therefore exactly "the raster sun and sky terms are off": what is left
+        // is the texture, lit only by the ray image's own contribution, which
+        // the Raywatcher compose pass wrote into the same target.
+        let light = if self.overrides.ambient && self.overrides.directional_light {
+            // In opt-in `replace_raster` mode, output unlit 1:1 textured albedo
+            // (`light = 1.0`) so Raywatcher's RT trace relights terrain and
+            // meshes cleanly instead of multiplying against black (0.0).
+            [1., 0., 1., 1.]
+        } else if self.overrides.ambient || self.overrides.directional_light {
+            let mut light = self.light;
+            if self.overrides.ambient {
+                light[0] = 0.;
+            }
+            if self.overrides.directional_light {
+                light[1] = 0.;
+            }
+            light
+        } else {
+            self.light
+        };
         Uniform {
             matrix: matrix.to_cols_array_2d(),
             direction,
@@ -146,7 +186,7 @@ impl FrameSnapshot {
             bounds: self.bounds,
             tree_bounds: self.tree_bounds,
             sun: self.sun,
-            light: self.light,
+            light,
             region_ambient: self.region_ambient,
             region_diffuse: self.region_diffuse,
             region_direction: self.region_direction,
@@ -232,6 +272,90 @@ fn water_view_scissor(
         return None;
     }
     Some([px0 as u32, py0 as u32, rw.max(1), rh.max(1)])
+}
+
+/// A compact prediction of fragment fog factors across the resident terrain window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FogDepthProbe {
+    camera_xz_depth: f32,
+    window_center_depth: f32,
+    min_depth: f32,
+    min_at: [f32; 2],
+    min_factor: f32,
+    max_depth: f32,
+    max_at: [f32; 2],
+    max_factor: f32,
+}
+
+/// Keep the logged CPU prediction identical to the linear shader fog equation.
+fn fog_factor_at_depth(view_depth: f32, range: [f32; 4]) -> f32 {
+    if range[2] < 0.5 {
+        return 0.;
+    }
+    let span = range[1] - range[0];
+    if span.abs() < 0.001 {
+        if view_depth >= range[1] {
+            1.
+        } else {
+            0.
+        }
+    } else {
+        ((view_depth - range[0]) / span).clamp(0., 1.)
+    }
+}
+
+/// Probe the 3x3 terrain-window footprint, plus the camera's XZ location, with
+/// exactly the same clip-space W transform used by the terrain fragment shader.
+fn fog_depth_probe(
+    matrix: Mat4,
+    bounds: [f32; 4],
+    eye: [f32; 3],
+    plane_y: f32,
+    range: [f32; 4],
+) -> FogDepthProbe {
+    let [x0, x1, z0, z1] = bounds;
+    let xm = (x0 + x1) * 0.5;
+    let zm = (z0 + z1) * 0.5;
+    let points = [
+        [x0, z0],
+        [xm, z0],
+        [x1, z0],
+        [x0, zm],
+        [xm, zm],
+        [x1, zm],
+        [x0, z1],
+        [xm, z1],
+        [x1, z1],
+        [eye[0], eye[2]],
+    ];
+    let depth_at = |xz: [f32; 2]| (matrix * Vec4::new(xz[0], plane_y, xz[1], 1.)).w.max(0.);
+    let camera_xz_depth = depth_at([eye[0], eye[2]]);
+    let window_center_depth = depth_at([xm, zm]);
+    let mut min_depth = f32::INFINITY;
+    let mut max_depth = f32::NEG_INFINITY;
+    let mut min_at = [0.; 2];
+    let mut max_at = [0.; 2];
+    for point in points {
+        let depth = depth_at(point);
+        if depth < min_depth {
+            min_depth = depth;
+            min_at = point;
+        }
+        if depth > max_depth {
+            max_depth = depth;
+            max_at = point;
+        }
+    }
+    FogDepthProbe {
+        camera_xz_depth,
+        window_center_depth,
+        min_depth,
+        min_at,
+        min_factor: fog_factor_at_depth(min_depth, range),
+        max_depth,
+        max_at,
+        max_factor: fog_factor_at_depth(max_depth, range),
+    }
 }
 
 /// Everything the top-down minimap's pixels can depend on.
@@ -559,6 +683,44 @@ struct WaterBatch {
     height: f32,
     bounds: [f32; 4], // min x, max x, min z, max z
 }
+/// Keep the planes used by Raywatcher's 16-entry water classifier representative
+/// of what the camera can actually see. A large lake can contain the camera even
+/// when its rectangle centre is hundreds of units away; centre-distance sorting
+/// used to discard that plane and let its pixels fall through as ordinary GI receivers.
+fn prioritize_raywatcher_water_surfaces(
+    surfaces: &mut Vec<crate::modules::raywatcher::harvest::WaterSurface>,
+    camera_pos: Vec3,
+) {
+    const MAX_SURFACES: usize = 16;
+    if surfaces.len() <= MAX_SURFACES {
+        return;
+    }
+    let contains_camera = |surface: &crate::modules::raywatcher::harvest::WaterSurface| {
+        camera_pos.x >= surface.bounds[0]
+            && camera_pos.x <= surface.bounds[1]
+            && camera_pos.z >= surface.bounds[2]
+            && camera_pos.z <= surface.bounds[3]
+    };
+    let distance_squared = |surface: &crate::modules::raywatcher::harvest::WaterSurface| {
+        let x = camera_pos.x.clamp(surface.bounds[0], surface.bounds[1]);
+        let z = camera_pos.z.clamp(surface.bounds[2], surface.bounds[3]);
+        (camera_pos - Vec3::new(x, surface.height, z)).length_squared()
+    };
+    surfaces.select_nth_unstable_by(MAX_SURFACES, |a, b| {
+        let a_contains_camera = contains_camera(a);
+        let b_contains_camera = contains_camera(b);
+        if a_contains_camera != b_contains_camera {
+            return if a_contains_camera {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+        distance_squared(a).total_cmp(&distance_squared(b))
+    });
+    surfaces.truncate(MAX_SURFACES);
+}
+
 impl WaterBatch {
     // Conservative homogeneous clip-space rejection for the rectangular bounds.
     fn visible(&self, matrix: Mat4) -> bool {
@@ -1719,11 +1881,18 @@ fn build(
 const SHADER: &str = r#"
 struct Camera { matrix: mat4x4<f32>, direction: vec4<f32>, clip: vec4<f32>, bounds:vec4<f32>, tree_bounds:vec4<f32>, sun:vec4<f32>, light:vec4<f32>, region_ambient:vec4<f32>, region_diffuse:vec4<f32>, region_direction:vec4<f32>, grass_eye:vec4<f32>, grass_wind:vec4<f32>, grass_history:array<vec4<f32>,80>, fog_range:vec4<f32>, fog_color:vec4<f32>, lod:vec4<f32> }; @group(0) @binding(0) var<uniform> camera:Camera;
 @group(0) @binding(1) var atlas:texture_2d<f32>; @group(0) @binding(2) var atlas_sampler:sampler;
-fn fogged(linear:vec3<f32>, reciprocal_w:f32)->vec3<f32> {
- if camera.fog_range.z<0.5 {return linear;}
- let view_z=1./max(reciprocal_w,0.0000001);
+fn fog_view_depth(world:vec3<f32>)->f32 {
+ // Re-evaluate clip-space W from the perspective-correct world position.
+ // This is the camera-space forward depth, independent of fragment builtin W.
+ return max((camera.matrix*vec4<f32>(world,1.)).w,0.);
+}
+fn fog_factor(view_z:f32)->f32 {
+ if camera.fog_range.z<0.5 {return 0.;}
  let span=camera.fog_range.y-camera.fog_range.x;
- let f=select(clamp((view_z-camera.fog_range.x)/select(span,0.001,abs(span)<0.001),0.,1.),select(0.,1.,view_z>=camera.fog_range.y),abs(span)<0.001);
+ return select(clamp((view_z-camera.fog_range.x)/select(span,0.001,abs(span)<0.001),0.,1.),select(0.,1.,view_z>=camera.fog_range.y),abs(span)<0.001);
+}
+fn fogged(linear:vec3<f32>,world:vec3<f32>)->vec3<f32> {
+ let f=fog_factor(fog_view_depth(world));
  let c=max(linear,vec3<f32>(0.));let encoded=select(c*12.92,1.055*pow(c,vec3<f32>(1./2.4))-0.055,c>vec3<f32>(0.0031308));
  let v=mix(encoded,camera.fog_color.rgb,f);
  return select(v/12.92,pow((max(v,vec3<f32>(0.))+0.055)/1.055,vec3<f32>(2.4)),v>vec3<f32>(0.04045));
@@ -1735,8 +1904,8 @@ fn bmd_refraction_transmittance(world:vec3<f32>)->f32 {
  if abs(delta.y)<=0.000001 {return select(1.,0.,depth>0.);}
  return exp2(-0.075*depth*length(delta)/delta.y);
 }
-fn bmd_pass_fog(linear:vec3<f32>,reciprocal_w:f32,transmittance:f32)->vec3<f32> {
- if camera.clip.y>=0. || camera.fog_range.z<0.5 {return fogged(linear,reciprocal_w);}
+fn bmd_pass_fog(linear:vec3<f32>,world:vec3<f32>,transmittance:f32)->vec3<f32> {
+ if camera.clip.y>=0. || camera.fog_range.z<0.5 {return fogged(linear,world);}
  let c=max(linear,vec3<f32>(0.));let encoded=select(c*12.92,1.055*pow(c,vec3<f32>(1./2.4))-0.055,c>vec3<f32>(0.0031308));
  let v=mix(camera.fog_color.rgb,encoded,clamp(transmittance,0.,1.));
  return select(v/12.92,pow((max(v,vec3<f32>(0.))+0.055)/1.055,vec3<f32>(2.4)),v>vec3<f32>(0.04045));
@@ -1756,20 +1925,57 @@ fn bmd_baked_rgb(day:u32, night:u32, night_factor:f32)->vec3<u32> {
 }
 @vertex fn vs(i:VIn)->VOut { var o:VOut; var pos=i.pos; var norm=i.normal;
  if i.kind>4.5 { let d=normalize(camera.direction.xyz); let az=atan2(d.z,d.x); let el=asin(clamp(d.y,-1.,1.)); let rho=i.color.w; let q=vec3<f32>(cos(el)*i.normal.x-sin(el)*i.normal.z,i.normal.y,sin(el)*i.normal.x+cos(el)*i.normal.z); let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. { v=i.normal; }pos+=vec3<f32>(v.x,v.z,v.y);norm=vec3<f32>(0.,1.,0.); }
- o.pos=camera.matrix*vec4<f32>(pos,1.);o.bmd_refraction=1.;if camera.clip.y<0. && i.kind>1.5 && i.kind<2.5 {o.bmd_refraction=bmd_refraction_transmittance(pos);}o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.diffuse=vec3<f32>(bmd_baked_rgb(i.diffuse,i.night_diffuse,1.-camera.direction.w))/255.;o.opacity=f32((i.diffuse>>24u)&255u)/255.;return o; }
+ o.pos=camera.matrix*vec4<f32>(pos,1.);o.bmd_refraction=1.;if camera.clip.y<0. && i.kind>1.5 && i.kind<2.5 {o.bmd_refraction=bmd_refraction_transmittance(pos);}o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;let baked_rgb=vec3<f32>(bmd_baked_rgb(i.diffuse,i.night_diffuse,1.-camera.direction.w))/255.;let bmd_ndl=max(dot(normalize(norm),normalize(camera.sun.xyz)),0.);let bmd_rt=vec3<f32>((camera.light.x+camera.light.y*bmd_ndl)*0.5)*camera.light.zww;o.diffuse=select(baked_rgb,bmd_rt,camera.sun.w<0.);o.opacity=f32((i.diffuse>>24u)&255u)/255.;return o; }
 fn sdr_blend_band(kind:f32)->bool { return (kind>2.01 && kind<2.03)||(kind>2.11 && kind<2.13); }
-fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || (i.kind>1.5 && i.kind<2.05)) && camera.clip.w == 0. && (front == (camera.clip.z != 0.)) {discard;} if camera.clip.y != 0.0 && (i.world.y-camera.clip.x)*camera.clip.y < 0.0 {discard;} if i.kind>0.5 && i.kind<1.05 {return vec4<f32>(fogged(i.color.rgb,i.pos.w),1.);} if i.kind>1.05 && i.kind<1.25 {return vec4<f32>(bmd_pass_fog(clamp(i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.)),i.pos.w,i.bmd_refraction),1.);} let uv_dx=dpdx(i.uv);let uv_dy=dpdy(i.uv);var uv=i.uv; if i.kind>1.5 {let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(uv_dx*dims),length(uv_dy*dims)),1.)),0.,7.);let border=0.5*exp2(mip);let half_pixel=min(vec2<f32>(border)/dims,scale*0.499);let sdr_v=select(0.,-0.5*camera.grass_wind.x,sdr_blend_band(i.kind));let local=fract((i.uv-i.color.xy)/scale+vec2<f32>(0.,sdr_v))*scale;uv=i.color.xy+clamp(local,half_pixel,scale-half_pixel);} let raw_tex=textureSampleGrad(atlas,atlas_sampler,uv,uv_dx*camera.lod.y,uv_dy*camera.lod.y);let encoded=raw_tex.rgb;let linear=select(encoded/12.92,pow((encoded+0.055)/1.055,vec3<f32>(2.4)),encoded>vec3<f32>(0.04045));let tex=vec4<f32>(linear,raw_tex.a);if !sdr_blend_band(i.kind) && ((i.kind>1.5 && i.kind<2.5) || i.kind>3.5) && tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9) {discard;} if i.kind>1.5 && i.kind<2.5 {let c=clamp(raw_tex.rgb*i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.));let rgb=select(c/12.92,pow((c+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));return vec4<f32>(bmd_pass_fog(rgb,i.pos.w,i.bmd_refraction),select(1.,raw_tex.a*i.opacity,sdr_blend_band(i.kind)));} let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.pos.w),1.); }
+fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || (i.kind>1.5 && i.kind<2.05)) && camera.clip.w == 0. && (front == (camera.clip.z != 0.)) {discard;} if camera.clip.y != 0.0 && (i.world.y-camera.clip.x)*camera.clip.y < 0.0 {discard;} if i.kind>0.5 && i.kind<1.05 {return vec4<f32>(fogged(i.color.rgb,i.world),1.);} if i.kind>1.05 && i.kind<1.25 {return vec4<f32>(bmd_pass_fog(clamp(i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.)),i.world,i.bmd_refraction),1.);} let uv_dx=dpdx(i.uv);let uv_dy=dpdy(i.uv);var uv=i.uv; if i.kind>1.5 {let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(uv_dx*dims),length(uv_dy*dims)),1.)),0.,7.);let border=0.5*exp2(mip);let half_pixel=min(vec2<f32>(border)/dims,scale*0.499);let sdr_v=select(0.,-0.5*camera.grass_wind.x,sdr_blend_band(i.kind));let local=fract((i.uv-i.color.xy)/scale+vec2<f32>(0.,sdr_v))*scale;uv=i.color.xy+clamp(local,half_pixel,scale-half_pixel);} let raw_tex=textureSampleGrad(atlas,atlas_sampler,uv,uv_dx*camera.lod.y,uv_dy*camera.lod.y);let encoded=raw_tex.rgb;let linear=select(encoded/12.92,pow((encoded+0.055)/1.055,vec3<f32>(2.4)),encoded>vec3<f32>(0.04045));let tex=vec4<f32>(linear,raw_tex.a);if !sdr_blend_band(i.kind) && ((i.kind>1.5 && i.kind<2.5) || i.kind>3.5) && tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9) {discard;} if i.kind>1.5 && i.kind<2.5 {let c=clamp(raw_tex.rgb*i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.));let rgb=select(c/12.92,pow((c+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));return vec4<f32>(bmd_pass_fog(rgb,i.world,i.bmd_refraction),select(1.,raw_tex.a*i.opacity,sdr_blend_band(i.kind)));} let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.world),1.); }
 @fragment fn fs(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
 @fragment fn fs_sdr(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if !sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
 "#;
 struct Renderer {
     /// Optional add-ons; default-disabled and absent from headless previews.
     modules: crate::modules::Modules,
+    /// Raywatcher's GPU state, created lazily the first time the module asks
+    /// for a traced frame and dropped when it stops asking. `None` on any frame
+    /// the module is off, so a disabled module owns no GPU memory at all.
+    raywatcher_gpu: Option<crate::modules::raywatcher::gpu::RaywatcherGpu>,
+    /// First-use GPU state is created on a worker; raster remains visible until ready.
+    raywatcher_gpu_init: Option<
+        std::sync::mpsc::Receiver<Result<crate::modules::raywatcher::gpu::RaywatcherGpu, String>>,
+    >,
+    /// Scene snapshot used by the single first-use GPU/DXR initialization worker.
+    /// Newer harvested scenes are applied to its result instead of abandoning it.
+    raywatcher_gpu_init_scene:
+        Option<std::sync::Arc<crate::modules::raywatcher::bvh::SceneGeometry>>,
+    /// The geometry the current `raywatcher_gpu` was built from, so a world
+    /// change can drop the tree instead of tracing stale geometry.
+    raywatcher_scene: Option<std::sync::Arc<crate::modules::raywatcher::bvh::SceneGeometry>>,
+    /// Builds and caches the ray scene from the resident world.
+    raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester,
+    /// Worst Raywatcher CPU frame time observed (ms), logged under `PWE_RT_DEBUG=1`.
+    raywatcher_worst_frame_ms: f64,
+    /// Last timestamp `raywatcher-diag.log` was written (reset when checkbox is turned off).
+    raywatcher_diag_last_write: Option<std::time::Instant>,
+    /// Temporally smoothed world-effect point lights keyed by 8u world cells to stop particle flicker.
+    raywatcher_eff_light_cache: std::collections::HashMap<(i32, i32, i32), CachedEffectLight>,
+    /// Reusable dynamic RT vertex buffer (Walker + Populator) avoiding per-frame ~737 KB allocations.
+    raywatcher_dyn_rt_verts: Vec<[f32; 3]>,
+    /// Last frame's sky parameters and blend sets, reused by Raywatcher to
+    /// render the real `SkyGpu` + `CloudGpu` reflection environment atlas.
+    last_sky_frame: Option<(crate::sky_gpu::SkyFrame, (i32, i32, f32))>,
+    /// This frame's ray plan, decided before the world pass and consumed after
+    /// it. `Plan::OFF` on a frame the module is not tracing.
+    raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan,
+    raywatcher_hw_probe: Option<(bool, Option<String>)>,
+    /// The one-time DXR capability check runs off the renderer thread.
+    raywatcher_hw_probe_init: Option<std::sync::mpsc::Receiver<(bool, Option<String>)>>,
+    /// The raster effects this frame's ray pass replaces. Read by `render` so a
+    /// replaced effect is not drawn, and by the tab so it can say which.
+    raywatcher_overrides: crate::modules::raywatcher::frame::RasterOverrides,
     module_format: wgpu::TextureFormat,
     models: Option<crate::world_models_gpu::World>,
     model_lights: std::sync::Arc<crate::scene_lights::SceneLights>,
     model_scene: std::sync::Arc<crate::scene::Scene>,
-    device: wgpu::Device,
+    device: std::sync::Arc<wgpu::Device>,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     scenery_pipeline: wgpu::RenderPipeline,
@@ -1905,7 +2111,9 @@ fn object_mv_target(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wg
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());
@@ -2545,6 +2753,20 @@ impl Renderer {
         );
         Ok(Self {
             modules: crate::modules::Modules::default(),
+            raywatcher_gpu: None,
+            raywatcher_gpu_init: None,
+            raywatcher_gpu_init_scene: None,
+            raywatcher_scene: None,
+            raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester::new(),
+            raywatcher_worst_frame_ms: 0.0,
+            raywatcher_diag_last_write: None,
+            raywatcher_eff_light_cache: std::collections::HashMap::new(),
+            raywatcher_dyn_rt_verts: Vec::new(),
+            last_sky_frame: None,
+            raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan::OFF,
+            raywatcher_hw_probe: None,
+            raywatcher_hw_probe_init: None,
+            raywatcher_overrides: crate::modules::raywatcher::frame::RasterOverrides::NONE,
             module_format: format.remove_srgb_suffix(),
             models,
             model_lights: t.scene_lights.clone(),
@@ -2561,7 +2783,7 @@ impl Renderer {
             world_width: t.width,
             world_height: t.height,
             world_spacing: t.grid_spacing,
-            device,
+            device: std::sync::Arc::new(device),
             queue,
             pipeline,
             scenery_pipeline,
@@ -2766,22 +2988,53 @@ impl Renderer {
         let daylight = crate::environment::daylight(camera.time_of_day);
         let angle = (camera.time_of_day - 6.0) * std::f32::consts::PI / 12.0;
         let twilight = (1. - ((angle.sin().abs()) / 0.35).clamp(0., 1.)) * daylight;
-        let sun = [
-            angle.cos() * 0.8,
-            angle.sin().max(0.05),
-            0.46,
-            if camera.terrain_lightmaps {
-                daylight
+        let region_light_pre = camera.regional_light.or(self.retained_regional_light);
+        let authored_pre = region_light_pre
+            .map(|l| l.material_direction().toward_sun())
+            .unwrap_or([0.6, -0.4, 0.8]);
+        let (tracked_dir, _, tracked_int, tracked_is_moon) =
+            crate::modules::raywatcher::frame::tracked_celestial_light(
+                camera.time_of_day,
+                authored_pre,
+                region_light_pre.as_ref(),
+            );
+        let sun = if self.raywatcher_overrides.suppress_baked_shadows {
+            [tracked_dir.x, tracked_dir.y, tracked_dir.z, -1.]
+        } else {
+            [
+                angle.cos() * 0.8,
+                angle.sin().max(0.05),
+                0.46,
+                if camera.terrain_lightmaps {
+                    daylight
+                } else {
+                    -1.
+                },
+            ]
+        };
+        let light = if self.raywatcher_overrides.suppress_baked_shadows {
+            if tracked_is_moon {
+                // Keep a quantization-safe 0.095 ambient carrier in the 8-bit raster target
+                // so night building textures are never crushed to 0/255 under point lights;
+                // Raywatcher's `night_dark_scale` darkens unlit areas back to pitch black.
+                [0.095, 0.03 + 0.18 * tracked_int, 1., 1.]
             } else {
-                -1.
-            },
-        ];
-        let light = [
-            0.17 + 0.38 * daylight,
-            0.07 + 0.38 * daylight,
-            1.,
-            1. - 0.18 * twilight,
-        ];
+                // Strong solar elevation curve across the day: low dim golden
+                // dawn/sunset -> crisp bright high noon.
+                let sun_elev = tracked_dir.y.clamp(0.0, 1.0);
+                let amb = 0.025 + 0.24 * sun_elev.powf(0.75);
+                let dir_l = 0.12 + 0.72 * sun_elev.powf(0.65);
+                let warm = 1. - 0.28 * (1. - sun_elev).powf(2.0);
+                [amb, dir_l, 1., warm]
+            }
+        } else {
+            [
+                0.17 + 0.38 * daylight,
+                0.07 + 0.38 * daylight,
+                1.,
+                1. - 0.18 * twilight,
+            ]
+        };
         // The region's authored light, resolved once for every consumer below.
         let region_light = camera.regional_light.or(self.retained_regional_light);
         let authored = region_light
@@ -2805,7 +3058,7 @@ impl Renderer {
         // Disc placement follows the render path 0x4b3e00: each object uses its
         // own recovered elevation curve and the shared regional azimuth.
         // `sun_dir` is a light direction, which 0x4b60b0 stores negated.
-        let (sun, moon) = match crate::sky_time::evaluate(camera.time_of_day, authored) {
+        let (sky_sun, sky_moon) = match crate::sky_time::evaluate(camera.time_of_day, authored) {
             Some(state) => {
                 let fade = |sun: bool| {
                     if camera.celestial_discs {
@@ -2923,8 +3176,8 @@ impl Renderer {
         let frame = crate::sky_gpu::SkyFrame {
             hour: camera.time_of_day,
             night_weight,
-            sun,
-            moon,
+            sun: sky_sun,
+            moon: sky_moon,
             // The 38.16-72.5 degree band has no native mesh; the client covers it
             // with something drawn at 0x799f88 that this build does not, so the
             // viewer blends the frame's atmospheric fog into the cap's own rim
@@ -2939,20 +3192,13 @@ impl Renderer {
             },
             drift: self.sky_drift,
         };
+        self.last_sky_frame = Some((frame, main_sets));
         self.sky
             .update(&self.queue, direction, w, h, frame, main_sets, false);
         if camera.water_reflections {
             self.sky
                 .update(&self.queue, direction, w, h, frame, reflected_sets, true);
         }
-        let resident_bounds = self.resident_bounds();
-        self.far_trees.update_resident_lods(
-            &self.device,
-            &self.queue,
-            camera.pos.to_array(),
-            self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
-            resident_bounds,
-        );
         // Use the actual uploaded window. The native window shifts at map
         // edges; recomputing a clamped camera square discarded the wrong area.
         let win = self.lod.window;
@@ -2977,7 +3223,15 @@ impl Renderer {
             camera.client_tree_wind_preview,
         );
         let tree_bounds = [camera.pos.x, camera.pos.z, tree_blend, elapsed];
-        let (region_ambient, region_diffuse, region_direction) = camera.region_uniform();
+        let (region_ambient, region_diffuse, mut region_direction) = camera.region_uniform();
+        if self.raywatcher_overrides.suppress_baked_shadows {
+            region_direction = [
+                tracked_dir.x,
+                tracked_dir.y,
+                tracked_dir.z,
+                region_direction[3],
+            ];
+        }
         let grass_eye = [
             camera.pos.x,
             camera.pos.y,
@@ -2992,7 +3246,11 @@ impl Renderer {
         let grass_wind = [
             self.grass_wind_state.time(),
             if camera.grass_wind_enabled { 1. } else { 0. },
-            if camera.area_grass_lightmaps { 1. } else { 0. },
+            if camera.area_grass_lightmaps && !self.raywatcher_overrides.suppress_baked_shadows {
+                1.
+            } else {
+                0.
+            },
             0.,
         ];
         let grass_history = self
@@ -3002,14 +3260,26 @@ impl Renderer {
             } else {
                 1.
             });
+        // Fit authored outdoor fog to the terrain window used by this frame.
+        // The bounds value is always the uploaded LOD window, independent of
+        // the optional memory-saving terrain-cutoff setting. Tying fog fitting
+        // to that setting made edge-only fog return when cutoff was disabled.
         let mut active_fog = camera.active_fog();
-        if active_fog.enabled && camera.underwater_depth <= 0. {
-            if let Some(cap) = self.resident_bounds().and_then(|b| {
-                crate::terrain_cutoff::fog_cap(b, camera.pos.to_array(), w as f32 / h.max(1) as f32)
-            }) {
-                let range = crate::terrain_cutoff::fit_fog(active_fog.start, active_fog.end, cap);
-                active_fog.start = range[0];
-                active_fog.end = range[1];
+        let fog_window_cap = if camera.underwater_depth <= 0. {
+            crate::terrain_cutoff::fog_cap(
+                bounds,
+                camera.pos.to_array(),
+                w as f32 / h.max(1) as f32,
+            )
+        } else {
+            None
+        };
+        if active_fog.enabled {
+            if let Some(cap) = fog_window_cap {
+                let [start, end] =
+                    crate::terrain_cutoff::fit_fog(active_fog.start, active_fog.end, cap);
+                active_fog.start = start;
+                active_fog.end = end;
             }
         }
         let (mut fog_range, fog_color) = (active_fog.range(), active_fog.color4());
@@ -3056,6 +3326,7 @@ impl Renderer {
             celestial,
             time_advances: 1,
             light_publications: 1,
+            overrides: self.raywatcher_overrides,
         };
         self.frame = snapshot;
         snapshot
@@ -3401,6 +3672,10 @@ impl Renderer {
             let delta = if advance { camera.logic_delta_ms } else { 0 };
             let frame = receiving_model_frame(uniform, camera, light);
             models.set_frustum(Some(*frustum));
+            // Only the main view consumes model geometry in this configuration.
+            // Water mirrors/refraction can see off-main-frustum objects, so keep
+            // full pose evaluation whenever either secondary view is active.
+            models.set_pose_culling(!camera.water_reflections && camera.underwater_depth <= 0.);
             models.set_keep_unbounded(crate::objects::unbounded_textures());
             models.update_pass(
                 &self.device,
@@ -3690,6 +3965,1287 @@ impl Renderer {
             Some(&self.reflected_far_runs),
         );
     }
+    /// Decide this frame's ray traces and tell the raster pass which original
+    /// effects to leave off.
+    ///
+    /// Called *before* the world pass: an effect the module replaces must not
+    /// draw at all, and the decision has to exist by then. The trace itself runs
+    /// afterwards (see [`Self::raywatcher_record`]) because it consumes the
+    /// motion vectors and depth the world pass writes.
+    fn raywatcher_plan(
+        &mut self,
+        render_extent: (u32, u32),
+        reset_history: bool,
+    ) -> crate::modules::raywatcher::frame::RasterOverrides {
+        use crate::modules::raywatcher::frame::RasterOverrides;
+        let (availability, sdk_probe_pending) = {
+            // The providers are probed from the DLLs that are present, not by
+            // creating a context: a context is created on the first traced
+            // frame, and the tab has to be right before then.
+            let (dlss, fsr) = crate::modules::raywatcher::reconstruct::probe_offline(
+                self.modules.raywatcher().sdk_dir(),
+                cfg!(windows),
+            );
+            (
+                (dlss.available, fsr.available),
+                dlss.note == "Checking SDK files in background...",
+            )
+        };
+        // Probe DXR Tier 1.1 once per session, but never call the native
+        // driver/COM capability path on the render thread. A slow driver check
+        // must not freeze the window when Raywatcher first becomes available.
+        if self.raywatcher_hw_probe.is_none() && self.raywatcher_hw_probe_init.is_none() {
+            let worker_device = std::sync::Arc::clone(&self.device);
+            let (tx, rx) = std::sync::mpsc::channel();
+            match std::thread::Builder::new()
+                .name("pwe-raywatcher-dxr-probe".to_string())
+                .spawn(move || {
+                    let result = crate::modules::raywatcher::dxr::probe_hardware_rt(&worker_device);
+                    let _ = tx.send(result);
+                }) {
+                Ok(_) => self.raywatcher_hw_probe_init = Some(rx),
+                Err(err) => {
+                    self.raywatcher_hw_probe = Some((
+                        false,
+                        Some(format!("Could not start DXR capability probe ({err})")),
+                    ));
+                }
+            }
+        }
+        if self.raywatcher_hw_probe.is_none() {
+            match self
+                .raywatcher_hw_probe_init
+                .as_ref()
+                .map(|rx| rx.try_recv())
+            {
+                Some(Ok(result)) => {
+                    self.raywatcher_hw_probe_init = None;
+                    self.raywatcher_hw_probe = Some(result);
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                    self.modules.raywatcher_mut().set_hardware_probing(true);
+                    self.raywatcher_frame_plan = crate::modules::raywatcher::plan::Plan::OFF;
+                    return RasterOverrides::NONE;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) | None => {
+                    self.raywatcher_hw_probe_init = None;
+                    self.raywatcher_hw_probe = Some((
+                        false,
+                        Some("DXR capability probe worker exited without a result".to_string()),
+                    ));
+                }
+            }
+        }
+        if sdk_probe_pending {
+            self.modules.raywatcher_mut().set_hardware_probing(true);
+            self.raywatcher_frame_plan = crate::modules::raywatcher::plan::Plan::OFF;
+            return RasterOverrides::NONE;
+        }
+        self.modules.raywatcher_mut().set_hardware_probing(false);
+        let (ray_queries, hw_note) = self
+            .raywatcher_hw_probe
+            .as_ref()
+            .expect("DXR probe result is cached before planning")
+            .clone();
+        {
+            let module = self.modules.raywatcher_mut();
+            module.configure(ray_queries, availability);
+            module.set_hardware_note(hw_note);
+            if reset_history {
+                module.reset_history();
+            }
+        }
+        let plan = self
+            .modules
+            .raywatcher()
+            .plan(render_extent, !reset_history);
+        // Update even on the disabled path: the render loop uses this exact
+        // flag to avoid creating/submitting an empty Raywatcher command encoder.
+        self.raywatcher_frame_plan = plan;
+        if !plan.trace {
+            // Holding the GPU state would keep a BVH and a dozen targets alive
+            // for a module the user turned off. The harvester also signals any
+            // detached CPU worker to cancel before dropping its receiver.
+            // A detached first-use or DXR worker cannot be stopped by
+            // dropping its receiver. Keep ownership until it completes so a
+            // quick re-enable cannot start a second hardware build in parallel.
+            if let Some(rx) = self.raywatcher_gpu_init.as_ref() {
+                match rx.try_recv() {
+                    Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.raywatcher_gpu_init = None;
+                        self.raywatcher_gpu_init_scene = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            } else {
+                self.raywatcher_gpu_init_scene = None;
+            }
+            let can_drop_gpu = self
+                .raywatcher_gpu
+                .as_mut()
+                .map_or(true, |gpu| gpu.discard_completed_background_work());
+            if can_drop_gpu {
+                self.raywatcher_gpu = None;
+            }
+            self.raywatcher_scene = None;
+            self.modules
+                .raywatcher_mut()
+                .set_hardware_initializing(false);
+            self.raywatcher_harvest.invalidate();
+            return RasterOverrides::NONE;
+        }
+        // This plan is decided before the raster pass, but its replacement
+        // pixels are produced afterwards. Keep every original raster term until
+        // a complete RT frame from the previous iteration exists. That closes
+        // the one-frame hole during first-use initialization and scene/AS swaps.
+        // Decide raster replacement from the backend that can dispatch now,
+        // not merely from a stale previous-frame-ready bit. An active DXR
+        // tracer remains usable while its replacement scene builds; first-use
+        // initialization and missing software BVHs keep the raster path on.
+        let hardware_mode = self.modules.raywatcher().effective_mode()
+            == crate::modules::raywatcher::plan::RayTracingMode::Hardware;
+        let rt_output_ready = !reset_history
+            && self.raywatcher_gpu.as_ref().is_some_and(|gpu| {
+                gpu.render_extent() == render_extent
+                    && gpu.can_replace_raster_effects()
+                    && gpu.can_trace_this_frame(hardware_mode)
+            });
+        RasterOverrides::for_plan_when_ready(&plan, rt_output_ready)
+    }
+
+    /// Trace and filter this frame's rays, then write the result into the world
+    /// target the upscaler reads.
+    ///
+    /// Runs after the world pass and before the upscaler. Raywatcher never
+    /// changes the render extent, never disables upscaling and never touches
+    /// frame generation: the filtered ray image simply *is* the image the
+    /// upscaler reconstructs.
+    #[allow(clippy::too_many_arguments)]
+    fn raywatcher_record(
+        &mut self,
+        camera: &Camera,
+        encoder: &mut wgpu::CommandEncoder,
+        render_extent: (u32, u32),
+        matrix: Mat4,
+        unjittered_vp: Mat4,
+        jitter: (f32, f32),
+        reset_history: bool,
+        map_space: Option<&crate::navigation::MapSpace>,
+        destination: &wgpu::Texture,
+    ) {
+        use crate::modules::raywatcher::frame::{FrameParams, LightingRecord, Sun};
+        let plan = self.raywatcher_frame_plan;
+        if !plan.trace {
+            return;
+        }
+        let reset_history = reset_history || self.modules.raywatcher_mut().take_history_reset();
+        let settings = self.modules.raywatcher().settings().clone();
+        let hardware_mode = self.modules.raywatcher().effective_mode()
+            == crate::modules::raywatcher::plan::RayTracingMode::Hardware;
+        // --- The scene. Frustum-wide chunked LOD terrain + real near meshes +
+        //     per-chunk building/tree proxies + reflective water planes out to
+        //     `camera.far`, rebuilt only when the camera chunk, view sector, or
+        //     loaded world pages change.
+        let config = crate::modules::raywatcher::harvest::HarvestConfig::default();
+        let view_forward = camera.direction();
+        let view_distance = if settings.ray_length > 0. {
+            settings
+                .ray_length
+                .clamp(128.0, crate::modules::raywatcher::plan::MAX_RAY_LENGTH)
+        } else {
+            crate::modules::raywatcher::plan::DEFAULT_RAY_LENGTH
+        };
+        // Once whole-world pages are loaded, ignore `local_pages.len()` so
+        // crossing a terrain block boundary does not spam BVH/BLAS rebuilds.
+        let active_pages_len = if self.world_done {
+            self.world_pages.len() as u64
+        } else {
+            self.local_pages.len() as u64
+        };
+        // DXR owns acceleration for Hardware scenes. Building a second CPU
+        // BVH for the old per-frame Software fallback duplicated an expensive
+        // scene build and competed with BLAS/TLAS preparation. Hardware frames
+        // now hold the last RT image (or raster) during rebuilds. If DXR fails,
+        // switch back to a CPU-BVH scene so Software can take over safely.
+        let hardware_failed = self
+            .raywatcher_gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.hardware_failed());
+        let skip_cpu_bvh = hardware_mode && !hardware_failed;
+        let content_hash = (active_pages_len << 16)
+            ^ (self.water_batches.len() as u64)
+            ^ (u64::from(skip_cpu_bvh) << 61)
+            ^ (u64::from(self.world_done) << 62);
+        let t_rw_frame = std::time::Instant::now();
+        // Poll any completed background BVH build without blocking the frame.
+        let _ = self.raywatcher_harvest.poll_background_build();
+        if !settings.diagnostics_log {
+            self.raywatcher_diag_last_write = None;
+        } else if self
+            .raywatcher_diag_last_write
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(4))
+        {
+            self.raywatcher_diag_last_write = Some(std::time::Instant::now());
+            use std::fmt::Write as _;
+            let detail_radius = view_distance.clamp(512.0, 1024.0);
+            let pages_slice = if self.world_done {
+                &self.world_pages[..]
+            } else {
+                &self.local_pages[..]
+            };
+            let mut report = String::with_capacity(4096);
+            let _ = writeln!(
+                report,
+                "=== Raywatcher RT Diagnostics ===\ncamera=({:.1}, {:.1}, {:.1}) detail_radius={:.0} world_done={} static_model_lights={} cached_effect_lights={}",
+                camera.pos.x,
+                camera.pos.y,
+                camera.pos.z,
+                detail_radius,
+                self.world_done,
+                self.model_lights.lights.len(),
+                self.raywatcher_eff_light_cache.len(),
+            );
+            let mut sum_pages = 0usize;
+            let mut thumb_pages = 0usize;
+            let mut sum_tris = 0usize;
+            let mut sum_opaque = 0usize;
+            let mut sum_masked = 0usize;
+            let mut sum_semi = 0usize;
+            let mut sum_drop = 0usize;
+            let mut sum_degen = 0usize;
+            let mut sum_untex = 0usize;
+            let mut suspect_pages: Vec<(f32, String)> = Vec::new();
+            for (pi, page) in pages_slice.iter().enumerate() {
+                let d = page.rt_diag();
+                sum_pages += 1;
+                if d.used_thumb_atlas {
+                    thumb_pages += 1;
+                }
+                sum_tris += d.total_tris;
+                sum_opaque += d.opaque_tris;
+                sum_masked += d.masked_tris;
+                sum_semi += d.semi_unmasked_tris;
+                sum_drop += d.dropped_transparent_tris;
+                sum_degen += d.degenerate_tris;
+                sum_untex += d.untextured_tris;
+                if d.semi_unmasked_tris > 0
+                    || d.untextured_tris > 0
+                    || d.degenerate_tris > 16
+                    || d.masked_tris > 0
+                {
+                    let (bmin, bmax) = page.page_bounds();
+                    let pmin = glam::Vec3::from_array(bmin);
+                    let pmax = glam::Vec3::from_array(bmax);
+                    let clamped = camera.pos.clamp(pmin, pmax);
+                    let page_dist = camera.pos.distance(clamped);
+                    if page_dist <= detail_radius {
+                        suspect_pages.push((
+                            page_dist,
+                            format!(
+                                "  page#{pi}: dist={page_dist:.1}u thumb={} tris={} opaque={} masked={} semi_unmasked={} dropped_alpha={} degen={} untex={} bounds=({:.0},{:.0},{:.0})..({:.0},{:.0},{:.0})",
+                                d.used_thumb_atlas,
+                                d.total_tris,
+                                d.opaque_tris,
+                                d.masked_tris,
+                                d.semi_unmasked_tris,
+                                d.dropped_transparent_tris,
+                                d.degenerate_tris,
+                                d.untextured_tris,
+                                bmin[0], bmin[1], bmin[2],
+                                bmax[0], bmax[1], bmax[2],
+                            ),
+                        ));
+                    }
+                }
+            }
+            suspect_pages.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            suspect_pages.truncate(64);
+            let _ = writeln!(
+                report,
+                "\n[BMD / World Objects] pages={} (thumb_atlas={}) tris={} opaque={} masked={} semi_unmasked={} dropped_alpha={} degenerate={} untextured={}",
+                sum_pages,
+                thumb_pages,
+                sum_tris,
+                sum_opaque,
+                sum_masked,
+                sum_semi,
+                sum_drop,
+                sum_degen,
+                sum_untex,
+            );
+            if suspect_pages.is_empty() {
+                let _ = writeln!(
+                    report,
+                    "  (no nearby foliage/suspect BMD pages within {detail_radius:.0}u)"
+                );
+            } else {
+                let _ = writeln!(
+                    report,
+                    "  nearest foliage/suspect pages within {detail_radius:.0}u (showing {}):",
+                    suspect_pages.len()
+                );
+                for (_, line) in suspect_pages {
+                    let _ = writeln!(report, "{line}");
+                }
+            }
+            let _ = writeln!(report, "\n[SpeedTree / FarTrees]");
+            report.push_str(&self.far_trees.diagnostics_report(camera.pos, detail_radius));
+            let log_dir =
+                crate::diagnostics::dir().unwrap_or_else(crate::diagnostics::default_log_dir);
+            let _ = std::fs::create_dir_all(&log_dir);
+            let _ = std::fs::write(log_dir.join("raywatcher-diag.log"), report);
+        }
+        if self.raywatcher_harvest.needs_frustum_rebuild(
+            config,
+            camera.pos,
+            view_distance,
+            0,
+            content_hash,
+        ) && !self.raywatcher_harvest.is_building_in_background()
+        {
+            use crate::modules::raywatcher::harvest::{Frustum, MeshTriangle, WaterSurface};
+            let _ = Frustum::from_view_projection(matrix);
+            // Keep a focused nearest-first real-mesh bubble around the camera
+            // (covering both on-screen and off-screen reflected buildings) with a
+            // bounded triangle budget so BLAS/BVH rebuilds stay hitch-free while
+            // moving; distant scenery beyond `detail_radius` uses compact proxies.
+            let detail_radius = view_distance.clamp(512.0, 1024.0);
+            let detail_radius_sq = detail_radius * detail_radius;
+            const REAL_MESH_TRI_BUDGET: usize = 900_000;
+
+            let mut real_meshes = Vec::new();
+            let mut page_tris = Vec::new();
+            let proxies = Vec::new();
+            let pages_slice = if self.world_done {
+                &self.world_pages[..]
+            } else {
+                &self.local_pages[..]
+            };
+            let mut candidate_pages: Vec<(f32, usize)> = pages_slice
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, page)| {
+                    let (pmin, pmax) = page.page_bounds();
+                    let bmin = Vec3::from_array(pmin);
+                    let bmax = Vec3::from_array(pmax);
+                    let center = (bmin + bmax) * 0.5;
+                    let half = (bmax - bmin) * 0.5;
+                    let dist_sq = (camera.pos - center).abs().max(half).distance_squared(half);
+                    if dist_sq <= detail_radius_sq {
+                        Some((dist_sq, idx))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            candidate_pages.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            // Queue ALL candidate pages within `detail_radius`: atlas pages span
+            // large regions, and `harvest.rs` distance-culls individual triangles
+            // on the background worker so nearby big buildings on later pages are
+            // never dropped when earlier pages are dense.
+            for (_, idx) in candidate_pages {
+                let page = &pages_slice[idx];
+                let tris = page.rt_triangles();
+                if !tris.is_empty() {
+                    page_tris.push(page.rt_triangles_arc());
+                }
+            }
+            // Do not emit coarse axis-aligned bounding boxes (`InstanceProxy`):
+            // solid boxes create rectangular shadow blocks and boxy water
+            // reflections. Real meshes already cover the full detail bubble.
+            // Share immutable SpeedTree RT geometry with the existing background
+            // scene worker. Expanding nearby placements and camera-facing LODs can
+            // involve hundreds of thousands of triangles; do not do that on the
+            // render/UI thread when Hardware is enabled.
+            let tree_species = self.far_trees.rt_species_snapshot();
+            let tree_harvest = crate::modules::raywatcher::harvest::TreeHarvestConfig {
+                eye: camera.pos,
+                view_direction: camera.direction(),
+                max_distance: detail_radius.min(640.0),
+                lod_scale: self.detail.tree_lod_scale
+                    * lod_scale(self.detail.scenery_quality, Class::Trees),
+                triangle_budget: 420_000,
+            };
+            // Diagnostics log is written immediately on toggle-on and every 4s above.
+
+            // Reflective water surfaces across the visible frustum.
+            let water: Vec<WaterSurface> = self
+                .water_batches
+                .iter()
+                .map(|w| WaterSurface {
+                    bounds: w.bounds,
+                    height: w.height,
+                })
+                .collect();
+
+            let base_cell = map_space.map(|s| s.spacing).unwrap_or(2.0);
+            let ground_box: Option<Box<dyn Fn(f32, f32) -> f32 + Send>> =
+                map_space.cloned().map(|ms| {
+                    Box::new(move |x: f32, z: f32| ms.ground(x, z))
+                        as Box<dyn Fn(f32, f32) -> f32 + Send>
+                });
+
+            self.raywatcher_harvest.start_background_frustum_build(
+                config,
+                camera.pos,
+                view_forward,
+                matrix,
+                view_distance,
+                base_cell,
+                0,
+                content_hash,
+                ground_box,
+                page_tris,
+                REAL_MESH_TRI_BUDGET,
+                real_meshes,
+                proxies,
+                water,
+                tree_species,
+                tree_harvest,
+                skip_cpu_bvh,
+            );
+        }
+        self.modules
+            .raywatcher_mut()
+            .set_scene_building(self.raywatcher_harvest.is_building_in_background());
+        let Some(scene) = self.raywatcher_harvest.cached().cloned() else {
+            // Initial BVH build is still running on the background worker; leave
+            // the untouched 1:1 raster world visible until it finishes.
+            return;
+        };
+        let same_world = self
+            .raywatcher_scene
+            .as_ref()
+            .is_some_and(|old| std::sync::Arc::ptr_eq(old, &scene));
+        let depth_extent = (self.depth.width().max(1), self.depth.height().max(1));
+        if !same_world {
+            if let Some(gpu) = self.raywatcher_gpu.as_mut() {
+                gpu.set_scene(&self.device, scene.clone());
+                self.raywatcher_scene = Some(scene.clone());
+            } else if self.raywatcher_gpu_init.is_some() {
+                // First-use GPU/DXR initialization is tied to the previous
+                // scene snapshot. Keep its receiver and single worker alive;
+                // when it finishes, apply this newest scene to the returned
+                // tracer rather than launching another full initializer.
+                self.raywatcher_scene = Some(scene.clone());
+                self.modules
+                    .raywatcher_mut()
+                    .set_hardware_initializing(hardware_mode);
+            } else {
+                let worker_device = std::sync::Arc::clone(&self.device);
+                let worker_scene = scene.clone();
+                let worker_extent = depth_extent;
+                let worker_grid = plan.grid;
+                // The Raywatcher composite writes into RenderScale's texture.
+                // Capture its exact format so its matching PSOs are ready before
+                // the first traced frame instead of being compiled on that frame.
+                let worker_output_format = destination.format();
+                let worker_hardware = hardware_mode;
+                let triangle_count = worker_scene.triangles.len();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let spawn = std::thread::Builder::new()
+                    .name("pwe-raywatcher-gpu-init".to_string())
+                    .spawn(move || {
+                        let started = std::time::Instant::now();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let mut gpu = crate::modules::raywatcher::gpu::RaywatcherGpu::new(
+                                std::sync::Arc::clone(&worker_device),
+                                worker_scene,
+                                worker_extent,
+                                worker_grid,
+                                worker_output_format,
+                            );
+                            if worker_hardware {
+                                gpu.initialize_hardware();
+                            }
+                            gpu
+                        }))
+                        .map_err(|_| "Raywatcher GPU initialization panicked".to_string());
+                        eprintln!(
+                            "[Raywatcher] First-use GPU setup took {:.1}s ({} triangles, hardware_requested={}, success={})",
+                            started.elapsed().as_secs_f32(),
+                            triangle_count,
+                            worker_hardware,
+                            result.is_ok()
+                        );
+                        let _ = tx.send(result);
+                    });
+                match spawn {
+                    Ok(_) => {
+                        self.raywatcher_gpu_init = Some(rx);
+                        self.raywatcher_gpu_init_scene = Some(scene.clone());
+                        self.raywatcher_scene = Some(scene.clone());
+                        self.modules
+                            .raywatcher_mut()
+                            .set_hardware_initializing(worker_hardware);
+                    }
+                    Err(err) => {
+                        self.raywatcher_gpu_init_scene = None;
+                        self.raywatcher_scene = None;
+                        self.modules
+                            .raywatcher_mut()
+                            .set_hardware_initializing(false);
+                        eprintln!("[Raywatcher] Could not start GPU initialization worker ({err})");
+                    }
+                }
+                return;
+            }
+        }
+
+        if self.raywatcher_gpu.is_none() {
+            match self.raywatcher_gpu_init.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(Ok(mut gpu))) => {
+                    self.raywatcher_gpu_init = None;
+                    let built_scene = self.raywatcher_gpu_init_scene.take();
+                    if !built_scene
+                        .as_ref()
+                        .is_some_and(|built| std::sync::Arc::ptr_eq(built, &scene))
+                    {
+                        // The worker finished an obsolete scene. Reuse its
+                        // expensive GPU/DXR state and queue one serialized
+                        // scene rebuild for the current world snapshot.
+                        gpu.set_scene(&self.device, scene.clone());
+                    }
+                    gpu.resize(&self.device, depth_extent, plan.grid);
+                    let still_initializing = gpu.hardware_initializing();
+                    self.raywatcher_gpu = Some(gpu);
+                    self.raywatcher_scene = Some(scene.clone());
+                    self.modules
+                        .raywatcher_mut()
+                        .set_hardware_initializing(still_initializing);
+                }
+                Some(Ok(Err(err))) => {
+                    self.raywatcher_gpu_init = None;
+                    self.raywatcher_gpu_init_scene = None;
+                    self.raywatcher_scene = None;
+                    self.modules
+                        .raywatcher_mut()
+                        .set_hardware_initializing(false);
+                    eprintln!("[Raywatcher] Background GPU initialization failed: {err}");
+                    return;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                    self.modules
+                        .raywatcher_mut()
+                        .set_hardware_initializing(hardware_mode);
+                    return;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) | None => {
+                    self.raywatcher_gpu_init = None;
+                    self.raywatcher_gpu_init_scene = None;
+                    self.raywatcher_scene = None;
+                    self.modules
+                        .raywatcher_mut()
+                        .set_hardware_initializing(false);
+                    eprintln!("[Raywatcher] Background GPU initialization worker disconnected");
+                    return;
+                }
+            }
+        } else if let Some(gpu) = self.raywatcher_gpu.as_mut() {
+            gpu.resize(&self.device, depth_extent, plan.grid);
+        }
+        // Refresh the 512x512 top-down real textured terrain albedo map whenever
+        // the camera moves to a new 192u snap anchor (once on load, then ~0 ms/frame).
+        let terrain_refresh = self
+            .raywatcher_gpu
+            .as_ref()
+            .and_then(|g| g.terrain_map_refresh_anchor(camera.pos.x, camera.pos.z));
+        if let Some((ax, az)) = terrain_refresh {
+            let prev = std::mem::replace(
+                encoder,
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("raywatcher terrain map"),
+                    }),
+            );
+            self.queue.submit(Some(prev.finish()));
+            let tmat = minimap_matrix(
+                ax,
+                az,
+                crate::modules::raywatcher::gpu::TERRAIN_MAP_HALF_EXTENT,
+            );
+            self.queue_map_runs(tmat);
+            let mut tframe = self.frame;
+            tframe.daylight = 1.0;
+            tframe.sun = [0.0, 1.0, 0.0, -1.0];
+            tframe.light = [0.55, 0.45, 1.0, 1.0];
+            tframe.fog_range = [1e6, 2e6, 0.0, 0.0];
+            let tuniform = tframe.uniform(
+                tmat,
+                [0.0, -1.0, 0.0, 1.0],
+                [0.0; 4],
+                [0.0; 4],
+                [0.0; 4],
+                [0.0, 1.0, 0.0, 0.0],
+            );
+            self.queue
+                .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&tuniform));
+            if let Some(gpu) = self.raywatcher_gpu.as_mut() {
+                let (cview, dview) =
+                    gpu.prepare_terrain_map_targets(&self.device, destination.format());
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("raywatcher terrain albedo map"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: cview,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: dview,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                self.terrain_gpu.draw(
+                    &mut rp,
+                    false,
+                    &self.vertex,
+                    &self.index,
+                    self.terrain_end,
+                    Some(self.map_terrain_runs.as_slice()),
+                    Some(self.map_far_runs.as_slice()),
+                );
+                drop(rp);
+                gpu.finish_terrain_map_blit(&self.device, encoder, (ax, az));
+            }
+        }
+        let Some(gpu) = self.raywatcher_gpu.as_mut() else {
+            return;
+        };
+        // --- The frame parameters.
+        // Use the exact camera-relative fog range/color already published to
+        // raster passes. This keeps RT and raster on the same horizon, without
+        // deriving fog distance from terrain residency or world bounds.
+        let fog_range = crate::modules::raywatcher::frame::effective_fog_range(
+            self.frame.active_fog_range[2] > 0.5,
+            self.frame.active_fog_range[0],
+            self.frame.active_fog_range[1],
+        );
+        let fog_colour = Vec3::new(
+            self.frame.active_fog_color[0],
+            self.frame.active_fog_color[1],
+            self.frame.active_fog_color[2],
+        );
+        let lighting = LightingRecord::derive(
+            camera.time_of_day,
+            crate::environment::daylight(camera.time_of_day),
+            camera.regional_light.as_ref(),
+            fog_colour,
+            fog_range,
+        );
+        let region_light_rw = camera.regional_light.or(self.retained_regional_light);
+        let authored_rw = region_light_rw
+            .map(|l| l.material_direction().toward_sun())
+            .unwrap_or([0.6, -0.4, 0.8]);
+        let (cel_dir, cel_col, cel_int, is_moon) =
+            crate::modules::raywatcher::frame::tracked_celestial_light(
+                camera.time_of_day,
+                authored_rw,
+                region_light_rw.as_ref(),
+            );
+        let mut lighting = lighting;
+        lighting.direction = cel_dir;
+        lighting.diffuse = cel_col;
+        if is_moon {
+            // Pitch-black night ambient so moon shadows and unlit interiors drop to true dark.
+            lighting.ambient = glam::Vec3::new(0.006, 0.008, 0.014);
+        } else {
+            let sun_elev = cel_dir.y.clamp(0.0, 1.0);
+            let amb_scale = 0.14 + 0.86 * sun_elev.powf(0.7);
+            lighting.ambient *= amb_scale;
+        }
+        let transport = crate::modules::raywatcher::shade::TransportConfig::new(
+            lighting,
+            settings.ambient_strength,
+            settings.bounce_strength,
+            settings.reflection_roughness_cutoff,
+            2e-3,
+        );
+        let sun = Sun {
+            direction: cel_dir,
+            colour: cel_col,
+            angular_radius: settings.sun_radius_degrees.to_radians(),
+            intensity: cel_int,
+        };
+        let params = FrameParams {
+            eye: camera.pos,
+            inv_view_projection: matrix.inverse(),
+            view_projection: matrix,
+            extent: render_extent,
+            grid: plan.grid,
+            near: CAMERA_NEAR,
+            far: view_distance,
+            jitter,
+            frame: self.modules.raywatcher().frame_index(),
+            history_valid: u32::from(!reset_history),
+            sun,
+            lighting,
+            bounces: plan.bounces,
+            samples: plan.samples,
+        };
+        let denoise = crate::modules::raywatcher::denoise::DenoiseConfig {
+            iterations: plan.denoise_iterations,
+            ..Default::default()
+        };
+        if plan.debug_view == crate::modules::raywatcher::plan::DebugView::RasterOnly {
+            // Phase 0 baseline check: leave the raster world target completely
+            // untouched so the user can compare against RT off.
+            self.modules.raywatcher_mut().next_frame();
+            if std::env::var_os("PWE_RT_DEBUG").is_some() {
+                let frame_ms = t_rw_frame.elapsed().as_secs_f64() * 1000.0;
+                if frame_ms > self.raywatcher_worst_frame_ms {
+                    self.raywatcher_worst_frame_ms = frame_ms;
+                    eprintln!(
+                        "[Raywatcher] worst_cpu_frame_ms={:.2} (bg_building={})",
+                        self.raywatcher_worst_frame_ms,
+                        self.raywatcher_harvest.is_building_in_background(),
+                    );
+                }
+            }
+            return;
+        }
+        if params.frame == 0 {
+            let probe_world = camera.pos + camera.direction() * 25.0;
+            let err = crate::modules::raywatcher::frame::depth_unprojection_error(
+                matrix,
+                params.inv_view_projection,
+                probe_world,
+            );
+            if std::env::var_os("PWE_RT_DEBUG").is_some() || err > 0.05 {
+                eprintln!(
+                    "[Raywatcher] Phase 0 depth-unprojection reference error at 25u: {:.6} u",
+                    err
+                );
+            }
+        }
+        let layered = !plan.replace_raster
+            && plan.debug_view == crate::modules::raywatcher::plan::DebugView::None;
+        // Always snapshot the untouched 1:1 raster world target so both layered
+        // mode and opt-in `replace_raster` anchor to real textures/geometry
+        // (never coarse proxy boxes).
+        if let Some((sky_frame, sky_sets)) = self.last_sky_frame {
+            gpu.update_sky_env(
+                &self.device,
+                &self.queue,
+                encoder,
+                &self.sky,
+                self.cloud.as_ref(),
+                destination.format(),
+                sky_frame,
+                sky_sets,
+                camera.pos,
+                camera.cloud_detail,
+                crate::environment::daylight(camera.time_of_day),
+                camera.active_fog(),
+            );
+        }
+        gpu.capture_raster(&self.device, encoder, destination);
+        // The G-buffer only needs planes that can contribute pixels in this view.
+        // Filtering before the 16-plane cap prevents off-screen batches from
+        // evicting a visible lake/river plane from the water classifier.
+        let mut active_water: Vec<crate::modules::raywatcher::harvest::WaterSurface> = self
+            .water_batches
+            .iter()
+            .filter(|w| w.visible(matrix))
+            .map(|w| crate::modules::raywatcher::harvest::WaterSurface {
+                bounds: w.bounds,
+                height: w.height,
+            })
+            .collect();
+        prioritize_raywatcher_water_surfaces(&mut active_water, camera.pos);
+        let need_point_lights = plan.effects.lighting
+            || plan.point_light_shadows
+            || !layered
+            || plan.debug_view == crate::modules::raywatcher::plan::DebugView::PointLights;
+        let active_point_lights: Vec<crate::modules::raywatcher::frame::PointLight> =
+            if need_point_lights {
+                // Boost #30: Pre-size light list + fast 1D XZ reject before 3D distance.
+                let night = crate::environment::night_factor(camera.time_of_day);
+                let mut point_lights: Vec<(f32, crate::modules::raywatcher::frame::PointLight)> =
+                    Vec::with_capacity(64);
+                for l in &self.model_lights.lights {
+                    // Retail flag 1 (`l.flags & 1 != 0`) marks night-only lamps/lanterns
+                    // (see `SceneLights::query`); skip them completely during daytime so
+                    // turned-off lamps never light or reflect in water at noon.
+                    let time_scale = if l.flags & 1 != 0 { night } else { 1.0 };
+                    if time_scale <= 0.02 {
+                        continue;
+                    }
+                    let radius = l.range.max(0.0);
+                    if radius <= 0.05 {
+                        continue;
+                    }
+                    let max_d = params.far + radius;
+                    let dx = l.position[0] - camera.pos.x;
+                    if dx.abs() > max_d {
+                        continue;
+                    }
+                    let dz = l.position[2] - camera.pos.z;
+                    if dz.abs() > max_d {
+                        continue;
+                    }
+                    let dy = l.position[1] - camera.pos.y;
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    if dist_sq > max_d * max_d {
+                        continue;
+                    }
+                    let colour = glam::Vec3::new(
+                        l.diffuse[0].max(0.0),
+                        l.diffuse[1].max(0.0),
+                        l.diffuse[2].max(0.0),
+                    ) * time_scale;
+                    if colour.length_squared() <= 1e-5 {
+                        continue;
+                    }
+                    let raw_int = l.diffuse[3];
+                    let base_int = if raw_int > 0.01 {
+                        raw_int.clamp(0.65, 8.0)
+                    } else {
+                        1.6
+                    };
+                    let intensity = base_int * time_scale;
+                    point_lights.push((
+                        dist_sq,
+                        crate::modules::raywatcher::frame::PointLight {
+                            position: glam::Vec3::from_array(l.position),
+                            radius,
+                            colour,
+                            intensity,
+                            casts_shadow: true,
+                        },
+                    ));
+                }
+                if let Some(models) = &self.models {
+                    for dl in models.dynamic_lights() {
+                        let radius = dl.radius.max(0.0);
+                        if radius <= 0.05 {
+                            continue;
+                        }
+                        let max_d = params.far + radius;
+                        let dx = dl.position[0] - camera.pos.x;
+                        if dx.abs() > max_d {
+                            continue;
+                        }
+                        let dz = dl.position[2] - camera.pos.z;
+                        if dz.abs() > max_d {
+                            continue;
+                        }
+                        let dy = dl.position[1] - camera.pos.y;
+                        let dist_sq = dx * dx + dy * dy + dz * dz;
+                        if dist_sq > max_d * max_d {
+                            continue;
+                        }
+                        let colour = glam::Vec3::new(
+                            dl.color[0].max(0.0),
+                            dl.color[1].max(0.0),
+                            dl.color[2].max(0.0),
+                        );
+                        if colour.length_squared() <= 1e-5 {
+                            continue;
+                        }
+                        let raw_int = dl.color[3];
+                        let intensity = if raw_int > 0.01 {
+                            raw_int.clamp(0.65, 8.0)
+                        } else {
+                            1.6
+                        };
+                        point_lights.push((
+                            dist_sq,
+                            crate::modules::raywatcher::frame::PointLight {
+                                position: glam::Vec3::from_array(dl.position),
+                                radius,
+                                colour,
+                                intensity,
+                                casts_shadow: true,
+                            },
+                        ));
+                    }
+                }
+                // Reserve up to 24 slots for static/dynamic point lights and leave 24..48
+                // slots for active world effects (Archosaur ring beams, wandering lights,
+                // dungeon entry circles, portals, torches, and 3D effect models).
+                // Opt #29: O(N) partial selection when > 48 lights (avoids full O(N log N) sort).
+                if point_lights.len() > 48 {
+                    point_lights.select_nth_unstable_by(48, |a, b| a.0.total_cmp(&b.0));
+                    point_lights.truncate(48);
+                }
+                let eff_slots = 128usize.saturating_sub(point_lights.len());
+                if eff_slots > 0 {
+                    if let Some(models) = &self.models {
+                        // Cluster value: (pos_sum, bmin, bmax, weighted_col_sum, col_w_sum, max_radius, max_lum, count)
+                        let mut grid: std::collections::HashMap<
+                            (i32, i32, i32),
+                            (
+                                glam::Vec3,
+                                glam::Vec3,
+                                glam::Vec3,
+                                glam::Vec3,
+                                f32,
+                                f32,
+                                f32,
+                                u32,
+                            ),
+                        > = std::collections::HashMap::with_capacity(64);
+                        let max_eff_d = params.far + 64.0;
+                        let max_eff_d_sq = max_eff_d * max_eff_d;
+                        for q in models.effect_quads() {
+                            // Accept additive (dest=2/4, src=2), alpha-blended glowing orbs/flares (dest=6),
+                            // and opaque/self-lit lamp effects (dest=1/3/7/9, e.g. City of Raging Tides lamps).
+                            let is_additive = q.destination_blend == 2
+                                || q.source_blend == 2
+                                || q.destination_blend == 4;
+                            let is_alpha_emissive = !is_additive;
+
+                            let (center, extent, vert_rgba, tex_name, mat_emissive) =
+                                if let Some(ref mesh) = q.mesh {
+                                    if mesh.vertices.is_empty() {
+                                        continue;
+                                    }
+                                    let mut vmin = glam::Vec3::splat(f32::INFINITY);
+                                    let mut vmax = glam::Vec3::splat(f32::NEG_INFINITY);
+                                    // Stride large meshes so centroid/bounds stay O(1).
+                                    let step = (mesh.vertices.len() / 24).max(1);
+                                    let mut idx = 0usize;
+                                    while idx < mesh.vertices.len() {
+                                        let p = glam::Vec3::from_array(mesh.vertices[idx].position);
+                                        vmin = vmin.min(p);
+                                        vmax = vmax.max(p);
+                                        idx += step;
+                                    }
+                                    let c = (vmin + vmax) * 0.5;
+                                    let ext = (vmax - vmin).length().clamp(1.0, 28.0);
+                                    let em = mesh
+                                        .material
+                                        .map(|m| {
+                                            glam::Vec3::new(
+                                                m.emissive[0].max(0.0),
+                                                m.emissive[1].max(0.0),
+                                                m.emissive[2].max(0.0),
+                                            )
+                                        })
+                                        .unwrap_or(glam::Vec3::ZERO);
+                                    (c, ext, q.color, mesh.texture.as_str(), em)
+                                } else {
+                                    let p0 = glam::Vec3::from_array(q.positions[0]);
+                                    if (p0.x - camera.pos.x).abs() > max_eff_d
+                                        || (p0.z - camera.pos.z).abs() > max_eff_d
+                                    {
+                                        continue;
+                                    }
+                                    let p1 = glam::Vec3::from_array(q.positions[1]);
+                                    let p2 = glam::Vec3::from_array(q.positions[2]);
+                                    let p3 = glam::Vec3::from_array(q.positions[3]);
+                                    let c = (p0 + p1 + p2 + p3) * 0.25;
+                                    let ext = p0.distance(p3).max(p1.distance(p2)).clamp(0.6, 24.0);
+                                    // Read per-corner vertex_colors when present (A3DGridDecalEx
+                                    // beams, rings, curtains, dungeon entry circles).
+                                    let rgba = if let Some(vc) = q.vertex_colors {
+                                        [
+                                            (vc[0][0] + vc[1][0] + vc[2][0] + vc[3][0]) * 0.25,
+                                            (vc[0][1] + vc[1][1] + vc[2][1] + vc[3][1]) * 0.25,
+                                            (vc[0][2] + vc[1][2] + vc[2][2] + vc[3][2]) * 0.25,
+                                            (vc[0][3] + vc[1][3] + vc[2][3] + vc[3][3]) * 0.25,
+                                        ]
+                                    } else {
+                                        q.color
+                                    };
+                                    (c, ext, rgba, q.texture.as_str(), glam::Vec3::ZERO)
+                                };
+
+                            if !center.is_finite() {
+                                continue;
+                            }
+                            if center.distance_squared(camera.pos) > max_eff_d_sq {
+                                continue;
+                            }
+                            let is_mesh = q.mesh.is_some();
+                            let a = if is_mesh {
+                                vert_rgba[3].clamp(0.45, 1.0)
+                            } else {
+                                vert_rgba[3].clamp(0.0, 1.0)
+                            };
+                            if !is_mesh && a < (if is_additive { 0.02 } else { 0.03 }) {
+                                continue;
+                            }
+                            let raw_tex =
+                                glam::Vec3::from_array(models.effect_texture_emissive(tex_name));
+                            let tex_rgb = if raw_tex.x.max(raw_tex.y).max(raw_tex.z) < 0.05 {
+                                glam::Vec3::ONE
+                            } else {
+                                raw_tex
+                            };
+                            let v_rgb = glam::Vec3::new(
+                                vert_rgba[0].max(0.0),
+                                vert_rgba[1].max(0.0),
+                                vert_rgba[2].max(0.0),
+                            );
+                            let mut col = v_rgb * tex_rgb * a.max(0.35) + mat_emissive * tex_rgb;
+                            if is_mesh && col.x.max(col.y).max(col.z) < 0.05 {
+                                col += tex_rgb * 0.55;
+                            }
+                            // Use peak chromatic channel (not Rec.709 luma) so vivid blue/cyan/violet/red
+                            // lamps and 3D effect models are never filtered out.
+                            let peak = col.x.max(col.y).max(col.z);
+                            let min_peak = if is_additive || is_mesh { 0.015 } else { 0.025 };
+                            if peak < min_peak {
+                                continue;
+                            }
+                            if is_alpha_emissive {
+                                col *= 0.85;
+                            }
+                            let lum = peak;
+                            let radius = (extent * 4.2).clamp(18.0, 60.0);
+                            let cell = (
+                                (center.x / 8.0).floor() as i32,
+                                (center.y / 8.0).floor() as i32,
+                                (center.z / 8.0).floor() as i32,
+                            );
+                            let entry = grid.entry(cell).or_insert((
+                                glam::Vec3::ZERO,
+                                glam::Vec3::splat(f32::INFINITY),
+                                glam::Vec3::splat(f32::NEG_INFINITY),
+                                glam::Vec3::ZERO,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0,
+                            ));
+                            let w_col = lum * extent.sqrt();
+                            entry.0 += center;
+                            entry.1 = entry.1.min(center);
+                            entry.2 = entry.2.max(center);
+                            entry.3 += col * w_col;
+                            entry.4 += w_col;
+                            entry.5 = entry.5.max(radius);
+                            entry.6 = entry.6.max(lum);
+                            entry.7 += 1;
+                        }
+                        // Temporally smooth & holdover effect lights so particle spawn/despawn
+                        // gaps and animated flame pulses never cause strobing or flickering.
+                        let mut seen_cells = std::collections::HashSet::with_capacity(grid.len());
+                        let night_boost =
+                            if crate::environment::night_factor(camera.time_of_day) > 0.4 {
+                                1.30
+                            } else {
+                                1.0
+                            };
+                        for (cell, (pos_sum, bmin, bmax, col_sum, col_w, max_rad, max_lum, cnt)) in
+                            grid
+                        {
+                            if cnt == 0 || col_w <= 1e-5 {
+                                continue;
+                            }
+                            let pos = pos_sum / cnt as f32;
+                            let span = (bmax - bmin).length();
+                            let radius = (max_rad + span * 0.85).clamp(18.0, 68.0);
+                            let mut colour = col_sum / col_w;
+                            let peak = colour.x.max(colour.y).max(colour.z).max(1e-4);
+                            if peak > 1.0 {
+                                colour /= peak;
+                            } else if peak < 0.75 {
+                                colour *= (0.75 / peak).min(2.2);
+                            }
+                            let size_boost = (1.0 + span * 0.03).min(1.45);
+                            let intensity = ((1.60 + max_lum * 2.00) * size_boost * night_boost)
+                                .clamp(1.60, 5.0);
+                            seen_cells.insert(cell);
+                            self.raywatcher_eff_light_cache
+                                .entry(cell)
+                                .and_modify(|c| {
+                                    c.pos = c.pos.lerp(pos, 0.18);
+                                    c.colour = c.colour.lerp(colour, 0.18);
+                                    c.radius = c.radius + (radius - c.radius) * 0.18;
+                                    c.intensity = c.intensity + (intensity - c.intensity) * 0.18;
+                                    c.miss_frames = 0;
+                                })
+                                .or_insert(CachedEffectLight {
+                                    pos,
+                                    colour,
+                                    radius,
+                                    intensity: intensity * 0.40,
+                                    miss_frames: 0,
+                                });
+                        }
+                        let prune_d = params.far + 128.0;
+                        let prune_d_sq = prune_d * prune_d;
+                        self.raywatcher_eff_light_cache.retain(|cell, c| {
+                            if !seen_cells.contains(cell) {
+                                c.miss_frames += 1;
+                                c.intensity *= 0.86;
+                            }
+                            c.miss_frames < 10
+                                && c.intensity >= 0.08
+                                && c.pos.distance_squared(camera.pos) <= prune_d_sq
+                        });
+                        let mut eff_lights: Vec<(
+                            f32,
+                            crate::modules::raywatcher::frame::PointLight,
+                        )> = self
+                            .raywatcher_eff_light_cache
+                            .values()
+                            .filter_map(|c| {
+                                let dist_sq = c.pos.distance_squared(camera.pos);
+                                let max_d = params.far + c.radius;
+                                if dist_sq > max_d * max_d {
+                                    return None;
+                                }
+                                Some((
+                                    dist_sq,
+                                    crate::modules::raywatcher::frame::PointLight {
+                                        position: c.pos,
+                                        radius: c.radius,
+                                        colour: c.colour,
+                                        intensity: c.intensity,
+                                        casts_shadow: true,
+                                    },
+                                ))
+                            })
+                            .collect();
+                        eff_lights.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                        eff_lights.truncate(eff_slots);
+                        point_lights.extend(eff_lights);
+                    }
+                }
+                let mut final_lights: Vec<crate::modules::raywatcher::frame::PointLight> =
+                    point_lights.into_iter().map(|(_, l)| l).collect();
+                // Dynamic RT Camera Light (Hotkey: L): always placed at slot 0 so it never gets culled.
+                if settings.camera_light_enabled {
+                    let cam_int = settings.camera_light_intensity.clamp(0.5, 100.0);
+                    // When Walker is active, place the camera light slightly ahead and above the
+                    // third-person character so it lights the world instead of blasting the
+                    // character's back into a glowing silhouette.
+                    let cam_light_pos = if self.modules.walker_active() {
+                        camera.pos + camera.direction() * 6.2 + glam::Vec3::new(0.0, 1.35, 0.0)
+                    } else {
+                        camera.pos + camera.direction() * 1.2
+                    };
+                    let cam_light = crate::modules::raywatcher::frame::PointLight {
+                        position: cam_light_pos,
+                        radius: (18.0 + cam_int * 2.4).clamp(22.0, 180.0),
+                        colour: crate::modules::raywatcher::plan::camera_light_rgb(
+                            settings.camera_light_warmness,
+                        ),
+                        intensity: cam_int,
+                        casts_shadow: true,
+                    };
+                    final_lights.insert(0, cam_light);
+                }
+                final_lights
+            } else {
+                Vec::new()
+            };
+        let walker_pos = self.modules.walker_world_pos();
+        self.raywatcher_dyn_rt_verts.clear();
+        if walker_pos.is_some() {
+            self.modules
+                .walker_rt_triangles(&mut self.raywatcher_dyn_rt_verts, 4096);
+        }
+        if self.modules.populator_active() {
+            self.modules.populator_rt_triangles(
+                camera.pos,
+                &mut self.raywatcher_dyn_rt_verts,
+                16_384,
+            );
+        }
+        gpu.record(
+            &self.device,
+            &self.queue,
+            encoder,
+            &params,
+            &plan,
+            hardware_mode,
+            &transport,
+            &denoise,
+            &self.object_mv,
+            &self.depth,
+            &active_water,
+            &active_point_lights,
+            unjittered_vp,
+            camera.weather_override != crate::client_weather::WeatherOverride::Clear,
+            walker_pos,
+            &self.raywatcher_dyn_rt_verts,
+        );
+        self.modules
+            .raywatcher_mut()
+            .set_hardware_initializing(gpu.hardware_initializing());
+        if !gpu.traced_last_frame {
+            return;
+        }
+        let mut dlss_rr_ran = false;
+        if plan.reconstruction
+            == crate::modules::raywatcher::plan::RayReconstruction::DlssRayReconstruction
+        {
+            // Flush the trace encoder before NGX DLSS Ray Reconstruction runs
+            // on the native DX12 command queue so it reads the freshly traced
+            // ray grid and G-buffer guides.
+            let pending = std::mem::replace(
+                encoder,
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("raywatcher post-rr"),
+                    }),
+            );
+            self.queue.submit(Some(pending.finish()));
+            let sdk_dir = self.modules.raywatcher().sdk_dir().to_path_buf();
+            let view = camera.view_matrix();
+            // Pass UNJITTERED projection to DLSS RR (jitter is already supplied via P_JITTER_X/Y).
+            let proj = unjittered_vp * view.inverse();
+            if let Some(gpu) = self.raywatcher_gpu.as_mut() {
+                dlss_rr_ran = gpu.reconstruct_dlss_rr(
+                    &self.device,
+                    &self.queue,
+                    encoder,
+                    &sdk_dir,
+                    &params,
+                    &self.object_mv_view,
+                    reset_history,
+                    layered,
+                    unjittered_vp,
+                    view.to_cols_array_2d(),
+                    proj.to_cols_array_2d(),
+                );
+                if !dlss_rr_ran {
+                    gpu.record_denoise(
+                        &self.queue,
+                        encoder,
+                        &params,
+                        &denoise,
+                        &self.object_mv,
+                        unjittered_vp,
+                        camera.weather_override != crate::client_weather::WeatherOverride::Clear,
+                    );
+                }
+                let rr_err = gpu.dlss_rr_error().map(str::to_string);
+                self.modules.raywatcher_mut().set_dlss_rr_error(rr_err);
+            }
+        }
+        // Composite the denoised RT lighting layer over the untouched raster
+        // world target (or blit directly when DLSS RR already composited or
+        // when `replace_raster` was explicitly opted into).
+        if let Some(gpu) = self.raywatcher_gpu.as_mut() {
+            gpu.composite_to(
+                &self.device,
+                &self.queue,
+                encoder,
+                destination,
+                layered,
+                dlss_rr_ran,
+                camera.water_reflections
+                    && camera.underwater_depth <= 0.0
+                    && self.raywatcher_overrides.reflection_pass,
+            );
+        }
+        self.modules.raywatcher_mut().next_frame();
+    }
+
     fn render(
         &mut self,
         target: &wgpu::TextureView,
@@ -3722,10 +5278,19 @@ impl Renderer {
             s.spawn(|| crate::terrain_residency::visible_runs_into(spans, matrix, terrain_runs));
             s.spawn(|| terrain_gpu.visible_far_runs_into(matrix, far_terrain_runs));
         });
+        // Snapshot counts before releasing the disjoint field borrows; the
+        // renderer's following &mut self calls must not overlap these borrows.
+        let terrain_run_count = terrain_runs.len();
+        let far_terrain_run_count = far_terrain_runs.len();
+        let span_count = spans.len();
         // One indirect record per run, so the terrain itself is one call per mesh
         // instead of one call per run.
         self.queue_main_runs();
         lap(STAGE_VISIBILITY, &mut stage_ms, &mut lap_at);
+        // Raywatcher's decision is already on `self.raywatcher_overrides`: it was
+        // made before this call, because the world pass must know which effects
+        // not to draw. `begin_frame` copies it onto the snapshot, which is what
+        // every uniform in this frame is made from.
         let frame = self.begin_frame(camera, w, h);
         self.weather.advance(camera.logic_delta_ms);
         let selected_weather = camera.regional_light.map_or(
@@ -3774,7 +5339,8 @@ impl Renderer {
         } else {
             Pass::Main
         };
-        let normal = frame.uniform(
+        let mut main_frame = frame;
+        let normal = main_frame.uniform(
             matrix,
             [direction.x, direction.y, direction.z, daylight],
             frame.clip,
@@ -3790,8 +5356,59 @@ impl Renderer {
                 0.,
             ],
         );
+        let fog_window_cap = crate::terrain_cutoff::fog_cap(
+            frame.bounds,
+            camera.pos.to_array(),
+            w as f32 / h.max(1) as f32,
+        );
+        let fog_fit_expected = camera.active_fog().enabled
+            && camera.underwater_depth <= 0.
+            && fog_window_cap.is_some();
+        let fog_fit_changed = (frame.active_fog_range[0] - camera.active_fog().start).abs() > 0.01
+            || (frame.active_fog_range[1] - camera.active_fog().end).abs() > 0.01;
+        // Sample the exact camera-space depth the terrain shader evaluates at a
+        // 3x3 grid over the resident window, plus the camera's XZ position. The
+        // two Y planes bracket the common camera-to-ground offset without
+        // requiring any environment variable or visual diagnostic mode.
+        let fog_probe_eye = fog_depth_probe(
+            matrix,
+            frame.bounds,
+            camera.pos.to_array(),
+            camera.pos.y,
+            frame.active_fog_range,
+        );
+        let fog_probe_eye_minus_160 = fog_depth_probe(
+            matrix,
+            frame.bounds,
+            camera.pos.to_array(),
+            camera.pos.y - 160.,
+            frame.active_fog_range,
+        );
+        // A focused capture for the long-standing outdoor-fog regression. Keep
+        // the authored source, camera-selected result and bytes sent to the
+        // terrain shader in one timestamped record so they can be compared
+        // without guessing which stage changed the values.
+        crate::diag!(
+            FogCheck,
+            "camera=({:.3},{:.3},{:.3}) yaw={:.6} pitch={:.6} far={:.3} viewport={}x{} underwater_depth={:.3} atmospheric_fog={} air_authored=(start={:.3},end={:.3},color={:?},density={:.6}) underwater_authored=(start={:.3},end={:.3},color={:?},density={:.6}) active_camera=(enabled={},start={:.3},end={:.3},color={:?}) frame_fog_range={:?} frame_active_fog_range={:?} frame_fog_color={:?} frame_active_fog_color={:?} gpu_uniform_fog_range={:?} gpu_uniform_fog_color={:?} main_pass_fogged={} matrix_cols={:?} daylight={:.4} terrain_cutoff={} fog_window_cap={:?} fog_fit_expected={} fog_fit_changed={} fog_depth_probe_eye={:?} fog_depth_probe_eye_minus_160={:?} bounds={:?} terrain_runs={} far_terrain_runs={} spans={} water_batches={} use_post={} water_reflections={} bloom={} sharpen={} reset_history={} depth_contract=terrain_fs_uses_camera_matrix_world_position_depth",
+            camera.pos.x, camera.pos.y, camera.pos.z, camera.yaw, camera.pitch,
+            camera.far, w, h, camera.underwater_depth, camera.atmospheric_fog,
+            camera.air_fog.start, camera.air_fog.end, camera.air_fog.color, camera.air_fog.density,
+            camera.underwater_fog.start, camera.underwater_fog.end, camera.underwater_fog.color, camera.underwater_fog.density,
+            camera.active_fog().enabled, camera.active_fog().start, camera.active_fog().end, camera.active_fog().color,
+            frame.fog_range, frame.active_fog_range, frame.fog_color, frame.active_fog_color,
+            normal.fog_range, normal.fog_color, camera.active_fog().enabled, matrix.to_cols_array(),
+            daylight, self.detail.terrain_cutoff, fog_window_cap, fog_fit_expected, fog_fit_changed, fog_probe_eye, fog_probe_eye_minus_160, frame.bounds, terrain_run_count, far_terrain_run_count, span_count,
+            self.water_batches.len(), use_post, camera.water_reflections, camera.bloom,
+            camera.sharpen, reset_history
+        );
+
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&normal));
+        let rt_water_reflections = camera.water_reflections
+            && camera.underwater_depth <= 0.0
+            && self.raywatcher_overrides.reflection_pass;
+        let water_fog = crate::water_gpu::surface_fog_range(frame.fog_range, rt_water_reflections);
         self.water.update(
             &self.queue,
             &crate::water_gpu::WaterUniform {
@@ -3811,24 +5428,25 @@ impl Renderer {
                     crate::water_gpu::normal_offset_angle(frame.elapsed64),
                 ],
                 edge_mode: [if camera.water_reflections { 1. } else { 0. }, 0., 0., 0.],
-                // Water-surface fog: the client binds the region's own triple
-                // (white 100..400 above water, blue 10..60 below).
-                fog: frame.active_fog_range,
-                fog_color: frame.active_fog_color,
+                // Use the same effective (terrain-window-fitted) fog range and
+                // colour as terrain, so water disappears at the same view depth.
+                fog: water_fog,
+                fog_color: frame.fog_color,
             },
         );
         self.simple_water.update(
             &self.queue,
             matrix,
             frame.elapsed64,
-            frame.active_fog_range,
-            frame.active_fog_color,
+            frame.fog_range,
+            frame.fog_color,
         );
         let reflection = self.water.reflection();
         let reflect_depth = self.water.depth();
         let refraction = self.water.refraction();
         let scene_color = self.water.scene();
         let scene_depth = self.depth.create_view(&Default::default());
+        let resident_bounds = self.resident_bounds();
         // The main view's unjittered view-projection. `matrix` carries the
         // upscaler's sub-pixel jitter, and a motion vector must not: it describes
         // where the surface was, not where this frame sampled it. Same expression
@@ -3836,6 +5454,16 @@ impl Renderer {
         // with the ones the reprojection pass writes.
         let unjittered_vp = camera.matrix(w, h, camera.far);
         let mut e = self.device.create_command_encoder(&Default::default());
+        // Tree LOD is a compute pass whose indirect arguments are consumed by
+        // the main scene draw below. Record it into this frame encoder rather
+        // than submitting a separate command buffer before rendering.
+        self.far_trees.update_resident_lods(
+            &self.queue,
+            &mut e,
+            camera.pos.to_array(),
+            self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
+            resident_bounds,
+        );
         // The object-motion attachment is cleared here, before any pass that may
         // write it, so a frame with no producer still hands the motion-vector
         // pass a zeroed surface instead of the previous frame's vectors.
@@ -3859,13 +5487,23 @@ impl Renderer {
         // refraction passes all read the same matrix, and this used to be
         // extracted from it three times per frame.
         let frustum = crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array());
+        // Classify water batches once for this view. The same visible set drives
+        // the main depth-copy decision, optional refraction copy, and later water
+        // rendering; repeating the four-corner clip test in each consumer wastes
+        // CPU time in zones with many authored water surfaces.
+        let mut visible = std::mem::take(&mut self.visible_water_batches);
+        visible.clear();
+        visible.extend(
+            self.water_batches
+                .iter()
+                .filter(|b| b.visible(matrix))
+                .cloned(),
+        );
+        let has_visible_complex_water = visible.iter().any(|b| !b.simple);
         // The main depth is copied into the water's `terrain_depth` for the edge
         // reconstruction, which only the water surface reads (and only when it is
         // above the plane). No water plane on screen, no reader.
-        let water_edge_reads_terrain_depth = self
-            .water_batches
-            .iter()
-            .any(|b| !b.simple && b.visible(matrix));
+        let water_edge_reads_terrain_depth = has_visible_complex_water;
         self.draw_opaque(
             &mut e,
             "main scene",
@@ -3957,12 +5595,7 @@ impl Renderer {
         // this copy can never be read: the only frame that needs it is one with
         // reflections off, where no per-plane pass runs and the surface still
         // samples the refraction by screen UV.
-        if !camera.water_reflections
-            && self
-                .water_batches
-                .iter()
-                .any(|b| !b.simple && b.visible(matrix))
-        {
+        if !camera.water_reflections && has_visible_complex_water {
             self.water.copy_scene_to_refraction(&mut e);
         }
         if use_post {
@@ -3984,11 +5617,7 @@ impl Renderer {
                     frame.elapsed,
                     camera.far,
                     camera.underwater_depth,
-                    if camera.underwater_depth > 0. {
-                        camera.underwater_fog
-                    } else {
-                        camera.air_fog
-                    },
+                    camera.active_environment_fog(),
                     false, // no screen-space fog; scene geometry uses material fog
                     false,
                     camera.bloom,
@@ -3998,20 +5627,13 @@ impl Renderer {
                     camera.gamma_setting,
                 );
             }
+            self.visible_water_batches = visible;
             self.end_frame(stage_ms, lap_at);
             return;
         }
 
         // The reflection texture is reused only after its previous water draw is
         // submitted. Each distinct height gets its own mirror and clip plane.
-        let mut visible = std::mem::take(&mut self.visible_water_batches);
-        visible.clear();
-        visible.extend(
-            self.water_batches
-                .iter()
-                .filter(|b| b.visible(matrix))
-                .cloned(),
-        );
         visible.sort_by(|a, b| {
             b.distance_squared(camera.pos)
                 .total_cmp(&a.distance_squared(camera.pos))
@@ -4063,8 +5685,8 @@ impl Renderer {
                     1. - daylight,
                     frame.elapsed,
                     self.resident_bounds(),
-                    frame.active_fog_range,
-                    frame.active_fog_color,
+                    frame.fog_range,
+                    frame.fog_color,
                 );
             }
             if use_post {
@@ -4078,11 +5700,7 @@ impl Renderer {
                     frame.elapsed,
                     camera.far,
                     camera.underwater_depth,
-                    if camera.underwater_depth > 0. {
-                        camera.underwater_fog
-                    } else {
-                        camera.air_fog
-                    },
+                    camera.active_environment_fog(),
                     false, // no screen-space fog; scene geometry uses material fog
                     false,
                     camera.bloom,
@@ -4105,7 +5723,9 @@ impl Renderer {
         // below. Nothing here is duplicated work to remove — a mirror is a mirror
         // — but the count is what decides how much world the frame rasterises, so
         // it goes into the `TimingFrame` line rather than staying invisible.
-        self.scene_passes = 1 + 2 * visible.iter().filter(|b| !b.simple).count() as u32;
+        self.scene_passes = 1
+            + (if rt_water_reflections { 1 } else { 2 })
+                * visible.iter().filter(|b| !b.simple).count() as u32;
         let mut simple_encoder: Option<wgpu::CommandEncoder> = None;
         for (batch_idx, batch) in visible.iter().enumerate() {
             if batch.simple {
@@ -4216,9 +5836,12 @@ impl Renderer {
                     camera,
                     Pass::Refraction,
                 );
-                self.queue.submit(Some(re.finish()));
+                // Append edge-alpha rendering to the refraction command
+                // buffer. It targets the same refraction image and must run
+                // after the clipped scene, so a separate queue submission is
+                // unnecessary; command order within this encoder is sufficient.
                 self.water.render_edge(
-                    &self.device,
+                    &mut re,
                     &self.queue,
                     matrix,
                     plane,
@@ -4227,6 +5850,7 @@ impl Renderer {
                     self.terrain_gpu.edge_mesh(),
                     (&self.vertex, &self.index, self.terrain_end),
                 );
+                self.queue.submit(Some(re.finish()));
             } else {
                 // Client 0x7cca50 renders the sky and the scene above this
                 // water height into its refraction target, using air fog.
@@ -4234,12 +5858,7 @@ impl Renderer {
                 above.clip = [plane, 1., 1., normal.clip[3]];
                 // 0x7cca50: the below-surface scene is drawn with air fog even
                 // while the camera is underwater.
-                let above_fog = crate::fog_matrix::below_surface_fog(crate::fog_matrix::Fog {
-                    start: camera.air_fog.start,
-                    end: camera.air_fog.end,
-                    color: camera.air_fog.color,
-                    enabled: true,
-                });
+                let above_fog = crate::fog_matrix::below_surface_fog(camera.outdoor_fog());
                 above.fog_range = above_fog.range();
                 above.fog_color = above_fog.color4();
                 self.queue
@@ -4333,6 +5952,22 @@ impl Renderer {
                     batch.end,
                 );
                 self.queue.submit(Some(re.finish()));
+                continue;
+            }
+            if rt_water_reflections {
+                // Above-water refraction is already rendered. Keep the exact
+                // existing water geometry/shader and skip only the old mirrored scene.
+                let mut water_encoder = self.device.create_command_encoder(&Default::default());
+                self.water.draw_water(
+                    &mut water_encoder,
+                    scene_target,
+                    &scene_depth,
+                    &self.vertex,
+                    &self.index,
+                    batch.start,
+                    batch.end,
+                );
+                self.queue.submit(Some(water_encoder.finish()));
                 continue;
             }
             let flip = Mat4::from_translation(Vec3::new(0., 2. * plane, 0.))
@@ -4479,8 +6114,8 @@ impl Renderer {
                 1. - daylight,
                 frame.elapsed,
                 self.resident_bounds(),
-                frame.active_fog_range,
-                frame.active_fog_color,
+                frame.fog_range,
+                frame.fog_color,
             );
         }
         if use_post {
@@ -4494,11 +6129,7 @@ impl Renderer {
                 frame.elapsed,
                 camera.far,
                 camera.underwater_depth,
-                if camera.underwater_depth > 0. {
-                    camera.underwater_fog
-                } else {
-                    camera.air_fog
-                },
+                camera.active_environment_fog(),
                 false, // no screen-space fog; scene geometry uses material fog
                 false,
                 camera.bloom,
@@ -4616,7 +6247,7 @@ impl Camera {
             water_reflections: true,
             world_effects: true,
             effect_distance: 0.,
-            atmospheric_fog: false,
+            atmospheric_fog: true,
             celestial_discs: false,
             celestial_brightness: 1.,
             ignore_celestial_flags: false,
@@ -4649,26 +6280,64 @@ impl Camera {
             logic_delta_ms: 0,
         }
     }
-    fn active_fog(&self) -> crate::fog_matrix::Fog {
-        // Main/reflection table fog uses the camera's active regional set; the
-        // selection (and its enable rule) lives in the audited fog matrix.
-        crate::fog_matrix::camera_fog(
-            self.underwater_depth > 0.,
-            self.atmospheric_fog,
-            crate::fog_matrix::Fog {
-                start: self.air_fog.start,
-                end: self.air_fog.end,
-                color: self.air_fog.color,
-                enabled: true,
-            },
-            crate::fog_matrix::Fog {
-                start: self.underwater_fog.start,
-                end: self.underwater_fog.end,
-                color: self.underwater_fog.color,
-                enabled: true,
-            },
-        )
+    fn authored_air_fog(&self) -> crate::fog_matrix::Fog {
+        crate::fog_matrix::Fog {
+            start: self.air_fog.start,
+            end: self.air_fog.end,
+            color: self.air_fog.color,
+            enabled: true,
+        }
     }
+    /// The selected region's authored atmosphere. Finite-residency fitting
+    /// happens later, where the renderer knows the resident bounds and viewport.
+    fn outdoor_fog(&self) -> crate::fog_matrix::Fog {
+        self.authored_air_fog()
+    }
+    fn active_fog(&self) -> crate::fog_matrix::Fog {
+        // Every pass obtains the same camera-relative air horizon here. Water
+        // retains its separate authored underwater range.
+        if self.underwater_depth > 0. {
+            crate::fog_matrix::camera_fog(
+                true,
+                self.atmospheric_fog,
+                self.authored_air_fog(),
+                crate::fog_matrix::Fog {
+                    start: self.underwater_fog.start,
+                    end: self.underwater_fog.end,
+                    color: self.underwater_fog.color,
+                    enabled: true,
+                },
+            )
+        } else {
+            crate::fog_matrix::camera_fog(
+                false,
+                self.atmospheric_fog,
+                self.outdoor_fog(),
+                crate::fog_matrix::Fog {
+                    start: self.underwater_fog.start,
+                    end: self.underwater_fog.end,
+                    color: self.underwater_fog.color,
+                    enabled: true,
+                },
+            )
+        }
+    }
+    /// Preserve the legacy post-processing API's environment fog type while
+    /// sharing the exact same camera-relative distance and colour as raster.
+    /// Density remains the authored environment value for the post shader.
+    fn active_environment_fog(&self) -> crate::environment::Fog {
+        let active = self.active_fog();
+        let mut fog = if self.underwater_depth > 0. {
+            self.underwater_fog
+        } else {
+            self.air_fog
+        };
+        fog.start = active.start;
+        fog.end = active.end;
+        fog.color = active.color;
+        fog
+    }
+
     fn fog_uniform(&self) -> ([f32; 4], [f32; 4]) {
         let f = self.active_fog();
         (f.range(), f.color4())
@@ -4837,6 +6506,28 @@ fn handoff_ready_exit_plan() -> HandoffReadyExit {
 fn restore_old_window(window: &winit::window::Window) {
     window.set_visible(true);
     window.focus_window();
+}
+
+/// Distinguish a real camera cut from legal free-flight movement. The position
+/// allowance includes simultaneous X/Y/Z input and the current boost speed;
+/// large continuous steps therefore do not repeatedly invalidate temporal RT.
+fn camera_cut_detected(
+    previous_position: Vec3,
+    current_position: Vec3,
+    previous_direction: Vec3,
+    current_direction: Vec3,
+    frame_dt: f32,
+    movement_speed: f32,
+) -> bool {
+    let max_continuous_step = movement_speed.max(0.0) * frame_dt.clamp(0.0, 0.1) * 3.0f32.sqrt();
+    let position_cut_threshold = 64.0f32.max(max_continuous_step * 1.5 + 8.0);
+    let turned_around = previous_direction
+        .normalize_or_zero()
+        .dot(current_direction.normalize_or_zero())
+        < 0.0;
+    current_position.distance_squared(previous_position)
+        > position_cut_threshold * position_cut_threshold
+        || turned_around
 }
 
 fn close_old_window_after_handoff_ready<T: 'static>(
@@ -5209,11 +6900,23 @@ fn receiving_model_frame_with(
         point_position: [0.; 3],
         attenuation: [0., 0.4, 0.],
         eye_direction: uniform.direction[..3].try_into().unwrap(),
+        eye_position: camera.pos.to_array(),
         directional_specular: [light.specular[0], light.specular[1], light.specular[2], 1.],
         specular_variant: true,
         vertex_fog: crate::fog_matrix::MODEL_VERTEX_FOG,
         fog_color: uniform.fog_color,
         fog_range: uniform.fog_range,
+        // Water attenuation is limited to camera-above-water clipped refraction.
+        water_fog: [
+            uniform.clip[0],
+            0.075,
+            if uniform.clip[1] < -0.5 && camera.pos.y > uniform.clip[0] {
+                1.
+            } else {
+                0.
+            },
+            0.,
+        ],
         clip_plane: [0., uniform.clip[1], 0., -uniform.clip[0] * uniform.clip[1]],
         reverse_front: uniform.clip[2] != 0.,
         alpha_compare: 5,
@@ -5283,6 +6986,27 @@ async fn adapter(
             .ok_or("No compatible GPU adapter")?
     };
     eprintln!("GPU adapter: {:?}", a.get_info());
+    let adapter_limits = a.limits();
+    let mut required_limits =
+        wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits.clone());
+    // Raywatcher's trace pass binds 5 write-only storage textures and 4 storage
+    // buffers; downlevel_defaults() caps storage textures at 4, which triggers
+    // a wgpu validation error on both hardware and software modes.
+    required_limits.max_storage_textures_per_shader_stage = adapter_limits
+        .max_storage_textures_per_shader_stage
+        .max(required_limits.max_storage_textures_per_shader_stage);
+    required_limits.max_storage_buffers_per_shader_stage = adapter_limits
+        .max_storage_buffers_per_shader_stage
+        .max(required_limits.max_storage_buffers_per_shader_stage);
+    required_limits.max_sampled_textures_per_shader_stage = adapter_limits
+        .max_sampled_textures_per_shader_stage
+        .max(required_limits.max_sampled_textures_per_shader_stage);
+    required_limits.max_storage_buffer_binding_size = adapter_limits
+        .max_storage_buffer_binding_size
+        .max(required_limits.max_storage_buffer_binding_size);
+    required_limits.max_buffer_size = adapter_limits
+        .max_buffer_size
+        .max(required_limits.max_buffer_size);
     let (d, q) = a
         .request_device(
             &wgpu::DeviceDescriptor {
@@ -5294,7 +7018,7 @@ async fn adapter(
                     & (wgpu::Features::TEXTURE_COMPRESSION_BC
                         | wgpu::Features::MULTI_DRAW_INDIRECT
                         | wgpu::Features::INDIRECT_FIRST_INSTANCE),
-                required_limits: wgpu::Limits::downlevel_defaults().using_resolution(a.limits()),
+                required_limits,
             },
             None,
         )
@@ -5611,6 +7335,10 @@ pub fn run(
         &t.scene,
         whole_ornaments.to_vec(),
     );
+    renderer
+        .modules
+        .raywatcher_mut()
+        .sync_sdk_dir(&settings.upscale_sdk_dir);
     // Add-ons get read access to the world's effect catalogue the moment the
     // world has one: the same grouped index the World tab's census uses, so a
     // module can look up what the map ships without opening the archive
@@ -5891,6 +7619,9 @@ pub fn run(
                     }
                 }
                 if let WindowEvent::KeyboardInput {ref event,..}=event {
+                    if event.physical_key == PhysicalKey::Code(KeyCode::KeyL) && event.state == ElementState::Pressed && !event.repeat && !world_loading_active && !menu_page.is_open() {
+                        renderer.modules.raywatcher_mut().toggle_camera_light();
+                    }
                     if event.physical_key==PhysicalKey::Code(KeyCode::KeyM) && event.state==ElementState::Pressed && !event.repeat && !world_loading_active && (menu_page!=MenuPage::Teleports) {
                         menu_page=if menu_page==MenuPage::WorldMap {MenuPage::Closed} else {MenuPage::WorldMap};
                         keys.clear(); map_refresh=Instant::now()-std::time::Duration::from_secs(10);
@@ -6486,19 +8217,22 @@ pub fn run(
                             }
                         }
                     }
-                    // Any discontinuous camera move invalidates the upscaler
-                    // history. Position alone is not enough: a respawn that keeps
-                    // the position, a look-behind snap or a cut that turns the
-                    // view most of the way round reprojects every pixel to the
-                    // wrong place, and the history takes many frames to wash out.
-                    //
-                    // Thirty degrees in one frame is far past anything a hand
-                    // produces — a 1000 deg/s flick is 16 deg at 60 Hz — and well
-                    // under the turn of a cut, so the threshold separates them
-                    // without resetting on ordinary fast play.
-                    let turned = last_fsr_camera_dir.dot(camera.direction()) < 0.866_025_4;
-                    let camera_jumped = camera.pos.distance_squared(last_fsr_camera_pos) > 64.0 * 64.0
-                        || turned;
+                    // Use the same clamped frame time as camera movement. A fixed
+                    // 64-unit cutoff falsely classified high-speed/boosted movement
+                    // as a teleport, clearing every temporal RT/upscaler history
+                    // while the camera was still moving normally.
+                    let dt = last.elapsed().as_secs_f32().min(0.1);
+                    last = Instant::now();
+                    let movement_speed = settings.camera_speed
+                        * if keys.contains(&KeyCode::ShiftLeft) { settings.boost } else { 1.0 };
+                    let camera_jumped = camera_cut_detected(
+                        last_fsr_camera_pos,
+                        camera.pos,
+                        last_fsr_camera_dir,
+                        camera.direction(),
+                        dt,
+                        movement_speed,
+                    );
                     if camera_jumped {
                         if let Some(fsr) = fsr_upscaler.as_mut() {
                             fsr.reset_history();
@@ -6516,8 +8250,6 @@ pub fn run(
                         if let Err(e)=settings.save(){eprintln!("Settings save: {e}");} else {saved_settings=settings.clone();}
                         last_settings_save=Instant::now();
                     }
-                    let dt = last.elapsed().as_secs_f32().min(0.1);
-                    last = Instant::now();
                     // Add-ons get an optional camera-owner hook. `None` leaves
                     // the original free-flight controls completely untouched.
                     let input_allowed = normal_input_allowed(
@@ -7054,6 +8786,16 @@ pub fn run(
                                 .or_else(|| xess_upscaler.as_ref().map(|xess| xess.jitter()))
                                 .or_else(|| dlss_upscaler.as_ref().map(|dlss| dlss.jitter()))
                                 .unwrap_or((0.0, 0.0));
+                            // Raywatcher decides before the world pass which
+                            // original effects to leave off, so a replaced
+                            // effect never draws twice (or at all).
+                            renderer
+                                .modules
+                                .raywatcher_mut()
+                                .sync_sdk_dir(&settings.upscale_sdk_dir);
+                            let ray_overrides = renderer
+                                .raywatcher_plan(world_extent, camera_jumped);
+                            renderer.raywatcher_overrides = ray_overrides;
                             renderer.render(
                                 &world_view,
                                 &world_raw_view,
@@ -7063,6 +8805,32 @@ pub fn run(
                                 world_extent.1,
                                 camera_jumped,
                             );
+                            // Raywatcher: the plan was decided before the world
+                            // pass (so the effects it replaces never drew), and
+                            // the trace runs now because it consumes the motion
+                            // vectors and depth that pass just wrote. It records
+                            // into its own encoder and submits it, which keeps
+                            // the queue order wgpu already guarantees: world,
+                            // rays, upscale, frame generation, present.
+                            if renderer.raywatcher_frame_plan.trace {
+                                let mut ray_encoder = renderer.device.create_command_encoder(
+                                    &wgpu::CommandEncoderDescriptor {
+                                        label: Some("raywatcher"),
+                                    },
+                                );
+                                renderer.raywatcher_record(
+                                    &camera,
+                                    &mut ray_encoder,
+                                    world_extent,
+                                    world_matrix,
+                                    unjittered_vp,
+                                    frame_jitter,
+                                    camera_jumped,
+                                    Some(&map_space),
+                                    render_scale.texture(),
+                                );
+                                renderer.queue.submit(Some(ray_encoder.finish()));
+                            }
                             if let Some(fsr) = fsr_upscaler.as_mut() {
                                 match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
                                     Ok(()) => fsr.composite(&renderer.device, &renderer.queue, scene_view),
@@ -7519,6 +9287,13 @@ pub fn run(
                                                 }
                                             });
                                     }
+                                    if menu_page.is_open()
+                                        && !ctx.wants_keyboard_input()
+                                        && ctx.input(|i| i.pointer.secondary_clicked())
+                                    {
+                                        menu_page = menu_page.escape();
+                                        keys.clear();
+                                    }
                                     if menu_page==MenuPage::Main {
                                         egui::Window::new("PERFECT WORLD EXPLORER  |  ESC MENU")
                                             .default_pos(egui::pos2(16.,16.)).default_size(egui::vec2(380.,330.)).min_size(egui::vec2(280.,260.)).collapsible(false).resizable(true).vscroll(true)
@@ -7538,7 +9313,7 @@ pub fn run(
                                                     ui.add_space(8.);
                                                     if ui.add_sized([button_width,40.],egui::Button::new(egui::RichText::new("WORLD MAP  [M]").size(17.))).clicked(){menu_page=MenuPage::WorldMap;map_refresh=Instant::now()-std::time::Duration::from_secs(10);}
                                                     ui.add_space(8.);
-                                                    if ui.add_sized([button_width,36.],egui::Button::new("Exit Explorer")).clicked(){if let Err(e)=settings.save(){eprintln!("Settings save: {e}");}target.exit();}
+                                                    if ui.add_sized([button_width,36.],egui::Button::new("Exit Explorer")).clicked(){if let Err(e)=settings.save(){eprintln!("Settings save: {e}");}target.exit();}ui.add_space(6.);ui.label(egui::RichText::new("◀ ESC or Right-click to resume").small().weak());
                                                 });
                                             });
                                     }
@@ -7546,7 +9321,7 @@ pub fn run(
                                         if renderer.modules.menu_ui(ctx,camera.pos,camera.yaw){menu_page=MenuPage::Main;}
                                     }
                                     if menu_page==MenuPage::Settings {
-                                        egui::Window::new("SETTINGS  |  ESC to go back")
+                                        egui::Window::new("SETTINGS  |  ◀ ESC / Right-click to go back")
                                             .default_pos(egui::pos2(16.,16.)).collapsible(false).resizable(true)
                                             .default_size(egui::vec2(490.,460.)).min_size(egui::vec2(310.,250.)).max_height(config.height as f32 / window.scale_factor() as f32-35.).vscroll(true)
                                             .show(ctx,|ui| {
@@ -7561,16 +9336,16 @@ pub fn run(
                                                 match settings_tab {
                                                     0=>{ui.heading("Graphics");let upscaling_off=settings.upscaling==crate::UpscaleMethod::Off;marked_slider(ui,egui::Slider::new(&mut settings.resolution_scale,10.0..=200.0).integer().suffix("%"),"Resolution scale",defaults.resolution_scale,10.,200.,false,upscaling_off);ui.label(egui::RichText::new("3D render resolution (10%–200% of the window). Applies only when Upscaling is Off; UI stays at native resolution.").small().weak());egui::ComboBox::from_label("Upscaling").selected_text(settings.upscaling.label()).show_ui(ui,|ui|{for method in crate::UpscaleMethod::ALL {let available=crate::support(method,&gpu_facts,&sdk_report).is_available();let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.upscaling==method,method.label()));if available && response.clicked() {settings.upscaling=method;}}});ui.label(egui::RichText::new(sdk_report.summary()).small().weak());{let mut notes:Vec<String>=Vec::new();for method in [crate::UpscaleMethod::Dlss,crate::UpscaleMethod::Fsr1,crate::UpscaleMethod::Fsr2,crate::UpscaleMethod::Fsr3,crate::UpscaleMethod::Fsr4,crate::UpscaleMethod::Xess] {if let Some(reason)=crate::support(method,&gpu_facts,&sdk_report).reason() {notes.push(format!("{}: {reason}",method.label()));}}if !notes.is_empty() {ui.label(egui::RichText::new(notes.join("  ·  ")).small().weak());}}if settings.upscaling==crate::UpscaleMethod::Fsr1 {marked_slider(ui,egui::Slider::new(&mut settings.fsr1_sharpness,0.0..=2.0),"FSR 1 RCAS sharpness (stops; lower = sharper)",defaults.fsr1_sharpness,0.,2.,false,true);}if settings.upscaling==crate::UpscaleMethod::Fsr2||settings.upscaling==crate::UpscaleMethod::Fsr3||settings.upscaling==crate::UpscaleMethod::Fsr4 {marked_slider(ui,egui::Slider::new(&mut settings.fsr3_sharpness,0.0..=1.0),"FSR sharpening (RCAS; 0 = off, 1 = maximum)",defaults.fsr3_sharpness,0.,1.,false,true);ui.label(egui::RichText::new("Passed to the FSR upscale dispatch as ffxDispatchDescUpscale.sharpness; it applies to FSR 2, FSR 3.1 and FSR 4 (and to Native AA, which is the same dispatch at a 1.0x ratio).").small().weak());}if settings.upscaling==crate::UpscaleMethod::Dlss {marked_slider(ui,egui::Slider::new(&mut settings.dlss_sharpness,0.0..=1.0),"DLSS sharpening (0 = off, 1 = maximum)",defaults.dlss_sharpness,0.,1.,false,true);ui.label(egui::RichText::new("Handed to NGX as NVSDK_NGX_Parameter_Sharpness (\"Sharpness\"). DLSS applies no sharpening of its own at 0, and its reconstruction is deliberately softer than a spatial filter, so 0 is what made Quality look blurry next to FSR. The default is a mild 0.35; use 0 for the raw vendor look or 1 for maximum.").small().weak());}if settings.upscaling==crate::UpscaleMethod::Xess {marked_slider(ui,egui::Slider::new(&mut settings.xess_sharpness,0.0..=1.0),"XeSS sharpening (0 = off, 1 = maximum)",defaults.xess_sharpness,0.,1.,false,true);ui.label(egui::RichText::new("Applied by the viewer after xessExecute: Intel's SDK 3.0.2 exposes no sharpening control at all, so this runs as an RCAS-style pass while the XeSS result is copied into the composition. It is clamped to the local neighbourhood, so it cannot halo or ring even at 1.").small().weak());}if settings.upscaling==crate::UpscaleMethod::Dlss {if let Some(reason)=&dlss_fail_reason {ui.label(egui::RichText::new(format!("DLSS is NOT running - the world is rendered at native resolution instead (no upscaling). {reason}")).small().color(egui::Color32::LIGHT_RED));}}if settings.upscaling==crate::UpscaleMethod::Xess {if let Some(reason)=&xess_fail_reason {ui.label(egui::RichText::new(format!("XeSS is NOT running - the world is rendered at native resolution instead (no upscaling). {reason}")).small().color(egui::Color32::LIGHT_RED));}}if settings.upscaling==crate::UpscaleMethod::Fsr2||settings.upscaling==crate::UpscaleMethod::Fsr3||settings.upscaling==crate::UpscaleMethod::Fsr4 {if let Some(reason)=&fsr_fail_reason {ui.label(egui::RichText::new(format!("FSR is NOT running - the world is rendered at native resolution instead (no upscaling). {reason}")).small().color(egui::Color32::LIGHT_RED));}}if settings.upscaling!=crate::UpscaleMethod::Off {egui::ComboBox::from_label("Upscaling quality").selected_text(settings.upscale_quality.label_for(settings.upscaling)).show_ui(ui,|ui|{for quality in crate::UpscaleQuality::ALL {let available=crate::quality_available(settings.upscaling,quality);let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.upscale_quality==quality,quality.label_for(settings.upscaling)));if available && response.clicked() {settings.upscale_quality=quality;}if let Some(note)=quality.availability_note(settings.upscaling) {response.on_disabled_hover_text(note);}}});let(internal_width,internal_height)=crate::provider_extent(settings.upscaling,settings.upscale_quality,config.width,config.height,max_texture_dimension);ui.label(egui::RichText::new(format!("Renders the world at {internal_width}×{internal_height} ({}), presented at native window resolution; the UI always stays native.",settings.upscaling.label())).small().weak());}egui::ComboBox::from_label("Frame generation").selected_text(settings.frame_generation.label()).show_ui(ui,|ui|{for method in crate::FrameGenMethod::ALL {let available=crate::support_framegen(method,settings.upscaling,&gpu_facts,&sdk_report).is_available();let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.frame_generation==method,method.label()));if available && response.clicked() {settings.frame_generation=method;}}});{let mut notes:Vec<String>=Vec::new();for method in [crate::FrameGenMethod::Dlss,crate::FrameGenMethod::Fsr,crate::FrameGenMethod::Xess] {if let Some(reason)=crate::support_framegen(method,settings.upscaling,&gpu_facts,&sdk_report).reason() {notes.push(format!("{}: {reason}",method.label()));}}if !notes.is_empty() {ui.label(egui::RichText::new(notes.join("  ·  ")).small().weak());}}egui::ComboBox::from_label("Frame multiplier").selected_text(settings.frame_multiplier.label()).show_ui(ui,|ui|{for multiplier in crate::FrameMultiplier::ALL {let available=crate::multiplier_support(settings.frame_generation,multiplier,&gpu_facts,&sdk_report).is_available();let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.frame_multiplier==multiplier,multiplier.label()));if available && response.clicked() {settings.frame_multiplier=multiplier;}}});if settings.frame_generation!=crate::FrameGenMethod::Off {let mut notes:Vec<String>=Vec::new();for multiplier in [crate::FrameMultiplier::X3,crate::FrameMultiplier::X4,crate::FrameMultiplier::X6] {if let Some(reason)=crate::multiplier_support(settings.frame_generation,multiplier,&gpu_facts,&sdk_report).reason() {notes.push(format!("{}: {reason}",multiplier.label()));}}if !notes.is_empty() {ui.label(egui::RichText::new(notes.join("  ·  ")).small().weak());}}ui.label(egui::RichText::new("Frame multiplier is how many frames are presented per rendered frame: x2 is classic frame generation (one interpolated frame per present), x3/x4/x6 need a generator that can interpolate several. DLSS Multi Frame Generation does that on RTX 50-series (Blackwell) GPUs through NGX DLSSG.MultiFrameCount; on Ada the runtime reports a maximum of one generated frame, so the higher multipliers are disabled there instead of being unlocked. XeSS Frame Generation asks libxess_fg for the count (xefgSwapChainSetNumInterpolatedFrames) and the SDK clamps it to the device maximum it reports. FSR frame generation interpolates exactly one frame per present. Changing the multiplier rebuilds the frame generator, and the generated frames are paced onto consecutive vsync intervals.").small().weak());egui::ComboBox::from_label("Latency").selected_text(settings.latency.label()).show_ui(ui,|ui|{for mode in crate::LatencyMode::ALL {let available=crate::support_latency(mode,settings.frame_generation,&gpu_facts,&sdk_report).is_available();let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.latency==mode,mode.label()));if available && response.clicked() {settings.latency=mode;}}});{let mut notes:Vec<String>=Vec::new();for mode in [crate::LatencyMode::Xell] {if let Some(note)=crate::support_latency(mode,settings.frame_generation,&gpu_facts,&sdk_report).note() {notes.push(format!("{}: {note}",mode.label()));}}if !notes.is_empty() {ui.label(egui::RichText::new(notes.join("  ·  ")).small().weak());}}ui.label(egui::RichText::new("VSync paces presents on the display refresh and is the default. Reflex paces the CPU instead of the presentation: NVIDIA's algorithm without Streamline, it keeps one frame in flight and holds the CPU until just before the next vblank, so presents stay vsync'd (Fifo, sync interval 1) and only the input-to-photon latency changes. XeLL (Intel Xe Low Latency, libxell.dll) keeps the same vsync'd present (sync interval 1, as Intel requires) but lets the library decide when each frame may start: xellSleep holds the CPU until the GPU queue is nearly empty, and the simulation / render-submit / present markers are delivered every frame. It is independent of the upscaler and works with Upscaling Off; XeSS Frame Generation needs its own XeLL context, so in that combination the frame generator performs the latency reduction. XeLL is selectable on every vendor; on a non-Intel GPU Intel only applies the latency reduction while XeSS Frame Generation is active, so expect the markers to run without a measurable gain there. Windows + DX12 only; runtime-unverified here.").small().weak());
 if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=crate::FrameGenMethod::Off {ui.label(egui::RichText::new("FSR 1 is in-tree spatial EASU + RCAS (AMD, NVIDIA and Intel GPUs; no SDK). FSR 2/3.1/4.1 render through the FFX upscaler from the vendored AMD SDK (Windows+DX12; camera-motion only; runtime-unverified). XeSS renders through the XeSS SDK (libxess.dll, SM 6.4) the same way. DLSS renders through the NGX DLLs from the vendored NVIDIA SDK (nvngx_dlss.dll; Windows+DX12, RTX GPU). FSR, XeSS and DLSS frame generation are synthesised natively on Windows+DX12 through each vendor's frame-generation interface and work with any upscaler or Off (XeSS FG with XeSS or Off only; DLSS FG with Upscaling Off or any upscaler on an RTX 40 series or later GPU).").small().weak());}ui.checkbox(&mut settings.all_to_vram,"All to VRAM (maximum speed, uses more memory)").on_hover_text("Keep the whole world resident instead of paging it. Restores the pre-optimisation residency as an option: the complete terrain height/normal grid stays decoded in memory (no disk paging, no per-block decode), the decoded scenery/model texture caches stop evicting, and the whole-world, tree and model preloads keep every page they build. Load time, block-window rebuilds and revisiting areas are much faster; steady-state memory is much higher (the recovered whole-world texture corpus is about 5.4 GiB of sources before geometry, terrain and models). The terrain half is applied when the world loads, so a change takes effect after Load World; the in-viewer caches follow the checkbox live. Leave it off to keep the bounded paged caches, which is the default.");ui.checkbox(&mut settings.fullscreen,"Fullscreen (borderless)");ui.checkbox(&mut settings.bloom,"Bloom");ui.checkbox(&mut settings.sharpen,"Client fullscreen sharpen");marked_slider(ui,egui::Slider::new(&mut settings.bloom_strength,0.0..=4.0),"Bloom strength",defaults.bloom_strength,0.,4.,false,settings.bloom);egui::ComboBox::from_label("Bloom mode").selected_text(match settings.bloom_mode {4=>"Client special 4 (mono)",5=>"Client special 5 (low glow)",_=>"Automatic"}).show_ui(ui,|ui| {ui.selectable_value(&mut settings.bloom_mode,0,"Automatic");ui.selectable_value(&mut settings.bloom_mode,4,"Client special 4 (mono)");ui.selectable_value(&mut settings.bloom_mode,5,"Client special 5 (low glow)");});ui.label("Client glow caller tint / opacity (preview)");let mut tint=[((settings.bloom_tint>>16)&255)as f32/255.,((settings.bloom_tint>>8)&255)as f32/255.,(settings.bloom_tint&255)as f32/255.,(settings.bloom_tint>>24)as f32/255.];if ui.color_edit_button_rgba_unmultiplied(&mut tint).changed() {let c=tint.map(|v|(v.clamp(0.,1.)*255.).round()as u32);settings.bloom_tint=(c[3]<<24)|(c[0]<<16)|(c[1]<<8)|c[2];}marked_slider(ui,egui::Slider::new(&mut settings.bloom_brightness_fade,0.0..=1.0),"Glow fade target (1s transition)",0.,0.,1.,false,settings.bloom);marked_slider(ui,egui::Slider::new(&mut settings.bloom_opacity_fade,0.0..=1.0),"Glow opacity fade (preview)",0.,0.,1.,false,settings.bloom);ui.checkbox(&mut settings.client_gamma,"Client gamma (fullscreen only)");marked_slider(ui,egui::Slider::new(&mut settings.gamma_setting,0.0..=100.0),"Gamma",defaults.gamma_setting,0.,100.,false,settings.client_gamma);}
-                                                    1=>{ui.heading("World");ui.checkbox(&mut settings.detail.terrain_cutoff,"Original-game terrain cutoff (saves memory)").on_hover_text("Live, saved terrain and scenery cutoff. Keeps the block window below; releases distant terrain geometry and unused blend-mask atlas pages. Combine independently with Client atmospheric fog. Fog keeps the authored colour and caps its distance to the resident window (viewer adaptation). Distant scenery preload is paused; global lightmaps and shared tree assets still have memory costs; realistic maps show only resident terrain.");ui.label(renderer.terrain_gpu.residency_label());let (trees,bytes)=renderer.far_trees.residency_stats();ui.label(format!("Tree LOD instances: {trees}; instance buffer {:.1} KiB",bytes as f64/1024.));if let Some(reason)=renderer.far_trees.off_reason(){ui.label(egui::RichText::new(reason).color(egui::Color32::from_rgb(255,190,80)));}ui.add_enabled(!settings.detail.terrain_cutoff,egui::Checkbox::new(&mut settings.whole_world,"Render whole world (trees, rocks, buildings)")).on_hover_text("Paused and its pages released while native cutoff is enabled.");ui.label(&world_status);if let Some(models)=&renderer.models {let (ready,failed,total)=models.status();{let clocks=models.effect_clocks();if !clocks.is_empty(){let (mut low,mut high)=(f32::MAX,f32::MIN);for (_,clock,_,_) in &clocks{low=low.min(*clock);high=high.max(*clock);}ui.label(format!("World effect clocks: {:.0}..{:.0} ms across {} playing roots",low,high,clocks.len())).on_hover_text("The clock each playing root has reached, read out of the effect player itself after the fSpeed the map record puts on it (A3DGFXEx::SetPlaySpeed). A sheet that flows reads a clock that keeps rising; a root whose number stands still is frozen however many of its cards are on screen, and then the fault is the frame delta rather than the texture. The same numbers, with the change since the previous report, are what PWE_EFFECT_CENSUS=1 writes into effect-census.txt next to the executable.");}}ui.label(format!("Animated world models: {ready}/{total}; rejected {failed}"));ui.label(models.status_line());let g=models.gfx_status();let alpha=models.alpha_status();{let fx_status=ui.label(format!("FX light producers: {} loaded, {} pending, {} elements, {} non-light roots, {} failed, {} unsupported binary roots; world effects: {} roots playing, {} quads, {} would not build, {} beyond the radius, {} outside the resident window, {} off by the day/night window ({} producers in total, so those add up); alpha meshes ordered {}/{} ({} drawable of {} slots, {} failed, {} without bounds)",g.live,g.pending,g.emitters,g.non_light_owners,g.failures,g.unsupported,g.players,models.effect_quad_count(),g.player_failures,models.activation_census()[1],models.activation_census()[2],models.activation_census()[3],models.effect_producer_count(),alpha.ordered,alpha.alpha_meshes,alpha.drawable,alpha.slots,alpha.failed,alpha.without_bounds));if fx_status.hovered(){fx_status.on_hover_text(format!("Loader queue: {} frame(s) ticked, one pending root admitted per frame (native 0x5b1a00). Non-light roots loaded cleanly but contain no LightType element; their sprites/particles/trails are what the world-effects count draws, from the placements world.ecwld and the model events authored. Failed counts FX roots only; world-model and alpha-queue problems are listed below. Unsupported binary roots are valid assets in a container this reader cannot parse yet. World effects are built one root per frame and only while their owner is inside the activation radius, so the playing count grows for a moment after a move. The three counts after the would-not-build count say which gate left the rest out: the radius around the camera, the resident terrain window while the cutoff is on, and each record\'s own day/night window from its iValidTime byte. They are a partition, not overlapping tallies: the first gate a root fails is the bucket it lands in, and the total printed after them is every producer, so playing + beyond + outside + day-night equals it.{}{}{}{}",g.frames,models.gfx_failures().iter().take(4).map(|e|format!("\nFailed: {e}")).collect::<String>(),models.gfx_unsupported().iter().take(2).map(|e|format!("\nUnsupported: {e}")).collect::<String>(),models.effect_failures().iter().take(3).map(|e|format!("\nEffect graph failed: {e}")).collect::<String>(),models.effect_warnings().iter().take(3).map(|e|format!("\nWorld effect notice: {e}")).collect::<String>()));}}}ui.checkbox(&mut settings.world_effects,"World effects (waterfalls, torch fire, glows)").on_hover_text("Draws the effect roots the map itself places: every world.ecwld effect record and every ECM model event, at the position, scale, play speed and day/night window the area authored. Nothing here follows the explorer or belongs to an add-on module. Off releases the animated graph and keeps the light producers those same roots carry, so a torch stops drawing its flame but still lights the wall. On rebuilds one root per frame."); marked_slider(ui,egui::Slider::new(&mut settings.effect_distance,0.0..=120.0).suffix(" m"),"Effect fade distance",defaults.effect_distance,0.,120.,false,settings.world_effects).on_hover_text("The client's own distance cull, applied as a fade instead of a pop. A placed effect whose record sets bAttenuation (the default) fades to invisible once it is further from the player than SCNRES_EFFECT - 60 units in the near scheme, 120 in the far one (EC_SceneBlock.cpp:1109/:1133) - and back in when the player returns, over 3,000 ms each way (CECOrnamentMan::Update, EC_ManOrnament.cpp:279; FadeGFX, :961). The client measures from the character\'s ground position, so the explorer measures horizontally from the camera, X and Z only: a camera 500 units above a city is still standing on that city. 0 (the left end, and the default) turns the fade off and restores every root to the alpha the map authored, including roots an earlier distance had already dimmed; 60 reproduces a player standing among the effects. Roots that are not attenuating, and every ECM model event, ignore the radius.");ui.label("RotFromView card axis:"); for m in crate::view_settings::EffectShaft::ALL { ui.selectable_value(&mut settings.effect_shaft,m,m.label()); } ui.label(egui::RichText::new(format!("decal channel will print shaft={}",settings.effect_shaft.token())).small().weak()).on_hover_text("A RotFromView card is an axial billboard: its height runs along one axis and only its width turns to the camera. The client builds that axis from the placement's own Z (A3DDecalEx.cpp:365, GetParentDir()*kp.m_vDir), which is the Client row and the faithful answer. Root direction drops the .gfx keypoint quaternion, World up always stands the shaft up, and Horizontal flattens the client axis into the world ground plane. The row is persisted as effect_shaft= and reprinted in the decal channel, so one report says which rule produced the picture.");marked_slider(ui,egui::Slider::new(&mut settings.far,2000.0..=24000.0),"View distance",defaults.far,2000.,24000.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.detail.radius,2..=12),"Terrain block window (blocks)",defaults.detail.radius as f32,2.,12.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.detail.tree_lod_scale,0.25..=4.0),"Tree LOD distance scale",defaults.detail.tree_lod_scale,0.25,4.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.detail.scenery_quality,0..=5),"Scenery quality preset",defaults.detail.scenery_quality as f32,0.,5.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.tree_wind_strength,0.0..=1.0),"Tree leaf rocking",defaults.tree_wind_strength,0.,1.,false,true);ui.checkbox(&mut settings.client_tree_wind_preview,"Client wind signal (preview)").on_hover_text("Modulates the existing 16-second sampled leaf loop with the recovered client wind signal. This is an approximation, not the original live leaf animation.");marked_slider(ui,egui::Slider::new(&mut settings.time_of_day,0.0..=24.0),"Time of day",defaults.time_of_day,0.,24.,false,true).on_hover_text("The sky clock the recovery put back: hour 0..24, stored in the settings file. Enabling the pass below makes the client's own clock run from here.");ui.checkbox(&mut settings.time_pass_enabled,"Enable time pass").on_hover_text("Runs the sky clock with wall-clock time instead of pinning it. The rate is the client's own: CECSunMoon::Tick (elementclient 0x4b5f10) adds elapsed_ms * ds:0x8db108 to the day fraction, and that constant is 1/14,400,000, so one authored day takes four real hours (one authored hour is ten real minutes) at speed 1.0. Sun and moon elevations, the dusk/night sky-set swap, the regional light blend, weather light and the zone music day/night choice all follow the same clock, so the world really does get dark. The slider below multiplies that rate.");marked_slider(ui,egui::Slider::new(&mut settings.time_pass_speed,0.1..=600.0).logarithmic(true).suffix("x"),"Time pass speed",defaults.time_pass_speed,0.1,600.,true,settings.time_pass_enabled).on_hover_text("Multiplier on the client's 4-real-hour day: 1x is the shipped speed, 2x is a day every two real hours, 60x is a day every four minutes, 600x is the fastest offered (one day per 14.4 real seconds). The label below shows the resulting length of one authored day.");ui.label(egui::RichText::new(format!("Client rate: 1 game day = {}",crate::sky_time::day_length_label(settings.time_pass_speed))).small().weak());egui::ComboBox::from_label("Sky set").selected_text(settings.sky_override.label()).show_ui(ui,|ui|{for o in crate::sky_transition::SkyOverride::ALL{ui.selectable_value(&mut settings.sky_override,o,o.label());}}).response.on_hover_text("Pins one sky.lst row (0 晴天 clear, 1 阴天01 overcast, 2 夕阳 sunset) instead of the client's day/night ladder (0x4203f4 -> autoscene sky_id_day/sky_id_night). Auto is the shipped behaviour; a pinned row never fades and the swap machine keeps running underneath, so returning to Auto resumes where the clock says. The night row is the overcast set, not a painted night panorama: the client darkens it with the regional light colour.");egui::ComboBox::from_label("Weather").selected_text(settings.weather_override.label()).show_ui(ui,|ui|{for o in crate::client_weather::WeatherOverride::ALL{ui.selectable_value(&mut settings.weather_override,o,o.label());}}).response.on_hover_text("Auto is the area's own EC-BSD flag word (world.ecbsd+0x04 bits 1 and 2, read at 0x421520): rain and snow are independent, and a zone may ask for both. The other rows force one effect anywhere. Rain and snow are falling particle quads, not a simulated weather system: the client owns the clock (33 ms object tick) and the textures (rain.tga, snow.bmp); the viewer now spawns them with the objects' own Speed 0.5 / Size 0.04 (rain, +-30 % size, +-50 % speed) and Size 0.3 (snow). The fall volume, the streak length and the flake descent scale are viewer values.");ui.checkbox(&mut settings.water_reflections,"Water reflections");ui.checkbox(&mut settings.celestial_discs,"Client sun and moon").on_hover_text("Native billboards: centre at direction*100 at the recovered template sizes (20-unit sun, 11.42 degrees; 40-unit moon, 22.62 degrees), gated on the recovered elevation curve and the 0.0003/ms visibility ramps. Sun adds its texture, moon alpha-blends it. The sun swells by 1+2n and adds its recovered 120x40 sunshine.bmp strip inside the recovered night-strength window; the moon carries no halo quad (retail takes every moon halo from the flare chain, and a centred quad landed off the painted disc because moon.tga's art is not centred in its texture). Both discs are submitted at half their object colour: 0x4b405f packs ([+0x48] & 0xfefefe | 0x01010100) >> 1, i.e. the recovered halving applied to the object's white default, so the texture is drawn at 127/255 instead of at full strength. Which record fills +0x48 is not recovered. The sun is tinted by the region's light colour (the object's only colour data is light data) and the sun also draws the client's whole flare chain: the fifteen quads `0x4b6270` pre-builds from `textures/nature/flares.bmp` (a 4x4 atlas, six vertices each, `add ebx,0xc0` per sprite and `cmp ebp,0x3c`), with the builder's own size, offset and UV tables. Sprite i sits `offset[i]` pixels from the sun along the line from the sun through the screen centre - the direction `0x450b30` computes - and its half extent is `metric * size[i]`, where the metric is the viewport height: `0x4360a0` hands `0x4b6270` a host block, the builder copies six dwords of it from `+0x14` and reads the fifth (`+0x24`) as an integer (`fild qword [esp+0x5c]`), which is the height of the viewport rectangle that block carries. The sprite colour is the disc's, so the chain shares the disc's half colour and the region light tint. The disc sizes and textures are the client's; the status line below says which part is which.");marked_slider(ui,egui::Slider::new(&mut settings.celestial_brightness,0.1..=1.0),"Star brightness",defaults.celestial_brightness,0.1,1.,false,settings.celestial_discs).on_hover_text("How strongly the sun and moon are drawn. 1.0 (the mark) is the texture itself. 0x4b405f packs each disc as ([+0x48] & 0xfefefe | 0x01010100) >> 1, half the object colour, but drawn that way both discs read as dim grey circles, so the recovered 0.498 is not the default; slide to it to compare. The region light is not multiplied into the discs for the same reason; it stays on the shine strip and the flare sprites, where 0x4b3e22 really does apply the +0x44 colour.");ui.checkbox(&mut settings.ignore_celestial_flags,"Ignore area sun/moon flags").on_hover_text("Every zone\'s EC-BSD record carries a flag word (record +4, read at 0x420992): bit 3 draws the sun, bit 4 the moon. A zone authored without bit 3 has no sun disc in the client either, which is what makes the sun vanish in some open areas while sky and lighting stay correct. This switch latches 0x18 instead of the zone word, so the disc always draws; the status line still prints the zone\'s own word, so flipping it tells the two causes apart.");ui.checkbox(&mut settings.cloud_detail,"Cloud detail (Client CloudDetail gate)").on_hover_text("Shows the native world.cld cloud surface. Point sizing and water-view parity remain approximate.");ui.checkbox(&mut settings.atmospheric_fog,"Client atmospheric fog (limits distant visibility)");ui.checkbox(&mut settings.terrain_lightmaps,"Client terrain lightmaps");ui.checkbox(&mut settings.area_grass_lightmaps,"Grass area-centered lightmaps").on_hover_text("Client area-center selection with clamped tile edges. Disable only to compare the legacy per-vertex selection.");ui.checkbox(&mut settings.regional_tree_lighting,"Experimental regional tree lighting");ui.checkbox(&mut settings.vegetation_authored_mips,"Authored vegetation mips (experimental, restart)").on_hover_text("P4.07 opt-in: preserve authored DDS mip chains for vegetation and use SpeedTree PWTREE08 per-LOD branch/frond alpha references plus the verified leaf reference 84. Default off keeps the approved legacy path. Applied at startup; restart after changing. Native sampler parity, grass anisotropy, and deeper-than-LOD-7 tails remain unresolved.");ui.checkbox(&mut settings.streamed_regions,"Streamed regional lighting/fog (experimental)").on_hover_text("Select environment regions from nearby world blocks using client-like priority. Changes atmospheric and underwater fog; affects trees only when experimental regional tree lighting is enabled. Asynchronous client load order is not yet reproduced.");ui.checkbox(&mut settings.grass_distance_fade,"Client grass distance fade");ui.checkbox(&mut settings.grass_wind_enabled,"Grass wind").on_hover_text("Native wind from the recovered logic clock. The client scales it with authored per-area data (+0x6c..+0x74), not a user setting, so this is an on/off switch.");marked_slider(ui,egui::Slider::new(&mut settings.grass_wind_amplitude,0.0..=2.0),"Grass wind sway",defaults.grass_wind_amplitude,0.,2.,false,settings.grass_wind_enabled).on_hover_text("Viewer-only multiplier on the wind history. The mark (1.0) is the recovered amplitude: the client's only wind inputs are the noise sample and the authored axis weights (+0x6c..+0x74 = 1.0, -0.5, 0.0), with no scale of its own, so there is no single retail number to show. The spring is critically damped at the recovered stiffness, which bounds the sway by that target instead of letting it resonate.");ui.checkbox(&mut settings.model_backface_culling,"Cull building back faces (experimental)");if camera.underwater_depth>0.{ui.label("Underwater effect active");}ui.label("Whole-world texture atlases are shared; geometry and unique source textures still require GPU memory.");}
+                                                    1=>{ui.heading("World");ui.checkbox(&mut settings.detail.terrain_cutoff,"Original-game terrain cutoff (saves memory)").on_hover_text("Live, saved terrain and scenery cutoff. Keeps the block window below; releases distant terrain geometry and unused blend-mask atlas pages. Combine independently with Client atmospheric fog. Fog keeps the authored colour and caps its distance to the resident window (viewer adaptation). Distant scenery preload is paused; global lightmaps and shared tree assets still have memory costs; realistic maps show only resident terrain.");ui.label(renderer.terrain_gpu.residency_label());let (trees,bytes)=renderer.far_trees.residency_stats();ui.label(format!("Tree LOD instances: {trees}; instance buffer {:.1} KiB",bytes as f64/1024.));ui.add_enabled(!settings.detail.terrain_cutoff,egui::Checkbox::new(&mut settings.whole_world,"Render whole world (trees, rocks, buildings)")).on_hover_text("Paused and its pages released while native cutoff is enabled.");ui.label(&world_status);if let Some(models)=&renderer.models {let (ready,failed,total)=models.status();{let clocks=models.effect_clocks();if !clocks.is_empty(){let (mut low,mut high)=(f32::MAX,f32::MIN);for (_,clock,_,_) in &clocks{low=low.min(*clock);high=high.max(*clock);}ui.label(format!("World effect clocks: {:.0}..{:.0} ms across {} playing roots",low,high,clocks.len())).on_hover_text("The clock each playing root has reached, read out of the effect player itself after the fSpeed the map record puts on it (A3DGFXEx::SetPlaySpeed). A sheet that flows reads a clock that keeps rising; a root whose number stands still is frozen however many of its cards are on screen, and then the fault is the frame delta rather than the texture. The same numbers, with the change since the previous report, are what PWE_EFFECT_CENSUS=1 writes into effect-census.txt next to the executable.");}}ui.label(format!("Animated world models: {ready}/{total}; rejected {failed}"));let g=models.gfx_status();let alpha=models.alpha_status();{let fx_status=ui.label(format!("FX light producers: {} loaded, {} pending, {} elements, {} non-light roots, {} failed, {} unsupported binary roots; world effects: {} roots playing, {} quads, {} would not build, {} beyond the radius, {} outside the resident window, {} off by the day/night window; alpha meshes ordered {}/{} ({} drawable of {} slots, {} failed, {} without bounds)",g.live,g.pending,g.emitters,g.non_light_owners,g.failures,g.unsupported,g.players,models.effect_quad_count(),g.player_failures,models.activation_census()[0],models.activation_census()[1],models.activation_census()[2],alpha.ordered,alpha.alpha_meshes,alpha.drawable,alpha.slots,alpha.failed,alpha.without_bounds));if fx_status.hovered(){fx_status.on_hover_text(format!("Loader queue: {} frame(s) ticked, one pending root admitted per frame (native 0x5b1a00). Non-light roots loaded cleanly but contain no LightType element; their sprites/particles/trails are what the world-effects count draws, from the placements world.ecwld and the model events authored. Failed counts FX roots only; world-model and alpha-queue problems are listed below. Unsupported binary roots are valid assets in a container this reader cannot parse yet. World effects are built one root per frame and only while their owner is inside the activation radius, so the playing count grows for a moment after a move. The three counts after the would-not-build count say which gate left the rest out: the radius around the camera, the resident terrain window while the cutoff is on, and each record\'s own day/night window from its iValidTime byte.{}{}{}{}",g.frames,models.gfx_failures().iter().take(4).map(|e|format!("\nFailed: {e}")).collect::<String>(),models.gfx_unsupported().iter().take(2).map(|e|format!("\nUnsupported: {e}")).collect::<String>(),models.effect_failures().iter().take(3).map(|e|format!("\nEffect graph failed: {e}")).collect::<String>(),models.effect_warnings().iter().take(3).map(|e|format!("\nWorld effect notice: {e}")).collect::<String>()));}}}ui.checkbox(&mut settings.world_effects,"World effects (waterfalls, torch fire, glows)").on_hover_text("Draws the effect roots the map itself places: every world.ecwld effect record and every ECM model event, at the position, scale, play speed and day/night window the area authored. Nothing here follows the explorer or belongs to an add-on module. Off releases the animated graph and keeps the light producers those same roots carry, so a torch stops drawing its flame but still lights the wall. On rebuilds one root per frame."); marked_slider(ui,egui::Slider::new(&mut settings.effect_distance,0.0..=120.0).suffix(" m"),"Effect fade distance",defaults.effect_distance,0.,120.,false,settings.world_effects).on_hover_text("The client's own distance cull, applied as a fade instead of a pop. A placed effect whose record sets bAttenuation (the default) fades to invisible once it is further from the player than SCNRES_EFFECT - 60 units in the near scheme, 120 in the far one (EC_SceneBlock.cpp:1109/:1133) - and back in when the player returns, over 3,000 ms each way (CECOrnamentMan::Update, EC_ManOrnament.cpp:279; FadeGFX, :961). The client measures from the character\'s ground position, so the explorer measures horizontally from the camera, X and Z only: a camera 500 units above a city is still standing on that city. 0 (the left end, and the default) turns the fade off and restores every root to the alpha the map authored, including roots an earlier distance had already dimmed; 60 reproduces a player standing among the effects. Roots that are not attenuating, and every ECM model event, ignore the radius.");ui.label("RotFromView card axis:"); for m in crate::view_settings::EffectShaft::ALL { ui.selectable_value(&mut settings.effect_shaft,m,m.label()); } ui.label(egui::RichText::new(format!("decal channel will print shaft={}",settings.effect_shaft.token())).small().weak()).on_hover_text("A RotFromView card is an axial billboard: its height runs along one axis and only its width turns to the camera. The client builds that axis from the placement's own Z (A3DDecalEx.cpp:365, GetParentDir()*kp.m_vDir), which is the Client row and the faithful answer. Root direction drops the .gfx keypoint quaternion, World up always stands the shaft up, and Horizontal flattens the client axis into the world ground plane. The row is persisted as effect_shaft= and reprinted in the decal channel, so one report says which rule produced the picture.");marked_slider(ui,egui::Slider::new(&mut settings.far,2000.0..=24000.0),"View distance",defaults.far,2000.,24000.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.detail.radius,2..=12),"Terrain block window (blocks)",defaults.detail.radius as f32,2.,12.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.detail.tree_lod_scale,0.25..=4.0),"Tree LOD distance scale",defaults.detail.tree_lod_scale,0.25,4.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.detail.scenery_quality,0..=5),"Scenery quality preset",defaults.detail.scenery_quality as f32,0.,5.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.tree_wind_strength,0.0..=1.0),"Tree leaf rocking",defaults.tree_wind_strength,0.,1.,false,true);ui.checkbox(&mut settings.client_tree_wind_preview,"Client wind signal (preview)").on_hover_text("Modulates the existing 16-second sampled leaf loop with the recovered client wind signal. This is an approximation, not the original live leaf animation.");marked_slider(ui,egui::Slider::new(&mut settings.time_of_day,0.0..=24.0),"Time of day",defaults.time_of_day,0.,24.,false,true).on_hover_text("The sky clock the recovery put back: hour 0..24, stored in the settings file. Enabling the pass below makes the client's own clock run from here.");ui.checkbox(&mut settings.time_pass_enabled,"Enable time pass").on_hover_text("Runs the sky clock with wall-clock time instead of pinning it. The rate is the client's own: CECSunMoon::Tick (elementclient 0x4b5f10) adds elapsed_ms * ds:0x8db108 to the day fraction, and that constant is 1/14,400,000, so one authored day takes four real hours (one authored hour is ten real minutes) at speed 1.0. Sun and moon elevations, the dusk/night sky-set swap, the regional light blend, weather light and the zone music day/night choice all follow the same clock, so the world really does get dark. The slider below multiplies that rate.");marked_slider(ui,egui::Slider::new(&mut settings.time_pass_speed,0.1..=600.0).logarithmic(true).suffix("x"),"Time pass speed",defaults.time_pass_speed,0.1,600.,true,settings.time_pass_enabled).on_hover_text("Multiplier on the client's 4-real-hour day: 1x is the shipped speed, 2x is a day every two real hours, 60x is a day every four minutes, 600x is the fastest offered (one day per 14.4 real seconds). The label below shows the resulting length of one authored day.");ui.label(egui::RichText::new(format!("Client rate: 1 game day = {}",crate::sky_time::day_length_label(settings.time_pass_speed))).small().weak());egui::ComboBox::from_label("Sky set").selected_text(settings.sky_override.label()).show_ui(ui,|ui|{for o in crate::sky_transition::SkyOverride::ALL{ui.selectable_value(&mut settings.sky_override,o,o.label());}}).response.on_hover_text("Pins one sky.lst row (0 晴天 clear, 1 阴天01 overcast, 2 夕阳 sunset) instead of the client's day/night ladder (0x4203f4 -> autoscene sky_id_day/sky_id_night). Auto is the shipped behaviour; a pinned row never fades and the swap machine keeps running underneath, so returning to Auto resumes where the clock says. The night row is the overcast set, not a painted night panorama: the client darkens it with the regional light colour.");egui::ComboBox::from_label("Weather").selected_text(settings.weather_override.label()).show_ui(ui,|ui|{for o in crate::client_weather::WeatherOverride::ALL{ui.selectable_value(&mut settings.weather_override,o,o.label());}}).response.on_hover_text("Auto is the area's own EC-BSD flag word (world.ecbsd+0x04 bits 1 and 2, read at 0x421520): rain and snow are independent, and a zone may ask for both. The other rows force one effect anywhere. Rain and snow are falling particle quads, not a simulated weather system: the client owns the clock (33 ms object tick) and the textures (rain.tga, snow.bmp); the viewer now spawns them with the objects' own Speed 0.5 / Size 0.04 (rain, +-30 % size, +-50 % speed) and Size 0.3 (snow). The fall volume, the streak length and the flake descent scale are viewer values.");ui.checkbox(&mut settings.water_reflections,"Water reflections");ui.checkbox(&mut settings.celestial_discs,"Client sun and moon").on_hover_text("Native billboards: centre at direction*100 at the recovered template sizes (20-unit sun, 11.42 degrees; 40-unit moon, 22.62 degrees), gated on the recovered elevation curve and the 0.0003/ms visibility ramps. Sun adds its texture, moon alpha-blends it. The sun swells by 1+2n and adds its recovered 120x40 sunshine.bmp strip inside the recovered night-strength window; the moon carries no halo quad (retail takes every moon halo from the flare chain, and a centred quad landed off the painted disc because moon.tga's art is not centred in its texture). Both discs are submitted at half their object colour: 0x4b405f packs ([+0x48] & 0xfefefe | 0x01010100) >> 1, i.e. the recovered halving applied to the object's white default, so the texture is drawn at 127/255 instead of at full strength. Which record fills +0x48 is not recovered. The sun is tinted by the region's light colour (the object's only colour data is light data) and the sun also draws the client's whole flare chain: the fifteen quads `0x4b6270` pre-builds from `textures/nature/flares.bmp` (a 4x4 atlas, six vertices each, `add ebx,0xc0` per sprite and `cmp ebp,0x3c`), with the builder's own size, offset and UV tables. Sprite i sits `offset[i]` pixels from the sun along the line from the sun through the screen centre - the direction `0x450b30` computes - and its half extent is `metric * size[i]`, where the metric is the viewport height: `0x4360a0` hands `0x4b6270` a host block, the builder copies six dwords of it from `+0x14` and reads the fifth (`+0x24`) as an integer (`fild qword [esp+0x5c]`), which is the height of the viewport rectangle that block carries. The sprite colour is the disc's, so the chain shares the disc's half colour and the region light tint. The disc sizes and textures are the client's; the status line below says which part is which.");marked_slider(ui,egui::Slider::new(&mut settings.celestial_brightness,0.1..=1.0),"Star brightness",defaults.celestial_brightness,0.1,1.,false,settings.celestial_discs).on_hover_text("How strongly the sun and moon are drawn. 1.0 (the mark) is the texture itself. 0x4b405f packs each disc as ([+0x48] & 0xfefefe | 0x01010100) >> 1, half the object colour, but drawn that way both discs read as dim grey circles, so the recovered 0.498 is not the default; slide to it to compare. The region light is not multiplied into the discs for the same reason; it stays on the shine strip and the flare sprites, where 0x4b3e22 really does apply the +0x44 colour.");ui.checkbox(&mut settings.ignore_celestial_flags,"Ignore area sun/moon flags").on_hover_text("Every zone\'s EC-BSD record carries a flag word (record +4, read at 0x420992): bit 3 draws the sun, bit 4 the moon. A zone authored without bit 3 has no sun disc in the client either, which is what makes the sun vanish in some open areas while sky and lighting stay correct. This switch latches 0x18 instead of the zone word, so the disc always draws; the status line still prints the zone\'s own word, so flipping it tells the two causes apart.");ui.checkbox(&mut settings.cloud_detail,"Cloud detail (Client CloudDetail gate)").on_hover_text("Shows the native world.cld cloud surface. Point sizing and water-view parity remain approximate.");{let fog_before=settings.atmospheric_fog;ui.checkbox(&mut settings.atmospheric_fog,"Client atmospheric fog (limits distant visibility)");if settings.atmospheric_fog!=fog_before{settings.atmospheric_fog_explicit=true;}}ui.checkbox(&mut settings.terrain_lightmaps,"Client terrain lightmaps");ui.checkbox(&mut settings.area_grass_lightmaps,"Grass area-centered lightmaps").on_hover_text("Client area-center selection with clamped tile edges. Disable only to compare the legacy per-vertex selection.");ui.checkbox(&mut settings.regional_tree_lighting,"Experimental regional tree lighting");ui.checkbox(&mut settings.vegetation_authored_mips,"Authored vegetation mips (experimental, restart)").on_hover_text("P4.07 opt-in: preserve authored DDS mip chains for vegetation and use SpeedTree PWTREE08 per-LOD branch/frond alpha references plus the verified leaf reference 84. Default off keeps the approved legacy path. Applied at startup; restart after changing. Native sampler parity, grass anisotropy, and deeper-than-LOD-7 tails remain unresolved.");ui.checkbox(&mut settings.streamed_regions,"Streamed regional lighting/fog (experimental)").on_hover_text("Select environment regions from nearby world blocks using client-like priority. Changes atmospheric and underwater fog; affects trees only when experimental regional tree lighting is enabled. Asynchronous client load order is not yet reproduced.");ui.checkbox(&mut settings.grass_distance_fade,"Client grass distance fade");ui.checkbox(&mut settings.grass_wind_enabled,"Grass wind").on_hover_text("Native wind from the recovered logic clock. The client scales it with authored per-area data (+0x6c..+0x74), not a user setting, so this is an on/off switch.");marked_slider(ui,egui::Slider::new(&mut settings.grass_wind_amplitude,0.0..=2.0),"Grass wind sway",defaults.grass_wind_amplitude,0.,2.,false,settings.grass_wind_enabled).on_hover_text("Viewer-only multiplier on the wind history. The mark (1.0) is the recovered amplitude: the client's only wind inputs are the noise sample and the authored axis weights (+0x6c..+0x74 = 1.0, -0.5, 0.0), with no scale of its own, so there is no single retail number to show. The spring is critically damped at the recovered stiffness, which bounds the sway by that target instead of letting it resonate.");ui.checkbox(&mut settings.model_backface_culling,"Cull building back faces (experimental)");if camera.underwater_depth>0.{ui.label("Underwater effect active");}ui.label("Whole-world texture atlases are shared; geometry and unique source textures still require GPU memory.");}
                                                     2=>{ui.heading("Sound");ui.checkbox(&mut settings.music_enabled,"Play music from current zone");marked_slider(ui,egui::Slider::new(&mut settings.music_volume,0.0..=1.0),"Music volume",defaults.music_volume,0.,1.,false,true);ui.label(music.status());let audio_diagnostic=music.diagnostic();if !audio_diagnostic.is_empty(){ui.label(audio_diagnostic);}ui.checkbox(&mut settings.ambience_enabled,"Play zone ambience (experimental)");marked_slider(ui,egui::Slider::new(&mut settings.sound_volume,0.0..=1.0),"Ambience volume",defaults.sound_volume,0.,1.,false,true);ui.label(ambience.status());ui.checkbox(&mut settings.effects_enabled,"Play world effect sounds (experimental)");marked_slider(ui,egui::Slider::new(&mut settings.effects_volume,0.0..=1.0),"Effects volume",defaults.effects_volume,0.,1.,false,true);ui.label(world_audio.status());if let Some(error)=world_audio.diagnostic(){ui.label(error);}ui.label("Zone selection, world sound timing and spatialization are approximations. Gameplay, combat and weather effects are not implemented.");}
                                                     3=>{ui.heading("Interface");ui.checkbox(&mut settings.show_zone_entry,"Show entering zone notification");ui.checkbox(&mut settings.show_minimap,"Show minimap");marked_slider(ui,egui::Slider::new(&mut settings.minimap_range,100.0..=600.0),"Minimap half-width (world units)",defaults.minimap_range,100.,600.,false,settings.show_minimap);ui.separator();egui::ComboBox::from_label("Minimap style").selected_text(settings.minimap_style.label()).show_ui(ui,|ui|{ui.selectable_value(&mut settings.minimap_style,MapStyle::Realistic,"Realistic");ui.selectable_value(&mut settings.minimap_style,MapStyle::Original,"Original");});ui.label(egui::RichText::new("Realistic renders the world from above each frame; Original shows the client's own minimap tiles (surfaces/minimaps/world) at their native resolution.").small().weak());egui::ComboBox::from_label("Minimap shape").selected_text(settings.minimap_shape.label()).show_ui(ui,|ui|{ui.selectable_value(&mut settings.minimap_shape,MinimapShape::Square,"Square");ui.selectable_value(&mut settings.minimap_shape,MinimapShape::Circular,"Circular");});egui::ComboBox::from_label("World map style").selected_text(settings.world_map_style.label()).show_ui(ui,|ui|{ui.selectable_value(&mut settings.world_map_style,MapStyle::Realistic,"Realistic");ui.selectable_value(&mut settings.world_map_style,MapStyle::Original,"Original");});ui.label(egui::RichText::new("Realistic renders the whole world from above; Original shows the client's map tiles (surfaces/maps).").small().weak());ui.separator();ui.heading("Camera controls");marked_slider(ui,egui::Slider::new(&mut settings.camera_speed,10.0..=3000.0).logarithmic(true),"Flight speed",defaults.camera_speed,10.,3000.,true,true);marked_slider(ui,egui::Slider::new(&mut settings.boost,1.0..=10.0),"Shift multiplier",defaults.boost,1.,10.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.sensitivity,0.0005..=0.01).logarithmic(true),"Mouse sensitivity",defaults.sensitivity,0.0005,0.01,true,true);}
                                                     _=>{ui.heading("Logging");ui.label(egui::RichText::new("Tick a channel, or click the capture for a report that is already filed, and the viewer writes the files below while you look at the artefact. F8 drops a marker with the camera pose into the log, so a report can name the spot instead of describing it.").small().weak());let mut mask=settings.logging_mask;let mut directory=settings.logging_dir.clone();let changed=crate::diagnostics::ui(ui,&mut mask,&mut directory);if mask!=settings.logging_mask{settings.logging_mask=mask;crate::diagnostics::set_mask(mask);}if directory!=settings.logging_dir{settings.logging_dir=directory;crate::diagnostics::apply_dir(&settings.logging_dir);}}
                                                 }
-                                                ui.separator();ui.horizontal(|ui|{if ui.add_sized([135.,32.],egui::Button::new("Back to menu")).clicked(){menu_page=MenuPage::Main;}if ui.button("Restore defaults").clicked(){settings=ViewSettings::default();}});
+                                                ui.separator();ui.horizontal(|ui|{if ui.add_sized([165.,32.],egui::Button::new("◀ Back to menu (RMB)")).clicked(){menu_page=MenuPage::Main;}if ui.button("Restore defaults").clicked(){settings=ViewSettings::default();}});
                                             });
                                     }
                                     if menu_page==MenuPage::Teleports {
-                                        egui::Window::new("TELEPORT LIST  |  ESC to go back").default_pos(egui::pos2(16.,16.)).default_size(egui::vec2(540.,570.)).min_size(egui::vec2(340.,280.)).max_height(config.height as f32/window.scale_factor() as f32-35.).collapsible(false).resizable(true).show(ctx,|ui|{
+                                        egui::Window::new("TELEPORT LIST  |  ◀ ESC / Right-click to go back").default_pos(egui::pos2(16.,16.)).default_size(egui::vec2(540.,570.)).min_size(egui::vec2(340.,280.)).max_height(config.height as f32/window.scale_factor() as f32-35.).collapsible(false).resizable(true).show(ctx,|ui|{
                                             ui.heading("Explore destinations");ui.label(egui::RichText::new("Locations and coordinates from the selected map").small().weak());ui.add_space(6.);
                                             ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new("Current world").strong());
@@ -7693,12 +9468,12 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                     if ui.button("Teleport").clicked(){camera.pos=Vec3::from_array(place.position)+Vec3::Y*3.;menu_page=MenuPage::Closed;keys.clear();}});ui.separator();
                                                 }});
                                             },Err(e)=>{ui.colored_label(egui::Color32::LIGHT_RED,format!("Could not load destinations: {e}"));}}
-                                            if ui.button("Back to menu").clicked(){menu_page=MenuPage::Main;}
+                                            if ui.button("◀ Back to menu (RMB)").clicked(){menu_page=MenuPage::Main;}
                                         });
                                     }
                                     if menu_page==MenuPage::WorldMap {
                                         let scale=window.scale_factor() as f32;let screen_w=config.width as f32/scale;let screen_h=config.height as f32/scale;
-                                        egui::Window::new("WORLD MAP  |  M or ESC to close").default_pos(egui::pos2(16.,16.)).default_size(egui::vec2((screen_w-32.).min(760.),(screen_h-32.).min(900.))).min_size(egui::vec2(330.,300.)).max_height(screen_h-35.).collapsible(false).resizable(true).show(ctx,|ui|{
+                                        egui::Window::new("WORLD MAP  |  ◀ M / ESC / Right-click to close").default_pos(egui::pos2(16.,16.)).default_size(egui::vec2((screen_w-32.).min(760.),(screen_h-32.).min(900.))).min_size(egui::vec2(330.,300.)).max_height(screen_h-35.).collapsible(false).resizable(true).show(ctx,|ui|{
                                             ui.label(egui::RichText::new("North: up  |  East: right  |  Mouse wheel: zoom").small().strong());
                                             if settings.world_map_style==MapStyle::Realistic && !renderer.world_done {ui.horizontal_wrapped(|ui|{ui.label(egui::RichText::new("Distant scenery: ").small().weak());if settings.detail.terrain_cutoff {ui.label("Scenery follows the resident window");}else if settings.whole_world {ui.label(egui::RichText::new(&world_status).small().weak());}else if ui.button("Load whole world scenery").clicked(){settings.whole_world=true;}});}
                                             let remaining=(ui.available_height()-78.).max(100.);let visible_width=ui.available_width();let base_width=visible_width.min(remaining*map_aspect).max(120.);let image_size=egui::vec2(base_width*map_zoom,base_width*map_zoom/map_aspect);
@@ -7712,7 +9487,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                 }else {if let Some(e)=&original_map_error{ui.colored_label(egui::Color32::LIGHT_RED,format!("Original map unavailable: {e}"));}else{ui.label("Loading original client map tiles...");}ui.allocate_space(egui::vec2(80.,80.));}
                                             });
                                             if let Some((pointer,rect,ratio))=zoom_anchor {let mut state=scroll.state;let local=pointer-rect.min;state.offset=anchored_zoom_offset(state.offset,local,ratio);state.store(ctx,scroll.id);ctx.request_repaint();}
-                                            ui.separator();ui.horizontal_wrapped(|ui|{ui.checkbox(&mut map_click_teleport,"Click to teleport");marked_slider(ui,egui::Slider::new(&mut map_zoom,1.0..=4.0),"Zoom",1.,1.,4.,false,true);ui.label(egui::RichText::new(format!("{} style — change in Settings ▸ Interface",settings.world_map_style.label())).small().weak());});
+                                            ui.separator();ui.horizontal_wrapped(|ui|{if ui.button("◀ Back (RMB)").clicked(){menu_page=MenuPage::Closed;}ui.checkbox(&mut map_click_teleport,"Click to teleport");marked_slider(ui,egui::Slider::new(&mut map_zoom,1.0..=4.0),"Zoom",1.,1.,4.,false,true);ui.label(egui::RichText::new(format!("{} style — change in Settings ▸ Interface",settings.world_map_style.label())).small().weak());});
                                         });
                                     }
                                     if settings.show_minimap {egui::Area::new(egui::Id::new("minimap-hud")).anchor(egui::Align2::RIGHT_TOP,egui::vec2(-16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.).rounding(match settings.minimap_shape { MinimapShape::Circular => 256.*0.5+5., MinimapShape::Square => 0.0 }).show(ui,|ui|{
@@ -8466,6 +10241,42 @@ pub fn preview(
 }
 
 #[cfg(test)]
+mod raywatcher_water_surface_selection_tests {
+    use super::*;
+
+    #[test]
+    fn camera_containing_large_water_plane_survives_the_sixteen_plane_cap() {
+        let camera = Vec3::new(0.0, -12.0, 0.0);
+        let mut surfaces: Vec<crate::modules::raywatcher::harvest::WaterSurface> = (0..16)
+            .map(|i| {
+                let x = 10.0 + i as f32 * 3.0;
+                crate::modules::raywatcher::harvest::WaterSurface {
+                    bounds: [x, x + 1.0, -1.0, 1.0],
+                    height: 0.0,
+                }
+            })
+            .collect();
+        // This lake contains the camera but has a distant rectangle centre.
+        // Centre-distance sorting placed all 16 small patches ahead of it.
+        let camera_lake = crate::modules::raywatcher::harvest::WaterSurface {
+            bounds: [-2_000.0, 50.0, -50.0, 50.0],
+            height: 0.0,
+        };
+        surfaces.push(camera_lake);
+
+        prioritize_raywatcher_water_surfaces(&mut surfaces, camera);
+
+        assert_eq!(surfaces.len(), 16);
+        assert!(
+            surfaces
+                .iter()
+                .any(|surface| surface.bounds == camera_lake.bounds),
+            "the water plane under the camera must be available to the G-buffer classifier"
+        );
+    }
+}
+
+#[cfg(test)]
 mod water_batch_tests {
     use super::*;
     fn batch(bounds: [f32; 4], height: f32) -> WaterBatch {
@@ -8636,6 +10447,27 @@ mod frame_snapshot_tests {
             .map(|i| i + 4)
             .unwrap_or(tail.len());
         tail[..end].to_string()
+    }
+
+    #[test]
+    fn fog_depth_probe_reports_camera_space_window_depth_and_fog_factor() {
+        let eye = Vec3::new(0., 100., 0.);
+        let matrix = Mat4::from_scale(Vec3::new(-1., 1., 1.))
+            * Mat4::perspective_rh(CAMERA_FOV_Y_RADIANS, 16. / 9., 16000., CAMERA_NEAR)
+            * Mat4::look_to_rh(eye, Vec3::NEG_Z, Vec3::Y);
+        let probe = fog_depth_probe(
+            matrix,
+            [-100., 100., -100., -500.],
+            eye.to_array(),
+            eye.y,
+            [50., 100., 1., 0.],
+        );
+        assert!(probe.camera_xz_depth.abs() < 0.01);
+        assert!((probe.window_center_depth - 300.).abs() < 0.1);
+        assert!(probe.min_depth < probe.window_center_depth);
+        assert!(probe.max_depth > probe.window_center_depth);
+        assert_eq!(probe.min_factor, 0.);
+        assert_eq!(probe.max_factor, 1.);
     }
 
     #[test]
@@ -9165,9 +10997,104 @@ mod handoff_exit_tests {
         // Only the code above the tests, or these assertions would match
         // themselves.
         let src = include_str!("gpu.rs");
-        let code = &src[..src.find("#[cfg(test)]").expect("the test module")];
+        let code = src
+            .split("#[cfg(test)]\nmod handoff_exit_tests")
+            .next()
+            .expect("the handoff test module");
         // One definition, used by both the `Failed` and `Disconnected` arms.
         assert_eq!(code.matches("fn restore_old_window(").count(), 1);
         assert_eq!(code.matches("restore_old_window(&window);").count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod raywatcher_fog_preservation_tests {
+    use super::*;
+
+    #[test]
+    fn raywatcher_shadow_replacement_preserves_the_native_fog_enable_bit() {
+        let effects = crate::modules::raywatcher::plan::Effects {
+            shadows: true,
+            lighting: false,
+            reflections: false,
+            ambient_occlusion: false,
+            global_illumination: false,
+            contact_shadows: false,
+            moonlit_night: false,
+            twilight_sky: false,
+        };
+        let mut snapshot = FrameSnapshot::default();
+        snapshot.overrides =
+            crate::modules::raywatcher::frame::RasterOverrides::for_effects(effects, true);
+
+        for fog_range in [[60., 400., 1., 0.], [60., 400., 0., 0.]] {
+            let uniform = snapshot.uniform(
+                Mat4::IDENTITY,
+                [0.; 4],
+                [0.; 4],
+                fog_range,
+                [0.2, 0.3, 0.4, 1.],
+                [0.; 4],
+            );
+            assert_eq!(
+                uniform.fog_range, fog_range,
+                "Raywatcher may replace lighting, never the client's fog range or enable flag"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod raywatcher_camera_cut_tests {
+    use super::*;
+
+    #[test]
+    fn boosted_continuous_flight_does_not_reset_temporal_history() {
+        let moved = Vec3::splat(240.0 * 4.0 * 0.1);
+        assert!(!camera_cut_detected(
+            Vec3::ZERO,
+            moved,
+            Vec3::NEG_Z,
+            Vec3::NEG_Z,
+            0.1,
+            240.0 * 4.0,
+        ));
+    }
+
+    #[test]
+    fn a_teleport_still_resets_temporal_history_during_fast_flight() {
+        assert!(camera_cut_detected(
+            Vec3::ZERO,
+            Vec3::new(900.0, 0.0, 0.0),
+            Vec3::NEG_Z,
+            Vec3::NEG_Z,
+            0.1,
+            240.0 * 4.0,
+        ));
+    }
+
+    #[test]
+    fn ordinary_fast_look_motion_is_not_a_camera_cut() {
+        let turned_45_degrees = Vec3::new(1.0, 0.0, -1.0).normalize();
+        assert!(!camera_cut_detected(
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::NEG_Z,
+            turned_45_degrees,
+            1.0 / 60.0,
+            240.0,
+        ));
+    }
+
+    #[test]
+    fn a_full_reverse_view_is_still_a_camera_cut() {
+        assert!(camera_cut_detected(
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::NEG_Z,
+            Vec3::Z,
+            1.0 / 60.0,
+            240.0,
+        ));
     }
 }

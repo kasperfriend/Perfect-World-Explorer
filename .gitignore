@@ -47,6 +47,9 @@ google_drive/
 !/sdk/amd_fidelityfx_loader_dx12.dll
 !/sdk/amd_fidelityfx_upscaler_dx12.dll
 !/sdk/amd_fidelityfx_framegeneration_dx12.dll
+# The FFX denoiser (FSR Ray Regeneration) Raywatcher's reconstruction option
+# loads; same SDK release and license as the three above.
+!/sdk/amd_fidelityfx_denoiser_dx12.dll
 !/sdk/AMD_FidelityFX-SDK-2.4.0-notices.md
 !/sdk/AMD_FidelityFX-SDK-2.4.0-LICENSE.md
 # The FidelityFX SDK API headers used by the FFI integration (MIT-style,
@@ -65,6 +68,8 @@ google_drive/
 !/sdk/libxell.dll
 !/sdk/nvngx_dlss.dll
 !/sdk/nvngx_dlssg.dll
+# Ray reconstruction (DLSS RR), same DLSS release and license.
+!/sdk/nvngx_dlssd.dll
 !/sdk/NVIDIA_DLSS-SDK-LICENSE.txt
 # The NGX headers the DLSS FFI was written against (same repository and
 # license); kept for review and for tools/verify-vendor-sdks.py.

@@ -75,7 +75,7 @@ fn main() {
 }
 @fragment fn test_fs(@builtin(position) p:vec4<f32>)->@location(0) vec4<f32> {
  let c=vec3<f32>(0.21404114,0.05087609,0.52252155);
- return vec4<f32>(surface_fog(c,1./p.x),1.);
+ return vec4<f32>(surface_fog(c,vec3<f32>(p.x,0.,0.)),1.);
 }
 "#;
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -153,6 +153,9 @@ fn main() {
     // Matrix (16) + inverse (16) + eye_time (4) + size (4) + animation (4) +
     // edge_mode (4) = 48 floats, then fog (4) and fog_color (4).
     let mut uniform = [0f32; 56];
+    // The production helper derives view depth from the projected world
+    // position's W component. Map world.x to that value for this 1D test.
+    uniform[3] = 1.0;
     for (name, bound, fog_on, column) in cases {
         let fog = bound.range();
         let color = bound.color4();

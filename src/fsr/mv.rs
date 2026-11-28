@@ -86,16 +86,25 @@ struct FOut {
     if (params.prev_valid != 0u) {
         let px = floor(i.pos.xy) + vec2<f32>(0.5, 0.5);
         let uv = px / size;
-        let ndc = vec4<f32>(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, d, 1.0);
-        var world = params.inv_vp * ndc;
-        if (abs(world.w) >= 1e-8) {
-            world = world / world.w;
-            let clip = params.prev_vp * world;
-            if (abs(clip.w) >= 1e-8) {
-                let prev_ndc = clip.xy / clip.w;
-                let prev_uv = vec2<f32>((prev_ndc.x + 1.0) * 0.5, (1.0 - prev_ndc.y) * 0.5);
-                out.mv = (prev_uv - uv) * size;
-            }
+        let ndc_xy = vec2<f32>(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0);
+        var clip: vec4<f32>;
+        if (d <= 1e-6) {
+            // Sky & roof clouds render rotation-only at infinity (`rotation.w_axis = W`):
+            // compute pure world ray direction (`w = 0`) so camera translation never
+            // injects false parallax ghosting onto sky clouds.
+            let p_far = params.inv_vp * vec4<f32>(ndc_xy, 0.0, 1.0);
+            let p_near = params.inv_vp * vec4<f32>(ndc_xy, 1.0, 1.0);
+            let dir = p_far.xyz * (1.0 / max(abs(p_far.w), 1e-8)) * sign(p_far.w)
+                    - p_near.xyz * (1.0 / max(abs(p_near.w), 1e-8)) * sign(p_near.w);
+            clip = params.prev_vp * vec4<f32>(dir, 0.0);
+        } else {
+            let world = params.inv_vp * vec4<f32>(ndc_xy, d, 1.0);
+            clip = params.prev_vp * world;
+        }
+        if (abs(clip.w) >= 1e-8) {
+            let prev_ndc = clip.xy / clip.w;
+            let prev_uv = vec2<f32>((prev_ndc.x + 1.0) * 0.5, (1.0 - prev_ndc.y) * 0.5);
+            out.mv = (prev_uv - uv) * size;
         }
     }
     // Content that moves on its own overrides the reprojection: the pass that

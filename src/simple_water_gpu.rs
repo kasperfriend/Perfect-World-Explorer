@@ -3,6 +3,17 @@
 //! are still approximations; see CLIENT_RESEARCH.md.
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
+#[cfg(test)]
+mod fog_contract_tests {
+    use super::SHADER;
+
+    #[test]
+    fn alternate_water_uses_the_same_world_view_depth_as_terrain() {
+        assert!(SHADER.contains("u.matrix*vec4<f32>(i.world,1.)"));
+        assert!(SHADER.contains("view_z-u.fog.x"));
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniform {
@@ -17,8 +28,8 @@ struct U {matrix:mat4x4<f32>,data:vec4<f32>,fog:vec4<f32>,fog_color:vec4<f32>};
 @group(0) @binding(1) var tex:texture_2d_array<f32>;
 @group(0) @binding(2) var smp:sampler;
 struct I {@location(0) pos:vec3<f32>,@location(2) uv:vec2<f32>};
-struct O {@builtin(position) p:vec4<f32>,@location(0) uv:vec2<f32>};
-@vertex fn vs(i:I)->O {var o:O;o.p=u.matrix*vec4<f32>(i.pos,1.);o.uv=i.uv;return o;}
+struct O {@builtin(position) p:vec4<f32>,@location(0) uv:vec2<f32>,@location(1) world:vec3<f32>};
+@vertex fn vs(i:I)->O {var o:O;o.p=u.matrix*vec4<f32>(i.pos,1.);o.uv=i.uv;o.world=i.pos;return o;}
 @fragment fn fs(i:O)->@location(0) vec4<f32> {
  let uv=i.uv*2.5+0.0125*vec2<f32>(cos(u.data.y),sin(u.data.y));
  let t=textureSample(tex,smp,uv,i32(u.data.x));
@@ -30,9 +41,9 @@ struct O {@builtin(position) p:vec4<f32>,@location(0) uv:vec2<f32>};
  // Same encoded-colour table-fog stage as reflected water and terrain.
  // Blend on the raw attachment, preserving the authored texture alpha.
  if u.fog.z>0.5 {
-  let depth=1./max(i.p.w,0.0000001);
+  let view_z=max((u.matrix*vec4<f32>(i.world,1.)).w,0.);
   let span=u.fog.y-u.fog.x;
-  let f=select(clamp((depth-u.fog.x)/select(span,0.001,abs(span)<0.001),0.,1.),select(0.,1.,depth>=u.fog.y),abs(span)<0.001);
+  let f=select(clamp((view_z-u.fog.x)/select(span,0.001,abs(span)<0.001),0.,1.),select(0.,1.,view_z>=u.fog.y),abs(span)<0.001);
   rgb=mix(rgb,u.fog_color.rgb,f);
  }
  let a=min(t.a+160./255.,1.);

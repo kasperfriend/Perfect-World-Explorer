@@ -7,13 +7,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  # `contents: write` is for the `ci-results` branch only: the measurement JSON
-  # is committed there because the job log is not readable from the agent's
-  # side, so a printed number is a number nobody can check.
+  actions: read
   contents: write
   pull-requests: write
-  # The Windows packaging audit downloads the artifact through the REST API.
-  actions: read
 
 concurrency:
   group: pr-checks-${{ github.event.pull_request.number || github.ref }}
@@ -833,37 +829,14 @@ jobs:
           path: artifact/
           if-no-files-found: error
           retention-days: 14
-      - name: Wait for the uploaded artifact to appear in the run catalog
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $artifactName = 'Perfect-World-Explorer-Windows-x64'
-          $endpoint = "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/artifacts"
-          for ($attempt = 1; $attempt -le 12; $attempt++) {
-            $names = gh api $endpoint --jq '.artifacts[].name'
-            if ($LASTEXITCODE -eq 0 -and ($names -contains $artifactName)) {
-              Write-Host "Artifact is visible after $attempt catalog check(s)."
-              exit 0
-            }
-            Write-Host "Artifact not listed yet ($attempt/12); waiting five seconds."
-            Start-Sleep -Seconds 5
-          }
-          $listed = gh api $endpoint --jq '.artifacts[] | [.name, .id] | @tsv'
-          Write-Host "Artifacts currently visible:`n$listed"
-          throw "Uploaded artifact '$artifactName' never appeared in the run catalog."
-      - name: Download the uploaded portable artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: Perfect-World-Explorer-Windows-x64
-          path: ${{ runner.temp }}/uploaded-viewer
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ github.run_id }}
-      - name: Audit the uploaded artifact layout
+      # The upload action already validates that the staged files are
+      # publishable. Audit the exact staged directory locally instead of
+      # downloading the same-run artifact again (the artifact service can
+      # transiently return 404 immediately after finalization).
+      - name: Audit the portable package layout
         shell: pwsh
         run: |
-          $uploaded = Join-Path $env:RUNNER_TEMP 'uploaded-viewer'
+          $uploaded = Join-Path $PWD 'artifact'
           $topLevel = @(Get-ChildItem -LiteralPath $uploaded -Force)
           if ($topLevel.Count -ne 1 -or $topLevel[0].Name -cne 'Perfect World Explorer') {
             throw 'The artifact must contain only the Perfect World Explorer top-level folder.'

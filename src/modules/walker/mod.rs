@@ -405,6 +405,85 @@ impl Walker {
         self.body.is_some() && self.character.is_some()
     }
 
+    /// World-space foot position of the active Walker character plus whether it is flying.
+    pub fn world_pos(&self) -> Option<(Vec3, bool)> {
+        let body = self.body.as_ref()?;
+        self.character.as_ref()?;
+        Some((body.position, self.travel == TravelState::Flying))
+    }
+
+    /// Collect posed world-space triangle vertices (`[a, b, c]` per triangle) of the active
+    /// Walker character (body, weapons, flight wings/sword, mount) for real-time RT shadows
+    /// and water reflections. Capped at `max_tris` via uniform stride to keep dynamic BLAS builds fast.
+    pub fn rt_triangles(&self, out: &mut Vec<[f32; 3]>, max_tris: usize) {
+        let Some(character) = self.character.as_ref() else {
+            return;
+        };
+        let Ok(models) = render_models(character, &character.posed.meshes) else {
+            return;
+        };
+        let mut total_tris = 0usize;
+        for model in &models {
+            if matches!(model.part, ModelPart::Face) {
+                continue;
+            }
+            for posed in model.poses {
+                if let Some(skin) = model.asset.skins.get(posed.skin) {
+                    if let Some(mesh) = skin.data.meshes.get(posed.mesh) {
+                        total_tris += mesh.indices.len() / 3;
+                    }
+                }
+            }
+        }
+        if total_tris == 0 {
+            return;
+        }
+        let step = (total_tris / max_tris.max(1)).max(1);
+        out.reserve(total_tris.min(max_tris) * 3);
+        let mut tri_idx = 0usize;
+        for model in &models {
+            if matches!(model.part, ModelPart::Face) {
+                continue;
+            }
+            for posed in model.poses {
+                let Some(skin) = model.asset.skins.get(posed.skin) else {
+                    continue;
+                };
+                let Some(mesh) = skin.data.meshes.get(posed.mesh) else {
+                    continue;
+                };
+                for tri in mesh.indices.chunks_exact(3) {
+                    let cur = tri_idx;
+                    tri_idx += 1;
+                    if cur % step != 0 {
+                        continue;
+                    }
+                    let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+                    if let (Some(v0), Some(v1), Some(v2)) = (
+                        posed.vertices.get(i0),
+                        posed.vertices.get(i1),
+                        posed.vertices.get(i2),
+                    ) {
+                        let a = v0.position;
+                        let b = v1.position;
+                        let c = v2.position;
+                        if a.iter().all(|v| v.is_finite())
+                            && b.iter().all(|v| v.is_finite())
+                            && c.iter().all(|v| v.is_finite())
+                        {
+                            out.push(a);
+                            out.push(b);
+                            out.push(c);
+                            if out.len() / 3 >= max_tris {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Starts and advances the building-hull loader on behalf of another
     /// add-on. The Populator stands authored placements on real BMD floors, so
     /// it needs the same hulls Walker collides with even when Walker itself is
@@ -1136,6 +1215,13 @@ impl Walker {
         if !self.is_active() || self.gpu_failed {
             return;
         }
+        // Walker equipment must keep its specular-variant diffuse/alpha path,
+        // but not the added directional Blinn reflection. Zero only the model
+        // coefficient; attached GFX effects retain their independent lighting.
+        let model_frame = model_draw_gpu::Frame {
+            directional_specular: [0.; 4],
+            ..frame
+        };
         if self.gpu.is_none() {
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("Walker character sampler"),
@@ -1223,7 +1309,7 @@ impl Walker {
             .as_ref()
             .is_some_and(|gpu| gpu.pose_generation == self.pose_generation);
         let update = (|| -> Result<Option<Vec<gfx_decal::Quad>>, String> {
-            let gpu = self.gpu.as_ref().ok_or("Walker GPU draws missing")?;
+            let gpu = self.gpu.as_mut().ok_or("Walker GPU draws missing")?;
             let character = self.character.as_ref().ok_or("Walker character missing")?;
             let models = render_models(character, &character.posed.meshes)?;
             if models.len() != gpu.draws.len() {
@@ -1232,11 +1318,11 @@ impl Walker {
             let mut quads = None;
             if pose_uploaded {
                 for (index, model) in models.iter().enumerate() {
-                    gpu.draws[index].update_constants(queue, model.asset, frame)?;
+                    gpu.draws[index].update_constants(queue, model.asset, model_frame)?;
                 }
             } else {
                 for (index, model) in models.into_iter().enumerate() {
-                    gpu.draws[index].update_posed(queue, model.asset, model.poses, frame)?;
+                    gpu.draws[index].update_posed(queue, model.asset, model.poses, model_frame)?;
                 }
                 quads = Some(
                     character
@@ -1312,6 +1398,7 @@ impl Walker {
                         direction: frame.direction,
                         fog_range: frame.fog_range,
                         fog_color: frame.fog_color,
+                        water_fog: frame.water_fog,
                         directional_specular: frame.directional_specular,
                         eye_direction: frame.eye_direction,
                     };
@@ -1332,6 +1419,36 @@ impl Walker {
                 Ok(_) => {}
                 Err(error) => {
                     self.last_error = Some(format!("Walker effects: {error}"));
+                }
+            }
+        }
+        if pose_uploaded {
+            // The effect graph was already advanced for this frame. Rebind only
+            // this view's constants so clipped refraction absorbs it through
+            // water without advancing its emitters a second time.
+            let light = gfx_effect_gpu::EffectLight {
+                lighting: frame.lighting,
+                direction: frame.direction,
+                fog_range: frame.fog_range,
+                fog_color: frame.fog_color,
+                water_fog: frame.water_fog,
+                directional_specular: frame.directional_specular,
+                eye_direction: frame.eye_direction,
+            };
+            if let Some(gpu) = self.gpu.as_mut() {
+                if let Err(error) = gpu.effects.update_view_frame(
+                    queue,
+                    frame.matrix,
+                    frame.clip_plane,
+                    [
+                        frame.eye_position[0],
+                        frame.eye_position[1],
+                        frame.eye_position[2],
+                        0.,
+                    ],
+                    Some(light),
+                ) {
+                    self.last_error = Some(format!("Walker effects frame: {error}"));
                 }
             }
         }

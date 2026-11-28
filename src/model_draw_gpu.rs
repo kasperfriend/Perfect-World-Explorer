@@ -22,11 +22,14 @@ pub struct Frame {
     pub point_position: [f32; 3],
     pub attenuation: [f32; 3],
     pub eye_direction: [f32; 3],
+    pub eye_position: [f32; 3],
     pub directional_specular: [f32; 4],
     pub specular_variant: bool,
     pub vertex_fog: f32,
     pub fog_color: [f32; 4],
     pub fog_range: [f32; 4],
+    /// Water plane Y, absorption density, enabled for clipped refraction, reserved.
+    pub water_fog: [f32; 4],
     pub clip_plane: [f32; 4],
     pub reverse_front: bool,
     /// Zero disables alpha testing; 1..8 are the source D3DCMPFUNC values.
@@ -141,6 +144,8 @@ impl Frame {
             ],
             fog_color: self.fog_color,
             fog_range: self.fog_range,
+            eye_position: vector(self.eye_position),
+            water_fog: self.water_fog,
             clip_plane: self.clip_plane,
             raster: [
                 u32::from(material.two_sided) as f32,
@@ -204,6 +209,10 @@ pub struct Draw {
     /// [`Self::update_posed`] convert vertices without re-running it.
     pose_of: Vec<usize>,
     alpha_meshes: Vec<usize>,
+    // Retained staging memory for animated vertex conversion. Queue writes copy
+    // the bytes before returning, so this scratch can be reused for every mesh
+    // and every frame without keeping a second copy of the whole posed model.
+    scratch_vertices: Vec<raster::Vertex>,
     // Keep authored textures alive and share repeated per-skin texture slots.
     textures: Vec<std::sync::Arc<wgpu::Texture>>,
 }
@@ -478,6 +487,7 @@ impl Draw {
             meshes,
             pose_of,
             alpha_meshes,
+            scratch_vertices: Vec::new(),
             textures,
         })
     }
@@ -531,7 +541,7 @@ impl Draw {
     /// constants. A pose that no longer matches the retained mesh is an explicit
     /// error, never a silently different draw.
     pub fn update_posed(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         asset: &ModelAsset,
         poses: &[PosedMesh],
@@ -541,10 +551,15 @@ impl Draw {
             return Err("model pass blending changed; rebuild its pipeline".into());
         }
         let original = asset.descriptor.render_settings().original_color;
-        let mut updates = Vec::with_capacity(self.meshes.len());
+        // Validate every retained mesh and build all per-mesh constants before
+        // the first queue write. Keep only the small constants here; staging all
+        // converted vertices for every mesh at once caused a burst of temporary
+        // allocations proportional to the entire animated model.
+        let mut params_by_mesh = Vec::with_capacity(self.meshes.len());
         for (index, gpu) in self.meshes.iter().enumerate() {
             let Some(gpu) = gpu else {
                 // A hidden queue mesh keeps its buffers untouched.
+                params_by_mesh.push(None);
                 continue;
             };
             let pose = self
@@ -571,28 +586,44 @@ impl Draw {
                 asset.mesh_color(pose.skin, pose.mesh, original)
             };
             let diffuse_alpha_only = asset.diffuse_alpha_meshes.contains(&gpu.key);
-            let params = frame.params(
+            params_by_mesh.push(Some(frame.params(
                 material,
                 color,
                 diffuse_alpha_only,
                 gpu.face_shader.as_ref(),
-            )?;
-            let mut vertices = Vec::with_capacity(pose.vertices.len());
-            for (source, posed) in source.vertices.iter().zip(&pose.vertices) {
-                vertices.push(raster::Vertex {
-                    position: posed.position,
-                    normal: posed.normal,
-                    uv: source.uv,
-                    fog: frame.vertex_fog,
-                });
-            }
-            updates.push((index, vertices, params));
+            )?));
         }
-        for (index, vertices, params) in updates {
-            if let Some(gpu) = &self.meshes[index] {
-                gpu.mesh.update(queue, &vertices)?;
-                gpu.binding.update(queue, &params)?;
-            }
+
+        // Queue writes copy their input immediately, so one scratch allocation
+        // can serve every mesh. Reusing it avoids one vertex Vec allocation per
+        // submesh and avoids retaining all converted vertices until the end.
+        let scratch = &mut self.scratch_vertices;
+        for (index, gpu) in self.meshes.iter().enumerate() {
+            let Some(gpu) = gpu else {
+                continue;
+            };
+            let pose = &poses[self.pose_of[index]];
+            let source = &asset.skins[pose.skin].data.meshes[pose.mesh];
+            scratch.clear();
+            scratch.extend(
+                source
+                    .vertices
+                    .iter()
+                    .zip(&pose.vertices)
+                    .map(|(source, posed)| raster::Vertex {
+                        position: posed.position,
+                        normal: posed.normal,
+                        uv: source.uv,
+                        fog: frame.vertex_fog,
+                    }),
+            );
+            gpu.mesh.update(queue, scratch)?;
+            gpu.binding.update(
+                queue,
+                params_by_mesh[index]
+                    .as_ref()
+                    .ok_or("missing validated model constants")?,
+            )?;
         }
         Ok(())
     }

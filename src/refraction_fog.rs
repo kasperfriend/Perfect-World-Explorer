@@ -95,8 +95,8 @@ fn grass_refraction_transmittance(original:vec3<f32>,displaced:vec3<f32>,eye:vec
  let unit_y=delta.y/length(delta);
  return exp2(-0.075*depth/unit_y);
 }
-fn grass_pass_fog(linear:vec3<f32>,reciprocal_w:f32,transmittance:f32)->vec3<f32> {
- if camera.clip.y>=0. || camera.fog_range.z<0.5 {return fogged(linear,reciprocal_w);}
+fn grass_pass_fog(linear:vec3<f32>,world:vec3<f32>,transmittance:f32)->vec3<f32> {
+ if camera.clip.y>=0. || camera.fog_range.z<0.5 {return fogged(linear,world);}
  let c=max(linear,vec3<f32>(0.));
  let encoded=select(c*12.92,1.055*pow(c,vec3<f32>(1./2.4))-0.055,c>vec3<f32>(0.0031308));
  let v=mix(camera.fog_color.rgb,encoded,clamp(transmittance,0.,1.));

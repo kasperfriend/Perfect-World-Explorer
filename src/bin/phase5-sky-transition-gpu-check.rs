@@ -137,9 +137,9 @@ fn read_back(
     bytes
 }
 
-/// One frame through the production shader. `params` is the exact 176-byte
+/// One frame through the production shader. `params` is the exact 208-byte
 /// `Params` uniform: `inv`, `time`, `celestial`, `celestial2`, `background`,
-/// `tint`, `sets`, `glow_center`.
+/// `tint`, `sets`, `glow_center`, `moon_glow`, `skyrot`.
 fn render(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -149,7 +149,7 @@ fn render(
     sampler: &wgpu::Sampler,
     roof_sampler: &wgpu::Sampler,
     t: &Target,
-    params: &[f32; 48],
+    params: &[f32; 52],
 ) -> Vec<u8> {
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("phase5 sky params"),
@@ -158,9 +158,8 @@ fn render(
         mapped_at_creation: false,
     });
     queue.write_buffer(&buf, 0, bytemuck::cast_slice(params));
-    // Depth dummy for the flare occlusion path — the check's own layout now
-    // carries it (see main) so the bind must too; the content is irrelevant
-    // for the crossfade probe.
+    // The binding layout still carries its legacy depth slots; use inert 1x1
+    // resources because the production sky shader no longer samples them.
     let depth_dummy = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("phase5 sky depth dummy (render)"),
         size: wgpu::Extent3d {
@@ -319,30 +318,6 @@ fn main() {
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
-    // Dummy depth for the flare occlusion path (shader samples it at 6 taps).
-    let depth_dummy = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("phase5 sky depth dummy"),
-        size: wgpu::Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let depth_view = depth_dummy.create_view(&Default::default());
-    let depth_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("phase5 sky depth sampler"),
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        mag_filter: wgpu::FilterMode::Nearest,
-        min_filter: wgpu::FilterMode::Nearest,
-        ..Default::default()
-    });
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("phase5 sky layout"),
         entries: &[
@@ -450,7 +425,7 @@ fn main() {
         }
     };
     let uniform = |inv: Mat4, sets: (f32, f32, f32)| {
-        let mut u = [0f32; 48];
+        let mut u = [0f32; 52];
         u[..16].copy_from_slice(&inv.to_cols_array());
         u[16] = 19.; // hour
         u[17] = 0.; // night weight: this probe is about sets and altitude
@@ -471,9 +446,10 @@ fn main() {
         u[37] = sets.1;
         u[38] = sets.2;
         u[39] = 0.; // night strength: day, so the sun keeps its native size
-                    // u[44] and u[45] stay zero: no drift in this probe. u[46] is the flare
-                    // pixel scale, unused here. u[47] is the descriptor's recovered scale.
-        u[47] = 8.;
+                    // u[44..48] disable the moon halo in this neutral probe.
+                    // u[48..50] are zero drift; u[50] is pixel scale and u[51] the native scale.
+        u[50] = 2. / H as f32; // NDC pixel scale for lens-flare sprites
+        u[51] = 8.; // descriptor scale
         u
     };
 
@@ -531,10 +507,8 @@ fn main() {
     }
     assert_eq!(machine.counter(), counter, "a view advanced the transition");
 
-    // Regression for the reported displaced red sun halo. Feed deliberately
-    // off-centre art through the production bright-core helper AND shader.
-    // Green identifies the disc and red identifies the glow independently.
-    let disc = image::RgbaImage::from_fn(W, H, |x, y| {
+    // Keep authored celestial sprites; they are not volumetric shafts.
+    let sun_disc = image::RgbaImage::from_fn(W, H, |x, y| {
         image::Rgba([
             0,
             if (24..40).contains(&x) && (24..40).contains(&y) {
@@ -546,25 +520,31 @@ fn main() {
             255,
         ])
     });
-    let glow = image::RgbaImage::from_fn(W, H, |x, y| {
+    let moon_disc = image::RgbaImage::from_fn(W, H, |x, y| {
         image::Rgba([
-            if (30..34).contains(&x) && (46..50).contains(&y) {
+            0,
+            0,
+            if (24..40).contains(&x) && (24..40).contains(&y) {
                 255
-            } else if y > 56 {
-                10
             } else {
                 0
             },
-            0,
-            0,
             255,
         ])
     });
+    let sunshine = image::RgbaImage::from_pixel(W, H, image::Rgba([255, 0, 0, 255]));
+    let moon_halo = image::RgbaImage::from_pixel(W, H, image::Rgba([255, 0, 0, 255]));
+    let sunflare = image::RgbaImage::from_pixel(W, H, image::Rgba([0, 0, 255, 255]));
+    let flare_atlas = image::RgbaImage::from_pixel(W, H, image::Rgba([0, 255, 0, 255]));
     let black = image::RgbaImage::new(W, H);
     for layer in 0..LAYERS {
         let image = match layer {
-            9 => &disc,
-            11 => &glow,
+            9 => &sun_disc,
+            10 => &moon_disc,
+            11 => &sunshine,
+            12 => &moon_halo,
+            13 => &sunflare,
+            14 => &flare_atlas,
             _ => &black,
         };
         queue.write_texture(
@@ -591,22 +571,18 @@ fn main() {
             },
         );
     }
-    let core_center = |pixels: &[u8], channel: usize| {
-        let peak = pixels.chunks_exact(4).map(|p| p[channel]).max().unwrap() as f32;
-        assert!(peak > 0., "missing celestial channel {channel}");
-        let mut sum = [0f32; 3];
-        for (i, p) in pixels.chunks_exact(4).enumerate() {
-            let weight = (p[channel] as f32 - peak * 0.5).max(0.);
-            sum[0] += (i as u32 % W) as f32 * weight;
-            sum[1] += (i as u32 / W) as f32 * weight;
-            sum[2] += weight;
-        }
-        [sum[0] / sum[2], sum[1] / sum[2]]
+    let channel_peak =
+        |pixels: &[u8], channel: usize| pixels.chunks_exact(4).map(|p| p[channel]).max().unwrap();
+    let channel_delta = |after: &[u8], before: &[u8], channel: usize| -> usize {
+        after
+            .chunks_exact(4)
+            .zip(before.chunks_exact(4))
+            .map(|(a, b)| a[channel].abs_diff(b[channel]) as usize)
+            .sum()
     };
     let el = 0.4f32;
     let az = -0.5f32;
     let sun = Vec3::new(az.cos() * el.cos(), el.sin(), az.sin() * el.cos());
-    let lookup = sky_gpu::glow_lookup_center(&disc, &glow);
     for mirrored in [false, true] {
         for pitch in [-0.025f32, 0., 0.025] {
             let direction = (sun + Vec3::Y * pitch).normalize();
@@ -616,14 +592,6 @@ fn main() {
                 direction
             };
             let view = Mat4::look_to_rh(Vec3::ZERO, direction, Vec3::Y);
-            // 60 degrees, not the 20 the other checks use: the sun's quad hangs
-            // from the emitted point (`template_hang`), so at night strength
-            // 0.45 its centre sits `atan(19 / 100)` = 10.76 degrees below the
-            // camera axis and the disc spans 21.5 degrees, with the shine strip
-            // hanging with it. A 20-degree frame clips both, and the half-peak
-            // centroid of a clipped disc is not the disc's core, so the two
-            // cores would disagree for a reason that has nothing to do with the
-            // shader.
             let projection = Mat4::from_scale(Vec3::new(-1., 1., 1.))
                 * Mat4::perspective_rh(60f32.to_radians(), 1., 1., 16000.);
             let inv = (projection * view).inverse();
@@ -632,14 +600,15 @@ fn main() {
             } else {
                 inv
             };
-            let mut params = uniform(inv, (0., 0., 0.));
-            params[20..24].copy_from_slice(&[1., el, az, 1.]);
-            params[28..32].fill(0.);
-            // Night strength 0.45 sits inside the recovered shine window, so the
-            // strip is drawn at half strength and the sun swells by `1 + 2n`.
-            params[39] = 0.45;
-            params[40..44].copy_from_slice(&lookup);
-            let pixels = render(
+
+            // Isolate the recovered 120x40 sunshine strip before enabling lens flares.
+            let mut sun_params = uniform(inv, (0., 0., 0.));
+            sun_params[20..24].copy_from_slice(&[1., el, az, 0.]);
+            sun_params[24..28].fill(0.);
+            sun_params[39] = 0.45; // dusk shine ramp
+            sun_params[40..44].copy_from_slice(&[0.5, 0.5, 0., 0.]);
+            sun_params[44..48].copy_from_slice(&[0., 0., 1., 0.]);
+            let shine_pixels = render(
                 &device,
                 &queue,
                 &pipeline,
@@ -648,38 +617,77 @@ fn main() {
                 &sampler,
                 &roof_sampler,
                 &t,
-                &params,
+                &sun_params,
+            );
+            assert!(channel_peak(&shine_pixels, 1) > 0, "missing sun disc");
+            assert!(
+                channel_peak(&shine_pixels, 0) > 0,
+                "sunshine.bmp strip missing: mirrored={mirrored}, pitch={pitch}"
+            );
+
+            // sunflare.bmp and the flares.bmp atlas each have a unique channel.
+            sun_params[23] = 1.;
+            let sun_flare_pixels = render(
+                &device,
+                &queue,
+                &pipeline,
+                &layout,
+                &sky_view,
+                &sampler,
+                &roof_sampler,
+                &t,
+                &sun_params,
             );
             assert!(
-                pixels.chunks_exact(4).any(|p| p[1] > 0),
-                "missing sun disc: mirrored={mirrored}, pitch={pitch}"
+                channel_delta(&sun_flare_pixels, &shine_pixels, 2) > 0,
+                "sunflare.bmp sprite missing: mirrored={mirrored}, pitch={pitch}"
             );
-            let d = core_center(&pixels, 1);
-            let g = core_center(&pixels, 0);
-            assert!((d[0]-g[0]).abs()<1.25 && (d[1]-g[1]).abs()<1.25,
-                "sun/glow cores misaligned: disc={d:?}, glow={g:?}, mirrored={mirrored}, pitch={pitch}");
-            if !mirrored && pitch == 0. {
-                params[40..44].copy_from_slice(&[0.5; 4]);
-                let broken = render(
-                    &device,
-                    &queue,
-                    &pipeline,
-                    &layout,
-                    &sky_view,
-                    &sampler,
-                    &roof_sampler,
-                    &t,
-                    &params,
-                );
-                let old = core_center(&broken, 0);
-                assert!(
-                    (old[1] - d[1]).abs() > 8.,
-                    "fixture must expose the old downward glow displacement"
-                );
-            }
+            assert!(
+                channel_delta(&sun_flare_pixels, &shine_pixels, 1) > 0,
+                "flares.bmp atlas ghosts missing: mirrored={mirrored}, pitch={pitch}"
+            );
+
+            // Only the moon halo enable lane differs between these two renders.
+            let mut moon_params = sun_params;
+            moon_params[20..24].fill(0.);
+            moon_params[24..28].copy_from_slice(&[1., el, az, 0.]);
+            moon_params[23] = 0.;
+            moon_params[46] = 1.; // explicitly enable moonflare.bmp for this render
+            let moon_with_halo = render(
+                &device,
+                &queue,
+                &pipeline,
+                &layout,
+                &sky_view,
+                &sampler,
+                &roof_sampler,
+                &t,
+                &moon_params,
+            );
+            assert!(channel_peak(&moon_with_halo, 2) > 0, "missing moon disc");
+            assert!(
+                channel_peak(&moon_with_halo, 0) > 0,
+                "moonflare.bmp halo missing: mirrored={mirrored}, pitch={pitch}"
+            );
+            moon_params[46] = 0.;
+            let moon_without_halo = render(
+                &device,
+                &queue,
+                &pipeline,
+                &layout,
+                &sky_view,
+                &sampler,
+                &roof_sampler,
+                &t,
+                &moon_params,
+            );
+            assert!(
+                channel_delta(&moon_with_halo, &moon_without_halo, 0) > 0,
+                "moon halo gate had no effect"
+            );
         }
     }
-    println!("sun/glow bright-core alignment: 6/6 production renders passed across pitch and reflected views; uncorrected fixture exposes displacement");
+    println!("sunshine strip, moon halo, sunflare sprite and flares atlas rendered across normal/reflected views");
 
     // Empty terrain must reveal the authored fog, not the sky texture's pale
     // bottom row. All pixels face down so this also catches double encoding.

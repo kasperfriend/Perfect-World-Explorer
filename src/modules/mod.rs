@@ -6,18 +6,14 @@ mod designer;
 mod librarian;
 mod package;
 mod populator;
-
-/// Register the client's CJK font on the shared egui context so HUD strings the
-/// client authored in Chinese render instead of drawing one tofu box per glyph.
-pub fn install_client_cjk(ctx: &egui::Context, element: &std::path::Path) {
-    populator::install_client_cjk(ctx, element);
-}
+pub mod raywatcher;
 mod walker;
 
 use crate::{model_draw_gpu, navigation::MapSpace, water::WaterArea};
 use glam::Vec3;
 use package::{Package, Registry};
 use populator::Populator;
+use raywatcher::Raywatcher;
 use std::{collections::HashSet, path::PathBuf};
 use walker::Walker;
 use winit::keyboard::KeyCode;
@@ -54,6 +50,10 @@ pub struct Modules {
     /// `World::spawn_catalog_effect`, which this handle deliberately does not
     /// reach yet — access first, wiring later.
     effect_catalog: Option<crate::gfx_catalog::Catalog>,
+    /// The ray tracer. It owns its settings and its GPU state; the renderer
+    /// asks it for a plan once per frame and records its passes into the
+    /// world's own command encoder.
+    raywatcher: Raywatcher,
 }
 
 impl Default for Modules {
@@ -65,6 +65,7 @@ impl Default for Modules {
             packages: Registry::discover(package::default_root()),
             selected: 0,
             effect_catalog: None,
+            raywatcher: Raywatcher::default(),
         }
     }
 }
@@ -81,6 +82,17 @@ impl Modules {
         // The add-ons each own their state; the host only clones the two
         // handles they need (client root and the loaded world space).
         let populator = Populator::new(element.clone(), map.clone(), map_dir);
+        // Raywatcher resolves its SDK folder from the explorer executable's
+        // directory (NOT the PW game client's `element/` folder).
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(|| {
+                element
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| element.clone())
+            });
         Self {
             walker: Walker::with_host(element.clone(), map, water, scene, ornaments),
             librarian: librarian::Librarian::new(element),
@@ -88,7 +100,17 @@ impl Modules {
             packages: Registry::discover(package::default_root()),
             selected: 0,
             effect_catalog: None,
+            raywatcher: Raywatcher::new(&exe_dir),
         }
+    }
+
+    /// The ray tracer, for the renderer and the menu.
+    pub fn raywatcher(&self) -> &Raywatcher {
+        &self.raywatcher
+    }
+
+    pub fn raywatcher_mut(&mut self) -> &mut Raywatcher {
+        &mut self.raywatcher
     }
 
     pub fn prepare_librarian_preview(
@@ -110,6 +132,7 @@ impl Modules {
             "walker" => self.walker.is_active(),
             "populator" => self.populator.is_active(),
             "librarian" => self.librarian.active(),
+            "raywatcher" => self.raywatcher.settings().mode.enabled(),
             _ => false,
         }
     }
@@ -118,8 +141,25 @@ impl Modules {
         self.walker.is_active()
     }
 
+    pub fn walker_world_pos(&self) -> Option<(glam::Vec3, bool)> {
+        self.walker.world_pos()
+    }
+
+    pub fn walker_rt_triangles(&self, out: &mut Vec<[f32; 3]>, max_tris: usize) {
+        self.walker.rt_triangles(out, max_tris);
+    }
+
     pub fn populator_active(&self) -> bool {
         self.populator.is_active()
+    }
+
+    pub fn populator_rt_triangles(
+        &self,
+        eye: glam::Vec3,
+        out: &mut Vec<[f32; 3]>,
+        max_tris: usize,
+    ) {
+        self.populator.rt_triangles(eye, out, max_tris);
     }
 
     pub fn walker_zoom(&mut self, steps: f32) {
@@ -133,7 +173,7 @@ impl Modules {
     /// Returns true when the user asks to go back to the main Escape menu.
     pub fn menu_ui(&mut self, ctx: &egui::Context, spawn: Vec3, yaw: f32) -> bool {
         let mut back = false;
-        egui::Window::new("MODULES  |  ESC to go back")
+        egui::Window::new("MODULES  |  ◀ ESC / Right-click to go back")
             .default_pos(egui::pos2(16., 16.))
             .default_size(egui::vec2(780., 650.))
             .min_size(egui::vec2(560., 480.))
@@ -162,7 +202,7 @@ impl Modules {
                     .frame(egui::Frame::default())
                     .show_inside(ui, |ui| {
                         ui.separator();
-                        if ui.button("Back to menu").clicked() {
+                        if ui.button("◀ Back to menu (RMB)").clicked() {
                             back = true;
                         }
                     });
@@ -288,6 +328,7 @@ impl Modules {
                 }
                 ui.label(self.librarian.status());
             }
+            "raywatcher" => self.raywatcher.settings_ui(ui),
             _ => {
                 ui.label(
                     egui::RichText::new(format!(
@@ -621,7 +662,7 @@ mod tests {
         // Let the default size and panel layout settle before grabbing the edge.
         frame(Vec::new());
         frame(Vec::new());
-        let id = egui::Id::new("MODULES  |  ESC to go back");
+        let id = egui::Id::new("MODULES  |  ◀ ESC / Right-click to go back");
         let before = context
             .memory(|memory| memory.area_rect(id))
             .expect("Modules window area");
@@ -674,7 +715,7 @@ mod tests {
         }
         frame(&context, &mut modules, screen);
         frame(&context, &mut modules, screen);
-        let id = egui::Id::new("MODULES  |  ESC to go back");
+        let id = egui::Id::new("MODULES  |  ◀ ESC / Right-click to go back");
         let before = context
             .memory(|memory| memory.area_rect(id))
             .expect("Modules window area");
@@ -700,4 +741,10 @@ mod tests {
             after
         );
     }
+}
+
+/// Register the client's CJK font on the shared egui context so HUD strings the
+/// client authored in Chinese render instead of drawing one tofu box per glyph.
+pub fn install_client_cjk(ctx: &egui::Context, element: &std::path::Path) {
+    populator::install_client_cjk(ctx, element);
 }
