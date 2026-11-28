@@ -1423,13 +1423,14 @@ mod tests {
         let before = camera_matrix(Vec3::ZERO, 1., 1., 0., 0.) * Vec3::ZERO.extend(1.);
         let after = camera_matrix(delta, 1., 1., 0., 0.) * Vec3::ZERO.extend(1.);
         assert!(after.x / after.w > before.x / before.w);
-        // Orbiting right turns the front toward the right on screen.
+        // Dragging right rotates the camera to the right, so the model's
+        // front moves left on screen. This is the non-mirrored horizontal drag.
         let front = Vec3::new(0., 0., 1.);
         let screen_x = |yaw: f32| {
             let p = camera_matrix(Vec3::ZERO, 1., 1., yaw, 0.) * front.extend(1.);
             p.x / p.w
         };
-        assert!(screen_x(orbit_yaw(0., 10.)) > screen_x(0.));
+        assert!(screen_x(orbit_yaw(0., 10.)) < screen_x(0.));
         assert!(orbit_pitch(0., 10.) > 0.);
         assert_eq!(animation_index(false, 2), None);
         assert_eq!(animation_index(true, 2), Some(2));
