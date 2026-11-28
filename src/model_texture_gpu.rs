@@ -115,6 +115,31 @@ fn decode_rgba(bytes: &[u8]) -> Result<(image::RgbaImage, bool), String> {
     Ok((image.into_rgba8(), alpha_texture))
 }
 
+/// Decode a single client-authored image for the lightweight Architect
+/// preview. DDS goes through the same DXT1/DXT3/DXT5 and uncompressed BGRA /
+/// RGB565 decoding as native model uploads; TGA/PNG/JPEG use the normal image
+/// decoder. Keeping this helper shared prevents the editor preview from
+/// substituting an untextured white/vertex-colour model on common game DDS files.
+pub(crate) fn decode_preview_rgba(bytes: &[u8]) -> Result<image::RgbaImage, String> {
+    if bytes.starts_with(b"DDS ") {
+        let dds = Dds::parse(bytes)?;
+        let mip = dds.mips.first().ok_or("DDS has no base mip")?;
+        let pixel_count = (mip.width as u64)
+            .checked_mul(mip.height as u64)
+            .ok_or("DDS preview dimensions overflow")?;
+        if mip.width == 0 || mip.height == 0 || pixel_count > 64 * 1024 * 1024 {
+            return Err("DDS preview dimensions exceed the safety limit".into());
+        }
+        let capacity = usize::try_from(pixel_count.checked_mul(4).ok_or("DDS preview byte size overflow")?)
+            .map_err(|_| "DDS preview byte size overflow")?;
+        let mut rgba = Vec::with_capacity(capacity);
+        append_mip(bytes, dds.format, mip, &mut rgba)?;
+        return image::RgbaImage::from_raw(mip.width, mip.height, rgba)
+            .ok_or_else(|| "DDS preview decoder returned an invalid pixel buffer".into());
+    }
+    decode_rgba(bytes).map(|(image, _)| image)
+}
+
 fn upload_image(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
