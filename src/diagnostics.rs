@@ -665,7 +665,11 @@ impl Channel {
             | Self::RenderWater
             | Self::RenderPost
             | Self::RenderTextures => 500,
-            Self::TimingFrame | Self::TimingMemory | Self::TimingCamera | Self::AudioState | Self::FogCheck => 1000,
+            Self::TimingFrame
+            | Self::TimingMemory
+            | Self::TimingCamera
+            | Self::AudioState
+            | Self::FogCheck => 1000,
         }
     }
 }
