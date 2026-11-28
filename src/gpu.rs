@@ -227,6 +227,20 @@ fn minimap_matrix(x: f32, z: f32, range: f32) -> Mat4 {
 /// plane at or behind the eye (a plane that runs past the camera has no finite
 /// screen rectangle), a rectangle that covers most of the target anyway, or a
 /// target too small to bother with.
+/// Narrow a water view's CPU/GPU culling frustum to the exact scissor
+/// rectangle that the surface can sample. The scissor still clips rasterization;
+/// this additionally avoids submitting and vertex-processing objects outside it.
+fn water_scissor_ndc_rect(extent: (u32, u32), scissor: Option<[u32; 4]>) -> Option<[f32; 4]> {
+    let [x, y, width, height] = scissor?;
+    let (w, h) = (extent.0.max(1) as f32, extent.1.max(1) as f32);
+    Some([
+        2. * x as f32 / w - 1.,
+        2. * (x + width) as f32 / w - 1.,
+        1. - 2. * (y + height) as f32 / h,
+        1. - 2. * y as f32 / h,
+    ])
+}
+
 fn water_view_scissor(
     matrix: Mat4,
     w: u32,
@@ -672,6 +686,7 @@ struct MeshData {
 enum ViewRuns {
     Full,
     Main,
+    Water,
     Reflected,
     Map,
 }
@@ -1999,6 +2014,9 @@ struct Renderer {
     /// changes per water height, so this is rebuilt for each reflected submit.
     reflected_terrain_runs: Vec<(u32, u32)>,
     reflected_far_runs: Vec<(u32, u32)>,
+    /// Terrain runs restricted to each water surface's sampled rectangle.
+    water_terrain_runs: Vec<(u32, u32)>,
+    water_far_terrain_runs: Vec<(u32, u32)>,
     /// Visible runs for the realistic minimap, which is an orthographic
     /// window of `minimap_range` around the eye rather than the whole world.
     map_terrain_runs: Vec<(u32, u32)>,
@@ -2846,6 +2864,8 @@ impl Renderer {
             far_terrain_runs: Vec::new(),
             reflected_terrain_runs: Vec::new(),
             reflected_far_runs: Vec::new(),
+            water_terrain_runs: Vec::new(),
+            water_far_terrain_runs: Vec::new(),
             map_terrain_runs: Vec::new(),
             map_far_runs: Vec::new(),
         })
@@ -3507,6 +3527,10 @@ impl Renderer {
                 Some(self.terrain_runs.as_slice()),
                 Some(self.far_terrain_runs.as_slice()),
             ),
+            ViewRuns::Water => (
+                Some(self.water_terrain_runs.as_slice()),
+                Some(self.water_far_terrain_runs.as_slice()),
+            ),
             ViewRuns::Reflected => (
                 Some(self.reflected_terrain_runs.as_slice()),
                 Some(self.reflected_far_runs.as_slice()),
@@ -3948,6 +3972,44 @@ impl Renderer {
             Some(&self.map_far_runs),
         );
     }
+    /// Queue only the terrain blocks the water surface can sample. This
+    /// prevents water's small scissor rectangle from still submitting the
+    /// entire main-view terrain set.
+    fn queue_water_main_runs(
+        &mut self,
+        matrix: Mat4,
+        extent: (u32, u32),
+        scissor: Option<[u32; 4]>,
+    ) {
+        if let Some(rect) = water_scissor_ndc_rect(extent, scissor) {
+            crate::terrain_residency::visible_runs_rect_into(
+                &self.spans,
+                matrix,
+                rect,
+                &mut self.water_terrain_runs,
+            );
+            self.terrain_gpu.visible_far_runs_rect_into(
+                matrix,
+                rect,
+                &mut self.water_far_terrain_runs,
+            );
+        } else {
+            crate::terrain_residency::visible_runs_into(
+                &self.spans,
+                matrix,
+                &mut self.water_terrain_runs,
+            );
+            self.terrain_gpu
+                .visible_far_runs_into(matrix, &mut self.water_far_terrain_runs);
+        }
+        self.terrain_gpu.prepare_runs(
+            &self.device,
+            &self.queue,
+            Some(&self.water_terrain_runs),
+            Some(&self.water_far_terrain_runs),
+        );
+    }
+
     /// Culls both terrain meshes for the water reflection's mirrored view
     /// (`matrix * flip`) and queues those records. The symmetry plane is the
     /// water height, so this runs once per reflected submit.
@@ -5771,11 +5833,9 @@ impl Renderer {
                 self.water_scissored += 1;
                 self.water_scissor_cover += (sw as f32 * sh as f32) / (w as f32 * h as f32);
             }
-            // A previous plane's reflection left its mirrored records in the
-            // buffer; the refraction passes below draw through the main matrix.
-            if batch_idx > 0 {
-                self.queue_main_runs();
-            }
+            // Queue only the terrain blocks sampled by this water plane. The
+            // water edge pass and both refraction branches consume these runs.
+            self.queue_water_main_runs(matrix, (w, h), refraction_scissor);
             if camera.pos.y > plane {
                 // Client 0x7cc6ac-0x7cc8b5: render below this plane into
                 // refraction, cleared to the region's water fog color. Fog
@@ -5828,7 +5888,7 @@ impl Renderer {
                     // Queued as `refracted = normal`: the main matrix, so the
                     // main view's blocks are the right set.
                     Pass::Refraction,
-                    ViewRuns::Main,
+                    ViewRuns::Water,
                     None,
                     Some(wgpu::Color {
                         r: linear(fog[0]),
@@ -5861,6 +5921,9 @@ impl Renderer {
                     &reflect_depth,
                     self.terrain_gpu.edge_mesh(),
                     (&self.vertex, &self.index, self.terrain_end),
+                    refraction_scissor,
+                    &self.water_far_terrain_runs,
+                    &self.water_terrain_runs,
                 );
                 self.queue.submit(Some(re.finish()));
             } else {
@@ -5886,7 +5949,7 @@ impl Renderer {
                     false,
                     // Queued as `above = normal`: the main matrix again.
                     Pass::Refraction,
-                    ViewRuns::Main,
+                    ViewRuns::Water,
                     None,
                     None,
                     &frustum,
@@ -10541,7 +10604,7 @@ mod frame_snapshot_tests {
         let src = source();
         for needle in [
             "            main_pass,\n            ViewRuns::Main,\n",
-            "                    Pass::Refraction,\n                    ViewRuns::Main,",
+            "                    Pass::Refraction,\n                    ViewRuns::Water,",
             "                Pass::Reflection,\n                ViewRuns::Reflected,",
             "                Pass::Minimap\n            },\n            view_runs,",
             "&normal, camera, Pass::Main, true);",
