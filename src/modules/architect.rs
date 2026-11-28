@@ -4935,6 +4935,7 @@ mod tests {
         assert_eq!(loaded.objects[0].group, "Buildings");
         assert!(!loaded.objects[0].visible);
         assert!(loaded.objects[0].locked);
+        assert_eq!(loaded.objects[0].scale_axes, [1.5, 0.75, 2.0]);
         assert_eq!(loaded.strokes.len(), 1);
         assert_eq!(loaded.strokes[0].mode, BrushMode::Smooth);
         assert_eq!(
@@ -4988,6 +4989,51 @@ mod tests {
             editor.renderer_bmd_asset_path("/client/element/litmodels/a01/1/litmodel_42.bmd"),
             Some("litmodels/a01/1/litmodel_42.bmd".into())
         );
+    }
+
+    #[test]
+    fn rotation_gizmo_renders_three_distinct_world_axis_rings() {
+        let viewport = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(800.0, 600.0),
+        );
+        let projection = glam::Mat4::perspective_rh(1.0, 800.0 / 600.0, 0.1, 1000.0);
+        let view = glam::Mat4::look_at_rh(
+            Vec3::new(8.0, 6.0, 10.0),
+            Vec3::ZERO,
+            Vec3::Y,
+        );
+        let vp = projection * view;
+        let x = Architect::gizmo_ring_points(Vec3::ZERO, Vec3::X, 2.0, viewport, vp);
+        let y = Architect::gizmo_ring_points(Vec3::ZERO, Vec3::Y, 2.0, viewport, vp);
+        let z = Architect::gizmo_ring_points(Vec3::ZERO, Vec3::Z, 2.0, viewport, vp);
+        assert!(x.len() >= 60 && y.len() >= 60 && z.len() >= 60);
+        assert!(x.iter().zip(&y).any(|(a, b)| a.distance(*b) > 1.0));
+        assert!(y.iter().zip(&z).any(|(a, b)| a.distance(*b) > 1.0));
+        assert!(z.iter().zip(&x).any(|(a, b)| a.distance(*b) > 1.0));
+    }
+
+    #[test]
+    fn rotation_gizmo_ray_intersects_the_selected_axis_plane() {
+        let viewport = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(100.0, 100.0),
+        );
+        let projection = glam::Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0);
+        let view = glam::Mat4::look_at_rh(
+            Vec3::new(0.0, 0.0, 10.0),
+            Vec3::ZERO,
+            Vec3::Y,
+        );
+        let point = Architect::ray_plane_point(
+            egui::pos2(60.0, 50.0),
+            viewport,
+            projection * view,
+            Vec3::ZERO,
+            Vec3::Y,
+        ).unwrap();
+        assert!(point.y.abs() < 1e-4);
+        assert!(point.x > 0.0);
     }
 
     #[test]
