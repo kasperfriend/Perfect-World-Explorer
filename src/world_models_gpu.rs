@@ -1942,11 +1942,6 @@ fn sphere_in_frustum(planes: &[[f32; 4]; 6], plane_lengths: &[f32; 6], center: [
     }
     true
 }
-            return false;
-        }
-    }
-    true
-}
 
 /// Upload one slot's already-evaluated pose. Split out of `World::draw_models`
 /// so the alpha-order snapshot and the attachment parent are read from the same
