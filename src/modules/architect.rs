@@ -1054,7 +1054,7 @@ impl Architect {
             .as_deref()
             .or(self.selected_asset.as_deref());
         let Some(asset) = asset else {
-            self.preview_message = "Hover or select an ECM/SMD model to preview it.".into();
+            self.preview_message = "Select a client asset to preview it or place it with its native world handler.".into();
             return;
         };
         if self.renderer_effect_path(asset).is_some() {
@@ -1096,7 +1096,7 @@ impl Architect {
                         self.preview_bounds
                             .insert(path.clone(), (min.to_array(), max.to_array()));
                         self.preview_message =
-                            "BMD bounds loaded from the client mesh. Its native materials are shown in the world viewport.".into();
+                            "BMD mesh bounds loaded. Its native materials appear in the world viewport after placement.".into();
                     } else {
                         self.preview_message =
                             "This BMD contains no finite mesh geometry for selection bounds."
@@ -1107,6 +1107,11 @@ impl Architect {
                     self.preview_message = format!("Could not load BMD selection bounds: {error}");
                 }
             }
+            return;
+        }
+        if self.renderer_tree_type(asset).is_some() {
+            self.preview = None;
+            self.preview_message = "SpeedTree uses the native vegetation renderer. Select Place to see its live LOD/material/wind preview in the world.".into();
             return;
         }
         match self.preview_path_for_asset(asset) {
@@ -2725,10 +2730,13 @@ impl Architect {
                             .clone()
                             .or_else(|| previous_hovered_asset.clone())
                         {
-                            self.selected_asset = Some(asset);
+                            self.select_asset_for_placement(asset);
                         }
                     }
                     if ui.button("Place selected asset").clicked() {
+                        if let Some(asset) = self.selected_asset.clone() {
+                            self.select_asset_for_placement(asset);
+                        }
                         self.add_selected_asset_at_camera(camera);
                     }
                 });
