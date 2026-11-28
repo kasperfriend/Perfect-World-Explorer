@@ -2552,7 +2552,7 @@ mod tests {
         assert!(text.contains("client root X"), "{text}");
         assert!(text.contains("effect-roots"), "{text}");
         assert!(text.contains("a root"), "{text}");
-        assert!(text.contains("of 36 on"), "{text}");
+        assert!(text.contains("of 37 on"), "{text}");
         set_mask(0);
         let _ = std::fs::remove_dir_all(&dir);
     }
