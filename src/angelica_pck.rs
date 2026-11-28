@@ -119,51 +119,93 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     let magic = u32le(&prefix, 0)?;
     let size = u32le(&prefix, 4)?;
     let tag = u32le(&prefix, 8)?;
-    if magic != 0x4dca23ef || tag != 0x56a089b7 || size as u64 != file_len {
-        return Err("bad Angelica prefix".into());
+    // The tag word is `0x56a089b7` in 1.5.2 and **zero** in 1.8.4 (measured on
+    // both clients' `configs.pck`), so it is checked as part of the family
+    // rather than as one exact value. The first word and the self-declared
+    // size are what actually identify the container.
+    if magic != 0x4dca23ef || !matches!(tag, 0x56a089b7 | 0) || size as u64 != file_len {
+        return Err(format!(
+            "bad Angelica prefix: {magic:08x} {size:08x} {tag:08x}, \
+             expected 4dca23ef <file size> 56a089b7 (1.5.2) or 00000000 (1.8.4)"
+        ));
     }
     let tail_start = file_len.saturating_sub(64 * 1024 * 1024);
     f.seek(SeekFrom::Start(tail_start))
         .map_err(|e| e.to_string())?;
     let mut blob = Vec::with_capacity((file_len - tail_start) as usize);
     f.read_to_end(&mut blob).map_err(|e| e.to_string())?;
-    let trailer = blob.len() - 280;
-    let guard = u32le(&blob, trailer)?;
-    let guard2 = u32le(&blob, trailer + 268)?;
-    let version = u32le(&blob, trailer + 276)?;
-    // Both shipped archives use the `0xfdfdfeee` / `0xf00dbeef` pair; the
-    // `0xa508bdc4` / `0x853567c8` pair is accepted for other Angelica builds.
-    let known_guard = (guard == 0xa508bdc4 && guard2 == 0x853567c8)
-        || (guard == 0xfdfdfeee && guard2 == 0xf00dbeef);
-    if !known_guard || (version != 0x20002 && version != 0x20001) {
-        return Err("unsupported Angelica trailer".into());
+    // The trailer is the retail package's oldest revision, byte for byte: a
+    // 272-byte `FILEHEADER`, the count, then the version word. Both shipped
+    // archives state `0x00020002` (1.5.2's `configs.pck`) or `0x00020001`
+    // (`shaders.pck`), which is why the layout, the field offsets and the guard
+    // pair all come from the one table in `pck` instead of a second copy here.
+    //
+    // The `0xa508bdc4` / `0x853567c8` pair is *required*, not merely accepted:
+    // it is what every 1.5.2 archive carries. A consolidation removed it on the
+    // strength of "it appears in no staged archive", which was a claim about
+    // what had been looked at rather than about the format, and it refused the
+    // whole 1.5.2 client. Both pairs are named in `pck` now.
+    //
+    // The version word sits in the last four bytes, exactly as in a retail
+    // package, and it is what says how long the trailer is -- so it is read
+    // first, the same order `pck::read_trailer` uses.
+    let version = u32le(&blob, blob.len() - 4)?;
+    let Some(rev) = crate::pck::angelica_revision(version) else {
+        return Err(format!(
+            "unsupported Angelica trailer: version {version:08x} is not a package \
+             revision this build reads"
+        ));
+    };
+    // `header` is `sizeof(FILEHEADER*)`; the count follows it and the version
+    // word follows the count.
+    let trailer = blob.len() - (rev.header + 8);
+    let header = &blob[trailer..trailer + rev.header];
+    let guard = u32le(header, 0)?;
+    let guard2 = u32le(header, rev.guard_byte1)?;
+    // Two pairs ship and both are measured, not tolerated. 1.5.2's revision
+    // `0x00020002` writes `a508bdc4`/`853567c8` (`configs.pck` 67 entries,
+    // `grasses.pck` 103); 1.8.4's `0x00020003` writes `fdfdfeee`/`f00dbeef`.
+    // Accepting only the second is what refused every 1.5.2 archive.
+    let known = (guard == crate::pck::ANGELICA_GUARD_0 && guard2 == crate::pck::ANGELICA_GUARD_1)
+        || (guard == crate::pck::GUARD_0 && guard2 == crate::pck::GUARD_1);
+    if !known {
+        return Err(format!(
+            "unsupported Angelica trailer: guard {guard:08x}/{guard2:08x} is neither \
+             {:08x}/{:08x} (1.5.2) nor {:08x}/{:08x} (1.8.4)",
+            crate::pck::ANGELICA_GUARD_0,
+            crate::pck::ANGELICA_GUARD_1,
+            crate::pck::GUARD_0,
+            crate::pck::GUARD_1
+        ));
     }
-    let count = u32le(&blob, trailer + 272)? as usize;
-    if count > 1_000_000 {
-        return Err("Angelica entry count exceeds limit".into());
+    let count = u32le(&blob, trailer + rev.header)? as usize;
+    // The same bound as the retail reader, and for the same reason: the largest
+    // staged Angelica package is 1.5.2's `configs.pck` at 58 entries, so this
+    // only ever fires on a damaged count.
+    if count > crate::pck::ENTRY_LIMIT {
+        return Err(format!(
+            "Angelica entry count {count} exceeds limit {}",
+            crate::pck::ENTRY_LIMIT
+        ));
     }
     let mut pos = trailer;
     let mut reversed = Vec::with_capacity(count);
     let mut decomp = Decompress::new(true);
     for _ in 0..count {
-        let (record, start) = record_ending_at(&blob, pos, &mut decomp)?;
+        let (record, start) = record_ending_at(&blob, pos, &mut decomp, rev.entry)?;
+        // `szFileName` is the first 260 bytes in every revision; the three
+        // dwords after it move with the revision, which is why they come from
+        // the shared row rather than being spelled here.
         let zero = record[..260].iter().position(|&x| x == 0).unwrap_or(260);
         let (decoded, _, _) = encoding_rs::GBK.decode(&record[..zero]);
-        let mut name = decoded.into_owned();
-        if name.as_bytes().contains(&b'\\') {
-            // SAFETY: replacing ASCII '\\' with ASCII '/' preserves UTF-8 validity.
-            unsafe {
-                for b in name.as_bytes_mut() {
-                    if *b == b'\\' {
-                        *b = b'/';
-                    }
-                }
-            }
-        }
-        let offset = u32le(&record, 260)?;
-        let usize_ = u32le(&record, 264)?;
-        let compressed = u32le(&record, 268)?;
-        if offset as u64 + compressed as u64 > file_len
+        let name = decoded.replace('\\', "/");
+        let offset = match rev.offset_width {
+            8 => u64le(&record, rev.offset_at)?,
+            _ => u32le(&record, rev.offset_at)? as u64,
+        };
+        let usize_ = u32le(&record, rev.size_at)?;
+        let compressed = u32le(&record, rev.compressed_at)?;
+        if offset + compressed as u64 > file_len
             || usize_ > 512 * 1024 * 1024
             || compressed > usize_
         {
