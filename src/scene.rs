@@ -563,8 +563,9 @@ impl Scene {
         let b = fs::read(path).map_err(|e| e.to_string())?;
         ecbsd_header(&b)?;
         let map_id = map_id_from_ecbsd_path(path);
-        let mut seen = std::collections::HashMap::<u32, u32>::new();
-        let mut result = Vec::new();
+        let est: usize = self.blocks.iter().map(|bl| bl.ornaments.len()).sum();
+        let mut seen = std::collections::HashMap::<u32, u32>::with_capacity(est);
+        let mut result = Vec::with_capacity(est);
         for block in &self.blocks {
             for r in &block.ornaments {
                 if let Some(old) = seen.insert(r.export_id, r.offset) {
@@ -580,7 +581,9 @@ impl Scene {
                 let extra = u32at(&b, p + 36)?;
                 let mut pos = p + 40;
                 let path = string(&b, &mut pos)?;
-                if path.is_empty() || !path.to_lowercase().ends_with(".bmd") {
+                if path.len() < 4
+                    || !path.as_bytes()[path.len() - 4..].eq_ignore_ascii_case(b".bmd")
+                {
                     return Err(format!(
                         "ornament {} has unexpected BMD path {path:?}",
                         r.export_id

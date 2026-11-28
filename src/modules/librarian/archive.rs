@@ -59,9 +59,16 @@ impl PckArchive {
 }
 
 pub fn normalize_archive_path(path: &str) -> String {
-    ecmodel::normalize(path)
-        .trim_start_matches('/')
-        .to_lowercase()
+    let mut normalized = ecmodel::normalize(path);
+    let trimmed = normalized.trim_start_matches('/');
+    if trimmed.len() == normalized.len() && normalized.is_ascii() {
+        normalized.make_ascii_lowercase();
+        normalized
+    } else if trimmed.is_ascii() {
+        trimmed.to_ascii_lowercase()
+    } else {
+        trimmed.to_lowercase()
+    }
 }
 
 fn safe_join(root: &Path, path: &str) -> Option<PathBuf> {

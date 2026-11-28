@@ -431,6 +431,9 @@ fn main() {
                     &dv,
                     if cutoff { None } else { Some((&vb, &ib, 0)) },
                     (&vb, &ib, 6),
+                    None,
+                    &[],
+                    &[(0, 6)],
                 );
                 queue.submit(Some(edge_encoder.finish()));
                 let read = device.create_buffer(&wgpu::BufferDescriptor {

@@ -61,6 +61,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 /// Outcome of resolving one texture reference the way the client does.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +87,25 @@ pub enum Resolution {
 pub struct MountedArchive {
     pub tag: String,
     pub index: HashSet<String>,
+    shared_index: Option<Arc<HashMap<String, usize>>>,
+}
+impl MountedArchive {
+    /// Mount a pre-indexed archive without cloning its member names into a
+    /// duplicate `HashSet`.
+    pub fn from_shared_index(tag: String, shared_index: Arc<HashMap<String, usize>>) -> Self {
+        Self {
+            tag,
+            index: HashSet::new(),
+            shared_index: Some(shared_index),
+        }
+    }
+    #[inline]
+    pub fn contains(&self, key: &str) -> bool {
+        match &self.shared_index {
+            Some(map) => map.contains_key(key),
+            None => self.index.contains(key),
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResolverStats {
@@ -118,7 +138,29 @@ pub struct TextureResolver {
 /// Normalizes a reference the way the client's lookups do: lowercase
 /// (`_strlwr` before the VFS scan, 0x771970) and `\` folded to `/`.
 pub fn normalize(name: &str) -> String {
-    name.to_lowercase().replace('\\', "/")
+    if name.is_ascii() {
+        let mut out = String::with_capacity(name.len());
+        for b in name.bytes() {
+            out.push(if b == b'\\' {
+                '/'
+            } else {
+                (b as char).to_ascii_lowercase()
+            });
+        }
+        return out;
+    }
+    let mut out = name.to_lowercase();
+    if out.contains('\\') {
+        // SAFETY: replacing single-byte ASCII '\\' with ASCII '/' preserves UTF-8 validity.
+        unsafe {
+            for b in out.as_bytes_mut() {
+                if *b == b'\\' {
+                    *b = b'/';
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Keep an EC-BSD-derived map ID safe to use as an archive namespace. A direct
@@ -204,12 +246,120 @@ fn litmodel_entry_candidates(canonical: &str) -> [String; 5] {
 /// Basename index for the final fallback. A basename is only usable when it is
 /// unique, so another map's same-named model is never selected by guess.
 pub fn litmodel_basename_index(entry_names: &[String]) -> HashMap<String, Vec<String>> {
-    let mut index: HashMap<String, Vec<String>> = HashMap::new();
+    let mut index: HashMap<String, Vec<String>> = HashMap::with_capacity(entry_names.len());
     for name in entry_names {
         let basename = name.rsplit('/').next().unwrap_or(name).to_string();
         index.entry(basename).or_default().push(name.clone());
     }
     index
+}
+
+/// Build the basename fallback index directly from a shared normalized PCK
+/// index map without cloning all keys into a separate `Vec<String>`.
+pub fn litmodel_basename_index_from_map(
+    entry_index: &HashMap<String, usize>,
+) -> HashMap<String, Vec<String>> {
+    let mut index: HashMap<String, Vec<String>> = HashMap::with_capacity(entry_index.len());
+    for name in entry_index.keys() {
+        let basename = name.rsplit('/').next().unwrap_or(name).to_string();
+        index.entry(basename).or_default().push(name.clone());
+    }
+    index
+}
+
+/// Precompute whether an archive index contains entries under `litmodels/<map_id>/`
+/// or under another map's namespace, avoiding O(N) scans per missing lookup.
+pub fn litmodel_partition_flags(
+    entry_index: &HashMap<String, usize>,
+    map_id: &str,
+) -> (bool, bool) {
+    let Some(safe_id) = safe_map_namespace(map_id) else {
+        return (false, false);
+    };
+    if safe_id == "world" {
+        return (false, false);
+    }
+    let map_prefix = format!("litmodels/{safe_id}/");
+    let mut has_map_prefix = false;
+    let mut has_other_map = false;
+    for key in entry_index.keys() {
+        if !has_map_prefix && key.starts_with(&map_prefix) {
+            has_map_prefix = true;
+        }
+        if !has_other_map && map_namespace(key).is_some_and(|id| id != safe_id) {
+            has_other_map = true;
+        }
+        if has_map_prefix && has_other_map {
+            break;
+        }
+    }
+    (has_map_prefix, has_other_map)
+}
+
+/// O(1) indexed version of [`litmodel_entry_key`] backed by a shared
+/// `HashMap<String, usize>` archive index.
+pub fn litmodel_entry_key_indexed(
+    path: &str,
+    map_id: &str,
+    entry_index: &HashMap<String, usize>,
+    by_basename: &HashMap<String, Vec<String>>,
+    has_map_prefix: bool,
+    has_other_map_partition: bool,
+) -> Result<String, String> {
+    let archive_path = normalize(path);
+    let canonical = litmodel_key(path);
+    let relative = litmodel_relative(&canonical);
+    let map_id = safe_map_namespace(map_id);
+
+    if let Some(map_id) = map_id.as_deref() {
+        if map_id != "world" {
+            let map_prefix = format!("litmodels/{map_id}/");
+            let scoped_candidate = format!("{map_prefix}{relative}");
+            if entry_index.contains_key(&scoped_candidate) {
+                return Ok(scoped_candidate);
+            }
+            if has_map_prefix || has_other_map_partition {
+                return Err(format!(
+                    "missing model {path} in map namespace {map_prefix}; refusing cross-map basename fallback"
+                ));
+            }
+        }
+    }
+
+    if entry_index.contains_key(&archive_path) {
+        return Ok(archive_path);
+    }
+    for candidate in litmodel_entry_candidates(&canonical) {
+        if entry_index.contains_key(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    let suffix = format!("/{relative}");
+    let suffix_matches: Vec<&String> = entry_index
+        .keys()
+        .filter(|key| key.ends_with(&suffix))
+        .collect();
+    match suffix_matches.as_slice() {
+        [only] => return Ok((*only).clone()),
+        matches if !matches.is_empty() => {
+            return Err(format!(
+                "no exact archive path for {path}; world-relative suffix {relative} is ambiguous ({} matches)",
+                matches.len()
+            ));
+        }
+        _ => {}
+    }
+    let basename = canonical.rsplit('/').next().unwrap_or(path).to_string();
+    match by_basename.get(&basename).map(Vec::as_slice) {
+        Some([only]) => Ok(only.clone()),
+        Some(matches) => Err(format!(
+            "no exact archive path for {path}; basename {basename} is ambiguous ({} matches)",
+            matches.len()
+        )),
+        None => Err(format!(
+            "missing model {path}; litmodels.pck has no member named {basename}"
+        )),
+    }
 }
 
 fn map_namespace(key: &str) -> Option<&str> {
@@ -345,7 +495,7 @@ impl TextureResolver {
                 if !key.contains(&archive.tag) {
                     continue;
                 }
-                if archive.index.contains(&key) {
+                if archive.contains(&key) {
                     found = Some(Resolution::Archive {
                         mount,
                         key: key.clone(),
@@ -427,7 +577,7 @@ impl TextureResolver {
             if !key.contains(&archive.tag) {
                 continue;
             }
-            if archive.index.contains(&key) {
+            if archive.contains(&key) {
                 found = Some(Resolution::Archive {
                     mount,
                     key: key.clone(),
@@ -459,7 +609,7 @@ pub fn file_exists(resolver_mounts: &[MountedArchive], disk_root: &Path, key: &s
     let key = normalize(key);
     if resolver_mounts
         .iter()
-        .any(|a| key.contains(&a.tag) && a.index.contains(&key))
+        .any(|a| key.contains(&a.tag) && a.contains(&key))
     {
         return true;
     }
@@ -620,6 +770,7 @@ mod tests {
         MountedArchive {
             tag: tag.to_string(),
             index: names.iter().map(|n| normalize(n)).collect(),
+            shared_index: None,
         }
     }
     fn resolver(root: &Path) -> TextureResolver {

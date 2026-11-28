@@ -511,6 +511,21 @@ jobs:
             done
             exit 1
           fi
+      - name: Test GPU world-page culling on software Vulkan
+        env:
+          WGPU_BACKEND: vulkan
+          XDG_RUNTIME_DIR: /tmp
+        run: |
+          icd="$(find /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d \
+            /etc/vulkan/icd.d -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null || true)"
+          if [ -z "$icd" ]; then
+            echo "::error::no lavapipe ICD found for world culling compute regression"
+            exit 41
+          fi
+          export VK_ICD_FILENAMES="$icd"
+          cargo test --locked --bin perfect-world-explorer \
+            gpu_world_culler_executes_and_updates_indirect_visibility \
+            -- --ignored --nocapture
       - name: Test Librarian preview with an sRGB window
         env:
           WGPU_BACKEND: vulkan
@@ -632,6 +647,9 @@ jobs:
           # Phase 4 vegetation diagnostics: tree LOD/lighting preservation,
           # grass mip coverage/upload, and synthetic authored tree mip upload.
           run_check tree-lod-gpu-check
+          # Production reversed-Z hierarchy: actual Depth32Float render output,
+          # odd viewport edges, and clear-depth hole propagation through mips.
+          run_check hiz-gpu-check
           run_check grass-gpu-mip-check
           run_check tree-authored-mip-gpu-check
           # The client's own loading-screen artwork: a synthetic surfaces.pck
@@ -823,7 +841,9 @@ jobs:
             -Modules Modules `
             -OutputDirectory artifact `
             -ArchivePath "$env:RUNNER_TEMP/Perfect-World-Explorer-package-test.zip"
-      - uses: actions/upload-artifact@v4
+      - name: Upload portable viewer artifact
+        id: viewer_package
+        uses: actions/upload-artifact@v4
         with:
           name: Perfect-World-Explorer-Windows-x64
           path: artifact/

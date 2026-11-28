@@ -28,7 +28,7 @@ pub struct Block {
     level: u8,
     cases: [u8; 4],
     vertices: Vec<Vertex>,
-    indices: Vec<u32>,
+    indices: std::sync::Arc<[u32]>,
     /// World-space `[x0, y0, z0, x1, y1, z1]` of the block surface.
     bounds: [f32; 6],
 }
@@ -65,7 +65,11 @@ pub struct Span {
 /// the only ones meshed and evicted blocks release their vertices.
 #[derive(Default)]
 pub struct Residency {
-    blocks: std::collections::BTreeMap<(usize, usize), Block>,
+    blocks: std::collections::HashMap<(usize, usize), Block>,
+    // Maintained as blocks enter, change mesh, and leave the window. Computing
+    // this diagnostic by walking the entire resident HashMap after every
+    // crossing added a second O(resident blocks) pass to terrain rebuilds.
+    triangles: u32,
 }
 
 impl Residency {
@@ -77,31 +81,49 @@ impl Residency {
     }
 
     pub fn triangles(&self) -> u32 {
-        self.blocks
-            .values()
-            .map(|b| (b.indices.len() / 3) as u32)
-            .sum()
+        self.triangles
+    }
+
+    fn remove_block(&mut self, key: (usize, usize)) -> bool {
+        let Some(block) = self.blocks.remove(&key) else {
+            return false;
+        };
+        self.triangles = self
+            .triangles
+            .saturating_sub((block.indices.len() / 3) as u32);
+        true
+    }
+
+    fn insert_block(&mut self, key: (usize, usize), block: Block) {
+        let new_triangles = (block.indices.len() / 3) as u32;
+        if let Some(previous) = self.blocks.insert(key, block) {
+            self.triangles = self
+                .triangles
+                .saturating_sub((previous.indices.len() / 3) as u32);
+        }
+        self.triangles = self.triangles.saturating_add(new_triangles);
     }
 
     /// Apply one window to the resident set: evict blocks outside it, build the
     /// blocks that entered and re-mesh the ones whose level changed. `level_of`
     /// returns `0` for a block the rule does not draw.
-    pub fn update<L, B>(
+    pub fn update<L, B, I>(
         &mut self,
         window: &crate::terrain_lod::Window,
         level_of: L,
-        mut build: B,
+        build: B,
     ) -> Result<Census, String>
     where
         L: Fn(usize, usize) -> u8,
-        B: FnMut(usize, usize, u8) -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String>,
+        B: FnMut(usize, usize, u8) -> Result<(Vec<Vertex>, I, [f32; 6]), String>,
+        I: Into<std::sync::Arc<[u32]>>,
     {
         self.update_stitched(window, |x, y| (level_of(x, y), [0; 4]), build)
     }
 
     /// Stitching is geometry: a neighbor can change our boundary without
     /// changing our own resolution. Include all four cases in the cache key.
-    pub fn update_stitched<L, B>(
+    pub fn update_stitched<L, B, I>(
         &mut self,
         window: &crate::terrain_lod::Window,
         state_of: L,
@@ -109,19 +131,29 @@ impl Residency {
     ) -> Result<Census, String>
     where
         L: Fn(usize, usize) -> (u8, [u8; 4]),
-        B: FnMut(usize, usize, u8) -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String>,
+        B: FnMut(usize, usize, u8) -> Result<(Vec<Vertex>, I, [f32; 6]), String>,
+        I: Into<std::sync::Arc<[u32]>>,
     {
         let mut census = Census::default();
         // Eviction first: the client's loader drops the slots the window left.
         let before = self.blocks.len();
-        self.blocks.retain(|&(x, y), _| window.contains(x, y));
+        let mut evicted_triangles = 0u32;
+        self.blocks.retain(|&(x, y), block| {
+            let keep = window.contains(x, y);
+            if !keep {
+                evicted_triangles =
+                    evicted_triangles.saturating_add((block.indices.len() / 3) as u32);
+            }
+            keep
+        });
+        self.triangles = self.triangles.saturating_sub(evicted_triangles);
         census.evicted = before - self.blocks.len();
         for y in window.y0..window.y1 {
             for x in window.x0..window.x1 {
                 let (level, cases) = state_of(x, y);
                 if level == 0 {
                     // No mesh for this block (`block+0x70 == 0`).
-                    census.evicted += usize::from(self.blocks.remove(&(x, y)).is_some());
+                    census.evicted += usize::from(self.remove_block((x, y)));
                     continue;
                 }
                 let stale = match self.blocks.get(&(x, y)) {
@@ -138,13 +170,166 @@ impl Residency {
                 } else {
                     census.loaded += 1;
                 }
-                self.blocks.insert(
+                self.insert_block(
                     (x, y),
                     Block {
                         level,
                         cases,
                         vertices,
-                        indices,
+                        indices: indices.into(),
+                        bounds,
+                    },
+                );
+            }
+        }
+        census.resident = self.blocks.len();
+        census.triangles = self.triangles;
+        Ok(census)
+    }
+
+    /// Parallel variant of [`Self::update_stitched`] for fast camera
+    /// flythroughs: collects all entering or re-meshed blocks and builds their
+    /// stitched surfaces concurrently across CPU cores when 4 or more blocks
+    /// are stale in the same crossing.
+    pub fn update_stitched_parallel<L, B, I>(
+        &mut self,
+        window: &crate::terrain_lod::Window,
+        state_of: L,
+        build: B,
+    ) -> Result<Census, String>
+    where
+        L: Fn(usize, usize) -> (u8, [u8; 4]),
+        B: Fn(usize, usize, u8, [u8; 4]) -> Result<(Vec<Vertex>, I, [f32; 6]), String> + Sync,
+        I: Into<std::sync::Arc<[u32]>> + Send,
+    {
+        let mut census = Census::default();
+        let before = self.blocks.len();
+        let mut evicted_triangles = 0u32;
+        self.blocks.retain(|&(x, y), block| {
+            let keep = window.contains(x, y);
+            if !keep {
+                evicted_triangles =
+                    evicted_triangles.saturating_add((block.indices.len() / 3) as u32);
+            }
+            keep
+        });
+        self.triangles = self.triangles.saturating_sub(evicted_triangles);
+        census.evicted = before - self.blocks.len();
+
+        let mut stale: Vec<(usize, usize, u8, [u8; 4], bool)> = Vec::new();
+        for y in window.y0..window.y1 {
+            for x in window.x0..window.x1 {
+                let (level, cases) = state_of(x, y);
+                if level == 0 {
+                    census.evicted += usize::from(self.remove_block((x, y)));
+                    continue;
+                }
+                match self.blocks.get(&(x, y)) {
+                    Some(block) if block.level == level && block.cases == cases => continue,
+                    Some(_) => stale.push((x, y, level, cases, true)),
+                    None => stale.push((x, y, level, cases, false)),
+                }
+            }
+        }
+
+        if stale.len() >= 4 {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(stale.len())
+                .min(16);
+            if workers > 1 {
+                let chunk_size = stale.len().div_ceil(workers);
+                let built: Vec<(usize, usize, u8, [u8; 4], bool, Vec<Vertex>, I, [f32; 6])> =
+                    std::thread::scope(|s| -> Result<_, String> {
+                        let build_ref = &build;
+                        let handles: Vec<_> = stale
+                            .chunks(chunk_size)
+                            .map(|chunk| {
+                                s.spawn(move || {
+                                    let mut local = Vec::with_capacity(chunk.len());
+                                    for &(x, y, level, cases, was_present) in chunk {
+                                        let (vertices, indices, bounds) =
+                                            build_ref(x, y, level, cases).map_err(|e| {
+                                                format!(
+                                                    "terrain block ({x},{y}) level {level}: {e}"
+                                                )
+                                            })?;
+                                        local.push((
+                                            x,
+                                            y,
+                                            level,
+                                            cases,
+                                            was_present,
+                                            vertices,
+                                            indices,
+                                            bounds,
+                                        ));
+                                    }
+                                    Ok::<_, String>(local)
+                                })
+                            })
+                            .collect();
+                        let mut out = Vec::with_capacity(stale.len());
+                        for h in handles {
+                            out.extend(h.join().unwrap()?);
+                        }
+                        Ok(out)
+                    })?;
+                for (x, y, level, cases, was_present, vertices, indices, bounds) in built {
+                    if was_present {
+                        census.remeshed += 1;
+                    } else {
+                        census.loaded += 1;
+                    }
+                    self.insert_block(
+                        (x, y),
+                        Block {
+                            level,
+                            cases,
+                            vertices,
+                            indices: indices.into(),
+                            bounds,
+                        },
+                    );
+                }
+            } else {
+                for (x, y, level, cases, was_present) in stale {
+                    let (vertices, indices, bounds) = build(x, y, level, cases)
+                        .map_err(|e| format!("terrain block ({x},{y}) level {level}: {e}"))?;
+                    if was_present {
+                        census.remeshed += 1;
+                    } else {
+                        census.loaded += 1;
+                    }
+                    self.insert_block(
+                        (x, y),
+                        Block {
+                            level,
+                            cases,
+                            vertices,
+                            indices: indices.into(),
+                            bounds,
+                        },
+                    );
+                }
+            }
+        } else {
+            for (x, y, level, cases, was_present) in stale {
+                let (vertices, indices, bounds) = build(x, y, level, cases)
+                    .map_err(|e| format!("terrain block ({x},{y}) level {level}: {e}"))?;
+                if was_present {
+                    census.remeshed += 1;
+                } else {
+                    census.loaded += 1;
+                }
+                self.insert_block(
+                    (x, y),
+                    Block {
+                        level,
+                        cases,
+                        vertices,
+                        indices: indices.into(),
                         bounds,
                     },
                 );
@@ -163,34 +348,44 @@ impl Residency {
         vertices: &mut Vec<Vertex>,
         indices: &mut Vec<u32>,
     ) -> Vec<Span> {
-        // One exact allocation, not geometric growth of a second near mesh.
-        let mut collected = Vec::with_capacity(window.blocks().min(self.blocks.len()));
-        let (mut total_v, mut total_i) = (0, 0);
+        // Count first, then append directly in window order. Keeping a
+        // temporary Vec of (coordinate, &Block) used to allocate and retain a
+        // second list on every terrain-window rebuild even though the resident
+        // HashMap already provides all the data needed for both passes.
+        let (mut total_v, mut total_i, mut span_count) = (0, 0, 0);
         for y in window.y0..window.y1 {
             for x in window.x0..window.x1 {
                 if let Some(block) = self.blocks.get(&(x, y)) {
                     if !block.indices.is_empty() {
                         total_v += block.vertices.len();
                         total_i += block.indices.len();
-                        collected.push(((x, y), block));
+                        span_count += 1;
                     }
                 }
             }
         }
         vertices.reserve_exact(total_v);
         indices.reserve_exact(total_i);
-        let mut spans = Vec::with_capacity(collected.len());
-        for ((x, y), block) in collected {
-            let base = vertices.len() as u32;
-            let start = indices.len() as u32;
-            vertices.extend_from_slice(&block.vertices);
-            indices.extend(block.indices.iter().map(|i| base + *i));
-            spans.push(Span {
-                block: (x, y),
-                start,
-                count: block.indices.len() as u32,
-                bounds: block.bounds,
-            });
+        let mut spans = Vec::with_capacity(span_count);
+        for y in window.y0..window.y1 {
+            for x in window.x0..window.x1 {
+                let Some(block) = self.blocks.get(&(x, y)) else {
+                    continue;
+                };
+                if block.indices.is_empty() {
+                    continue;
+                }
+                let base = vertices.len() as u32;
+                let start = indices.len() as u32;
+                vertices.extend_from_slice(&block.vertices);
+                indices.extend(block.indices.iter().map(|i| base + *i));
+                spans.push(Span {
+                    block: (x, y),
+                    start,
+                    count: block.indices.len() as u32,
+                    bounds: block.bounds,
+                });
+            }
         }
 
         spans
@@ -217,6 +412,23 @@ fn planes(matrix: Mat4) -> [[f32; 4]; 6] {
     ]
 }
 
+fn planes_rect(matrix: Mat4, rect: [f32; 4]) -> [[f32; 4]; 6] {
+    let m = matrix.to_cols_array();
+    let r0 = [m[0], m[4], m[8], m[12]];
+    let r1 = [m[1], m[5], m[9], m[13]];
+    let r2 = [m[2], m[6], m[10], m[14]];
+    let r3 = [m[3], m[7], m[11], m[15]];
+    let [left, right, bottom, top] = rect;
+    [
+        std::array::from_fn(|i| r0[i] - left * r3[i]),
+        std::array::from_fn(|i| right * r3[i] - r0[i]),
+        std::array::from_fn(|i| r1[i] - bottom * r3[i]),
+        std::array::from_fn(|i| top * r3[i] - r1[i]),
+        r2,
+        std::array::from_fn(|i| r3[i] - r2[i]),
+    ]
+}
+
 fn intersects(planes: &[[f32; 4]; 6], bounds: [f32; 6]) -> bool {
     for &[a, b, c, d] in planes {
         let px = if a >= 0.0 { bounds[3] } else { bounds[0] };
@@ -232,7 +444,7 @@ fn intersects(planes: &[[f32; 4]; 6], bounds: [f32; 6]) -> bool {
 /// Merge the visible blocks of one view into contiguous index ranges, so a
 /// frame is submitted as a handful of draw calls instead of one per block.
 pub fn visible_runs(spans: &[Span], matrix: Mat4) -> Vec<(u32, u32)> {
-    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut runs: Vec<(u32, u32)> = Vec::with_capacity(spans.len().min(64));
     visible_runs_into(spans, matrix, &mut runs);
     runs
 }
@@ -244,11 +456,31 @@ pub fn visible_runs(spans: &[Span], matrix: Mat4) -> Vec<(u32, u32)> {
 /// handing out a fresh `Vec` each time. The result is identical: `runs` is
 /// emptied first and refilled in span order.
 pub fn visible_runs_into(spans: &[Span], matrix: Mat4, runs: &mut Vec<(u32, u32)>) {
+    visible_runs_with_planes_into(spans, &planes(matrix), runs);
+}
+
+/// Restrict a view's terrain block runs to a scissor rectangle in NDC
+/// (left, right, bottom, top). Used by water views whose render targets are
+/// sampled only in the expanded water-surface rectangle.
+pub fn visible_runs_rect_into(
+    spans: &[Span],
+    matrix: Mat4,
+    rect: [f32; 4],
+    runs: &mut Vec<(u32, u32)>,
+) {
+    let planes = planes_rect(matrix, rect);
+    visible_runs_with_planes_into(spans, &planes, runs);
+}
+
+fn visible_runs_with_planes_into(
+    spans: &[Span],
+    planes: &[[f32; 4]; 6],
+    runs: &mut Vec<(u32, u32)>,
+) {
     runs.clear();
     runs.reserve(spans.len().min(256));
-    let planes = planes(matrix);
     for span in spans {
-        if span.count == 0 || !intersects(&planes, span.bounds) {
+        if span.count == 0 || !intersects(planes, span.bounds) {
             continue;
         }
         match runs.last_mut() {
@@ -300,6 +532,85 @@ mod tests {
     }
 
     #[test]
+    fn parallel_residency_shares_immutable_index_topology() {
+        let topology: std::sync::Arc<[u32]> = vec![0, 1, 0].into();
+        let shared = std::sync::Arc::clone(&topology);
+        let mut residency = Residency::default();
+        let win = window(0, 0, 4, 1);
+        residency
+            .update_stitched_parallel(
+                &win,
+                |_, _| (3, [0; 4]),
+                move |x, _, _, _| {
+                    Ok((
+                        vec![vertex(x as f32), vertex(x as f32 + 1.)],
+                        std::sync::Arc::clone(&shared),
+                        [x as f32, 0., 0., x as f32 + 1., 0., 1.],
+                    ))
+                },
+            )
+            .unwrap();
+
+        let first = &residency.blocks[&(0, 0)].indices;
+        for x in 1..4 {
+            assert!(
+                std::sync::Arc::ptr_eq(first, &residency.blocks[&(x, 0)].indices),
+                "resident block {x} duplicated an immutable terrain index topology"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_updates_keep_the_triangle_census_incremental() {
+        let mut residency = Residency::default();
+        let first = window(0, 0, 3, 2);
+        let census = residency
+            .update_stitched_parallel(&first, |_, _| (3, [0; 4]), |x, _, _, _| Ok(block(x as f32)))
+            .unwrap();
+        assert_eq!(census.loaded, 6);
+        assert_eq!(census.triangles, 6);
+        assert_eq!(residency.triangles(), 6);
+
+        let unchanged = residency
+            .update_stitched_parallel(
+                &first,
+                |_, _| (3, [0; 4]),
+                |_, _, _, _| -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String> {
+                    panic!("unchanged terrain blocks must not be rebuilt")
+                },
+            )
+            .unwrap();
+        assert_eq!(unchanged.loaded, 0);
+        assert_eq!(unchanged.remeshed, 0);
+        assert_eq!(unchanged.triangles, 6);
+
+        let shifted = window(1, 0, 4, 2);
+        let moved = residency
+            .update_stitched_parallel(
+                &shifted,
+                |_, _| (3, [0; 4]),
+                |x, _, _, _| Ok(block(x as f32)),
+            )
+            .unwrap();
+        assert_eq!(moved.evicted, 2);
+        assert_eq!(moved.loaded, 2);
+        assert_eq!(moved.triangles, 6);
+
+        let disabled = residency
+            .update_stitched_parallel(
+                &shifted,
+                |x, y| (if x == 1 && y == 0 { 0 } else { 3 }, [0; 4]),
+                |_, _, _, _| -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String> {
+                    panic!("level-zero blocks must not be built")
+                },
+            )
+            .unwrap();
+        assert_eq!(disabled.evicted, 1);
+        assert_eq!(disabled.triangles, 5);
+        assert_eq!(residency.triangles(), 5);
+    }
+
+    #[test]
     fn neighbor_stitch_changes_invalidate_an_unchanged_level() {
         let mut r = Residency::default();
         let win = window(0, 0, 2, 1);
@@ -320,7 +631,9 @@ mod tests {
             .update_stitched(
                 &win,
                 |x, _| (3, if x == 0 { [0, 0, 0, 1] } else { [0; 4] }),
-                |_, _, _| panic!("unchanged stitched mesh must be reused"),
+                |_, _, _| -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String> {
+                    panic!("unchanged stitched mesh must be reused")
+                },
             )
             .unwrap();
         assert_eq!(c.remeshed, 0);
@@ -332,7 +645,13 @@ mod tests {
         let win = window(0, 0, 1, 1);
         r.update(&win, |_, _| 3, |_, _, _| Ok(block(0.))).unwrap();
         let c = r
-            .update(&win, |_, _| 0, |_, _, _| panic!("disabled"))
+            .update(
+                &win,
+                |_, _| 0,
+                |_, _, _| -> Result<(Vec<Vertex>, Vec<u32>, [f32; 6]), String> {
+                    panic!("disabled")
+                },
+            )
             .unwrap();
         assert_eq!(c.resident, 0);
         assert_eq!(c.triangles, 0);
@@ -441,6 +760,27 @@ mod tests {
         assert!(!in_frustum(identity, [2., -0.5, 0.25, 3., 0.5, 0.75]));
         // Straddling the right plane is still drawn.
         assert!(in_frustum(identity, [0.5, -0.5, 0.25, 1.5, 0.5, 0.75]));
+    }
+
+    #[test]
+    fn scissored_visible_runs_drop_terrain_outside_the_water_rectangle() {
+        let spans = [
+            Span {
+                block: (0, 0),
+                start: 0,
+                count: 6,
+                bounds: [-0.1, -0.1, 0.1, 0.1, 0.1, 0.9],
+            },
+            Span {
+                block: (1, 0),
+                start: 6,
+                count: 6,
+                bounds: [0.6, -0.1, 0.1, 0.8, 0.1, 0.9],
+            },
+        ];
+        let mut runs = Vec::new();
+        visible_runs_rect_into(&spans, Mat4::IDENTITY, [-0.5, 0.5, -0.25, 0.75], &mut runs);
+        assert_eq!(runs, vec![(0, 6)]);
     }
 
     #[test]

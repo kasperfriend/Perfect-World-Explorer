@@ -144,7 +144,7 @@ impl CollisionBrush {
         let extents = v3(b, *p + 12)?;
         let _mins = v3(b, *p + 24)?;
         let _maxs = v3(b, *p + 36)?;
-        if extents.iter().any(|v| *v < 0.0) {
+        if extents[0] < 0.0 || extents[1] < 0.0 || extents[2] < 0.0 {
             return Err("negative collision-brush extent".into());
         }
         *p = p.checked_add(48).ok_or("collision-brush overflow")?;
@@ -159,7 +159,7 @@ impl CollisionBrush {
         for _ in 0..count {
             let normal = v3(b, *p)?;
             let distance = f(b, *p + 12)?;
-            if normal.iter().map(|v| v * v).sum::<f32>() < 1e-12 {
+            if normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] < 1e-12 {
                 return Err("zero collision-plane normal".into());
             }
             let bevel = *b.get(*p + 16).ok_or("truncated collision plane")? != 0;
@@ -196,112 +196,27 @@ fn f(b: &[u8], p: usize) -> Result<f32, String> {
 fn v3(b: &[u8], p: usize) -> Result<[f32; 3], String> {
     Ok([f(b, p)?, f(b, p + 4)?, f(b, p + 8)?])
 }
-fn fixed_lossy_tracked(b: &[u8], p: usize, n: usize) -> Result<(String, bool), String> {
+fn fixed(b: &[u8], p: usize, n: usize) -> Result<String, String> {
     let s = b
         .get(p..p.checked_add(n).ok_or("overflow")?)
         .ok_or("truncated string")?;
     let end = s.iter().position(|&c| c == 0).unwrap_or(n);
     let (t, _, bad) = encoding_rs::GBK.decode(&s[..end]);
-    Ok((t.replace('\\', "/"), bad))
-}
-fn parse_material(b: &[u8], p: &mut usize) -> Result<Material, String> {
-    let tail = b.get(*p..).ok_or("truncated material")?;
-    let len = tail
-        .iter()
-        .position(|&c| c == 0)
-        .ok_or("unterminated material name")?;
-    if len > 4096 {
-        return Err("oversized BMD material name".into());
+    if bad {
+        return Err("invalid GBK in BMD".into());
     }
-    let (name, _) = fixed_lossy_tracked(b, *p, len)?;
-    *p = p.checked_add(len + 1).ok_or("material overflow")?;
-    let color = |off| -> Result<[f32; 4], String> {
-        Ok([f(b, off)?, f(b, off + 4)?, f(b, off + 8)?, f(b, off + 12)?])
-    };
-    let m = Material {
-        name,
-        ambient: color(*p)?,
-        diffuse: color(*p + 16)?,
-        emissive: color(*p + 32)?,
-        specular: color(*p + 48)?,
-        power: f(b, *p + 64)?,
-        two_sided: *b.get(*p + 68).ok_or("truncated material")? != 0,
-    };
-    *p = p.checked_add(69).ok_or("material overflow")?;
-    Ok(m)
-}
-fn parse_collision(b: &[u8], mut p: usize) -> Result<Vec<CollisionBrush>, String> {
-    let mut collision = Vec::new();
-    let hull_count = u(b, p)? as usize;
-    p += 4;
-    if hull_count > 65_536 {
-        return Err(format!("BMD collision-hull limit exceeded: {hull_count}"));
-    }
-    for _ in 0..hull_count {
-        let count = u(b, p)? as usize;
-        p += 4;
-        if count > 1_000_000 {
-            return Err(format!("BMD collision mesh-list limit exceeded: {count}"));
-        }
-        let bytes = count.checked_mul(4).ok_or("BMD collision list overflow")?;
-        p = p.checked_add(bytes).ok_or("BMD collision list overflow")?;
-        if p > b.len() {
-            return Err("truncated BMD collision mesh list".into());
+    let mut out = t.into_owned();
+    if out.as_bytes().contains(&b'\\') {
+        // SAFETY: replacing ASCII '\\' with ASCII '/' preserves UTF-8 validity.
+        unsafe {
+            for b in out.as_bytes_mut() {
+                if *b == b'\\' {
+                    *b = b'/';
+                }
+            }
         }
     }
-    for _ in 0..hull_count {
-        collision.push(CollisionBrush::read(b, &mut p)?);
-    }
-    Ok(collision)
-}
-fn count_opaque_words(vertices: &[Vertex]) -> (usize, usize) {
-    let mut day = 0usize;
-    let mut night = 0usize;
-    for v in vertices {
-        if (v.day_diffuse >> 24) == 0xff {
-            day += 1;
-        }
-        if (v.night_diffuse >> 24) == 0xff {
-            night += 1;
-        }
-    }
-    (day, night)
-}
-fn looks_like_v300_mesh_header(b: &[u8], q: usize, require_nonempty_name: bool) -> bool {
-    let check = || -> Option<bool> {
-        if *b.get(q)? > 1 || *b.get(q + 1)? > 1 {
-            return Some(false);
-        }
-        let name_len = u(b, q + 2).ok()? as usize;
-        if (require_nonempty_name && name_len == 0) || name_len > 256 {
-            return Some(false);
-        }
-        let name_end = q.checked_add(6)?.checked_add(name_len)?;
-        if b.get(q + 6..name_end)?.contains(&0) {
-            return Some(false);
-        }
-        let tex_len = u(b, name_end).ok()? as usize;
-        if tex_len > 512 {
-            return Some(false);
-        }
-        let tex_end = name_end.checked_add(4)?.checked_add(tex_len)?;
-        if b.get(name_end + 4..tex_end)?.contains(&0) {
-            return Some(false);
-        }
-        let n = u(b, tex_end).ok()? as usize;
-        let faces = u(b, tex_end + 4).ok()? as usize;
-        if n > 1_000_000 || faces > 2_000_000 {
-            return Some(false);
-        }
-        let min_body = n
-            .checked_mul(24)?
-            .checked_add(faces.checked_mul(6)?)?
-            .checked_add(n.checked_mul(12)?)?
-            .checked_add(n.checked_mul(8)?)?;
-        let end = tex_end.checked_add(8)?.checked_add(min_body)?;
-        Some(end <= b.len())
-    };
-    check().unwrap_or(false)
+    Ok(out)
 }
 impl Model {
     /// Mirrors the retail loaders exactly:
@@ -362,488 +277,170 @@ impl Model {
         let up = v3(b, p + 24)?;
         let position = v3(b, p + 36)?;
         p += 48;
-        let v305_header_word = if version >= 0x10000303 {
-            // Provisional parser assumption only: the code treats
-            // 0x10000303..=0x10000305 as carrying a 4-byte word before the mesh
-            // count. No raw 1.8.4 BMD has verified this offset or version range.
-            let word = u(b, p)?;
-            p += 4;
-            Some(word)
-        } else {
-            None
-        };
         let count = u(b, p)? as usize;
         p += 4;
-        if count > 65_536 {
-            let extra = match v305_header_word {
-                Some(w) => format!(", hdr={w:#010x}"),
-                None => String::new(),
-            };
-            return Err(format!(
-                "too many meshes ({count}, version={version:#x}{extra})"
-            ));
+        if count > 4096 {
+            return Err("too many meshes".into());
         }
-        let mut meshes = Vec::with_capacity(count.min(4096));
-        let mut lossy_gbk_diagnostics = Vec::new();
-        let mut v300_branch_counters = V300BranchCounters::default();
-        if is_v300 {
-            // PROVISIONAL 1.8.4 path: the disassembly distinguishes the
-            // 0x01000030/0x10000301 route from 0x10000302, but no raw BMD has
-            // verified this parser's offsets or the broader 0x10000300..=305
-            // acceptance range. This implementation assumes two model-level
-            // bytes, then two per-mesh bytes, length-prefixed GBK strings,
-            // counts, 24-byte vertices and a normal block. It guesses index
-            // width (u32 if all candidates are in-range and fit, otherwise
-            // u16), infers colour/UV blocks from tags, sizes and alpha bytes,
-            // and probes a material/AABB/size tail. The parsed flag bytes do not
-            // select the colour branch. Do not treat these guesses as a format
-            // specification; P3.01 stays partial until fixtures validate each
-            // route and every next-mesh offset.
-            const MAT_TAG: &[u8] = b"MATERIAL: \0";
-            let _b_lightmap = *b.get(p).ok_or("truncated BMD v300 bLightMap")? != 0;
-            let b_shared_data = *b.get(p + 1).ok_or("truncated BMD v300 bSharedData")? != 0;
-            p += 2;
-            if b_shared_data {
-                let share_len = u(b, p)? as usize;
-                p += 4;
-                if share_len > 4096 {
-                    return Err("oversized BMD v300 shared-data path".into());
+        let mut meshes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let ver = u(b, p)?;
+            p += 4;
+            match ver {
+                0x10000004 | 0x10000005 => {}
+                // v2 (0x7ba0b8) and v3 (0x7ba30d) are older layouts: 28-byte
+                // vertex records and no normal array. The advance sizes are
+                // recorded in `src/bin/bmd-corpus-census.rs`, which walks these
+                // same versions, so the shape is known rather than guessed.
+                0x10000002 | 0x10000003 => {}
+                0x10000001 => {
+                    return Err(
+                        "mesh version 0x10000001: client A3DLitMesh::Load rejects it without logging (0x7baa64)".into(),
+                    )
                 }
-                let (share_file, _) = fixed_lossy_tracked(b, p, share_len)?;
-                return Err(format!(
-                    "A3DLitModel v300 shared data file {share_file:?} is unsupported"
-                ));
-            }
-            for mesh_idx in 0..count {
-                let b_support_lm = *b.get(p).ok_or("truncated BMD v300 bSupportLightMap")? != 0;
-                let b_use_lm = *b.get(p + 1).ok_or("truncated BMD v300 bUseLightMap")? != 0;
-                p += 2;
-                v300_branch_counters.flags_read += 1;
-                let name_len = u(b, p)? as usize;
-                p += 4;
-                if name_len > 4096 {
-                    let dump_start = p.saturating_sub(6);
-                    let dump_end = b.len().min(dump_start + 48);
-                    let hex: String = b[dump_start..dump_end]
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect();
+                other => {
                     return Err(format!(
-                        "oversized BMD v300 mesh {mesh_idx} name len={name_len:#x} flags=({},{}) ver={version:#x} tail={hex}",
-                        u8::from(b_support_lm),
-                        u8::from(b_use_lm),
-                    ));
+                        "A3DLitMesh::Load(), Unknown version [{other:x}]! (client 0x7baa51)"
+                    ))
                 }
-                let (name, name_lossy_gbk) = fixed_lossy_tracked(b, p, name_len)?;
-                if name_lossy_gbk {
-                    lossy_gbk_diagnostics.push(format!("mesh {mesh_idx} name lossy GBK: {name}"));
-                }
-                p = p.checked_add(name_len).ok_or("BMD v300 name overflow")?;
-                let tex_len = u(b, p)? as usize;
-                p += 4;
-                if tex_len > 4096 {
-                    return Err("oversized BMD v300 texture name".into());
-                }
-                let (texture, texture_lossy_gbk) = fixed_lossy_tracked(b, p, tex_len)?;
-                if texture_lossy_gbk {
-                    lossy_gbk_diagnostics
-                        .push(format!("mesh {mesh_idx} texture lossy GBK: {texture}"));
-                }
-                p = p.checked_add(tex_len).ok_or("BMD v300 texture overflow")?;
-                let n = u(b, p)? as usize;
-                let faces = u(b, p + 4)? as usize;
-                p += 8;
-                if n > 1_000_000 || faces > 2_000_000 {
-                    return Err("invalid BMD mesh size".into());
-                }
-                let min_needed = n
-                    .checked_mul(24)
-                    .and_then(|v| v.checked_add(faces.checked_mul(6)?))
-                    .and_then(|v| v.checked_add(n.checked_mul(12)?))
-                    .and_then(|v| v.checked_add(n.checked_mul(8)?))
+            }
+            let name = fixed(b, p, 64)?;
+            let texture = fixed(b, p + 64, 256)?;
+            p += 320;
+            let n = u(b, p)? as usize;
+            let faces = u(b, p + 4)? as usize;
+            p += 8;
+            if n > 1_000_000 || faces > 2_000_000 {
+                return Err("invalid BMD mesh size".into());
+            }
+            // v2/v3 use 28-byte vertex records; v4/v5 use 24-byte records plus
+            // a trailing normal array. v3 additionally carries two packed
+            // per-vertex light arrays, exactly like v4/v5.
+            let stride: usize = if ver >= 0x10000004 { 24 } else { 28 };
+            let light_arrays = ver != 0x10000002;
+            let mut needed = n
+                .checked_mul(stride)
+                .and_then(|v| v.checked_add(faces * 6))
+                .and_then(|v| v.checked_add(n * 12))
+                .and_then(|v| v.checked_add(48))
+                .ok_or("BMD size overflow")?;
+            if light_arrays {
+                needed = needed
+                    .checked_add(n * 4)
+                    .and_then(|v| v.checked_add(n * 4))
                     .ok_or("BMD size overflow")?;
-                if p.checked_add(min_needed).is_none_or(|e| e > b.len()) {
-                    return Err("truncated BMD mesh data".into());
-                }
-                let mut vertices = Vec::with_capacity(n);
-                for i in 0..n {
-                    let q = p + i * 24;
-                    vertices.push(Vertex {
-                        position: v3(b, q)?,
-                        diffuse: u(b, q + 12)?,
-                        day_diffuse: 0,
-                        night_diffuse: 0,
-                        uv: [f(b, q + 16)?, f(b, q + 20)?],
-                        normal: [0.; 3],
-                    });
-                }
-                p += n * 24;
-                let idx_count = faces.checked_mul(3).ok_or("BMD size overflow")?;
-                let bytes_32 = idx_count.checked_mul(4).ok_or("BMD size overflow")?;
-                let bytes_16 = idx_count.checked_mul(2).ok_or("BMD size overflow")?;
-                let post_idx_min = n.checked_mul(20).ok_or("BMD size overflow")?;
-                let can_try_32 = p
-                    .checked_add(bytes_32)
-                    .and_then(|v| v.checked_add(post_idx_min))
-                    .is_some_and(|e| e <= b.len());
-                let mut indices = Vec::with_capacity(idx_count);
-                let mut parsed_32 = false;
-                if can_try_32 {
-                    let mut all_ok = true;
-                    for i in 0..idx_count {
-                        let idx = u(b, p + i * 4)?;
-                        if idx as usize >= n {
-                            all_ok = false;
-                            break;
-                        }
-                        indices.push(idx);
-                    }
-                    if all_ok {
-                        p += bytes_32;
-                        parsed_32 = true;
-                    } else {
-                        indices.clear();
-                    }
-                }
-                if !parsed_32 {
-                    for i in 0..idx_count {
-                        let q = p + i * 2;
-                        let s = b.get(q..q + 2).ok_or("truncated BMD indices")?;
-                        let idx = u16::from_le_bytes([s[0], s[1]]) as u32;
-                        if idx as usize >= n {
-                            return Err("BMD vertex index out of range".into());
-                        }
-                        indices.push(idx);
-                    }
-                    p += bytes_16;
-                }
-                for v in &mut vertices {
-                    v.normal = v3(b, p)?;
-                    p += 12;
-                }
-                let n8 = n.checked_mul(8).ok_or("BMD size overflow")?;
-                let mut tail_advance = None;
-                let mut material = None;
-                let mat_at_p = b.get(p..p + MAT_TAG.len()) == Some(MAT_TAG);
-                let has_mat_at = |off: usize| -> bool {
-                    off.checked_add(48 + MAT_TAG.len()).is_some_and(|e| {
-                        e <= b.len() && &b[off + 48..off + 48 + MAT_TAG.len()] == MAT_TAG
-                    })
-                };
-                let n16 = n.checked_mul(16).ok_or("BMD size overflow")?;
-                let double_block = !mat_at_p
-                    && p.checked_add(n16).is_some_and(has_mat_at)
-                    && !p.checked_add(n8).is_some_and(has_mat_at);
-                let color_branch = if mat_at_p {
-                    if p.checked_add(80).is_none_or(|e| e > b.len()) {
-                        return Err("truncated material".into());
-                    }
-                    let mut mat_p = p;
-                    material = parse_material(b, &mut mat_p).ok();
-                    p = if material.is_some() { mat_p } else { p + 80 };
-                    if p.checked_add(n8).is_none_or(|e| e > b.len()) {
-                        return Err("truncated BMD mesh data".into());
-                    }
-                    for v in &mut vertices {
-                        v.day_diffuse = u(b, p)?;
-                        p += 4;
-                    }
-                    for v in &mut vertices {
-                        v.night_diffuse = u(b, p)?;
-                        p += 4;
-                    }
-                    v300_branch_counters.colours_read += 1;
-                    if p.checked_add(52).is_some_and(|e| e <= b.len()) {
-                        let dw_pos = p + 48;
-                        let extra_size = u(b, dw_pos)? as usize;
-                        if (4..=65536).contains(&extra_size)
-                            && dw_pos.checked_add(extra_size).is_some_and(|e| e <= b.len())
-                        {
-                            tail_advance = Some(48 + extra_size);
-                        }
-                    }
-                    V300ColorBranch::VertexColorsOnly
-                } else if double_block {
-                    p += n8;
-                    v300_branch_counters.uv_block_skipped += 1;
-                    for v in &mut vertices {
-                        v.day_diffuse = u(b, p)?;
-                        p += 4;
-                    }
-                    for v in &mut vertices {
-                        v.night_diffuse = u(b, p)?;
-                        p += 4;
-                    }
-                    v300_branch_counters.colours_read += 1;
-                    V300ColorBranch::LightmapUvAndVertexColors
-                } else {
-                    for v in &mut vertices {
-                        v.day_diffuse = u(b, p)?;
-                        p += 4;
-                    }
-                    for v in &mut vertices {
-                        v.night_diffuse = u(b, p)?;
-                        p += 4;
-                    }
-                    let (opaque_day, _) = count_opaque_words(&vertices);
-                    if n > 0 && opaque_day * 10 < n * 9 {
-                        let following_opaque = p
-                            .checked_add(n8)
-                            .is_some_and(|e| e <= b.len())
-                            .then(|| {
-                                let mut c = 0usize;
-                                for i in 0..n {
-                                    let d_ok = u(b, p + i * 4).is_ok_and(|w| (w >> 24) == 0xff);
-                                    let n_ok =
-                                        u(b, p + n * 4 + i * 4).is_ok_and(|w| (w >> 24) == 0xff);
-                                    if d_ok && n_ok {
-                                        c += 1;
-                                    }
-                                }
-                                c
-                            })
-                            .unwrap_or(0);
-                        v300_branch_counters.uv_block_skipped += 1;
-                        if following_opaque * 10 >= n * 9 {
-                            for v in &mut vertices {
-                                v.day_diffuse = u(b, p)?;
-                                p += 4;
-                            }
-                            for v in &mut vertices {
-                                v.night_diffuse = u(b, p)?;
-                                p += 4;
-                            }
-                            v300_branch_counters.colours_read += 1;
-                            V300ColorBranch::LightmapUvAndVertexColors
-                        } else {
-                            for v in &mut vertices {
-                                v.day_diffuse = 0xff80_8080;
-                                v.night_diffuse = 0xff80_8080;
-                            }
-                            v300_branch_counters.neutral_fallback += 1;
-                            V300ColorBranch::LightmapUvNeutralFallback
-                        }
-                    } else {
-                        v300_branch_counters.colours_read += 1;
-                        V300ColorBranch::VertexColorsOnly
-                    }
-                };
-                let (opaque_day_words, opaque_night_words) = count_opaque_words(&vertices);
-                // Tail: 48 B AABB + 80 B A3DMaterial ("MATERIAL: \0" + 69 B) +
-                // dwExtraSize (counts its own 4 B; 22 B when strDetailMap is empty -> 150 B total).
-                // When MATERIAL preceded the day/night colours (`mat_at_p`), only 48 B AABB +
-                // dwExtraSize remain here.
-                if !mat_at_p
-                    && p.checked_add(132).is_some_and(|e| e <= b.len())
-                    && &b[p + 48..p + 48 + MAT_TAG.len()] == MAT_TAG
-                {
-                    let mut mat_p = p + 48;
-                    material = parse_material(b, &mut mat_p).ok();
-                    let dw_pos = if material.is_some() { mat_p } else { p + 128 };
-                    let extra_size = u(b, dw_pos)? as usize;
-                    if (4..=65536).contains(&extra_size)
-                        && dw_pos.checked_add(extra_size).is_some_and(|e| e <= b.len())
-                    {
-                        tail_advance = Some((dw_pos - p) + extra_size);
-                    }
-                }
-                if let Some(step) = tail_advance {
-                    p += step;
-                } else if mat_at_p && p.checked_add(70).is_some_and(|e| e <= b.len()) {
-                    p += 70;
-                } else if !mat_at_p && p.checked_add(150).is_some_and(|e| e <= b.len()) {
-                    let mut mat_p = p + 48;
-                    if b.get(mat_p..mat_p + MAT_TAG.len()) == Some(MAT_TAG) {
-                        material = parse_material(b, &mut mat_p).ok();
-                    }
-                    p += 150;
-                } else if mesh_idx + 1 < count {
-                    return Err("truncated BMD v300 mesh tail".into());
-                } else {
-                    p = b.len();
-                }
-                if mesh_idx + 1 < count && !looks_like_v300_mesh_header(b, p, false) {
-                    if p.checked_add(18)
-                        .is_some_and(|q| looks_like_v300_mesh_header(b, q, false))
-                    {
-                        p += 18;
-                    } else if let Some(delta) = (1..=256usize).find(|&d| {
-                        p.checked_add(d)
-                            .is_some_and(|q| looks_like_v300_mesh_header(b, q, true))
-                    }) {
-                        p += delta;
-                    }
-                }
-                meshes.push(Mesh {
-                    name,
-                    version,
-                    material,
-                    texture,
-                    vertices,
-                    indices,
-                    color_branch: Some(color_branch),
-                    b_support_lightmap: b_support_lm,
-                    b_use_lightmap: b_use_lm,
-                    opaque_day_words,
-                    opaque_night_words,
-                    name_lossy_gbk,
-                    texture_lossy_gbk,
+            }
+            if p.checked_add(needed).is_none_or(|e| e > b.len()) {
+                return Err("truncated BMD mesh data".into());
+            }
+            let mut vertices = Vec::with_capacity(n);
+            for i in 0..n {
+                let q = p + i * stride;
+                vertices.push(Vertex {
+                    position: v3(b, q)?,
+                    diffuse: u(b, q + 12)?,
+                    day_diffuse: 0,
+                    night_diffuse: 0,
+                    uv: [f(b, q + 16)?, f(b, q + 20)?],
+                    normal: [0.; 3],
                 });
             }
-        } else {
-            for mesh_idx in 0..count {
-                let ver = u(b, p)?;
-                p += 4;
-                match ver {
-                    0x10000004 | 0x10000005 | 0x10000006 => {}
-                    // v2 (0x7ba0b8) and v3 (0x7ba30d) are older layouts: 28-byte
-                    // vertex records and no normal array. The advance sizes are
-                    // recorded in `src/bin/bmd-corpus-census.rs`, which walks these
-                    // same versions, so the shape is known rather than guessed.
-                    0x10000002 | 0x10000003 => {}
-                    0x10000001 => {
-                        return Err(
-                            "mesh version 0x10000001: client A3DLitMesh::Load rejects it without logging (0x7baa64)".into(),
-                        )
-                    }
-                    other => {
-                        return Err(format!(
-                            "A3DLitMesh::Load(), Unknown version [{other:x}]! (client 0x7baa51)"
-                        ))
-                    }
+            p += n * stride;
+            let mut indices = Vec::with_capacity(faces * 3);
+            for _ in 0..faces * 3 {
+                let s = b.get(p..p + 2).ok_or("truncated BMD indices")?;
+                let i = u16::from_le_bytes([s[0], s[1]]);
+                if i as usize >= n {
+                    return Err("BMD vertex index out of range".into());
                 }
-                let (name, name_lossy_gbk) = fixed_lossy_tracked(b, p, 64)?;
-                if name_lossy_gbk {
-                    lossy_gbk_diagnostics.push(format!("mesh {mesh_idx} name lossy GBK: {name}"));
-                }
-                let (texture, texture_lossy_gbk) = fixed_lossy_tracked(b, p + 64, 256)?;
-                if texture_lossy_gbk {
-                    lossy_gbk_diagnostics
-                        .push(format!("mesh {mesh_idx} texture lossy GBK: {texture}"));
-                }
-                p += 320;
-                let n = u(b, p)? as usize;
-                let faces = u(b, p + 4)? as usize;
-                p += 8;
-                let has_extra_colors = if ver == 0x10000006 {
-                    let flag = *b.get(p).ok_or("truncated BMD")? != 0;
-                    p += 1;
-                    flag
-                } else {
-                    false
-                };
-                if n > 1_000_000 || faces > 2_000_000 {
-                    return Err("invalid BMD mesh size".into());
-                }
-                // v2/v3 use 28-byte vertex records; v4/v5/v6 use 24-byte
-                // records plus a trailing normal array. v3 additionally
-                // carries two packed per-vertex light arrays, like v4/v5/v6.
-                let stride: usize = if ver >= 0x10000004 { 24 } else { 28 };
-                let light_arrays = ver != 0x10000002;
-                let mut needed = n
-                    .checked_mul(stride)
-                    .and_then(|v| v.checked_add(faces * 6))
-                    .and_then(|v| v.checked_add(n * 12))
-                    .and_then(|v| v.checked_add(48))
-                    .ok_or("BMD size overflow")?;
-                if light_arrays {
-                    needed = needed
-                        .checked_add(n * 4)
-                        .and_then(|v| v.checked_add(n * 4))
-                        .ok_or("BMD size overflow")?;
-                }
-                if has_extra_colors {
-                    needed = needed
-                        .checked_add(n * 4)
-                        .and_then(|v| v.checked_add(n * 4))
-                        .ok_or("BMD size overflow")?;
-                }
-                if p.checked_add(needed).is_none_or(|e| e > b.len()) {
-                    return Err("truncated BMD mesh data".into());
-                }
-                let mut vertices = Vec::with_capacity(n);
-                for i in 0..n {
-                    let q = p + i * stride;
-                    vertices.push(Vertex {
-                        position: v3(b, q)?,
-                        diffuse: u(b, q + 12)?,
-                        day_diffuse: 0,
-                        night_diffuse: 0,
-                        uv: [f(b, q + 16)?, f(b, q + 20)?],
-                        normal: [0.; 3],
-                    });
-                }
-                p += n * stride;
-                let mut indices = Vec::with_capacity(faces * 3);
-                for _ in 0..faces * 3 {
-                    let s = b.get(p..p + 2).ok_or("truncated BMD indices")?;
-                    let i = u16::from_le_bytes([s[0], s[1]]);
-                    if i as usize >= n {
-                        return Err("BMD vertex index out of range".into());
-                    }
-                    indices.push(u32::from(i));
-                    p += 2;
-                }
-                // The normal array is present in every version (n*12 bytes);
-                // the 28-byte v2/v3 record simply has no room for one inline,
-                // so the block is where it always is. This matches the advance
-                // sizes in `src/bin/bmd-corpus-census.rs` for all versions.
+                indices.push(i);
+                p += 2;
+            }
+            // The normal array is present in every version (n*12 bytes); the
+            // 28-byte v2/v3 record simply has no room for one inline, so the
+            // block is where it always is. This matches the advance sizes in
+            // `src/bin/bmd-corpus-census.rs` for all four versions.
+            for v in &mut vertices {
+                v.normal = v3(b, p)?;
+                p += 12;
+            }
+            // The client loads two packed vertex-light arrays into mesh
+            // members +0x284/+0x288 and blends them at 0x7b9bc0. v2 has
+            // neither; v3 has both.
+            if light_arrays {
                 for v in &mut vertices {
-                    v.normal = v3(b, p)?;
-                    p += 12;
+                    v.day_diffuse = u(b, p)?;
+                    p += 4;
                 }
-                // The client loads two packed vertex-light arrays into mesh
-                // members +0x284/+0x288 and blends them at 0x7b9bc0. v2 has
-                // neither; v3 has both.
-                if light_arrays {
-                    for v in &mut vertices {
-                        v.day_diffuse = u(b, p)?;
-                        p += 4;
-                    }
-                    for v in &mut vertices {
-                        v.night_diffuse = u(b, p)?;
-                        p += 4;
-                    }
+                for v in &mut vertices {
+                    v.night_diffuse = u(b, p)?;
+                    p += 4;
                 }
-                if has_extra_colors {
-                    p += n * 8;
+            }
+            p += 48;
+            let material = if ver >= 0x10000005 {
+                let tail = b.get(p..).ok_or("truncated material")?;
+                let len = tail
+                    .iter()
+                    .position(|&c| c == 0)
+                    .ok_or("unterminated material name")?;
+                if len > 4096 {
+                    return Err("oversized BMD material name".into());
                 }
-                p += 48;
-                let material = if ver >= 0x10000005 {
-                    Some(parse_material(b, &mut p)?)
-                } else {
-                    None
+                let name = fixed(b, p, len)?;
+                p = p.checked_add(len + 1).ok_or("material overflow")?;
+                let color = |off| -> Result<[f32; 4], String> {
+                    Ok([f(b, off)?, f(b, off + 4)?, f(b, off + 8)?, f(b, off + 12)?])
                 };
-                let (opaque_day_words, opaque_night_words) = count_opaque_words(&vertices);
-                meshes.push(Mesh {
+                let m = Material {
                     name,
-                    version: ver,
-                    material,
-                    texture,
-                    vertices,
-                    indices,
-                    color_branch: None,
-                    b_support_lightmap: false,
-                    b_use_lightmap: false,
-                    opaque_day_words,
-                    opaque_night_words,
-                    name_lossy_gbk,
-                    texture_lossy_gbk,
-                });
+                    ambient: color(p)?,
+                    diffuse: color(p + 16)?,
+                    emissive: color(p + 32)?,
+                    specular: color(p + 48)?,
+                    power: f(b, p + 64)?,
+                    two_sided: *b.get(p + 68).ok_or("truncated material")? != 0,
+                };
+                p = p.checked_add(69).ok_or("material overflow")?;
+                Some(m)
+            } else {
+                None
+            };
+            meshes.push(Mesh {
+                name,
+                version: ver,
+                material,
+                texture,
+                vertices,
+                indices,
+            });
+        }
+        let mut collision = Vec::new();
+        // CELBrushBuilding accepts old files whose stream ends before the
+        // hull-count word, but a partially present native trailer is an error.
+        if p < b.len() {
+            let hull_count = u(b, p)? as usize;
+            p += 4;
+            if hull_count > 65_536 {
+                return Err(format!("BMD collision-hull limit exceeded: {hull_count}"));
+            }
+            collision.reserve(hull_count);
+            for _ in 0..hull_count {
+                let count = u(b, p)? as usize;
+                p += 4;
+                if count > 1_000_000 {
+                    return Err(format!("BMD collision mesh-list limit exceeded: {count}"));
+                }
+                let bytes = count.checked_mul(4).ok_or("BMD collision list overflow")?;
+                p = p.checked_add(bytes).ok_or("BMD collision list overflow")?;
+                if p > b.len() {
+                    return Err("truncated BMD collision mesh list".into());
+                }
+            }
+            for _ in 0..hull_count {
+                collision.push(CollisionBrush::read(b, &mut p)?);
             }
         }
-        let collision = if p < b.len() {
-            if is_v300 {
-                match parse_collision(b, p) {
-                    Ok(brushes) => brushes,
-                    Err(_) => Vec::new(),
-                }
-            } else {
-                parse_collision(b, p)?
-            }
-        } else {
-            Vec::new()
-        };
         Ok(Self {
             scale,
             direction,
@@ -851,8 +448,6 @@ impl Model {
             position,
             meshes,
             collision,
-            lossy_gbk_diagnostics,
-            v300_branch_counters,
         })
     }
 }

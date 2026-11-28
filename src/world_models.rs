@@ -74,22 +74,116 @@ impl Assets {
         if placements.is_empty() {
             return Ok(Self::load_with(placements, |_| unreachable!()));
         }
-        let mut package = crate::pck::Package::open(&element.join("models.pck"))
-            .map_err(|e| format!("models.pck: {e}"))?;
-        let dir = package.directory()?;
-        let mut entries = HashMap::with_capacity(dir.len());
-        for entry in dir {
+        let mut file =
+            File::open(element.join("models.pck")).map_err(|e| format!("models.pck: {e}"))?;
+        let dir = crate::pck::directory_arc(&mut file)?;
+        let mut entries: HashMap<String, usize> = HashMap::with_capacity(dir.len());
+        for (idx, entry) in dir.iter().enumerate() {
             let name = ecmodel::normalize(&entry.name);
-            if entries.insert(name.clone(), entry).is_some() {
+            if entries.insert(name.clone(), idx).is_some() {
                 return Err(format!("duplicate normalized models.pck entry: {name}"));
             }
         }
-        Ok(Self::load_with(placements, |path| {
-            let entry = entries
-                .get(path)
-                .ok_or_else(|| format!("missing models.pck entry: {path}"))?;
-            package.read(entry)
-        }))
+        // Deduplicate unique normalized ECM paths in first-seen order so we
+        // can load & parse all unique world models in parallel across all CPU
+        // cores while preserving exact deterministic asset/failure order.
+        let mut unique_paths: Vec<String> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for placement in &placements {
+            let path = ecmodel::normalize(&placement.path);
+            if !seen.contains_key(&path) {
+                let idx = unique_paths.len();
+                seen.insert(path.clone(), idx);
+                unique_paths.push(path);
+            }
+        }
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(32)
+            .min(unique_paths.len().max(1));
+        let loaded: Vec<Result<ModelAsset, String>> = if workers > 1 && unique_paths.len() >= 2 {
+            let chunk_size = unique_paths.len().div_ceil(workers);
+            let file_ref = &file;
+            let dir_ref = &dir;
+            let entries_ref = &entries;
+            std::thread::scope(|s| {
+                let handles: Vec<_> = unique_paths
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            let mut tracks = crate::model_asset::TrackCache::default();
+                            let mut read = |path: &str| -> Result<Vec<u8>, String> {
+                                let &idx = entries_ref
+                                    .get(path)
+                                    .ok_or_else(|| format!("missing models.pck entry: {path}"))?;
+                                crate::pck::read_entry_at(file_ref, &dir_ref[idx])
+                                    .map_err(|e| e.to_string())
+                            };
+                            chunk
+                                .iter()
+                                .map(|path| ModelAsset::load_cached(path, &mut read, &mut tracks))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect()
+            })
+        } else {
+            let mut tracks = crate::model_asset::TrackCache::default();
+            let mut read = |path: &str| -> Result<Vec<u8>, String> {
+                let &idx = entries
+                    .get(path)
+                    .ok_or_else(|| format!("missing models.pck entry: {path}"))?;
+                crate::pck::read_entry_at(&file, &dir[idx]).map_err(|e| e.to_string())
+            };
+            unique_paths
+                .iter()
+                .map(|path| ModelAsset::load_cached(path, &mut read, &mut tracks))
+                .collect()
+        };
+        let mut result = Self {
+            assets: Vec::with_capacity(unique_paths.len()),
+            instances: Vec::with_capacity(placements.len()),
+            failures: Vec::new(),
+            unloaded: Vec::new(),
+        };
+        let mut slot_map: Vec<Option<usize>> = Vec::with_capacity(loaded.len());
+        for outcome in loaded {
+            match outcome {
+                Ok(asset) => {
+                    let index = result.assets.len();
+                    result.assets.push(asset);
+                    slot_map.push(Some(index));
+                }
+                Err(e) => {
+                    result.failures.push(e);
+                    slot_map.push(None);
+                }
+            }
+        }
+        for placement in placements {
+            let path = ecmodel::normalize(&placement.path);
+            let asset = seen.get(&path).and_then(|&u| slot_map[u]);
+            if let Some(asset) = asset {
+                let action = result.assets[asset]
+                    .descriptor
+                    .scene_action(&placement.action);
+                let playback = crate::model_playback::Playback::new(&result.assets[asset], action);
+                result.instances.push(Instance {
+                    placement,
+                    asset,
+                    action,
+                    playback,
+                });
+            } else {
+                result.unloaded.push(placement);
+            }
+        }
+        Ok(result)
     }
 }
 /// 1.4.2 0x6d4304 -> 0x7b0d60 -> 0x788960. Normalize forward/up

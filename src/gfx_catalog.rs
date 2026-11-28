@@ -450,14 +450,16 @@ impl Catalog {
     pub fn from_directory(names: Vec<(&str, u32)>) -> Catalog {
         let mut entries: Vec<Entry> = names
             .into_iter()
-            .filter(|(name, _)| name.to_lowercase().ends_with(".gfx"))
+            .filter(|(name, _)| {
+                name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".gfx")
+            })
             .map(|(name, size)| {
                 let path = normalize(name);
                 let group = group_of(&path);
                 Entry { path, group, size }
             })
             .collect();
-        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         entries.dedup_by(|a, b| a.path == b.path);
         Catalog { entries }
     }
@@ -484,7 +486,12 @@ impl Catalog {
     pub fn census(&self) -> Vec<(Group, usize)> {
         Group::all()
             .iter()
-            .map(|group| (*group, self.group(*group).len()))
+            .map(|group| {
+                (
+                    *group,
+                    self.entries.iter().filter(|e| e.group == *group).count(),
+                )
+            })
             .collect()
     }
 
@@ -492,10 +499,16 @@ impl Catalog {
     /// differences an authored reference carries.
     pub fn find(&self, path: &str) -> Option<&Entry> {
         let wanted = normalize(path);
+        if let Ok(idx) = self
+            .entries
+            .binary_search_by(|entry| entry.path.as_str().cmp(wanted.as_str()))
+        {
+            return Some(&self.entries[idx]);
+        }
         let lower = wanted.to_lowercase();
         self.entries
             .iter()
-            .find(|entry| entry.path == wanted || entry.path.to_lowercase() == lower)
+            .find(|entry| entry.path.to_lowercase() == lower)
     }
 
     /// Every member whose path contains `needle`, case-insensitively.

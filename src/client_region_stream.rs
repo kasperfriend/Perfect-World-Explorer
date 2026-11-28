@@ -41,7 +41,7 @@ impl Window {
         if rect.0 >= rect.1 || rect.1 > self.cols || rect.2 >= rect.3 || rect.3 > self.rows {
             return Err("invalid active block rectangle".into());
         }
-        let mut changes = Vec::new();
+        let mut changes = Vec::with_capacity(self.budget);
         if self.rect != Some(rect) {
             let old = self.rect;
             let overlap =

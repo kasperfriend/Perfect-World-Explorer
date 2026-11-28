@@ -156,6 +156,10 @@ pub fn upload(
     tiles: &[Tile],
     side: usize,
 ) {
+    if pixels.is_empty() {
+        return;
+    }
+    let rows = (pixels.len() / (side * 4)).clamp(1, side);
     queue.write_texture(
         wgpu::ImageCopyTexture {
             texture: atlas,
@@ -163,15 +167,15 @@ pub fn upload(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        pixels,
+        &pixels[..rows * side * 4],
         wgpu::ImageDataLayout {
             offset: 0,
             bytes_per_row: Some((side * 4) as u32),
-            rows_per_image: Some(side as u32),
+            rows_per_image: Some(rows as u32),
         },
         wgpu::Extent3d {
             width: side as u32,
-            height: side as u32,
+            height: rows as u32,
             depth_or_array_layers: 1,
         },
     );

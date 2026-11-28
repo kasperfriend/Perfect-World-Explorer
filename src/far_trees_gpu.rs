@@ -4,6 +4,7 @@ use crate::{gpu::Vertex, trees::Trees};
 mod cutoff_residency;
 use crate::indirect_args::{base_instance, multi_draw, record, DrawIndexedArgs, DRAW_ARGS};
 use bytemuck::{Pod, Zeroable};
+use std::cell::RefCell;
 use wgpu::util::DeviceExt;
 /// One instance record: `[position.xyz, 0]`, then `[fraction, mode, 0, 0]`.
 ///
@@ -54,6 +55,123 @@ pub(crate) struct GroupInfo {
     /// Placements per level, i.e. the capacity of each level's slice.
     pub(crate) capacity: u32,
 }
+
+const TREE_SPATIAL_CELL_SIZE: f32 = 256.0;
+
+struct TreeSpatialCell {
+    min: [f32; 3],
+    max: [f32; 3],
+    placement_indices: Vec<u32>,
+}
+
+fn build_tree_spatial_cells(
+    placements: &[Placement],
+    groups: &[GroupInfo],
+) -> Vec<TreeSpatialCell> {
+    let mut cells = std::collections::BTreeMap::<(i32, i32), TreeSpatialCell>::new();
+    for (index, placement) in placements.iter().enumerate() {
+        let Some(group) = groups.get(placement.group as usize) else {
+            continue;
+        };
+        if group.capacity == 0 {
+            continue;
+        }
+        let position = [
+            placement.pos_height[0],
+            placement.pos_height[1],
+            placement.pos_height[2],
+        ];
+        if !position.iter().all(|value| value.is_finite()) {
+            continue;
+        }
+        let radius = group.height.max(5.0) * 2.0;
+        let min = [
+            position[0] - radius,
+            position[1] - radius,
+            position[2] - radius,
+        ];
+        let max = [
+            position[0] + radius,
+            position[1] + radius,
+            position[2] + radius,
+        ];
+        let key = (
+            (position[0] / TREE_SPATIAL_CELL_SIZE).floor() as i32,
+            (position[2] / TREE_SPATIAL_CELL_SIZE).floor() as i32,
+        );
+        let cell = cells.entry(key).or_insert_with(|| TreeSpatialCell {
+            min: [f32::INFINITY; 3],
+            max: [f32::NEG_INFINITY; 3],
+            placement_indices: Vec::new(),
+        });
+        for axis in 0..3 {
+            cell.min[axis] = cell.min[axis].min(min[axis]);
+            cell.max[axis] = cell.max[axis].max(max[axis]);
+        }
+        cell.placement_indices.push(index as u32);
+    }
+    cells.into_values().collect()
+}
+
+/// Conservative AABB/frustum rejection kept local because this module is also
+/// compiled by standalone tree diagnostics that intentionally omit world_objects.
+fn tree_cell_intersects_frustum(planes: &[[f32; 4]; 6], min: [f32; 3], max: [f32; 3]) -> bool {
+    if min.iter().chain(max.iter()).any(|value| !value.is_finite())
+        || (0..3).any(|axis| min[axis] > max[axis])
+    {
+        return true;
+    }
+    for plane in planes {
+        let positive = [
+            if plane[0] >= 0.0 { max[0] } else { min[0] },
+            if plane[1] >= 0.0 { max[1] } else { min[1] },
+            if plane[2] >= 0.0 { max[2] } else { min[2] },
+        ];
+        if plane[0] * positive[0] + plane[1] * positive[1] + plane[2] * positive[2] + plane[3] < 0.0
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Reject only when the complete tree-cell AABB is on the clipped side.
+fn tree_cell_survives_clip(clip_plane: Option<(f32, f32)>, min: [f32; 3], max: [f32; 3]) -> bool {
+    if let Some((water_y, sign)) = clip_plane {
+        if sign > 0.0 && max[1] < water_y {
+            return false;
+        }
+        if sign < 0.0 && min[1] > water_y {
+            return false;
+        }
+    }
+    true
+}
+
+/// Append only cells whose conservative tree bounds can intersect this view.
+/// The per-tree shader tests still run on every selected placement.
+fn append_visible_tree_indices(
+    cells: &[TreeSpatialCell],
+    frustum: &[[f32; 4]; 6],
+    clip_plane: Option<(f32, f32)>,
+    bounds: Option<[f32; 4]>,
+    out: &mut Vec<u32>,
+) {
+    for cell in cells {
+        if let Some([x0, x1, z0, z1]) = bounds {
+            if cell.max[0] < x0 || cell.min[0] >= x1 || cell.max[2] < z0 || cell.min[2] >= z1 {
+                continue;
+            }
+        }
+        if !tree_cell_survives_clip(clip_plane, cell.min, cell.max)
+            || !tree_cell_intersects_frustum(frustum, cell.min, cell.max)
+        {
+            continue;
+        }
+        out.extend_from_slice(&cell.placement_indices);
+    }
+}
+
 /// Per-frame inputs of the LOD compute pass.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -62,14 +180,27 @@ pub(crate) struct LodParams {
     pub(crate) camera: [f32; 4],
     /// Admitted XZ square (`x0, x1, z0, z1`); ignored when `counts.z` is 0.
     pub(crate) bounds: [f32; 4],
-    /// `placements, groups, bounds_active, 0`.
+    /// Normalized view-frustum planes; tree spheres are tested conservatively.
+    pub(crate) frustum: [[f32; 4]; 6],
+    /// Optional water clip plane: height, sign, enabled, unused.
+    pub(crate) clip: [f32; 4],
+    /// `active placements, active-index word offset (0 = full scan), bounds_active, 0`.
     pub(crate) counts: [u32; 4],
+    /// The exact view-projection used by the depth-producing pass.
+    pub(crate) view_projection: [[f32; 4]; 4],
+    /// `(width, height, element offset, 0)` for each ceil-halved mip.
+    pub(crate) hiz_mips: [[u32; 4]; 16],
+    /// Width, height, mip count, enabled.
+    pub(crate) hiz_info: [u32; 4],
+    /// Positive reversed-depth comparison bias and padding.
+    pub(crate) hiz_bias: [f32; 4],
 }
 
 /// The LOD selection pass.
 ///
 /// This is `tree_lod::client_distance` + `tree_lod::select` transcribed into
-/// WGSL and run once per placement on the GPU, so a camera move no longer costs
+/// WGSL and run for the view's spatially selected candidates on the GPU, so a
+/// camera move no longer costs
 /// a walk over every tree placement in the world plus a full instance-buffer
 /// upload. Both functions are pure arithmetic and are reproduced operation for
 /// operation: the same fast square root on the squared distance
@@ -79,16 +210,35 @@ pub(crate) struct LodParams {
 /// which can move a distance by ~1e-7 relative — inside a transition window that
 /// changes the fade fraction, never whether the tree is drawn.
 pub(crate) const LOD_COMPUTE: &str = r#"
-struct LodParamsGpu {camera:vec4<f32>,bounds:vec4<f32>,counts:vec4<u32>};
+struct LodParamsGpu {
+ camera:vec4<f32>, bounds:vec4<f32>, frustum:array<vec4<f32>,6>, clip:vec4<f32>, counts:vec4<u32>,
+ view_projection:mat4x4<f32>, hiz_mips:array<vec4<u32>,16>, hiz_info:vec4<u32>, hiz_bias:vec4<f32>
+};
 struct Placement {pos_height:vec4<f32>,group:u32,pad0:u32,pad1:u32,pad2:u32};
 struct GroupInfo {height:f32,args_base:u32,first_instance:u32,capacity:u32};
 struct Args {index_count:u32,instance_count:atomic<u32>,first_index:u32,base_vertex:i32,first_instance:u32};
 struct Instance {data0:vec4<f32>,data1:vec4<f32>};
 @group(0) @binding(0) var<uniform> p:LodParamsGpu;
-@group(0) @binding(1) var<storage,read> placements:array<Placement>;
+@group(0) @binding(1) var<storage,read> placement_words:array<u32>;
 @group(0) @binding(2) var<storage,read> groups:array<GroupInfo>;
 @group(0) @binding(3) var<storage,read_write> instances:array<Instance>;
 @group(0) @binding(4) var<storage,read_write> args:array<Args>;
+@group(0) @binding(5) var hiz:texture_2d<f32>;
+fn load_placement(index:u32)->Placement {
+ let base=index*8u;
+ return Placement(
+  vec4<f32>(
+   bitcast<f32>(placement_words[base]),
+   bitcast<f32>(placement_words[base+1u]),
+   bitcast<f32>(placement_words[base+2u]),
+   bitcast<f32>(placement_words[base+3u])
+  ),
+  placement_words[base+4u],
+  placement_words[base+5u],
+  placement_words[base+6u],
+  placement_words[base+7u]
+ );
+}
 fn is_finite(v:f32)->bool {return v>=-3.0e38 && v<=3.0e38;}
 // SpeedTreeRT 0x100282b0's estimate: f32 squared distance, then the float-bit
 // square root. Matches `tree_lod::client_distance`.
@@ -117,6 +267,68 @@ fn select_level(distance:f32,height:f32,scale:f32)->vec4<f32> {
  if distance<a {primary=0.;} else if distance<b {primary=1.;}
  return vec4<f32>(primary,3.,0.,0.);
 }
+// Plane normals are normalized on the CPU. The radius uses twice the
+// authored tree height, conservatively enclosing the trunk and broad canopies.
+fn sphere_in_frustum(position:vec3<f32>,radius:f32)->bool {
+ for(var i=0u;i<6u;i=i+1u) {
+  let plane=p.frustum[i];
+  if dot(plane.xyz,position)+plane.w < -radius {return false;}
+ }
+ return true;
+}
+// Reversed-Z conservative occlusion. The placement sphere is projected as
+// an AABB; any near/far-plane ambiguity or invalid projection keeps it visible.
+fn sphere_occluded(position:vec3<f32>,radius:f32)->bool {
+ if p.hiz_info.w==0u || p.hiz_info.z==0u {return false;}
+ let extent=vec2<f32>(f32(p.hiz_info.x),f32(p.hiz_info.y));
+ var min_pixel=vec2<f32>(1.0e30);
+ var max_pixel=vec2<f32>(-1.0e30);
+ var nearest_depth=0.0;
+ for(var corner=0u;corner<8u;corner=corner+1u) {
+  let sx=select(-1.0,1.0,(corner&1u)!=0u);
+  let sy=select(-1.0,1.0,(corner&2u)!=0u);
+  let sz=select(-1.0,1.0,(corner&4u)!=0u);
+  let clip=p.view_projection*vec4<f32>(position+vec3<f32>(sx,sy,sz)*radius,1.0);
+  if !is_finite(clip.x) || !is_finite(clip.y) || !is_finite(clip.z) || !is_finite(clip.w) || clip.w<=1.0 {return false;}
+  let ndc=clip.xyz/clip.w;
+  // A box intersecting either depth plane is uncertain and must be drawn.
+  if !is_finite(ndc.x) || !is_finite(ndc.y) || !is_finite(ndc.z) || ndc.z<0.0 || ndc.z>=1.0 {return false;}
+  let pixel=vec2<f32>((ndc.x*0.5+0.5)*extent.x,(0.5-ndc.y*0.5)*extent.y);
+  min_pixel=min(min_pixel,pixel);
+  max_pixel=max(max_pixel,pixel);
+  nearest_depth=max(nearest_depth,ndc.z);
+ }
+ // No overlap with the viewport means the frustum path owns this decision.
+ if max_pixel.x<0.0 || max_pixel.y<0.0 || min_pixel.x>=extent.x || min_pixel.y>=extent.y {return false;}
+ let screen_max=extent-vec2<f32>(1.0);
+ let rect_min=vec2<u32>(clamp(floor(min_pixel-vec2<f32>(2.0)),vec2<f32>(0.0),screen_max));
+ let rect_max=vec2<u32>(clamp(ceil(max_pixel+vec2<f32>(2.0)),vec2<f32>(0.0),screen_max));
+ let threshold=nearest_depth+p.hiz_bias.x;
+ if !is_finite(threshold) || threshold>=1.0 {return false;}
+ var mip=0u;
+ loop {
+  let scale=1u<<mip;
+  let lo=rect_min/vec2<u32>(scale);
+  let hi=rect_max/vec2<u32>(scale);
+  // At most 2x2 conservative Hi-Z cells. The coarser minimum pyramid can
+  // only turn an occlusion into a visible candidate; it cannot hide a hole.
+  if (hi.x-lo.x)<2u && (hi.y-lo.y)<2u {break;}
+  if mip+1u>=p.hiz_info.z {break;}
+  mip=mip+1u;
+ }
+ let info=p.hiz_mips[mip];
+ if info.x==0u || info.y==0u {return false;}
+ let scale=1u<<mip;
+ let lo=min(rect_min/vec2<u32>(scale),info.xy-vec2<u32>(1u));
+ let hi=min(rect_max/vec2<u32>(scale),info.xy-vec2<u32>(1u));
+ for(var y=lo.y;y<=hi.y;y=y+1u) {
+  for(var x=lo.x;x<=hi.x;x=x+1u) {
+   let depth=textureLoad(hiz,vec2<i32>(i32(x),i32(y)),i32(mip)).r;
+   if !is_finite(depth) || depth<0.0 || depth>1.0 || depth<=threshold {return false;}
+  }
+ }
+ return true;
+}
 fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>) {
  let g=groups[group_index];
  if level>2u {return;}
@@ -130,9 +342,10 @@ fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>) {
 }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id:vec3<u32>) {
- let index=id.x;
- if index>=p.counts.x {return;}
- let placement=placements[index];
+ let active_slot=id.x;
+ if active_slot>=p.counts.x {return;}
+ let index=select(active_slot,placement_words[p.counts.y+active_slot],p.counts.y!=0u);
+ let placement=load_placement(index);
  let position=placement.pos_height.xyz;
  if !is_finite(position.x) || !is_finite(position.y) || !is_finite(position.z) {return;}
  if p.counts.z!=0u {
@@ -140,6 +353,13 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {
   if position.z<p.bounds.z || position.z>=p.bounds.w {return;}
  }
  let constants=groups[placement.group];
+ let radius=max(constants.height,5.)*2.;
+ if !sphere_in_frustum(position,radius) {return;}
+ if p.clip.z>0.5 {
+  if p.clip.y>0. && position.y+radius<p.clip.x {return;}
+  if p.clip.y<0. && position.y>p.clip.x {return;}
+ }
+ if sphere_occluded(position,radius) {return;}
  let distance=client_distance(position,p.camera.xyz);
  if distance<0. {return;}
  let selection=select_level(distance,constants.height,p.camera.w);
@@ -570,6 +790,35 @@ fn rt_foliage_mip_images(
     images
 }
 
+type ResidentUpdateKey = (
+    [f32; 3],
+    f32,
+    Option<[f32; 4]>,
+    [[f32; 4]; 6],
+    Option<(f32, f32)>,
+);
+
+/// Whether the spatial candidate set is still valid. The small camera epsilon
+/// matches the old no-Hi-Z early-out; frustum and residency remain exact.
+fn same_resident_update(
+    previous: &ResidentUpdateKey,
+    camera: [f32; 3],
+    scale: f32,
+    bounds: Option<[f32; 4]>,
+    frustum: [[f32; 4]; 6],
+    clip_plane: Option<(f32, f32)>,
+) -> bool {
+    let (prev_cam, prev_scale, prev_bounds, prev_frustum, prev_clip) = previous;
+    let dx = camera[0] - prev_cam[0];
+    let dy = camera[1] - prev_cam[1];
+    let dz = camera[2] - prev_cam[2];
+    dx * dx + dy * dy + dz * dz < 1e-4
+        && *prev_scale == scale
+        && *prev_bounds == bounds
+        && *prev_frustum == frustum
+        && *prev_clip == clip_plane
+}
+
 pub struct FarTrees {
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
@@ -582,11 +831,30 @@ pub struct FarTrees {
     rt_species: std::sync::Arc<[RtTreeSpecies]>,
     /// Slots in the instance buffer: three level slices per placement.
     capacity: usize,
-    last_resident_update: Option<([f32; 3], f32, Option<[f32; 4]>)>,
+    /// Coarse CPU spatial index; only indices from cells intersecting this view
+    /// are uploaded before the per-tree GPU LOD/occlusion pass.
+    spatial_cells: Vec<TreeSpatialCell>,
+    active_placement_indices: RefCell<Vec<u32>>,
+    /// Byte offset of the optional active-index tail packed after placements.
+    /// None means the combined buffer would exceed the adapter's storage limit;
+    /// the shader then scans the static placement prefix directly.
+    active_index_offset: Option<u64>,
+    last_resident_update: RefCell<
+        Option<(
+            [f32; 3],
+            f32,
+            Option<[f32; 4]>,
+            [[f32; 4]; 6],
+            Option<(f32, f32)>,
+        )>,
+    >,
     /// The LOD selection pass: a camera move dispatches this instead of walking
     /// every placement on the CPU and re-uploading the instance buffer.
     lod_pipeline: wgpu::ComputePipeline,
     lod_bind: wgpu::BindGroup,
+    lod_layout: wgpu::BindGroupLayout,
+    placement_buffer: wgpu::Buffer,
+    group_buffer: wgpu::Buffer,
     lod_params: wgpu::Buffer,
     placements: u32,
     /// Why no trees are drawn, copied from the loader so the panel and the log
@@ -645,10 +913,10 @@ struct In {@builtin(vertex_index) vertex_id:u32,@location(0) pos:vec3<f32>,@loca
 struct Out {@builtin(position) pos:vec4<f32>,@location(0) normal:vec3<f32>,@location(1) uv:vec2<f32>,@location(2) color:vec4<f32>,@location(3) @interpolate(flat) kind:f32,@location(4) world:vec3<f32>,@location(5) @interpolate(flat) tree:vec3<f32>,@location(6) @interpolate(flat) tex_h:f32,@location(7) @interpolate(flat) fade:vec2<f32>,@location(8) @interpolate(flat) alpha_ref:u32};
 @vertex fn vs(i:In)->Out {var o:Out;var pos=i.pos+i.instance;var norm=i.normal;
  if i.kind>4.5 {let d=normalize(camera.direction.xyz);let az=atan2(d.z,d.x);let el=asin(clamp(d.y,-1.,1.));let rho=i.color.w;var corner=i.normal;let rock_index=i.tex_h>>8u;if rock_index>0u {corner=mix(corner,rock_sample(rock_index-1u,camera.tree_bounds.w),clamp(camera.tree_bounds.z,0.,1.));}let q=vec3<f32>(cos(el)*corner.x-sin(el)*corner.z,corner.y,sin(el)*corner.x+cos(el)*corner.z);let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. {v=corner;}pos+=vec3<f32>(v.x,v.z,v.y);norm=vec3<f32>(0.,1.,0.);if i.vertex_id<arrayLength(&leaf_normals) {let n=leaf_normals[i.vertex_id];if n.w>0.5 {norm=n.xyz;}}}
- o.pos=camera.matrix*vec4<f32>(pos,1.);o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.tree=i.instance;o.tex_h=f32(i.tex_h & 127u)*select(128./8192.,128./2048.,(i.tex_h & 128u)!=0u);o.fade=i.info;o.alpha_ref=i.alpha_ref;return o;}
+ o.pos=camera.matrix*vec4<f32>(pos,1.);o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.tree=i.instance;o.tex_h=f32(i.tex_h & 127u)*128.;o.fade=i.info;o.alpha_ref=i.alpha_ref;return o;}
 @fragment fn fs(i:Out)->@location(0) vec4<f32>{if camera.clip.y!=0. && (i.world.y-camera.clip.x)*camera.clip.y<0. {discard;}
 
- let scale=vec2<f32>(i.color.z,i.tex_h);var dx=dpdx(i.uv);var dy=dpdy(i.uv);let lod_bias=exp2(camera.lod.x);dx*=lod_bias;dy*=lod_bias;let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(dx*dims),length(dy*dims)),1.)),0.,7.);let halfpixel=min(vec2<f32>(0.5*exp2(mip))/dims,scale*0.499);let uv=i.color.xy+clamp(fract((i.uv-i.color.xy)/scale)*scale,halfpixel,scale-halfpixel);let tex=textureSampleGrad(atlas,atlas_sampler,uv,dx,dy);if i.alpha_ref!=0xffffffffu {let threshold=bitcast<f32>(i.alpha_ref);if tex.a<=threshold {discard;}}else if i.kind>3.5 && tex.a<0.5 {discard;}
+ let dims=vec2<f32>(textureDimensions(atlas));let scale=vec2<f32>(i.color.z,i.tex_h/dims.y);var dx=dpdx(i.uv);var dy=dpdy(i.uv);let lod_bias=exp2(camera.lod.x);dx*=lod_bias;dy*=lod_bias;let mip=clamp(log2(max(max(length(dx*dims),length(dy*dims)),1.)),0.,7.);let halfpixel=min(vec2<f32>(0.5*exp2(mip))/dims,scale*0.499);let uv=i.color.xy+clamp(fract((i.uv-i.color.xy)/scale)*scale,halfpixel,scale-halfpixel);let tex=textureSampleGrad(atlas,atlas_sampler,uv,dx,dy);if i.alpha_ref!=0xffffffffu {let threshold=bitcast<f32>(i.alpha_ref);if tex.a<=threshold {discard;}}else if i.kind>3.5 && tex.a<0.5 {discard;}
  // Complementary ordered coverage: old and new snapshots never both draw
  // at the same pixel, while the tree is fully visible at the endpoints.
  if i.fade.y>0.5 {let xy=vec2<u32>(i.pos.xy)%vec2<u32>(4u);let b=(((xy.x&1u)^(xy.y&1u))*8u)+((xy.y&1u)*4u)+((((xy.x>>1u)&1u)^((xy.y>>1u)&1u))*2u)+((xy.y>>1u)&1u);let d=(f32(b)+0.5)/16.;if (i.fade.y<1.5 && d<i.fade.x)||(i.fade.y>1.5 && d>=i.fade.x){discard;}}
@@ -684,14 +952,24 @@ impl FarTrees {
         let side = if small { 2048usize } else { 8192usize };
         let grid = side / 128;
         let mut occupied = vec![false; grid * grid];
-        let mut atlas = vec![0u8; side * side * 4];
+        // Grow the tree atlas dynamically by rows instead of allocating the
+        // full 8192x8192x4 (256 MiB) up front; empty or sparse tree maps then
+        // allocate only the rows they actually pack.
+        let mut atlas: Vec<u8> = Vec::new();
+        let mut used_rows: usize = 0;
         let mut vertices = Vec::new();
         let mut rocking_samples: Vec<[f32; 4]> = Vec::new();
         let mut leaf_normals: Vec<[f32; 4]> = Vec::new();
         let mut indices = Vec::new();
-        let mut instances = Vec::new();
-        let mut batches = Vec::new();
-        let mut groups = Vec::new();
+        let mut instances = Vec::with_capacity(trees.placements.len() * 3);
+        let mut batches = Vec::with_capacity(trees.types.len() * 3);
+        let mut groups = Vec::with_capacity(trees.types.len());
+        let mut placements_by_type: Vec<Vec<[f32; 3]>> = vec![Vec::new(); trees.types.len()];
+        for placement in &trees.placements {
+            if let Some(bucket) = placements_by_type.get_mut(placement.tree_type as usize) {
+                bucket.push(placement.position);
+            }
+        }
         let mut rt_species = Vec::new();
         let mut packed_count = 0usize;
         let mut mip_slots: Vec<(
@@ -735,12 +1013,7 @@ impl FarTrees {
         }
         for (id, maybe) in trees.types.iter().enumerate() {
             let Some(tree) = maybe else { continue };
-            let positions: Vec<_> = trees
-                .placements
-                .iter()
-                .filter(|p| p.tree_type as usize == id)
-                .map(|p| p.position)
-                .collect();
+            let positions = std::mem::take(&mut placements_by_type[id]);
             if positions.is_empty() {
                 continue;
             }
@@ -752,7 +1025,7 @@ impl FarTrees {
                 .map(|v| v.pos[2])
                 .chain(tree.lods[0].leaves.iter().map(|l| l.center[2]))
                 .fold(5.0f32, f32::max);
-            let mut slots = Vec::new();
+            let mut slots = Vec::with_capacity(2);
             for (part_index, img) in [&tree.bark, &tree.composite].into_iter().enumerate() {
                 let w = if small {
                     128
@@ -788,6 +1061,17 @@ impl FarTrees {
                     }
                 }
                 let (ox, oy) = (gx * 128, gy * 128);
+                let need_rows = oy + h;
+                if need_rows > used_rows {
+                    used_rows = need_rows;
+                    let needed_bytes = used_rows * side * 4;
+                    if atlas.len() < needed_bytes {
+                        let grown = (atlas.len().max(side * 128 * 4) * 2)
+                            .max(needed_bytes)
+                            .min(side * side * 4);
+                        atlas.resize(grown, 0);
+                    }
+                }
                 for y in 0..h {
                     for x in 0..w {
                         let sx = (x as u32 * img.width() / w as u32).min(img.width() - 1);
@@ -1137,11 +1421,32 @@ impl FarTrees {
         if instances.is_empty() {
             instances.push(Instance::zeroed())
         }
+        // Trim the tree atlas GPU texture to the exact packed row extent
+        // (multiple of 128 so all 7 lower mip levels stay tile-aligned). Maps
+        // with no trees allocate a minimal 128x128 placeholder (~64 KiB)
+        // instead of 8192x8192 (~341 MiB VRAM).
+        let (atlas_w, atlas_h) = if mip_slots.is_empty() {
+            atlas.clear();
+            atlas.resize(128 * 128 * 4, 0);
+            (128usize, 128usize)
+        } else {
+            let trimmed_h = ((used_rows + 127) & !127).clamp(128, side);
+            atlas.truncate(trimmed_h * side * 4);
+            atlas.resize(trimmed_h * side * 4, 0);
+            if trimmed_h < side {
+                let v_scale = side as f32 / trimmed_h as f32;
+                for v in &mut vertices {
+                    v.uv[1] *= v_scale;
+                    v.color[1] *= v_scale;
+                }
+            }
+            (side, trimmed_h)
+        };
         let image = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("far tree textures"),
             size: wgpu::Extent3d {
-                width: side as u32,
-                height: side as u32,
+                width: atlas_w as u32,
+                height: atlas_h as u32,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 8,
@@ -1161,19 +1466,19 @@ impl FarTrees {
             &atlas,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some((side * 4) as u32),
-                rows_per_image: Some(side as u32),
+                bytes_per_row: Some((atlas_w * 4) as u32),
+                rows_per_image: Some(atlas_h as u32),
             },
             wgpu::Extent3d {
-                width: side as u32,
-                height: side as u32,
+                width: atlas_w as u32,
+                height: atlas_h as u32,
                 depth_or_array_layers: 1,
             },
         );
         // Generate each rectangle separately so lower mip levels cannot blend
         // neighboring trees. Keep unadjusted alpha for the next reduction;
         // preserve approximate cutout coverage only in the uploaded copy.
-        for (ox, oy, w, h, cutout, authored) in mip_slots {
+        for &(ox, oy, w, h, cutout, ref authored) in &mip_slots {
             if let Some(chain) = authored {
                 for (index, img) in chain.iter().enumerate() {
                     let level = index as u32 + 1;
@@ -1203,45 +1508,112 @@ impl FarTrees {
                 }
                 continue;
             }
-            let mut raw = vec![0u8; w * h * 4];
-            for y in 0..h {
-                let src = ((oy + y) * side + ox) * 4;
-                raw[y * w * 4..(y + 1) * w * 4].copy_from_slice(&atlas[src..src + w * 4]);
-            }
-            let source_coverage = crate::foliage_mips::coverage(&raw);
-            let (mut mw, mut mh) = (w, h);
-            for level in 1..8 {
-                raw = crate::foliage_mips::downsample(&raw, mw, mh, cutout);
-                mw /= 2;
-                mh /= 2;
-                let corrected = if cutout {
-                    crate::foliage_mips::preserve_coverage(&raw, source_coverage)
+            // Generated in parallel below.
+            let _ = (ox, oy, w, h, cutout);
+        }
+        // Generate all non-authored foliage mip chains concurrently across CPU
+        // cores before submitting write_texture calls.
+        let gen_slots: Vec<(usize, usize, usize, usize, bool)> = mip_slots
+            .iter()
+            .filter_map(|(ox, oy, w, h, cutout, authored)| {
+                if authored.is_none() {
+                    Some((*ox, *oy, *w, *h, *cutout))
                 } else {
-                    raw.clone()
-                };
-                queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: &image,
-                        mip_level: level,
-                        origin: wgpu::Origin3d {
-                            x: (ox >> level) as u32,
-                            y: (oy >> level) as u32,
-                            z: 0,
+                    None
+                }
+            })
+            .collect();
+        if !gen_slots.is_empty() {
+            let mip_workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(32)
+                .min(gen_slots.len());
+            let build_slot = |ox: usize,
+                              oy: usize,
+                              w: usize,
+                              h: usize,
+                              cutout: bool,
+                              atlas_ref: &[u8]|
+             -> Vec<(u32, u32, u32, u32, u32, Vec<u8>)> {
+                let mut raw = vec![0u8; w * h * 4];
+                for y in 0..h {
+                    let src = ((oy + y) * side + ox) * 4;
+                    raw[y * w * 4..(y + 1) * w * 4].copy_from_slice(&atlas_ref[src..src + w * 4]);
+                }
+                let source_coverage = crate::foliage_mips::coverage(&raw);
+                let (mut mw, mut mh) = (w, h);
+                let mut levels = Vec::with_capacity(7);
+                for level in 1..8u32 {
+                    raw = crate::foliage_mips::downsample(&raw, mw, mh, cutout);
+                    mw /= 2;
+                    mh /= 2;
+                    let corrected = if cutout {
+                        crate::foliage_mips::preserve_coverage(&raw, source_coverage)
+                    } else {
+                        raw.clone()
+                    };
+                    levels.push((
+                        level,
+                        (ox >> level) as u32,
+                        (oy >> level) as u32,
+                        mw as u32,
+                        mh as u32,
+                        corrected,
+                    ));
+                }
+                levels
+            };
+            let generated: Vec<Vec<(u32, u32, u32, u32, u32, Vec<u8>)>> = if mip_workers > 1 {
+                let chunk_size = (gen_slots.len() + mip_workers - 1) / mip_workers;
+                let atlas_ref = &atlas;
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = gen_slots
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            s.spawn(move || {
+                                chunk
+                                    .iter()
+                                    .map(|&(ox, oy, w, h, cutout)| {
+                                        build_slot(ox, oy, w, h, cutout, atlas_ref)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .flat_map(|h| h.join().unwrap())
+                        .collect()
+                })
+            } else {
+                gen_slots
+                    .iter()
+                    .map(|&(ox, oy, w, h, cutout)| build_slot(ox, oy, w, h, cutout, &atlas))
+                    .collect()
+            };
+            for levels in generated {
+                for (level, dx, dy, mw, mh, corrected) in levels {
+                    queue.write_texture(
+                        wgpu::ImageCopyTexture {
+                            texture: &image,
+                            mip_level: level,
+                            origin: wgpu::Origin3d { x: dx, y: dy, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
                         },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &corrected,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some((mw * 4) as u32),
-                        rows_per_image: Some(mh as u32),
-                    },
-                    wgpu::Extent3d {
-                        width: mw as u32,
-                        height: mh as u32,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                        &corrected,
+                        wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(mw * 4),
+                            rows_per_image: Some(mh),
+                        },
+                        wgpu::Extent3d {
+                            width: mw,
+                            height: mh,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
         }
         drop(atlas);
@@ -1449,7 +1821,8 @@ impl FarTrees {
         // Placement table, per-group constants and the indirect args are built
         // once here. Nothing per-frame is uploaded any more: a camera move only
         // dispatches `LOD_COMPUTE` over the placement table.
-        let mut placement_data = Vec::new();
+        let total_placements: usize = groups.iter().map(|g| g.positions.len()).sum();
+        let mut placement_data = Vec::with_capacity(total_placements);
         for (index, group) in groups.iter().enumerate() {
             for &position in &group.positions {
                 placement_data.push(Placement {
@@ -1476,12 +1849,31 @@ impl FarTrees {
                 capacity: 0,
             });
         }
+        let spatial_cells = build_tree_spatial_cells(&placement_data, &group_data);
         let placement_count = placement_data.len() as u32;
+        // WebGPU guarantees four storage buffers per compute stage. Pack the
+        // visible-index tail into the placement buffer so tree LOD uses exactly
+        // four storage bindings (placements, groups, instances and indirect args).
+        // On an adapter whose maximum storage binding cannot hold both regions,
+        // keep only the placement prefix and let the shader conservatively scan
+        // every placement instead of requesting an unsupported fifth binding.
+        let placement_bytes = bytemuck::cast_slice::<Placement, u8>(&placement_data);
+        let active_index_offset = placement_bytes.len() as u64;
+        let active_index_bytes = (placement_data.len().max(1) * std::mem::size_of::<u32>()) as u64;
+        let combined_size = active_index_offset.saturating_add(active_index_bytes);
+        let can_pack_active_indices = combined_size
+            <= u64::from(device.limits().max_storage_buffer_binding_size)
+            && combined_size <= device.limits().max_buffer_size;
+        let mut placement_storage = placement_bytes.to_vec();
+        if can_pack_active_indices {
+            placement_storage.resize(combined_size as usize, 0);
+        }
         let placement_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tree placements"),
-            contents: bytemuck::cast_slice(&placement_data),
+            label: Some("tree placements and visible-index tail"),
+            contents: &placement_storage,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        let active_index_offset = can_pack_active_indices.then_some(active_index_offset);
         let lod_group_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tree lod groups"),
             contents: bytemuck::cast_slice(&group_data),
@@ -1581,6 +1973,16 @@ impl FarTrees {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let lod_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1595,6 +1997,23 @@ impl FarTrees {
             module: &lod_module,
             entry_point: "main",
         });
+        // A sampled texture keeps the non-Hi-Z fallback valid on devices
+        // where Hi-Z allocation or R32Float storage textures are unavailable.
+        let hiz_dummy_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("disabled Hi-Z fallback texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let hiz_dummy_view = hiz_dummy_texture.create_view(&Default::default());
         let lod_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tree lod"),
             layout: &lod_layout,
@@ -1618,6 +2037,10 @@ impl FarTrees {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: lod_args.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&hiz_dummy_view),
                 },
             ],
         });
@@ -1645,9 +2068,15 @@ impl FarTrees {
             groups,
             rt_species: rt_species.into(),
             capacity,
-            last_resident_update: None,
+            spatial_cells,
+            active_placement_indices: RefCell::new(Vec::new()),
+            active_index_offset,
+            last_resident_update: RefCell::new(None),
             lod_pipeline,
             lod_bind,
+            lod_layout,
+            placement_buffer,
+            group_buffer: lod_group_buffer,
             lod_params,
             placements: placement_count,
             off_reason: trees.off_reason.clone(),
@@ -1834,47 +2263,182 @@ impl FarTrees {
         out
     }
 
+    pub fn set_hiz_view(&mut self, device: &wgpu::Device, view: &wgpu::TextureView) {
+        self.lod_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tree LOD with current Hi-Z texture"),
+            layout: &self.lod_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.lod_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.placement_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.group_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.instances.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.lod_args.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+            ],
+        });
+    }
+
+    /// Compatibility entry point for diagnostics that run only the LOD/frustum
+    /// pass. Production encodes this dispatch in the view's render command buffer.
     pub fn update_resident_lods(
-        &mut self,
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        camera: [f32; 3],
+        scale: f32,
+        bounds: Option<[f32; 4]>,
+        frustum: [[f32; 4]; 6],
+        clip_plane: Option<(f32, f32)>,
+    ) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tree LOD diagnostic encoder"),
+        });
+        self.encode_resident_lods(
+            device,
+            queue,
+            &mut encoder,
+            camera,
+            scale,
+            bounds,
+            frustum,
+            clip_plane,
+            glam::Mat4::IDENTITY.to_cols_array_2d(),
+            [[1, 1, 0, 0]; 16],
+            None,
+        );
+        queue.submit(Some(encoder.finish()));
+    }
+
+    /// Encode the frustum, optional Hi-Z occlusion, LOD compaction and indirect
+    /// count generation into the caller's view command buffer. Hi-Z is forced
+    /// for every enabled view because main/reflection/refraction depth differs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_resident_lods(
+        &self,
+        _device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         camera: [f32; 3],
         scale: f32,
         bounds: Option<[f32; 4]>,
+        frustum: [[f32; 4]; 6],
+        clip_plane: Option<(f32, f32)>,
+        view_projection: [[f32; 4]; 4],
+        hiz_mips: [[u32; 4]; 16],
+        hiz_extent: Option<(u32, u32, u32)>,
     ) {
         if self.placements == 0 {
             return;
         }
-        let key = (camera, scale, bounds);
-        if self.last_resident_update == Some(key) {
+        let frustum = normalize_frustum(frustum);
+        let key = (camera, scale, bounds, frustum, clip_plane);
+        let hiz_enabled = hiz_extent.is_some();
+        // The spatial broad phase depends on camera/frustum/residency, not on
+        // the depth image. Hi-Z still needs a fresh compute dispatch each frame,
+        // but rebuilding and re-uploading an identical candidate list does not.
+        let same_resident = self
+            .last_resident_update
+            .borrow()
+            .as_ref()
+            .is_some_and(|previous| {
+                same_resident_update(previous, camera, scale, bounds, frustum, clip_plane)
+            });
+        if same_resident && !hiz_enabled {
             return;
         }
+        // A cheap spatial-cell test reduces the compute dispatch from the full
+        // map's tree count to the subset whose conservative cell bounds overlap
+        // this view. The shader still performs exact per-tree frustum, clip,
+        // distance/LOD and optional Hi-Z tests.
+        let active_count = if let Some(offset) = self.active_index_offset {
+            if !same_resident {
+                let mut active_indices = self.active_placement_indices.borrow_mut();
+                active_indices.clear();
+                append_visible_tree_indices(
+                    &self.spatial_cells,
+                    &frustum,
+                    clip_plane,
+                    bounds,
+                    &mut active_indices,
+                );
+                if active_indices.is_empty() {
+                    queue.write_buffer(&self.lod_args, 0, &self.lod_args_reset);
+                    *self.last_resident_update.borrow_mut() = Some(key);
+                    return;
+                }
+                queue.write_buffer(
+                    &self.placement_buffer,
+                    offset,
+                    bytemuck::cast_slice(active_indices.as_slice()),
+                );
+            }
+            let active_count = self.active_placement_indices.borrow().len();
+            if active_count == 0 {
+                queue.write_buffer(&self.lod_args, 0, &self.lod_args_reset);
+                *self.last_resident_update.borrow_mut() = Some(key);
+                return;
+            }
+            active_count
+        } else {
+            // The packed tail would exceed this adapter's binding limit. Keep
+            // the correctness path by dispatching over every placement; the
+            // shader's original frustum/clip/LOD/Hi-Z tests remain authoritative.
+            self.placements as usize
+        };
+        let (hiz_width, hiz_height, hiz_levels) = hiz_extent.unwrap_or((0, 0, 0));
         let params = LodParams {
             camera: [camera[0], camera[1], camera[2], scale],
             bounds: bounds.unwrap_or([0.; 4]),
+            frustum,
+            clip: clip_plane.map_or([0.; 4], |(height, sign)| [height, sign, 1., 0.]),
             counts: [
-                self.placements,
-                self.groups.len() as u32,
+                active_count as u32,
+                self.active_index_offset.map_or(0, |offset| {
+                    (offset / std::mem::size_of::<u32>() as u64) as u32
+                }),
                 u32::from(bounds.is_some()),
                 0,
             ],
+            view_projection,
+            hiz_mips,
+            hiz_info: [hiz_width, hiz_height, hiz_levels, u32::from(hiz_enabled)],
+            // Positive depth-space slack prevents near-equal surfaces from
+            // being classified as occluders due to floating-point rounding.
+            hiz_bias: [0.00005, 0., 0., 0.],
         };
-        // Zero the per-batch instance counts, keep the static draw spans.
         queue.write_buffer(&self.lod_args, 0, &self.lod_args_reset);
         queue.write_buffer(&self.lod_params, 0, bytemuck::bytes_of(&params));
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("tree lod selection"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.lod_pipeline);
-            pass.set_bind_group(0, &self.lod_bind, &[]);
-            pass.dispatch_workgroups(self.placements.div_ceil(64), 1, 1);
-        }
-        // The caller records this before the first world draw in the same
-        // frame encoder. This keeps the compute-to-indirect dependency ordered
-        // while avoiding a standalone queue submission for tree LOD selection.
-        self.last_resident_update = Some(key);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(if hiz_enabled {
+                "tree Hi-Z + LOD culling"
+            } else {
+                "tree LOD selection"
+            }),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.lod_pipeline);
+        pass.set_bind_group(0, &self.lod_bind, &[]);
+        pass.dispatch_workgroups((active_count as u32).div_ceil(64), 1, 1);
+        drop(pass);
+        *self.last_resident_update.borrow_mut() = Some(key);
     }
     /// CPU LOD packing, kept for the checks that place one tree at a distance.
     ///
@@ -2025,7 +2589,7 @@ impl FarTrees {
         bytes
     }
     pub fn draw<'a>(&'a self, p: &mut wgpu::RenderPass<'a>, reflected: bool) {
-        if self.batches.is_empty() {
+        if self.placements == 0 || self.batches.is_empty() {
             return;
         }
         p.set_pipeline(&self.pipeline);
@@ -2062,9 +2626,139 @@ impl FarTrees {
     }
 }
 
+/// Normalize extracted frustum planes once per view so the compute shader
+/// can compare sphere radii without six square roots per tree.
+fn normalize_frustum(mut planes: [[f32; 4]; 6]) -> [[f32; 4]; 6] {
+    for plane in &mut planes {
+        let length = (plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]).sqrt();
+        if length > 1e-8 && length.is_finite() {
+            for value in plane {
+                *value /= length;
+            }
+        }
+    }
+    planes
+}
+
+/// CPU reference for the conservative sphere/frustum test mirrored in WGSL.
+fn sphere_visible(position: [f32; 3], radius: f32, planes: &[[f32; 4]; 6]) -> bool {
+    planes
+        .iter()
+        .all(|p| p[0] * position[0] + p[1] * position[1] + p[2] * position[2] + p[3] >= -radius)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stable_tree_view_reuses_spatial_candidates_even_when_hiz_is_enabled() {
+        let key = (
+            [10.0, 20.0, 30.0],
+            1.0,
+            Some([-100.0, 100.0, -100.0, 100.0]),
+            [[1.0, 0.0, 0.0, 1.0]; 6],
+            Some((5.0, 1.0)),
+        );
+        assert!(super::same_resident_update(
+            &key,
+            [10.0, 20.0, 30.0],
+            1.0,
+            key.2,
+            key.3,
+            key.4,
+        ));
+        assert!(super::same_resident_update(
+            &key,
+            [10.001, 20.0, 30.0],
+            1.0,
+            key.2,
+            key.3,
+            key.4,
+        ));
+        assert!(!super::same_resident_update(
+            &key,
+            [10.0, 20.0, 30.0],
+            1.0,
+            key.2,
+            [[0.0, 1.0, 0.0, 1.0]; 6],
+            key.4,
+        ));
+        assert!(!super::same_resident_update(
+            &key,
+            [10.0, 20.0, 30.0],
+            1.0,
+            None,
+            key.3,
+            key.4,
+        ));
+    }
     use super::*;
+
+    #[test]
+    fn tree_spatial_cells_keep_intersections_and_reject_distant_regions() {
+        let groups = [GroupInfo {
+            height: 5.0,
+            args_base: 0,
+            first_instance: 0,
+            capacity: 3,
+        }];
+        let placements = [
+            Placement {
+                pos_height: [95.0, 0.0, 0.0, 0.0],
+                group: 0,
+                pad: [0; 3],
+            },
+            Placement {
+                pos_height: [120.0, 0.0, 0.0, 0.0],
+                group: 0,
+                pad: [0; 3],
+            },
+            Placement {
+                pos_height: [1024.0, 0.0, 0.0, 0.0],
+                group: 0,
+                pad: [0; 3],
+            },
+        ];
+        let cells = build_tree_spatial_cells(&placements, &groups);
+        let cube = [
+            [1.0, 0.0, 0.0, 100.0],
+            [-1.0, 0.0, 0.0, 100.0],
+            [0.0, 1.0, 0.0, 100.0],
+            [0.0, -1.0, 0.0, 100.0],
+            [0.0, 0.0, 1.0, 100.0],
+            [0.0, 0.0, -1.0, 100.0],
+        ];
+        let mut visible = Vec::new();
+        append_visible_tree_indices(&cells, &cube, None, None, &mut visible);
+        // The first two trees share a cell. The second tree's sphere reaches
+        // the view, so retaining that entire cell is intentionally conservative.
+        assert_eq!(visible, vec![0, 1]);
+        assert!(LOD_COMPUTE.contains("placement_words[p.counts.y+active_slot]"));
+        assert!(!LOD_COMPUTE.contains("@group(0) @binding(6)"));
+        assert!(LOD_COMPUTE.contains("load_placement(index)"));
+    }
+
+    #[test]
+    fn tree_frustum_spheres_reject_outside_and_keep_intersecting_canopies() {
+        let cube = [
+            [1., 0., 0., 10.],
+            [-1., 0., 0., 10.],
+            [0., 1., 0., 10.],
+            [0., -1., 0., 10.],
+            [0., 0., 1., 10.],
+            [0., 0., -1., 10.],
+        ];
+        assert!(sphere_visible([0., 0., 0.], 2., &cube));
+        assert!(sphere_visible([12., 0., 0.], 3., &cube));
+        assert!(!sphere_visible([14., 0., 0.], 2., &cube));
+    }
+
+    #[test]
+    fn frustum_normalization_scales_plane_distance_too() {
+        let mut planes = [[0.; 4]; 6];
+        planes[0] = [3., 0., 0., 30.];
+        let normalized = normalize_frustum(planes);
+        assert_eq!(normalized[0], [1., 0., 0., 10.]);
+    }
 
     #[test]
     fn legacy_cutout_still_covers_fronds_and_leaves_without_native_refs() {

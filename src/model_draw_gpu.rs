@@ -191,6 +191,7 @@ struct Mesh {
     indices: Vec<u16>,
     vertices: usize,
     alpha_texture: bool,
+    diffuse_alpha_only: bool,
     face_shader: Option<crate::model_asset::FaceShader>,
     /// Initial (bind-pose) mesh AABB in model space, used by the retail alpha
     /// sort: 0x7a5460 measures the eight transformed initial-box corners.
@@ -209,9 +210,9 @@ pub struct Draw {
     /// [`Self::update_posed`] convert vertices without re-running it.
     pose_of: Vec<usize>,
     alpha_meshes: Vec<usize>,
-    // Retained staging memory for animated vertex conversion. Queue writes copy
-    // the bytes before returning, so this scratch can be reused for every mesh
-    // and every frame without keeping a second copy of the whole posed model.
+    /// Reused uniform payloads avoid per-frame allocations on camera turns.
+    constant_scratch: std::cell::RefCell<Vec<raster::Params>>,
+    // Queue writes copy the bytes, so one vertex Vec can serve every submesh/frame.
     scratch_vertices: Vec<raster::Vertex>,
     // Keep authored textures alive and share repeated per-skin texture slots.
     textures: Vec<std::sync::Arc<wgpu::Texture>>,
@@ -321,7 +322,7 @@ impl Draw {
             .iter()
             .map(|m| frame.params(m.material, m.color, m.diffuse_alpha_only, m.face_shader))
             .collect::<Result<_, _>>()?;
-        let mut textures: Vec<std::sync::Arc<wgpu::Texture>> = Vec::new();
+        let mut textures: Vec<std::sync::Arc<wgpu::Texture>> = Vec::with_capacity(prepared.len());
         let mut cache: std::collections::HashMap<[String; 2], (usize, bool)> =
             std::collections::HashMap::new();
         let mut loaded: Vec<(usize, bool)> = Vec::with_capacity(prepared.len());
@@ -474,6 +475,7 @@ impl Draw {
                 indices: m.indices.to_vec(),
                 vertices: vertices.len(),
                 alpha_texture,
+                diffuse_alpha_only: asset.diffuse_alpha_meshes.contains(&(m.skin, m.mesh)),
                 face_shader: m.face_shader.cloned(),
                 bounds,
                 mesh: raster::Mesh::new(device, &vertices, m.indices.as_ref())?,
@@ -487,6 +489,7 @@ impl Draw {
             meshes,
             pose_of,
             alpha_meshes,
+            constant_scratch: std::cell::RefCell::new(Vec::new()),
             scratch_vertices: Vec::new(),
             textures,
         })
@@ -551,15 +554,13 @@ impl Draw {
             return Err("model pass blending changed; rebuild its pipeline".into());
         }
         let original = asset.descriptor.render_settings().original_color;
-        // Validate every retained mesh and build all per-mesh constants before
-        // the first queue write. Keep only the small constants here; staging all
-        // converted vertices for every mesh at once caused a burst of temporary
-        // allocations proportional to the entire animated model.
-        let mut params_by_mesh = Vec::with_capacity(self.meshes.len());
+
+        // Validate every retained pose and cache all material parameters before
+        // the first GPU write. Constant scratch is reused across camera turns.
+        let mut constants = self.constant_scratch.borrow_mut();
+        constants.clear();
         for (index, gpu) in self.meshes.iter().enumerate() {
             let Some(gpu) = gpu else {
-                // A hidden queue mesh keeps its buffers untouched.
-                params_by_mesh.push(None);
                 continue;
             };
             let pose = self
@@ -585,18 +586,17 @@ impl Draw {
             } else {
                 asset.mesh_color(pose.skin, pose.mesh, original)
             };
-            let diffuse_alpha_only = asset.diffuse_alpha_meshes.contains(&gpu.key);
-            params_by_mesh.push(Some(frame.params(
+            constants.push(frame.params(
                 material,
                 color,
-                diffuse_alpha_only,
+                gpu.diffuse_alpha_only,
                 gpu.face_shader.as_ref(),
-            )?));
+            )?);
         }
 
-        // Queue writes copy their input immediately, so one scratch allocation
-        // can serve every mesh. Reusing it avoids one vertex Vec allocation per
-        // submesh and avoids retaining all converted vertices until the end.
+        // Queue writes copy their bytes before returning, so one vertex staging
+        // Vec can serve every mesh without allocating a Vec per submesh.
+        let mut params_index = 0usize;
         let scratch = &mut self.scratch_vertices;
         for (index, gpu) in self.meshes.iter().enumerate() {
             let Some(gpu) = gpu else {
@@ -618,16 +618,14 @@ impl Draw {
                     }),
             );
             gpu.mesh.update(queue, scratch)?;
-            gpu.binding.update(
-                queue,
-                params_by_mesh[index]
-                    .as_ref()
-                    .ok_or("missing validated model constants")?,
-            )?;
+            let params = constants
+                .get(params_index)
+                .ok_or("missing validated model constants")?;
+            gpu.binding.update(queue, params)?;
+            params_index += 1;
         }
         Ok(())
     }
-
     /// World-owned immutable topology: pass changes only require constants,
     /// not another prepare/copy/upload of the exact same posed vertices.
     pub fn update_constants(
@@ -640,7 +638,8 @@ impl Draw {
             return Err("model pass blending changed; rebuild its pipeline".into());
         }
         let original = asset.descriptor.render_settings().original_color;
-        let mut updates = Vec::new();
+        let mut constant_scratch = self.constant_scratch.borrow_mut();
+        constant_scratch.clear();
         for mesh in self.meshes.iter().flatten() {
             let skin = asset.skins.get(mesh.key.0).ok_or("missing retained skin")?;
             let source = skin
@@ -657,19 +656,17 @@ impl Draw {
             } else {
                 asset.mesh_color(mesh.key.0, mesh.key.1, original)
             };
-            let diffuse_alpha_only = asset.diffuse_alpha_meshes.contains(&mesh.key);
-            updates.push((
-                &mesh.binding,
-                frame.params(
-                    material,
-                    color,
-                    diffuse_alpha_only,
-                    mesh.face_shader.as_ref(),
-                )?,
-            ));
+            // Validate and retain the exact uniform payload before any writes,
+            // so a bad final mesh cannot leave a partially updated model.
+            constant_scratch.push(frame.params(
+                material,
+                color,
+                mesh.diffuse_alpha_only,
+                mesh.face_shader.as_ref(),
+            )?);
         }
-        for (binding, params) in updates {
-            binding.update(queue, &params)?;
+        for (mesh, params) in self.meshes.iter().flatten().zip(constant_scratch.iter()) {
+            mesh.binding.update(queue, params)?;
         }
         Ok(())
     }
@@ -713,7 +710,7 @@ impl Draw {
             // pipeline owns a different implicit bind-group layout. Submitting
             // them here would be a layout mismatch, so `draw_alpha_mesh` owns
             // them instead.
-            if self.alpha_meshes.contains(&index) || !visible(mesh.key) {
+            if self.alpha_meshes.binary_search(&index).is_ok() || !visible(mesh.key) {
                 continue;
             }
             self.receiver.draw(pass, &mesh.mesh, &mesh.binding);

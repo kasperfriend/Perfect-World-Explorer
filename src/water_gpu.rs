@@ -248,6 +248,8 @@ pub struct WaterGpu {
     /// decodes it. The scissor for the reflection and refraction renders is sized
     /// from this instead of from the worst case a normal map could hold.
     normal_extent: f32,
+    has_water: bool,
+    reflections_enabled: bool,
 }
 fn color(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> wgpu::Texture {
     let alternate = [format.remove_srgb_suffix()];
@@ -283,6 +285,21 @@ impl WaterGpu {
         h: u32,
         frames: &[Vec<image::RgbaImage>],
     ) -> Self {
+        Self::new_for_map(device, queue, format, w, h, frames, true)
+    }
+
+    /// Create water GPU resources, allocating minimal 1x1 offscreen render
+    /// targets on dry maps (`has_water == false`) to save 48-198 MiB VRAM.
+    pub fn new_for_map(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        w: u32,
+        h: u32,
+        frames: &[Vec<image::RgbaImage>],
+        has_water: bool,
+    ) -> Self {
+        let (tw, th) = if has_water { (w, h) } else { (1, 1) };
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("water uniforms"),
             contents: bytemuck::bytes_of(&WaterUniform {
@@ -297,49 +314,67 @@ impl WaterGpu {
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let (nw, nh) = frames[0][0].dimensions();
-        let normal = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("client water normals"),
-            size: wgpu::Extent3d {
-                width: nw,
-                height: nh,
-                depth_or_array_layers: frames.len() as u32,
-            },
-            mip_level_count: frames[0].len() as u32,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        for (i, levels) in frames.iter().enumerate() {
-            for (level, img) in levels.iter().enumerate() {
-                let (mw, mh) = img.dimensions();
-                queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: &normal,
-                        mip_level: level as u32,
-                        origin: wgpu::Origin3d {
-                            x: 0,
-                            y: 0,
-                            z: i as u32,
+        let normal = if has_water {
+            let (nw, nh) = frames[0][0].dimensions();
+            let normal = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("client water normals"),
+                size: wgpu::Extent3d {
+                    width: nw,
+                    height: nh,
+                    depth_or_array_layers: frames.len() as u32,
+                },
+                mip_level_count: frames[0].len() as u32,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            for (i, levels) in frames.iter().enumerate() {
+                for (level, img) in levels.iter().enumerate() {
+                    let (mw, mh) = img.dimensions();
+                    queue.write_texture(
+                        wgpu::ImageCopyTexture {
+                            texture: &normal,
+                            mip_level: level as u32,
+                            origin: wgpu::Origin3d {
+                                x: 0,
+                                y: 0,
+                                z: i as u32,
+                            },
+                            aspect: wgpu::TextureAspect::All,
                         },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    img.as_raw(),
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(mw * 4),
-                        rows_per_image: Some(mh),
-                    },
-                    wgpu::Extent3d {
-                        width: mw,
-                        height: mh,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                        img.as_raw(),
+                        wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(mw * 4),
+                            rows_per_image: Some(mh),
+                        },
+                        wgpu::Extent3d {
+                            width: mw,
+                            height: mh,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
-        }
+            normal
+        } else {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("client water normals (dry map dummy)"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
         let screen_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -591,11 +626,13 @@ impl WaterGpu {
         };
         let edge_near = make_edge(std::mem::size_of::<crate::gpu::Vertex>() as u64, "near_vs");
         let edge_far = make_edge(16, "far_vs");
+        let reflections_enabled = true;
         let targets = Self::targets(
             device,
             format,
-            w,
-            h,
+            tw,
+            th,
+            reflections_enabled,
             &layout,
             &uniform,
             &normal,
@@ -617,6 +654,8 @@ impl WaterGpu {
             edge_far,
             format,
             normal_extent: normal_extent(frames),
+            has_water,
+            reflections_enabled,
         }
     }
     fn targets(
@@ -624,16 +663,18 @@ impl WaterGpu {
         format: wgpu::TextureFormat,
         w: u32,
         h: u32,
+        reflections: bool,
         layout: &wgpu::BindGroupLayout,
         uniform: &wgpu::Buffer,
         normal: &wgpu::Texture,
         screen: &wgpu::Sampler,
         tile: &wgpu::Sampler,
     ) -> Targets {
-        let reflection = color(device, format, w, h);
+        let (rw, rh) = if reflections { (w, h) } else { (1, 1) };
+        let reflection = color(device, format, rw, rh);
         let refraction = color(device, format, w, h);
         let scene = color(device, format, w, h);
-        let reflect_depth = super::gpu::depth(device, w, h);
+        let reflect_depth = super::gpu::depth(device, rw, rh);
         let sample_depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("water scene depth copy"),
             size: wgpu::Extent3d {
@@ -736,12 +777,87 @@ impl WaterGpu {
         self.normal_extent
     }
 
+    /// Toggle full-resolution water reflection color + depth targets.
+    /// When disabled on a water map, allocates `reflection` and `reflect_depth`
+    /// at `1x1` instead of `(w, h)`, reallocating lazily if re-enabled.
+    pub fn set_reflections(&mut self, device: &wgpu::Device, w: u32, h: u32, enabled: bool) {
+        if self.reflections_enabled == enabled {
+            return;
+        }
+        self.reflections_enabled = enabled;
+        if !self.has_water {
+            return;
+        }
+        let (rw, rh) = if enabled { (w, h) } else { (1, 1) };
+        self.targets.reflection = color(device, self.format, rw, rh);
+        self.targets.reflect_depth = super::gpu::depth(device, rw, rh);
+        let raw_view = wgpu::TextureViewDescriptor {
+            format: Some(self.format.remove_srgb_suffix()),
+            ..Default::default()
+        };
+        let reflect_view = self.targets.reflection.create_view(&raw_view);
+        let refract_view = self.targets.refraction.create_view(&raw_view);
+        let scene_view = self.targets.scene.create_view(&raw_view);
+        let normal_view = self.normal.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let sample_depth_view = self.targets.sample_depth.create_view(&Default::default());
+        let terrain_depth_view = self.targets.terrain_depth.create_view(&Default::default());
+        self.targets.bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("water maps"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&reflect_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&refract_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.screen_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&self.tile_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&sample_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&terrain_depth_view),
+                },
+            ],
+        });
+    }
+
     pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) {
+        if !self.has_water {
+            return;
+        }
         self.targets = Self::targets(
             device,
             self.format,
             w,
             h,
+            self.reflections_enabled,
             &self.layout,
             &self.uniform,
             &self.normal,
@@ -896,7 +1012,14 @@ impl WaterGpu {
         depth: &wgpu::TextureView,
         far: Option<(&wgpu::Buffer, &wgpu::Buffer, u32)>,
         near: (&wgpu::Buffer, &wgpu::Buffer, u32),
+        scissor: Option<[u32; 4]>,
+        far_runs: &[(u32, u32)],
+        near_runs: &[(u32, u32)],
     ) {
+        let far = far.filter(|f| f.2 > 0 && !far_runs.is_empty());
+        if far.is_none() && near_runs.is_empty() {
+            return;
+        }
         let params = EdgeUniform {
             matrix: matrix.to_cols_array_2d(),
             bounds,
@@ -926,17 +1049,26 @@ impl WaterGpu {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            if let Some([x, y, width, height]) = scissor {
+                pass.set_scissor_rect(x, y, width, height);
+            }
             pass.set_bind_group(0, &self.edge_bind, &[]);
             if let Some(far) = far {
                 pass.set_pipeline(&self.edge_far);
                 pass.set_vertex_buffer(0, far.0.slice(..));
                 pass.set_index_buffer(far.1.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..far.2, 0, 0..1);
+                for &(start, count) in far_runs {
+                    pass.draw_indexed(start..start + count, 0, 0..1);
+                }
             }
-            pass.set_pipeline(&self.edge_near);
-            pass.set_vertex_buffer(0, near.0.slice(..));
-            pass.set_index_buffer(near.1.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..near.2, 0, 0..1);
+            if near.2 > 0 {
+                pass.set_pipeline(&self.edge_near);
+                pass.set_vertex_buffer(0, near.0.slice(..));
+                pass.set_index_buffer(near.1.slice(..), wgpu::IndexFormat::Uint32);
+                for &(start, count) in near_runs {
+                    pass.draw_indexed(start..start + count, 0, 0..1);
+                }
+            }
         }
     }
     pub fn draw_water(
@@ -949,6 +1081,9 @@ impl WaterGpu {
         start: u32,
         end: u32,
     ) {
+        if start >= end {
+            return;
+        }
         {
             let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("water surface"),

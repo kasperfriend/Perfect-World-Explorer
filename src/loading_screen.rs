@@ -104,7 +104,7 @@ pub fn list(element: &Path) -> Result<Vec<Picture>, String> {
             size: entry.size,
         })
         .collect();
-    pictures.sort_by(|a, b| a.path.cmp(&b.path));
+    pictures.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     pictures.dedup_by(|a, b| a.path == b.path);
     Ok(pictures)
 }

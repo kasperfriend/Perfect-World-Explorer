@@ -150,543 +150,146 @@ pub struct Entry {
     pub size: u32,
     pub compressed: u32,
 }
-
-/// Trailer and entry-record sizes for each package revision the client opens.
-///
-/// The client dispatches on the version word at `nOffset - 4`
-/// (`AFilePackage::Open`). All three revisions keep the same shape: a trailer
-/// holding the guards, the entry offset and the count, followed backwards by a
-/// run of length-prefixed entry records. Only the sizes differ, so the reader
-/// walks them with one routine.
-///
-/// | revision     | `sizeof` header | header at  | `sizeof` entry |
-/// |--------------|-----------------|------------|----------------|
-/// | `0x00020001` | 272             | `end - 280` | 272           |
-/// | `0x00020002` | 272             | `end - 280` | 272           |
-/// | `0x00020003` | 280             | `end - 288` | 280           |
-///
-/// `guardByte1` sits at `+268` in all three; `0x00020003` adds an `UNKNOWN`
-/// dword after it and widens `dwOffset` to `UINT64`. The count is *not* a
-/// header field: the client reads it from `end - 8`, in the eight bytes between
-/// the trailer and the version word (for `0x00020003` that lands in the
-/// alignment padding after the struct, which is why the trailer looks eight
-/// bytes longer than it is).
-#[derive(Clone, Copy)]
-pub(crate) struct Revision {
-    pub(crate) version: u32,
-    /// `sizeof(FILEHEADER*)` — the trailer alone, without the count or the
-    /// version word that follow it.
-    pub(crate) header: usize,
-    /// `sizeof(FILEENTRY*)`, which is also the size of an uncompressed entry
-    /// record: `szFileName[260]`, `dwOffset`, `dwLength`,
-    /// `dwCompressedLength`, `iAccessCnt`, plus `Zalupa0`/`Zalupa1` in the
-    /// newest revision, which widens `dwOffset` to 64 bits.
-    pub(crate) entry: usize,
-    /// Where `dwOffset` starts inside an entry record.
-    pub(crate) offset_at: usize,
-    /// Width of `dwOffset`.
-    pub(crate) offset_width: usize,
-    /// Where `dwLength` starts.
-    pub(crate) size_at: usize,
-    /// Where `dwCompressedLength` starts.
-    pub(crate) compressed_at: usize,
-    /// Where `dwEntryOffset` starts inside the trailer. It is `UINT64` in
-    /// `0x00020003` and `DWORD` before that, so its width has to be read from
-    /// the revision rather than assumed: taking the low half of the 64-bit word
-    /// yields a position that is inside the package but nowhere near the table.
-    pub(crate) table_offset_at: usize,
-    /// Width of `dwEntryOffset` in the trailer, in bytes.
-    pub(crate) table_offset_width: usize,
-    /// Where `dwFlags` starts inside the trailer.
-    ///
-    /// `None` for a layout that has no flags field at all: 1.8.4's `trees.pck`
-    /// puts `szDescription` at `+16` and nothing between the table offset and
-    /// it. A sentinel offset would have to point at *something* and would be
-    /// read as a flag word, so the absence is spelled as an absence.
-    pub(crate) flags_at: Option<usize>,
-    /// Where `szDescription` starts inside the trailer.
-    description_at: usize,
-    /// Where `guardByte1` starts inside the trailer.
-    pub(crate) guard_byte1: usize,
+#[derive(Hash, PartialEq, Eq)]
+struct DirCacheKey {
+    size: u64,
+    mtime_secs: u64,
+    mtime_nanos: u32,
+    end: u64,
+    pos: u64,
+    count: usize,
+    header_hash: [u8; 32],
 }
 
-/// One table serves all three revisions; only the sizes differ.
-///
-/// | revision     | trailer | entry | `dwOffset` | `dwLength` | `dwCompressedLength` |
-/// |--------------|---------|-------|------------|------------|----------------------|
-/// | `0x00020001` | 272     | 276   | `+260`/4   | `+264`     | `+268`               |
-/// | `0x00020002` | 272     | 276   | `+260`/4   | `+264`     | `+268`               |
-/// | `0x00020003` | 280     | 288   | `+264`/8   | `+272`     | `+276`               |
-///
-/// The trailer's own fields move in `0x00020003` because `dwEntryOffset` is
-/// 64-bit there, which pushes everything after it eight bytes along:
-/// `dwFlags` `+12`→`+16`, `szDescription` `+16`→`+20`, `guardByte1`
-/// `+268`→`+272`. It then adds an `UNKNOWN` dword and pads to 280.
-///
-/// The count is *not* a trailer field in any revision: the client reads it from
-/// `end - 8`, the four bytes between the trailer and the version word at
-/// `end - 4`.
-///
-/// **The version word does not identify a layout.** 1.8.4's `litmodels.pck` and
-/// its `trees.pck` both say `0x00020003`, yet the first writes `dwEntryOffset`
-/// as `UINT64` and the second as `DWORD` with no `dwFlags` field at all (its
-/// description starts at `+16`). A small package cannot name its table above
-/// 4 GiB, so the compiler emitting it for a wide revision narrowed the field
-/// instead of enlarging the package -- which means the layout has to be
-/// *probed* against the trailer's own guards, not looked up by version.
-///
-/// So this table lists the layout that the version word promises, and
-/// [`TRAILER_PROBES`] is tried when its geometry does not fit. Each candidate
-/// is still checked against the guard pair, the description tag and the entry
-/// table itself, so a probe that guesses wrong is refused rather than
-/// mis-parsed.
-pub(crate) const REVISIONS: [Revision; 3] = [
-    Revision {
-        version: 0x2_0003,
-        header: 280,
-        entry: 288,
-        offset_at: 264,
-        offset_width: 8,
-        size_at: 272,
-        compressed_at: 276,
-        table_offset_at: 8,
-        table_offset_width: 8,
-        flags_at: Some(16),
-        description_at: 20,
-        guard_byte1: 272,
-    },
-    Revision {
-        version: 0x2_0002,
-        header: 272,
-        entry: 276,
-        offset_at: 260,
-        offset_width: 4,
-        size_at: 264,
-        compressed_at: 268,
-        table_offset_at: 8,
-        table_offset_width: 4,
-        flags_at: Some(12),
-        description_at: 16,
-        guard_byte1: 268,
-    },
-    Revision {
-        version: 0x2_0001,
-        header: 272,
-        entry: 276,
-        offset_at: 260,
-        offset_width: 4,
-        size_at: 264,
-        compressed_at: 268,
-        table_offset_at: 8,
-        table_offset_width: 4,
-        flags_at: Some(12),
-        description_at: 16,
-        guard_byte1: 268,
-    },
-];
-
-/// Trailer layouts that do not match what their version word promises.
-///
-/// 1.8.4's `trees.pck` is the case that forced this: it declares
-/// `0x00020003` but writes the *narrow* trailer -- a 32-bit `dwEntryOffset` at
-/// `+8`, no `dwFlags` at all, and `szDescription` at `+16`, i.e. the
-/// `0x00020002` field order inside a 280-byte struct whose tail still reaches
-/// `guardByte1` at `+272`. Measured on the shipped file: 326 entries, table at
-/// 26,203,745, 23,911 bytes, and the description reads
-/// `"Angelica File Package, Perfect World Co. Ltd. 2002~2008."` from `+16`.
-///
-/// It is tried only when the version's own layout fails, and it has to pass
-/// the same guard, description and table checks as everything else. Listing it
-/// here rather than branching on "if version == 0x00020003 and size < ..." is
-/// the point: the condition that separates it from the wide trailer is the
-/// trailer's own bytes, not the package's size on disk.
-pub(crate) const TRAILER_PROBES: [Revision; 2] = [
-    Revision {
-        // Matched against any declared version that has no resolved layout of its
-        // own; the guard pair is what actually admits it.
-        version: 0,
-        header: 280,
-        entry: 288,
-        offset_at: 264,
-        offset_width: 8,
-        size_at: 272,
-        compressed_at: 276,
-        table_offset_at: 8,
-        table_offset_width: 4,
-        // `0x00020002`'s field order: no dwFlags, description at `+16`. `+12` holds
-        // `0xffffffff` in the shipped file, which is *not* a flag word -- reading
-        // it as one would refuse a package whose table decodes perfectly.
-        flags_at: None,
-        description_at: 16,
-        guard_byte1: 272,
-    },
-    // The wide field order with a *32-bit* table word, which is 1.8.4's
-    // `element/surfaces.pck` -- the file the minimap needs.
-    //
-    // Every other fact about that trailer points at the wide layout: it declares
-    // `0x00020003`, its guardByte1 is at `+272`, and its `dwFlags` at `+16` reads
-    // zero, which is a real flag word and not the 'A' of a description like the
-    // narrow `trees.pck` writes there. Its description therefore starts at `+20`,
-    // on the 280-byte struct, and its 252-byte region ends exactly at the guard.
-    // Only the table word is 32 bits: read as a `u64` the field is 2^64 minus
-    // 3,147,722,044, and its low half is 1,147,245,252, which leaves 1,862,559
-    // bytes for the 22,269-entry table -- 83.6 bytes a record. The table decides,
-    // as always, and this candidate is what lets it be walked.
-    //
-    // Measured from a shipped refusal, not guessed:
-    //   "the trailer declares its table at 18446744070561829572 but only 1149107811
-    //    bytes of this file (len 1149108099) precede the footer (declared end
-    //    1149108099, base 0, count 22269, flags 0x00000000)"
-    // The `flags 0x00000000` in that line is what ruled the *narrow* probe out --
-    // it reads that word from `+16`, where the narrow order keeps the first four
-    // bytes of `"Angelica File Package"`, so a zero there can only be `dwFlags`.
-    Revision {
-        version: 0,
-        header: 280,
-        entry: 288,
-        offset_at: 264,
-        offset_width: 8,
-        size_at: 272,
-        compressed_at: 276,
-        table_offset_at: 8,
-        table_offset_width: 4,
-        flags_at: Some(16),
-        description_at: 20,
-        guard_byte1: 272,
-    },
-];
-
-/// The guard pair `guardByte0` / `guardByte1` that every revision's trailer
-/// carries.
-///
-/// Retail packages from the 1.8.4 client write this pair. It is one of *two*
-/// shipped pairs, which is why it is not the only constant here: see
-/// [`ANGELICA_GUARD_0`]. The mistake to avoid is deduplicating two genuinely
-/// different values into one, not spelling the same value twice.
-pub(crate) const GUARD_0: u32 = 0xfdfdfeee;
-pub(crate) const GUARD_1: u32 = 0xf00dbeef;
-
-/// The guard pair a 1.5.2-era Angelica container writes instead.
-///
-/// This is **not** a legacy oddity to be tolerated: it is what every 1.5.2
-/// `.pck` carries. Measured on `configs.pck` (67 entries) and `grasses.pck`
-/// (103 entries), both revision `0x00020002`, both `0xa508bdc4`/`0x853567c8`
-/// at trailer `+0` and `+268`. Only the 1.8.4 pack, revision `0x00020003`,
-/// carries `0xfdfdfeee`/`0xf00dbeef`.
-///
-/// An earlier consolidation removed this pair on the grounds that "it appears
-/// in no staged archive". The archive had not been staged; the claim was
-/// really "I did not look", and it broke every 1.5.2 package. Two pairs, each
-/// measured, each named.
-pub(crate) const ANGELICA_GUARD_0: u32 = 0xa508_bdc4;
-pub(crate) const ANGELICA_GUARD_1: u32 = 0x8535_67c8;
-
-/// `dwFlags` bit 31: the package's entry records and payloads are enciphered.
-///
-/// Named rather than spelled `0x80000000` at the refusal, because the *bit* is
-/// a fact about the format and the refusal is a fact about this build. The
-/// client clears this bit itself when it opens such a package; this reader has
-/// no deciphering step, so it stops here -- but it stops by *name*.
-pub(crate) const ENCRYPTED_FLAG: u32 = 0x8000_0000;
-
-/// The package is a well-formed retail package that this build cannot read.
-///
-/// It is deliberately distinguishable from a corrupt archive. Every other
-/// rejection says "these bytes are not a package"; this one says "these bytes
-/// are a package, and here is the feature the reader lacks". A survey that
-/// cannot tell the two apart reports a shipped archive as broken, which is how
-/// an unsupported feature hides for years -- so the census and the harnesses
-/// match this text and count it as a skip, not a failure.
-pub(crate) const ENCRYPTED_REFUSAL: &str = "encrypted package unsupported";
-
-/// Whether a reader error is [`ENCRYPTED_REFUSAL`] rather than a parse failure.
-pub fn is_encrypted_refusal(err: &str) -> bool {
-    err.starts_with(ENCRYPTED_REFUSAL)
+struct CachedDir {
+    entries: std::sync::Arc<[Entry]>,
+    normalized_index: std::sync::OnceLock<std::sync::Arc<std::collections::HashMap<String, usize>>>,
 }
 
-/// Upper bound on a package's entry count.
-///
-/// The number is a memory guard, not a property of the format: the largest
-/// staged pack declares 3,499 entries, and this sits ~285x above it. Exceeding
-/// it means the count word is damaged.
-pub(crate) const ENTRY_LIMIT: usize = 1_000_000;
-
-/// The revision whose trailer *is* an Angelica package trailer.
-///
-/// `configs.pck` and `shaders.pck` carry the same 280-byte tail as the retail
-/// package's oldest revision: a 272-byte `FILEHEADER`, then the count, then the
-/// version word. That is why the Angelica reader can share this table rather
-/// than restate it -- the layout is not similar, it is identical, and the two
-/// shipped archives' `0x00020002` word is a retail revision number.
-pub(crate) fn angelica_revision(version: u32) -> Option<Revision> {
-    match version {
-        // `0x00020001` shares the `0x00020002` layout byte for byte, so it is
-        // read on the word the archive states rather than refused for the one
-        // it does not. `0x00020003` is a genuinely different, longer trailer
-        // (280-byte header, 288-byte records, 8-byte offsets) and is read from
-        // its own row -- 1.8.4's `configs.pck` states it and holds 1,057
-        // entries that the 0x00020002 row would misparse.
-        0x0002_0001 | 0x0002_0002 => REVISIONS.iter().find(|r| r.version == 0x0002_0002).copied(),
-        0x0002_0003 => REVISIONS.iter().find(|r| r.version == 0x0002_0003).copied(),
-        _ => None,
-    }
-}
-
-/// Validate the 12-byte prefix every package starts with.
-///
-/// `whole` is the size of the package when its two halves are known, so a
-/// declared size larger than the file on disk is the split it is. Without that
-/// evidence the same bytes are a corrupt size word, and calling it a split would
-/// send a reader looking for a file that does not exist.
-fn safe_header(safe: &[u8], size: u64, whole: Option<u64>) -> Result<(), String> {
-    // Only `tag1` is required. `AFilePackage::LoadSafeHeader` (AFilePackage.cpp)
-    // accepts two shapes and the second is what the 1.8.4 client writes:
-    //
-    //     if (tag1 == 0x4DCA23EF && tag2 == 0x56a089b7)      m_bHasSafeHeader = true;
-    //     else if (tag1 == 0x4DCA23EF && tag2 != 0x56a089b7) { re-read as
-    //             SAFEFILEHEADER_0x00020003; m_bHasSafeHeader = true; }
-    //     else                                                m_bHasSafeHeader = false;
-    //
-    // In the second shape the 8 bytes after `tag1` are a **UINT64** offset
-    // (`SAFEFILEHEADER_0x00020003`), and `tag2` is not a tag at all -- it is the
-    // low half of that offset, which is where 1.8.4's `configs.pck` gets the
-    // `0x00000000` that a tag comparison reports as `a83e5e82`. Requiring
-    // `tag2` here is literally the "unsupported PCK safe header" dialog, and it
-    // rejected every package of that shape.
-    if u32le(safe, 0)? != 0x4dca23ef {
-        return Err("unsupported PCK safe header".into());
-    }
-    // `tag2 != 0x56a089b7` selects the 64-bit form; the offset must then be read
-    // from 8 bytes rather than 4.
-    let end = if u32le(safe, 8)? == 0x56a089b7 {
-        u32le(safe, 4)? as u64
-    } else {
-        u64le(safe, 4)?
-    };
-    // A package longer than 4 GiB cannot state its length in this `DWORD`, so
-    // the word is the total truncated. 1.8.4's `building.pck` is 2 GiB + 4 GiB +
-    // a remainder, which leaves a declared value smaller than a package's own
-    // header. The wrap is only believed once every piece is open, because the
-    // pieces are what prove the number.
-    let wrapped = whole.is_some_and(|whole| whole > u32::MAX as u64 && whole as u32 as u64 == end);
-    if wrapped {
-        return Ok(());
-    }
-    if end < 292 {
-        return Err("bad package end offset".into());
-    }
-    if end > size {
-        // The client reads a package split at `MAX_FILE_PACKAGE` together with
-        // its continuations (`litmodels.pck` + `litmodels.pkx` in the 1.5.2
-        // client is one 2.86 GB archive). With every piece open the declared
-        // size is simply the package's size and is not an error.
-        //
-        // The size word is a `DWORD`, so a package longer than 4 GiB cannot
-        // state its length: 1.8.4's `building.pck` is 2 GiB + 4 GiB + a
-        // remainder, and the word is that total truncated. A wrapped match is
-        // accepted for that reason, and only once the pieces are all open --
-        // the check below is what proves they are the right pieces.
-        if whole == Some(end) {
-            return Ok(());
+fn normalize_pck_key(name: &str) -> String {
+    if name.is_ascii() {
+        let mut out = String::with_capacity(name.len());
+        for b in name.bytes() {
+            out.push(if b == b'\\' {
+                '/'
+            } else {
+                (b as char).to_ascii_lowercase()
+            });
         }
-        return Err(match whole {
-            Some(whole) => format!(
-                "split package: the header declares {end} bytes but the two halves hold {whole}"
-            ),
-            // A file of exactly `MAX_FILE_PACKAGE` is the first half of a split
-            // package even when no `.pkx` sits beside it, so the missing half is
-            // named rather than the size word being called corrupt.
-            None if size == MAX_FILE_PACKAGE => format!(
-                "split package: the header declares {end} bytes, this file holds the first \
-                 {size} of them and the `.pkx` continuation is missing"
-            ),
-            None => format!(
-                "bad package end offset: the header declares {end} bytes but this file holds {size}"
-            ),
+        return out;
+    }
+    let mut out = name.to_lowercase();
+    if out.contains('\\') {
+        // SAFETY: replacing single-byte ASCII '\\' with ASCII '/' preserves UTF-8 validity.
+        unsafe {
+            for b in out.as_bytes_mut() {
+                if *b == b'\\' {
+                    *b = b'/';
+                }
+            }
+        }
+    }
+    out
+}
+
+fn build_normalized_index(entries: &[Entry]) -> std::collections::HashMap<String, usize> {
+    let mut index = std::collections::HashMap::with_capacity(entries.len());
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(32);
+    if workers > 1 && entries.len() >= 2048 {
+        let chunk_size = entries.len().div_ceil(workers);
+        let chunks: Vec<Vec<(String, usize)>> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(workers);
+            for (ci, chunk) in entries.chunks(chunk_size).enumerate() {
+                let base = ci * chunk_size;
+                handles.push(s.spawn(move || {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for (offset, entry) in chunk.iter().enumerate() {
+                        out.push((normalize_pck_key(&entry.name), base + offset));
+                    }
+                    out
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-    }
-    Ok(())
-}
-
-/// The size the client's `MAX_FILE_PACKAGE` splits a package at.
-///
-/// `AFilePackage` starts a new file once a package has written this much, which
-/// is why a 2.86 GB `litmodels.pck` sits on disk as a 2,147,483,392-byte
-/// `litmodels.pck` (`0x7fffff00` = this constant) plus the remainder in
-/// `litmodels.pkx`.
-///
-/// A file is *not* capped at this size: the 1.8.4 client ships a
-/// `building.pkx` of 4,294,966,784 bytes, two splits' worth in one file. Piece
-/// lengths therefore have to be measured, not assumed.
-pub const MAX_FILE_PACKAGE: u64 = 0x7fff_ff00;
-
-/// Where each file of one package sits in the logical byte stream.
-///
-/// An unsplit package is just the `.pck`. Otherwise the client appends files of
-/// the same stem — `.pkx`, `.pkx1`, … — and every entry offset is measured from
-/// the start of the *first* file, so a package is one continuous address space
-/// spread over the pieces.
-///
-/// The pieces are not all [`MAX_FILE_PACKAGE`] long. The 1.8.4 client ships
-/// `building.pck` (2,147,483,392) + `building.pkx` (4,294,966,784) +
-/// `building.pkx1` (1,733,966,474), and that middle file is two splits' worth in
-/// one file, which is why the lengths are recorded as they are on disk rather
-/// than derived from a split count.
-#[derive(Clone)]
-pub struct Layout {
-    /// `(logical start, length)` for each file, in order. Empty only for a
-    /// layout built by hand.
-    pieces: Vec<(u64, u64)>,
-    /// Bytes of the `.pck` (`pieces[0]`), or the whole file when unsplit.
-    pub part0: u64,
-    /// Total bytes the package spans.
-    span: u64,
-}
-
-impl Layout {
-    /// Every byte of one file.
-    pub fn single(len: u64) -> Self {
-        Self {
-            pieces: vec![(0, len)],
-            part0: len,
-            span: len,
+        for chunk in chunks {
+            for (key, idx) in chunk {
+                index.insert(key, idx);
+            }
         }
-    }
-
-    /// A package spread over `lens`, in order.
-    fn of_pieces(lens: &[u64]) -> Self {
-        let mut pieces = Vec::with_capacity(lens.len());
-        let mut start = 0u64;
-        for len in lens {
-            pieces.push((start, *len));
-            start = start.saturating_add(*len);
-        }
-        Self {
-            pieces,
-            part0: lens.first().copied().unwrap_or(0),
-            span: start,
-        }
-    }
-
-    /// The package as a single logical byte range, so a caller can check an
-    /// entry's span against one number.
-    pub fn total(&self) -> u64 {
-        self.span
-    }
-
-    /// The logical start of piece `index`.
-    fn start_of(&self, index: usize) -> Option<u64> {
-        self.pieces.get(index).map(|(start, _)| *start)
-    }
-
-    /// The logical start of the last piece, where the trailer is written.
-    fn last_start(&self) -> u64 {
-        self.pieces.last().map(|(start, _)| *start).unwrap_or(0)
-    }
-
-    /// How many pieces the package holds.
-    fn len(&self) -> usize {
-        self.pieces.len()
-    }
-}
-
-impl std::fmt::Debug for Layout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Layout{:?} total={}", self.pieces, self.span)
-    }
-}
-
-/// Open the `.pkx` that continues a `.pck` cut at [`MAX_FILE_PACKAGE`].
-///
-/// Only a `.pck` that reaches the split point can have one, so a stray `.pkx`
-/// next to a small pack is never mounted.
-pub fn open_continuation(path: &Path) -> Option<(File, u64)> {
-    let len = fs::metadata(path).ok()?.len();
-    if len != MAX_FILE_PACKAGE {
-        return None;
-    }
-    let mut name = path.file_stem()?.to_os_string();
-    name.push(".pkx");
-    let pkx = path.with_file_name(name);
-    let file = File::open(&pkx).ok()?;
-    let len = file.metadata().ok()?.len();
-    Some((file, len))
-}
-
-/// The offset the trailer sits at: the prefix's declared size when it fits on
-/// disk, otherwise the end of the `.pck` file itself.
-fn package_end(f: &mut File) -> Result<u64, String> {
-    let size = f.metadata().map_err(|e| e.to_string())?.len();
-    let mut safe = [0u8; 12];
-    f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-    f.read_exact(&mut safe).map_err(|e| e.to_string())?;
-    let declared = u32le(&safe, 4)? as u64;
-    Ok(if declared <= size && declared >= 292 {
-        declared
     } else {
-        size
+        for (idx, entry) in entries.iter().enumerate() {
+            index.insert(normalize_pck_key(&entry.name), idx);
+        }
+    }
+    index
+}
+
+fn dir_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<DirCacheKey, std::sync::Arc<CachedDir>>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<DirCacheKey, std::sync::Arc<CachedDir>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn decode_entry_record(
+    raw: &[u8],
+    end: u64,
+    decomp: &mut Decompress,
+    buf: &mut [u8; 276],
+) -> Result<Entry, String> {
+    let data: &[u8] = if raw.len() == 276 {
+        raw
+    } else {
+        decomp.reset(true);
+        decomp
+            .decompress(raw, buf, FlushDecompress::Finish)
+            .map_err(|e| e.to_string())?;
+        if decomp.total_out() != 276 {
+            let n = decomp.total_out();
+            return Err(format!("unexpected entry record size: {n}"));
+        }
+        buf.as_slice()
+    };
+    let zero = data[..260].iter().position(|&x| x == 0).unwrap_or(260);
+    let name_bytes = &data[..zero];
+    let mut name = if name_bytes.is_ascii() {
+        // Fast path: ASCII filenames skip GBK state-machine decoding.
+        String::from_utf8(name_bytes.to_vec()).unwrap_or_default()
+    } else {
+        encoding_rs::GBK.decode(name_bytes).0.into_owned()
+    };
+    if name.as_bytes().contains(&b'\\') {
+        // SAFETY: replacing ASCII '\\' with ASCII '/' preserves UTF-8 validity.
+        unsafe {
+            for b in name.as_bytes_mut() {
+                if *b == b'\\' {
+                    *b = b'/';
+                }
+            }
+        }
+    }
+    let offset = u32le(data, 260)?;
+    let usize_ = u32le(data, 264)?;
+    let compressed = u32le(data, 268)?;
+    if offset as u64 + compressed as u64 > end || usize_ > 512 * 1024 * 1024 || compressed > usize_
+    {
+        return Err(format!("invalid entry bounds: {name}"));
+    }
+    Ok(Entry {
+        name,
+        offset,
+        size: usize_,
+        compressed,
     })
 }
 
-/// The container revision, read the way the client reads it, and the trailer
-/// that belongs to it.
-///
-/// The client seeks to `end - 4` for the version word *before* it knows how
-/// large the trailer is, then reads the trailer at `end - (header + 4 + 4)`
-/// because the file count sits between the trailer and the version word. The
-/// two reads are reproduced here in that order.
-fn trailer_candidates(version: u32) -> Vec<Revision> {
-    let mut candidates: Vec<Revision> = REVISIONS
-        .iter()
-        .filter(|r| r.version == version)
-        .copied()
-        .collect();
-    // The version word orders the candidates; it does not select one. 1.8.4
-    // ships two packages that both declare `0x00020003` and disagree about the
-    // trailer (see `TRAILER_PROBES`), so the version's own layout is tried
-    // first and the narrow one after it. A probe is never trusted on its
-    // guards alone: `read_directory` has to walk the table it names, which is
-    // the check that actually separates the two.
-    candidates.extend(TRAILER_PROBES.iter().copied());
-    candidates
-}
-
-/// Read `rev`'s trailer and check the two things every layout must satisfy.
-///
-/// Split out so the same checks guard the version's own layout and every probe:
-/// a probe that skips them is a different reader wearing the same name.
-fn read_named_trailer(f: &File, end: u64, rev: &Revision) -> Result<Vec<u8>, String> {
-    // The client reads the trailer at `nOffset - (sizeof(header) + 4 + 4)` and
-    // the count at `nOffset - 8`: the two reads overlap the same eight bytes
-    // only when the struct's tail padding is counted, so both are done from the
-    // header start here instead.
-    let header_start = end
-        .checked_sub((rev.header + 8) as u64)
-        .ok_or("bad package end offset")?;
-    let header = at_shared(f, header_start, rev.header)?;
-    if u32le(&header, 0)? != 0xfdfdfeee || u32le(&header, rev.guard_byte1)? != 0xf00dbeef {
-        return Err("unsupported PCK guard keys".into());
-    }
-    // The client refuses a package whose description lacks "lica File
-    // Package" (`strstr(m_header.szDescription, "lica File Package")`), so a
-    // file that passes the guards but not this is not a package at all. Saying
-    // "unsupported version" for it would send the reader after a version that
-    // does not exist.
-    let stop_at = (rev.description_at + 252).min(header.len());
-    let description = &header[rev.description_at.min(stop_at)..stop_at];
-    let stop = description
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(description.len());
-    let description = String::from_utf8_lossy(&description[..stop]);
-    if !description.contains("lica File Package") {
-        return Err("not an Angelica file package (description tag missing)".into());
-    }
-    Ok(header)
-}
-
-pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
-    let size = f.metadata().map_err(|e| e.to_string())?.len();
+fn directory_cached(f: &mut File) -> Result<std::sync::Arc<CachedDir>, String> {
+    let meta = f.metadata().map_err(|e| e.to_string())?;
+    let size = meta.len();
     // The trailer is at least 280 bytes plus the count and version words; a
     // shorter file cannot hold the narrow trailer either, so one bound covers
     // every layout rather than one bound per revision.
@@ -1019,253 +622,41 @@ impl Package {
     pub fn continuation_count(&self) -> usize {
         self.continuations.len()
     }
-
-    /// The first continuation (`.pkx`) that completes this package, when split.
-    pub fn continuation(&self) -> Option<PathBuf> {
-        self.continuation_path(1)
-    }
-
-    /// Continuation file `n`, 1-based, whether or not it exists on disk.
-    pub fn continuation_path(&self, n: usize) -> Option<PathBuf> {
-        if n == 0 || n > self.continuations.len() {
-            return None;
-        }
-        let mut name = self.path.file_stem().unwrap_or_default().to_os_string();
-        name.push(".pkx");
-        if n > 1 {
-            name.push((n - 1).to_string());
-        }
-        Some(self.path.with_file_name(name))
-    }
-
-    /// Bytes of the whole logical package.
-    pub fn len(&self) -> u64 {
-        self.layout.total()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// The first file of the package: always the one that was opened.
-    pub fn first_file(&self) -> &File {
-        &self.first
-    }
-
-    /// A positioned handle for the Angelica directory walk, which seeks.
-    pub fn first_file_mut(&mut self) -> &mut File {
-        &mut self.first
-    }
-
-    /// The first continuation's file, for code that reads the pieces itself.
-    pub fn second_file(&self) -> Option<&File> {
-        self.continuations.first().map(|(file, _)| file)
-    }
-
-    /// The continuation files in order, with their lengths.
-    pub fn files(&self) -> Vec<&(File, u64)> {
-        self.continuations.iter().collect()
-    }
-
-    /// The pieces' sizes, for code that reads them itself.
-    pub fn layout(&self) -> &Layout {
-        &self.layout
-    }
-
-    /// The ordered file list `read_package_range` needs.
-    fn parts(&self) -> Vec<(File, u64)> {
-        let mut parts = Vec::with_capacity(1 + self.continuations.len());
-        // `try_clone` shares the file offset, but every read here is positional
-        // (`read_at` / `seek_read`), so the cursor is never used.
-        if let Ok(clone) = self.first.try_clone() {
-            parts.push((clone, self.layout.part0));
-        }
-        for (file, len) in &self.continuations {
-            if let Ok(clone) = file.try_clone() {
-                parts.push((clone, *len));
+    // Check process-wide PCK directory cache before reading/decompressing the
+    // entry table. Avoids re-parsing multi-hundred-thousand-entry archives like
+    // textures.pck (8-10x per world load) and litmodels.pck on world switches
+    // and whole-world toggles.
+    let cache_key = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|dur| {
+            use sha2::Digest as _;
+            let mut h = sha2::Sha256::new();
+            h.update(&safe);
+            h.update(&header);
+            DirCacheKey {
+                size,
+                mtime_secs: dur.as_secs(),
+                mtime_nanos: dur.subsec_nanos(),
+                end,
+                pos,
+                count,
+                header_hash: h.finalize().into(),
+            }
+        });
+    if let Some(ref key) = cache_key {
+        if let Ok(guard) = dir_cache().lock() {
+            if let Some(cached) = guard.get(key) {
+                return Ok(std::sync::Arc::clone(cached));
             }
         }
-        parts
     }
-
-    /// The package's own entry directory.
-    pub fn directory(&mut self) -> Result<Vec<Entry>, String> {
-        let safe = at(&mut self.first, 0, 12)?;
-        // A split is only the explanation when the two halves add up to what the
-        // header declares; safe_header says so, and read_directory re-checks the
-        // table's own offsets.
-        safe_header(
-            &safe,
-            self.layout.part0,
-            if self.is_split() {
-                Some(self.len())
-            } else {
-                None
-            },
-        )?;
-        let parts = self.parts();
-        if self.is_split() {
-            // The trailer lives in the last file, whose own logical base is
-            // where its length begins counting.
-            return read_directory(&parts, &self.layout, self.len(), self.last_part_base());
-        }
-        let end = package_end(&mut self.first)?;
-        read_directory(&parts, &self.layout, end, 0)
-    }
-
-    /// One entry's bytes, spanning the split when the payload does.
-    pub fn read(&self, e: &Entry) -> Result<Vec<u8>, String> {
-        let stored = read_package_range(
-            &self.parts(),
-            &self.layout,
-            e.offset as u64,
-            e.compressed as u64,
-        )?;
-        if e.compressed < e.size {
-            inflate(&stored, e.size as usize)
-        } else {
-            Ok(stored)
-        }
-    }
-
-    /// Read a batch of entries, across however many files the package spans.
-    pub fn read_many(&self, entries: &[&Entry]) -> Result<Vec<Vec<u8>>, String> {
-        read_entries_in(&self.parts(), &self.layout, entries).map_err(|error| error.to_string())
-    }
-
-    /// The pieces in order with their logical lengths, for a caller that reads
-    /// batches in its own threads.
-    pub fn part_list(&self) -> Vec<(File, u64)> {
-        self.parts()
-    }
-
-    /// The logical position where the last file of a split package begins.
-    fn last_part_base(&self) -> u64 {
-        self.layout.last_start()
-    }
-}
-
-/// Read `len` bytes starting at `pos` inside the logical package, which spans
-/// `first` and then `second` when the package is split.
-/// Read an entry table without trusting `table_end - table_at` as its length.
-///
-/// The table's upper bound is not worth trusting. In 1.8.4's `litmodels` the
-/// span from the table's start to the trailer is 2,163,612,196 bytes, while the
-/// 237,241 records in it occupy a small fraction: reading the whole span moves
-/// gigabytes to parse seventy megabytes, and on a 32-bit host the allocation
-/// fails before a single record is read. So the read starts small and grows
-/// while the table's *own* framing says it is incomplete -- a record header that
-/// runs past the bytes read, or a record body that does -- and stops as soon as
-/// `count` records parse. That is the same "let the structure decide" rule the
-/// rest of this module follows.
-///
-/// The exact-length check is preserved: the returned bytes are exactly what the
-/// records consumed, so a table whose records do not end where the reader thinks
-/// they do is still refused by `read_entry_table`.
-fn read_entry_table_chunked(
-    files: &[(File, u64)],
-    layout: &Layout,
-    pos: u64,
-    limit: u64,
-    count: usize,
-    rev: &Revision,
-    end: u64,
-    size: u64,
-) -> Result<Vec<Entry>, String> {
-    // A table of `count` records cannot exceed this.
-    let ceiling = (count as u64)
-        .saturating_mul(rev.entry as u64 + 8)
-        .min(limit);
-    // The first chunk is deliberately small: most tables are a fraction of their
-    // ceiling, and the common case should not read the ceiling.
-    let mut have = 256u64.saturating_mul(1024).min(ceiling).max(8);
-    let mut bytes = read_package_range(files, layout, pos, have)?;
-    loop {
-        match read_entry_table(&bytes, count, rev, end, size) {
-            Ok((entries, _used)) => return Ok(entries),
-            Err(error) => {
-                // These two mean "the bytes read stop before the records do";
-                // anything else is a real framing fault and is reported as such
-                // rather than grown past.
-                let short = error.contains("overlaps footer") || error.contains("record (length)");
-                if !short || have >= ceiling {
-                    return Err(error);
-                }
-            }
-        }
-        // Extend, do not re-read: the bytes already fetched stay fetched.
-        let more = have.saturating_mul(2).min(ceiling) - have;
-        let tail = read_package_range(files, layout, pos + have, more)?;
-        bytes.extend_from_slice(&tail);
-        have += more;
-    }
-}
-
-fn read_package_range(
-    files: &[(File, u64)],
-    layout: &Layout,
-    pos: u64,
-    len: u64,
-) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity((len as usize).min(4 << 20));
-    let mut left = len;
-    let mut cursor = pos;
-    while left > 0 {
-        // Which opened file holds `cursor`, and how far into it. The starts come
-        // from the layout, so a piece that is wider than one split is just a
-        // piece.
-        let index = (0..layout.len())
-            .rev()
-            .find(|&i| layout.start_of(i).is_some_and(|start| cursor >= start))
-            .unwrap_or(0);
-        let start = layout.start_of(index).unwrap_or(0);
-        let local = cursor - start;
-        let file_len = files.get(index).map(|(_, len)| *len).unwrap_or(0);
-        let take = left.min(file_len.saturating_sub(local));
-        if take == 0 {
-            return Err(match index {
-                0 => "split package range is empty".to_string(),
-                n => format!(
-                    "entry runs past the end of continuation file {n} of {}",
-                    layout.len() - 1
-                ),
-            });
-        }
-        // Every file is read positionally, so reading one never disturbs a
-        // cursor another file's caller may hold.
-        let (file, _) = files.get(index).ok_or_else(|| {
-            format!(
-                "entry continues into a missing continuation file {index} of {}",
-                layout.len() - 1
-            )
-        })?;
-        out.extend_from_slice(&at_shared(file, local, take as usize)?);
-        cursor += take;
-        left -= take;
-    }
-    Ok(out)
-}
-
-/// Walk the length-prefixed run of entry records the client reads one at a
-/// time.
-///
-/// Every revision frames a record as two masked dwords — the stored length and
-/// a check word — followed by that many bytes. A record whose stored length
-/// equals the record size is stored verbatim; anything else is a zlib stream of
-/// it, which the client decodes with `Uncompress` and, when the stored copy is
-/// no smaller, re-compresses (`AFilePackage::Open`). Both cases occur in retail
-/// packs, so both are handled here.
-fn read_entry_table(
-    table: &[u8],
-    count: usize,
-    rev: &Revision,
-    end: u64,
-    size: u64,
-) -> Result<(Vec<Entry>, usize), String> {
+    let table = at(f, pos, (table_end - pos) as usize)?;
+    // Fast linear scan of 8-byte record headers to collect record slices,
+    // allowing parallel zlib + GBK decoding across all CPU cores.
+    let mut slices: Vec<(usize, usize)> = Vec::with_capacity(count);
     let mut cursor = 0usize;
-    let mut decomp = Decompress::new(true);
-    let mut buf = [0u8; 288];
-    let mut result = Vec::with_capacity(count);
     for _ in 0..count {
         if cursor + 8 > table.len() {
             return Err("entry table overlaps footer".into());
@@ -1280,64 +671,104 @@ fn read_entry_table(
         if len == 0 || len > rev.entry || cursor + 8 + len > table.len() {
             return Err("invalid entry table record (length)".into());
         }
-        let raw = &table[cursor + 8..cursor + 8 + len];
-        let data: &[u8] = if len == rev.entry {
-            raw
-        } else {
-            decomp.reset(true);
-            decomp
-                .decompress(raw, &mut buf[..rev.entry], FlushDecompress::Finish)
-                .map_err(|e| e.to_string())?;
-            if decomp.total_out() != rev.entry as u64 {
-                let n = decomp.total_out();
-                return Err(format!("unexpected entry record size: {n}"));
-            }
-            &buf[..rev.entry]
-        };
-        let zero = data[..260].iter().position(|&x| x == 0).unwrap_or(260);
-        let (decoded, _, _) = encoding_rs::GBK.decode(&data[..zero]);
-        let name = decoded.replace('\\', "/");
-        // `dwOffset` is `DWORD` in the older revisions and `UINT64` in
-        // `0x00020003`. It is kept 64 bits wide here because a package can be
-        // longer than 4 GiB and its far entries are addressed by their real
-        // offset: 1.8.4's `building.pck` is 2 GiB + 4 GiB + 1.7 GiB, and
-        // narrowing the word would turn an entry past the fourth split into a
-        // near one and read somebody else's bytes.
-        let offset = if rev.offset_width == 8 {
-            u64::from_le_bytes(data[rev.offset_at..rev.offset_at + 8].try_into().unwrap())
-        } else {
-            u32le(data, rev.offset_at)? as u64
-        };
-        let file_size = u32le(data, rev.size_at)?;
-        let compressed = u32le(data, rev.compressed_at)?;
-        if offset + compressed as u64 > end
-            || offset + compressed as u64 > size
-            || file_size > 512 * 1024 * 1024
-            || compressed > file_size
-        {
-            return Err(format!("invalid entry bounds: {name}"));
-        }
-        result.push(Entry {
-            name,
-            offset,
-            size: file_size,
-            compressed,
-        });
+        slices.push((cursor + 8, len));
         cursor += 8 + len;
     }
-    // The client seeks to the table and reads exactly `count` records; it never
-    // looks at what follows. Bytes left over after the last record therefore
-    // mean the framing was misread — a wrong count, length or encryption flag —
-    // and the entries that came out are not necessarily the archive's. The
-    // shipped packs end exactly on the last record, so this costs no coverage
-    // and turns a silently wrong directory into a refusal.
-    if cursor != table.len() {
-        return Err(format!(
-            "{} trailing bytes after the last of {count} entry records",
-            table.len() - cursor
-        ));
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(32);
+    let result = if workers > 1 && count >= 512 {
+        let chunk_size = (count + workers - 1) / workers;
+        let table_ref = &table;
+        let chunks: Result<Vec<Vec<Entry>>, String> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(workers);
+            for chunk in slices.chunks(chunk_size) {
+                handles.push(s.spawn(move || -> Result<Vec<Entry>, String> {
+                    let mut decomp = Decompress::new(true);
+                    let mut buf = [0u8; 276];
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for &(start, len) in chunk {
+                        out.push(decode_entry_record(
+                            &table_ref[start..start + len],
+                            end,
+                            &mut decomp,
+                            &mut buf,
+                        )?);
+                    }
+                    Ok(out)
+                }));
+            }
+            let mut all = Vec::with_capacity(handles.len());
+            for h in handles {
+                all.push(h.join().unwrap()?);
+            }
+            Ok(all)
+        });
+        let mut flat = Vec::with_capacity(count);
+        for chunk in chunks? {
+            flat.extend(chunk);
+        }
+        flat
+    } else {
+        let mut decomp = Decompress::new(true);
+        let mut buf = [0u8; 276];
+        let mut out = Vec::with_capacity(count);
+        for &(start, len) in &slices {
+            out.push(decode_entry_record(
+                &table[start..start + len],
+                end,
+                &mut decomp,
+                &mut buf,
+            )?);
+        }
+        out
+    };
+    let cached = std::sync::Arc::new(CachedDir {
+        entries: std::sync::Arc::from(result),
+        normalized_index: std::sync::OnceLock::new(),
+    });
+    if let Some(key) = cache_key {
+        if let Ok(mut guard) = dir_cache().lock() {
+            // Cap cache to 32 distinct archives so tests creating temporary PCKs
+            // cannot grow memory unboundedly.
+            if guard.len() >= 32 {
+                guard.clear();
+            }
+            guard.insert(key, std::sync::Arc::clone(&cached));
+        }
     }
-    Ok((result, cursor))
+    Ok(cached)
+}
+
+/// Shared zero-clone PCK directory view backed by the process-wide archive cache.
+pub fn directory_arc(f: &mut File) -> Result<std::sync::Arc<[Entry]>, String> {
+    Ok(std::sync::Arc::clone(&directory_cached(f)?.entries))
+}
+
+/// Shared zero-clone PCK directory and lazily-built normalized (lowercase, `/`
+/// separator) key-to-index table. Parallelizes key normalization across cores
+/// once per archive and reuses the `Arc` across all subsystems.
+pub fn normalized_index_arc(
+    f: &mut File,
+) -> Result<
+    (
+        std::sync::Arc<[Entry]>,
+        std::sync::Arc<std::collections::HashMap<String, usize>>,
+    ),
+    String,
+> {
+    let cached = directory_cached(f)?;
+    let index = std::sync::Arc::clone(
+        cached
+            .normalized_index
+            .get_or_init(|| std::sync::Arc::new(build_normalized_index(&cached.entries))),
+    );
+    Ok((std::sync::Arc::clone(&cached.entries), index))
+}
+
+pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
+    Ok(directory_arc(f)?.to_vec())
 }
 
 pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {

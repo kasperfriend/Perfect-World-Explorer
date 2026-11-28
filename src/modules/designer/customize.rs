@@ -552,7 +552,8 @@ impl PlayerCustomize {
     }
 
     pub fn to_ini(&self) -> String {
-        let mut out = String::new();
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(2048);
         macro_rules! section {
             ($name:literal) => {
                 out.push_str("[");
@@ -562,10 +563,7 @@ impl PlayerCustomize {
         }
         macro_rules! write {
             ($key:literal, $value:expr) => {
-                out.push_str($key);
-                out.push_str(" = ");
-                out.push_str(&($value).to_string());
-                out.push_str("\r\n");
+                let _ = std::write!(out, "{} = {}\r\n", $key, $value);
             };
         }
         macro_rules! color {
@@ -821,7 +819,7 @@ impl Ini {
         if had_errors {
             return Err("character INI is not valid GBK text".into());
         }
-        let mut values = std::collections::HashMap::new();
+        let mut values = std::collections::HashMap::with_capacity(bytes.len() / 24);
         let mut section = String::new();
         for original in text.lines() {
             let line = original.trim();
@@ -829,29 +827,50 @@ impl Ini {
                 continue;
             }
             if line.starts_with('[') && line.ends_with(']') {
-                section = line[1..line.len() - 1].trim().to_lowercase();
+                let s = line[1..line.len() - 1].trim();
+                section = if s.is_ascii() {
+                    s.to_ascii_lowercase()
+                } else {
+                    s.to_lowercase()
+                };
                 continue;
             }
             if let Some((key, value)) = line.split_once('=') {
-                values.insert(
-                    (section.clone(), key.trim().to_lowercase()),
-                    value.trim().to_owned(),
-                );
+                let k = key.trim();
+                let key_lower = if k.is_ascii() {
+                    k.to_ascii_lowercase()
+                } else {
+                    k.to_lowercase()
+                };
+                values.insert((section.clone(), key_lower), value.trim().to_owned());
             }
         }
         Ok(Self { values })
     }
     pub fn number(&self, section: &str, key: &str, default: i64) -> i64 {
+        let s = if section.is_ascii() {
+            section.to_ascii_lowercase()
+        } else {
+            section.to_lowercase()
+        };
+        let k = if key.is_ascii() {
+            key.to_ascii_lowercase()
+        } else {
+            key.to_lowercase()
+        };
         self.values
-            .get(&(section.to_lowercase(), key.to_lowercase()))
+            .get(&(s, k))
             .and_then(|value| value.parse().ok())
             .unwrap_or(default)
     }
     pub fn range(&self, section: &str, key: &str) -> (u8, u8) {
-        let min = self.number(section, &format!("{key}Min"), 0).clamp(0, 255) as u8;
-        let max = self
-            .number(section, &format!("{key}Max"), 255)
-            .clamp(0, 255) as u8;
+        let mut key_buf = String::with_capacity(key.len() + 3);
+        key_buf.push_str(key);
+        key_buf.push_str("Min");
+        let min = self.number(section, &key_buf, 0).clamp(0, 255) as u8;
+        key_buf.truncate(key.len());
+        key_buf.push_str("Max");
+        let max = self.number(section, &key_buf, 255).clamp(0, 255) as u8;
         if min <= max {
             (min, max)
         } else {

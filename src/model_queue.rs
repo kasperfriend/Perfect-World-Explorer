@@ -86,25 +86,25 @@ pub fn alpha_corner_distance(
     {
         return Err("invalid alpha distance bounds/affine transform/eye".into());
     }
-    let mut nearest = f32::from_bits(0x497423fe);
+    let sentinel = f32::from_bits(0x497423fe);
+    let mut nearest_sq = f32::INFINITY;
     for x in [min[0], max[0]] {
         for y in [min[1], max[1]] {
             for z in [min[2], max[2]] {
-                let mut delta = [0.; 3];
-                for i in 0..3 {
-                    delta[i] =
-                        world[0][i] * x + world[1][i] * y + world[2][i] * z + world[3][i] - eye[i];
-                }
-                let distance =
-                    (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-                if !distance.is_finite() {
+                let dx = world[0][0] * x + world[1][0] * y + world[2][0] * z + world[3][0] - eye[0];
+                let dy = world[0][1] * x + world[1][1] * y + world[2][1] * z + world[3][1] - eye[1];
+                let dz = world[0][2] * x + world[1][2] * y + world[2][2] * z + world[3][2] - eye[2];
+                let dist_sq = dx * dx + dy * dy + dz * dz;
+                if !dist_sq.is_finite() {
                     return Err("alpha distance overflow".into());
                 }
-                nearest = nearest.min(distance);
+                if dist_sq < nearest_sq {
+                    nearest_sq = dist_sq;
+                }
             }
         }
     }
-    Ok(nearest)
+    Ok(nearest_sq.sqrt().min(sentinel))
 }
 /// Source 0x7a5a1d–0x7a5aef. In 1.4.2, AABB comparisons ALSO run when
 /// the new same-model weight is greater (not merely equal). Related 1.5.2
@@ -291,8 +291,26 @@ pub struct AlphaCandidate {
 pub fn alpha_order(candidates: &[AlphaCandidate]) -> Result<Vec<AlphaCandidate>, String> {
     let mut out: Vec<AlphaCandidate> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let existing: Vec<AlphaNode> = out.iter().map(|c| c.node).collect();
-        let at = alpha_insert_index(&existing, candidate.node)?;
+        let new = candidate.node;
+        if !new.valid() {
+            return Err("invalid alpha queue bounds/distance".into());
+        }
+        let at = out
+            .iter()
+            .position(|existing| {
+                let old = &existing.node;
+                if old.model == new.model {
+                    new.weight() < old.weight()
+                        || old.max[1] > new.max[1]
+                        || old.max[2] > new.max[2]
+                        || old.min[2] < new.min[2]
+                } else if old.group != 0 && old.group == new.group {
+                    new.group_weight < old.group_weight
+                } else {
+                    old.distance <= new.distance
+                }
+            })
+            .unwrap_or(out.len());
         out.insert(at, *candidate);
     }
     Ok(out)

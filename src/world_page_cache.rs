@@ -7,14 +7,14 @@ use crate::{
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
 
 const CACHE_MAGIC: &[u8; 8] = b"PWWPAGE1";
 const PAGE_MAGIC: &[u8; 8] = b"PWWPG001";
-const FORMAT: u64 = 10;
+const FORMAT: u64 = 3;
 const MAX_CACHED_PAGES: usize = 100_000;
 const MAX_CACHED_VERTICES: usize = 16_000_000;
 const MAX_CACHED_INDICES: usize = 100_000_000;
@@ -97,26 +97,20 @@ fn cache_root() -> PathBuf {
 fn final_dir(key: &[u8; 32]) -> PathBuf {
     cache_root().join(hex(key))
 }
-fn write_hashed(file: &mut File, hash: &mut Sha256, bytes: &[u8]) -> std::io::Result<()> {
+fn write_hashed<W: Write>(file: &mut W, hash: &mut Sha256, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)?;
     hash.update(bytes);
     Ok(())
 }
-fn write_u64(file: &mut File, hash: &mut Sha256, value: u64) -> std::io::Result<()> {
+fn write_u64<W: Write>(file: &mut W, hash: &mut Sha256, value: u64) -> std::io::Result<()> {
     write_hashed(file, hash, &value.to_le_bytes())
-}
-fn write_u32(file: &mut File, hash: &mut Sha256, value: u32) -> std::io::Result<()> {
-    write_hashed(file, hash, &value.to_le_bytes())
-}
-fn write_f32(file: &mut File, hash: &mut Sha256, value: f32) -> std::io::Result<()> {
-    write_u32(file, hash, value.to_bits())
 }
 
 pub(crate) struct Writer {
     key: [u8; 32],
     temp: PathBuf,
     final_dir: PathBuf,
-    pages_file: Option<File>,
+    pages_file: Option<BufWriter<File>>,
     pages: usize,
     published: bool,
 }
@@ -144,7 +138,7 @@ impl Writer {
             key,
             temp,
             final_dir,
-            pages_file: Some(pages_file),
+            pages_file: Some(BufWriter::with_capacity(IO_CHUNK, pages_file)),
             pages: 0,
             published: false,
         })
@@ -152,8 +146,9 @@ impl Writer {
     pub(crate) fn write_page(&mut self, page: &Page) -> std::io::Result<()> {
         let file = self.pages_file.as_mut().expect("page cache file open");
         let mut hash = Sha256::new();
-        write_hashed(file, &mut hash, PAGE_MAGIC)?;
-        for value in [
+        let mut header = [0u8; 8 + 9 * 8 + 1 + 6 * 4];
+        header[0..8].copy_from_slice(PAGE_MAGIC);
+        let fields = [
             page.processed as u64,
             page.used_height as u64,
             page.shared_atlas.map(|n| n as u64).unwrap_or(u64::MAX),
@@ -163,13 +158,15 @@ impl Writer {
             page.mips.len() as u64,
             page.placements.len() as u64,
             page.bounds.len() as u64,
-        ] {
-            write_u64(file, &mut hash, value)?;
+        ];
+        for (i, value) in fields.into_iter().enumerate() {
+            header[8 + i * 8..16 + i * 8].copy_from_slice(&value.to_le_bytes());
         }
-        write_hashed(file, &mut hash, &[u8::from(page.page_has_sdr)])?;
-        for value in page.page_min.into_iter().chain(page.page_max) {
-            write_f32(file, &mut hash, value)?;
+        header[80] = u8::from(page.page_has_sdr);
+        for (i, value) in page.page_min.into_iter().chain(page.page_max).enumerate() {
+            header[81 + i * 4..85 + i * 4].copy_from_slice(&value.to_bits().to_le_bytes());
         }
+        write_hashed(file, &mut hash, &header)?;
         write_hashed(file, &mut hash, bytemuck::cast_slice(&page.vertices))?;
         write_hashed(file, &mut hash, bytemuck::cast_slice(&page.indices))?;
         write_hashed(file, &mut hash, &page.atlas)?;
@@ -177,25 +174,29 @@ impl Writer {
             write_u64(file, &mut hash, mip.len() as u64)?;
             write_hashed(file, &mut hash, mip)?;
         }
-        for placement in &page.placements {
-            write_u32(file, &mut hash, placement.start)?;
-            write_u32(file, &mut hash, placement.end)?;
-            write_u32(file, &mut hash, placement.export_id)?;
-            write_u64(file, &mut hash, placement.order)?;
-            write_hashed(
-                file,
-                &mut hash,
-                &[
-                    u8::from(placement.visibility.reflect),
-                    u8::from(placement.visibility.refract),
-                ],
-            )?;
-        }
-        for bound in &page.bounds {
-            for value in bound.min.into_iter().chain(bound.max) {
-                write_f32(file, &mut hash, value)?;
+        if !page.placements.is_empty() {
+            let mut buf = Vec::with_capacity(page.placements.len() * 30);
+            for placement in &page.placements {
+                buf.extend_from_slice(&placement.start.to_le_bytes());
+                buf.extend_from_slice(&placement.end.to_le_bytes());
+                buf.extend_from_slice(&placement.vertex_start.to_le_bytes());
+                buf.extend_from_slice(&placement.vertex_end.to_le_bytes());
+                buf.extend_from_slice(&placement.export_id.to_le_bytes());
+                buf.extend_from_slice(&placement.order.to_le_bytes());
+                buf.push(u8::from(placement.visibility.reflect));
+                buf.push(u8::from(placement.visibility.refract));
             }
-            write_hashed(file, &mut hash, &[u8::from(bound.has_sdr)])?;
+            write_hashed(file, &mut hash, &buf)?;
+        }
+        if !page.bounds.is_empty() {
+            let mut buf = Vec::with_capacity(page.bounds.len() * 25);
+            for bound in &page.bounds {
+                for value in bound.min.into_iter().chain(bound.max) {
+                    buf.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+                buf.push(u8::from(bound.has_sdr));
+            }
+            write_hashed(file, &mut hash, &buf)?;
         }
         file.write_all(&hash.finalize())?;
         self.pages += 1;
@@ -210,8 +211,9 @@ impl Writer {
     ) -> std::io::Result<()> {
         let mut pages_file = self.pages_file.take().expect("page cache file open");
         pages_file.flush()?;
-        pages_file.sync_all()?;
-        drop(pages_file);
+        let raw_file = pages_file.into_inner().map_err(|e| e.into_error())?;
+        raw_file.sync_all()?;
+        drop(raw_file);
         let manifest_tmp = self.temp.join("manifest.tmp");
         let mut file = File::create(&manifest_tmp)?;
         let mut bytes = Vec::with_capacity(88);
@@ -247,7 +249,7 @@ impl Drop for Writer {
 
 pub(crate) struct Reader {
     dir: PathBuf,
-    pages_file: Option<File>,
+    pages_file: Option<BufReader<File>>,
     pages: usize,
     next_page: usize,
     pub(crate) processed: usize,
@@ -285,7 +287,7 @@ impl Reader {
         let pages_file = File::open(dir.join("pages.bin")).ok()?;
         Some(Self {
             dir,
-            pages_file: Some(pages_file),
+            pages_file: Some(BufReader::with_capacity(IO_CHUNK, pages_file)),
             pages,
             next_page: 0,
             processed,
@@ -373,40 +375,61 @@ impl Reader {
             mips.push(read_byte_vec(file, &mut hash, len)?);
         }
         let mut placements = Vec::with_capacity(placement_count);
-        for _ in 0..placement_count {
-            let start = read_u32(file, &mut hash)?;
-            let end = read_u32(file, &mut hash)?;
-            let export_id = read_u32(file, &mut hash)?;
-            let order = read_u64(file, &mut hash)?;
-            let mut flags = [0; 2];
-            read_hashed(file, &mut hash, &mut flags)?;
-            if start > end || end as usize > index_count {
-                return Err("invalid cached placement index range".into());
+        if placement_count > 0 {
+            let pbytes = read_byte_vec(file, &mut hash, placement_count * 30)?;
+            for chunk in pbytes.chunks_exact(30) {
+                let start = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+                let end = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                let vertex_start = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+                let vertex_end = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
+                let export_id = u32::from_le_bytes(chunk[16..20].try_into().unwrap());
+                let order = u64::from_le_bytes(chunk[20..28].try_into().unwrap());
+                if start > end || end as usize > index_count {
+                    return Err("invalid cached placement index range".into());
+                }
+                if vertex_start > vertex_end || vertex_end as usize > vertex_count {
+                    return Err("invalid cached placement vertex range".into());
+                }
+                if indices[start as usize..end as usize]
+                    .iter()
+                    .any(|&index| index < vertex_start || index >= vertex_end)
+                {
+                    return Err("cached placement indices escape their vertex range".into());
+                }
+                placements.push(PlacementRange {
+                    start,
+                    end,
+                    vertex_start,
+                    vertex_end,
+                    export_id,
+                    order,
+                    visibility: crate::scenery_visibility::Visibility {
+                        reflect: chunk[28] != 0,
+                        refract: chunk[29] != 0,
+                    },
+                });
             }
-            placements.push(PlacementRange {
-                start,
-                end,
-                export_id,
-                order,
-                visibility: crate::scenery_visibility::Visibility {
-                    reflect: flags[0] != 0,
-                    refract: flags[1] != 0,
-                },
-            });
         }
         let mut bounds = Vec::with_capacity(bounds_count);
-        for _ in 0..bounds_count {
-            let mut min = [0.; 3];
-            let mut max = [0.; 3];
-            for value in min.iter_mut().chain(max.iter_mut()) {
-                *value = read_f32(file, &mut hash)?;
+        if bounds_count > 0 {
+            let bbytes = read_byte_vec(file, &mut hash, bounds_count * 25)?;
+            for chunk in bbytes.chunks_exact(25) {
+                let min = [
+                    f32::from_bits(u32::from_le_bytes(chunk[0..4].try_into().unwrap())),
+                    f32::from_bits(u32::from_le_bytes(chunk[4..8].try_into().unwrap())),
+                    f32::from_bits(u32::from_le_bytes(chunk[8..12].try_into().unwrap())),
+                ];
+                let max = [
+                    f32::from_bits(u32::from_le_bytes(chunk[12..16].try_into().unwrap())),
+                    f32::from_bits(u32::from_le_bytes(chunk[16..20].try_into().unwrap())),
+                    f32::from_bits(u32::from_le_bytes(chunk[20..24].try_into().unwrap())),
+                ];
+                bounds.push(PlacementBounds {
+                    min,
+                    max,
+                    has_sdr: chunk[24] != 0,
+                });
             }
-            read_hashed(file, &mut hash, &mut byte)?;
-            bounds.push(PlacementBounds {
-                min,
-                max,
-                has_sdr: byte[0] != 0,
-            });
         }
         let mut expected_hash = [0; 32];
         file.read_exact(&mut expected_hash)
@@ -443,6 +466,340 @@ impl Reader {
         self.next_page += 1;
         Ok(page)
     }
+
+    /// Reads raw byte slabs for up to `batch_len` consecutive pages sequentially
+    /// at full disk speed, then SHA-256 verifies and deserializes all of them in
+    /// parallel across CPU cores.
+    pub(crate) fn read_pages_batch(&mut self, batch_len: usize) -> Vec<Result<Page, String>> {
+        let remaining = self.pages.saturating_sub(self.next_page);
+        let count = batch_len.min(remaining);
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut raw_pages: Vec<Result<Vec<u8>, String>> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let file = match self.pages_file.as_mut() {
+                Some(f) => f,
+                None => {
+                    raw_pages.push(Err("page cache file closed".into()));
+                    break;
+                }
+            };
+            let mut header = [0u8; 105];
+            if let Err(e) = file.read_exact(&mut header) {
+                raw_pages.push(Err(e.to_string()));
+                break;
+            }
+            if &header[0..8] != PAGE_MAGIC {
+                raw_pages.push(Err("bad page-cache record magic".into()));
+                break;
+            }
+            let used_height =
+                match usize::try_from(u64::from_le_bytes(header[16..24].try_into().unwrap())) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        raw_pages.push(Err("page height overflow".into()));
+                        break;
+                    }
+                };
+            let shared = u64::from_le_bytes(header[24..32].try_into().unwrap());
+            let vertex_count = match checked_count(
+                u64::from_le_bytes(header[32..40].try_into().unwrap()),
+                MAX_CACHED_VERTICES,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    raw_pages.push(Err(e));
+                    break;
+                }
+            };
+            let index_count = match checked_count(
+                u64::from_le_bytes(header[40..48].try_into().unwrap()),
+                MAX_CACHED_INDICES,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    raw_pages.push(Err(e));
+                    break;
+                }
+            };
+            let atlas_len = match checked_count(
+                u64::from_le_bytes(header[48..56].try_into().unwrap()),
+                crate::world_objects::SIDE * crate::world_objects::SIDE * 4,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    raw_pages.push(Err(e));
+                    break;
+                }
+            };
+            let mip_count =
+                match checked_count(u64::from_le_bytes(header[56..64].try_into().unwrap()), 7) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        raw_pages.push(Err(e));
+                        break;
+                    }
+                };
+            let placement_count = match checked_count(
+                u64::from_le_bytes(header[64..72].try_into().unwrap()),
+                MAX_CACHED_PLACEMENTS,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    raw_pages.push(Err(e));
+                    break;
+                }
+            };
+            let bounds_count = match checked_count(
+                u64::from_le_bytes(header[72..80].try_into().unwrap()),
+                MAX_CACHED_PLACEMENTS,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    raw_pages.push(Err(e));
+                    break;
+                }
+            };
+            if !(128..=crate::world_objects::SIDE).contains(&used_height)
+                || mip_count != if shared == u64::MAX { 7 } else { 0 }
+                || bounds_count != placement_count
+            {
+                raw_pages.push(Err("invalid cached page dimensions".into()));
+                break;
+            }
+            let mip_bytes: usize = (1..=mip_count)
+                .map(|level| 8 + (crate::world_objects::SIDE >> level) * (used_height >> level) * 4)
+                .sum();
+            let body_len = vertex_count * std::mem::size_of::<crate::gpu::Vertex>()
+                + index_count * 4
+                + atlas_len
+                + mip_bytes
+                + placement_count * 30
+                + bounds_count * 25
+                + 32;
+            let mut slab = vec![0u8; 105 + body_len];
+            slab[..105].copy_from_slice(&header);
+            if let Err(e) = file.read_exact(&mut slab[105..]) {
+                raw_pages.push(Err(e.to_string()));
+                break;
+            }
+            self.next_page += 1;
+            raw_pages.push(Ok(slab));
+        }
+        // Cache batches are at most a handful of pages. Cap parallelism
+        // at four and require at least two pages per worker so a machine with
+        // many cores does not recreate the old one-thread-per-page behaviour.
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(4)
+            .min(raw_pages.len().div_ceil(2).max(1));
+        if workers > 1 && raw_pages.len() >= 2 {
+            // A cache batch is intentionally small (normally 2–8 pages). Spawn
+            // one worker per contiguous chunk, not one OS thread per page: the
+            // latter repeatedly pays thread creation/join costs on every batch.
+            // Contiguous chunks also keep each worker's page allocations and
+            // checksum/decode work local while preserving file order on return.
+            let chunk_len = raw_pages.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = raw_pages
+                    .chunks(chunk_len)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|slab_res| match slab_res {
+                                    Ok(slab) => decode_page_slab(slab),
+                                    Err(error) => Err(error.clone()),
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|handle| handle.join().unwrap())
+                    .collect()
+            })
+        } else {
+            raw_pages
+                .into_iter()
+                .map(|slab_res| slab_res.and_then(|slab| decode_page_slab(&slab)))
+                .collect()
+        }
+    }
+}
+
+fn decode_page_slab(slab: &[u8]) -> Result<Page, String> {
+    if slab.len() < 105 + 32 {
+        return Err("truncated cached page slab".into());
+    }
+    let split = slab.len() - 32;
+    let payload = &slab[..split];
+    let expected_hash = &slab[split..];
+    let actual_hash = Sha256::digest(payload);
+    if expected_hash != actual_hash.as_slice() {
+        return Err("cached world page checksum mismatch".into());
+    }
+    let mut cur = std::io::Cursor::new(payload);
+    let mut dummy_hash = Sha256::new();
+    let mut magic = [0u8; 8];
+    cur.read_exact(&mut magic).map_err(|e| e.to_string())?;
+    if &magic != PAGE_MAGIC {
+        return Err("bad page-cache record magic".into());
+    }
+    let rd_u64 = |c: &mut std::io::Cursor<&[u8]>| -> Result<u64, String> {
+        let mut b = [0u8; 8];
+        c.read_exact(&mut b).map_err(|e| e.to_string())?;
+        Ok(u64::from_le_bytes(b))
+    };
+    let rd_f32 = |c: &mut std::io::Cursor<&[u8]>| -> Result<f32, String> {
+        let mut b = [0u8; 4];
+        c.read_exact(&mut b).map_err(|e| e.to_string())?;
+        Ok(f32::from_bits(u32::from_le_bytes(b)))
+    };
+    let processed = usize::try_from(rd_u64(&mut cur)?).map_err(|_| "processed count overflow")?;
+    let used_height = usize::try_from(rd_u64(&mut cur)?).map_err(|_| "page height overflow")?;
+    let shared = rd_u64(&mut cur)?;
+    let vertex_count = checked_count(rd_u64(&mut cur)?, MAX_CACHED_VERTICES)?;
+    let index_count = checked_count(rd_u64(&mut cur)?, MAX_CACHED_INDICES)?;
+    let atlas_len = checked_count(
+        rd_u64(&mut cur)?,
+        crate::world_objects::SIDE * crate::world_objects::SIDE * 4,
+    )?;
+    let mip_count = checked_count(rd_u64(&mut cur)?, 7)?;
+    let placement_count = checked_count(rd_u64(&mut cur)?, MAX_CACHED_PLACEMENTS)?;
+    let bounds_count = checked_count(rd_u64(&mut cur)?, MAX_CACHED_PLACEMENTS)?;
+    let mut byte = [0u8; 1];
+    cur.read_exact(&mut byte).map_err(|e| e.to_string())?;
+    let page_has_sdr = byte[0] != 0;
+    let mut page_min = [0.; 3];
+    let mut page_max = [0.; 3];
+    for value in page_min.iter_mut().chain(page_max.iter_mut()) {
+        *value = rd_f32(&mut cur)?;
+    }
+    let vertices = {
+        let mut out = vec![<crate::gpu::Vertex as bytemuck::Zeroable>::zeroed(); vertex_count];
+        cur.read_exact(bytemuck::cast_slice_mut(&mut out))
+            .map_err(|e| e.to_string())?;
+        out
+    };
+    let indices = {
+        let mut out = vec![0u32; index_count];
+        cur.read_exact(bytemuck::cast_slice_mut(&mut out))
+            .map_err(|e| e.to_string())?;
+        out
+    };
+    if indices.iter().any(|&index| index as usize >= vertex_count) {
+        return Err("cached page contains an out-of-range vertex index".into());
+    }
+    let mut atlas = vec![0u8; atlas_len];
+    if atlas_len > 0 {
+        cur.read_exact(&mut atlas).map_err(|e| e.to_string())?;
+    }
+    let mut mips = Vec::with_capacity(mip_count);
+    for level in 1..=mip_count {
+        let expected = (crate::world_objects::SIDE >> level) * (used_height >> level) * 4;
+        let len = checked_count(rd_u64(&mut cur)?, expected)?;
+        if len != expected {
+            return Err("invalid cached mip size".into());
+        }
+        let mut m = vec![0u8; len];
+        cur.read_exact(&mut m).map_err(|e| e.to_string())?;
+        mips.push(m);
+    }
+    let mut placements = Vec::with_capacity(placement_count);
+    if placement_count > 0 {
+        let pos = cur.position() as usize;
+        let pbytes = payload
+            .get(pos..pos + placement_count * 30)
+            .ok_or("truncated cached placements")?;
+        cur.set_position((pos + placement_count * 30) as u64);
+        for chunk in pbytes.chunks_exact(30) {
+            let start = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let end = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+            let vertex_start = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+            let vertex_end = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
+            let export_id = u32::from_le_bytes(chunk[16..20].try_into().unwrap());
+            let order = u64::from_le_bytes(chunk[20..28].try_into().unwrap());
+            if start > end || end as usize > index_count {
+                return Err("invalid cached placement index range".into());
+            }
+            if vertex_start > vertex_end || vertex_end as usize > vertex_count {
+                return Err("invalid cached placement vertex range".into());
+            }
+            if indices[start as usize..end as usize]
+                .iter()
+                .any(|&index| index < vertex_start || index >= vertex_end)
+            {
+                return Err("cached placement indices escape their vertex range".into());
+            }
+            placements.push(PlacementRange {
+                start,
+                end,
+                vertex_start,
+                vertex_end,
+                export_id,
+                order,
+                visibility: crate::scenery_visibility::Visibility {
+                    reflect: chunk[28] != 0,
+                    refract: chunk[29] != 0,
+                },
+            });
+        }
+    }
+    let mut bounds = Vec::with_capacity(bounds_count);
+    if bounds_count > 0 {
+        let pos = cur.position() as usize;
+        let bbytes = payload
+            .get(pos..pos + bounds_count * 25)
+            .ok_or("truncated cached bounds")?;
+        cur.set_position((pos + bounds_count * 25) as u64);
+        for chunk in bbytes.chunks_exact(25) {
+            let min = [
+                f32::from_bits(u32::from_le_bytes(chunk[0..4].try_into().unwrap())),
+                f32::from_bits(u32::from_le_bytes(chunk[4..8].try_into().unwrap())),
+                f32::from_bits(u32::from_le_bytes(chunk[8..12].try_into().unwrap())),
+            ];
+            let max = [
+                f32::from_bits(u32::from_le_bytes(chunk[12..16].try_into().unwrap())),
+                f32::from_bits(u32::from_le_bytes(chunk[16..20].try_into().unwrap())),
+                f32::from_bits(u32::from_le_bytes(chunk[20..24].try_into().unwrap())),
+            ];
+            bounds.push(PlacementBounds {
+                min,
+                max,
+                has_sdr: chunk[24] != 0,
+            });
+        }
+    }
+    let _ = &mut dummy_hash;
+    if shared == u64::MAX && atlas.len() != crate::world_objects::SIDE * used_height * 4 {
+        return Err("cached atlas size mismatch".into());
+    }
+    if shared != u64::MAX && atlas_len != 0 {
+        return Err("shared page contains an atlas copy".into());
+    }
+    let shared_atlas = if shared == u64::MAX {
+        None
+    } else {
+        Some(usize::try_from(shared).map_err(|_| "shared atlas index overflow")?)
+    };
+    Ok(Page {
+        vertices,
+        indices,
+        atlas,
+        shared_atlas,
+        processed,
+        used_height,
+        mips,
+        placements,
+        bounds,
+        page_min,
+        page_max,
+        page_has_sdr,
+    })
 }
 
 fn checked_count(value: u64, max: usize) -> Result<usize, String> {
@@ -452,38 +809,33 @@ fn checked_count(value: u64, max: usize) -> Result<usize, String> {
     }
     Ok(value)
 }
-fn read_hashed(file: &mut File, hash: &mut Sha256, bytes: &mut [u8]) -> Result<(), String> {
+fn read_hashed<R: Read>(file: &mut R, hash: &mut Sha256, bytes: &mut [u8]) -> Result<(), String> {
     file.read_exact(bytes).map_err(|e| e.to_string())?;
     hash.update(bytes);
     Ok(())
 }
-fn read_u64(file: &mut File, hash: &mut Sha256) -> Result<u64, String> {
+fn read_u64<R: Read>(file: &mut R, hash: &mut Sha256) -> Result<u64, String> {
     let mut b = [0; 8];
     read_hashed(file, hash, &mut b)?;
     Ok(u64::from_le_bytes(b))
 }
-fn read_u32(file: &mut File, hash: &mut Sha256) -> Result<u32, String> {
+fn read_u32<R: Read>(file: &mut R, hash: &mut Sha256) -> Result<u32, String> {
     let mut b = [0; 4];
     read_hashed(file, hash, &mut b)?;
     Ok(u32::from_le_bytes(b))
 }
-fn read_f32(file: &mut File, hash: &mut Sha256) -> Result<f32, String> {
+fn read_f32<R: Read>(file: &mut R, hash: &mut Sha256) -> Result<f32, String> {
     Ok(f32::from_bits(read_u32(file, hash)?))
 }
-fn read_byte_vec(file: &mut File, hash: &mut Sha256, len: usize) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(len);
-    let mut scratch = vec![0; IO_CHUNK.min(len.max(1))];
-    let mut left = len;
-    while left != 0 {
-        let n = left.min(scratch.len());
-        read_hashed(file, hash, &mut scratch[..n])?;
-        out.extend_from_slice(&scratch[..n]);
-        left -= n;
+fn read_byte_vec<R: Read>(file: &mut R, hash: &mut Sha256, len: usize) -> Result<Vec<u8>, String> {
+    let mut out = vec![0u8; len];
+    if len > 0 {
+        read_hashed(file, hash, &mut out)?;
     }
     Ok(out)
 }
 fn read_pod_vec<T: bytemuck::Pod + bytemuck::Zeroable + Copy>(
-    file: &mut File,
+    file: &mut impl Read,
     hash: &mut Sha256,
     count: usize,
 ) -> Result<Vec<T>, String> {
@@ -536,6 +888,8 @@ mod tests {
             placements: vec![PlacementRange {
                 start: 0,
                 end: 1,
+                vertex_start: 0,
+                vertex_end: 1,
                 export_id: 4,
                 order: 12,
                 visibility: crate::scenery_visibility::Visibility {

@@ -296,12 +296,16 @@ impl Population {
                 (distance2 <= radius2).then_some((index, distance2))
             })
             .collect();
-        candidates.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        candidates.truncate(limit);
+        let cmp = |a: &(usize, f32), b: &(usize, f32)| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0));
+        if limit == 0 {
+            candidates.clear();
+        } else if candidates.len() > limit {
+            candidates.select_nth_unstable_by(limit, cmp);
+            candidates.truncate(limit);
+            candidates.sort_unstable_by(cmp);
+        } else {
+            candidates.sort_unstable_by(cmp);
+        }
         candidates
     }
 }

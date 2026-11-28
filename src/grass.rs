@@ -176,11 +176,12 @@ fn f(b: &[u8], p: usize) -> Result<f32, String> {
 /// child name for the caller to resolve inside the same pack and directory.
 pub fn mox_wrapper_child(b: &[u8]) -> Result<String, String> {
     let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-    let text = encoding_rs::GBK
-        .decode(&b[..end])
-        .0
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    let decoded = encoding_rs::GBK.decode(&b[..end]).0;
+    let text = if decoded.contains('\r') {
+        decoded.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        decoded.into_owned()
+    };
     if !text.starts_with("MOXTMODEL: ") {
         return Err("unsupported MOXTMODEL header".into());
     }
@@ -259,7 +260,7 @@ fn parse_model(b: &[u8], name: &str) -> Result<Model, String> {
         return Err("unsupported MOXB hierarchy".into());
     }
     let dir = name.rsplit_once('/').map(|x| x.0).unwrap_or("");
-    let mut meshes = Vec::new();
+    let mut meshes = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let st = find(b, q, b"MESH: ")?;
         let (_, p) = cstr(b, st)?;
@@ -322,7 +323,29 @@ fn parse_model(b: &[u8], name: &str) -> Result<Model, String> {
         if bad {
             return Err("invalid MOXB texture path".into());
         }
-        let t = decoded.replace('\\', "/").to_lowercase();
+        let t = if decoded.is_ascii() {
+            let mut s = String::with_capacity(decoded.len());
+            for b in decoded.bytes() {
+                s.push(if b == b'\\' {
+                    '/'
+                } else {
+                    (b as char).to_ascii_lowercase()
+                });
+            }
+            s
+        } else {
+            let mut s = decoded.to_lowercase();
+            if s.as_bytes().contains(&b'\\') {
+                unsafe {
+                    for b in s.as_bytes_mut() {
+                        if *b == b'\\' {
+                            *b = b'/';
+                        }
+                    }
+                }
+            }
+            s
+        };
         if t.contains("..") || t.starts_with('/') || t.contains(':') {
             return Err("unsafe MOXB texture path".into());
         }
@@ -676,35 +699,7 @@ impl Grass {
         };
         let mut areas = Vec::with_capacity(records.len());
         for res in bsd_results {
-            match res {
-                Ok(group) => areas.extend(group),
-                // A group is one placement file. Failing it costs that file's
-                // areas, never the map, which is the whole point of the
-                // per-area tolerance above.
-                Err(reason) => note(&notes, reason),
-            }
-        }
-        // Name what was dropped, once per distinct reason. Silence here would
-        // hide a map whose grass is thinner than the archive says it is.
-        {
-            let notes = notes.into_inner().unwrap_or_default();
-            let mut seen = HashSet::new();
-            let mut listed = 0usize;
-            for note in &notes {
-                if !seen.insert(note.as_str()) {
-                    continue;
-                }
-                listed += 1;
-                if listed <= 8 {
-                    eprintln!("grass placement skipped: {note}");
-                }
-            }
-            if seen.len() > 8 {
-                eprintln!(
-                    "grass placement skipped: {} further reasons not listed",
-                    seen.len() - 8
-                );
-            }
+            areas.extend(res?);
         }
         areas.sort_by_key(|a| a.0);
         let areas: Vec<_> = areas.into_iter().map(|(_, area)| area).collect();
@@ -712,52 +707,8 @@ impl Grass {
         let active: usize = areas.iter().map(|a| a.active.len()).sum();
         eprintln!("Grass placement residency: {:.2} MiB compressed bitmaps; {} live cells; avoided {:.2} MiB of eager IDs/transforms", packed as f64 / 1048576., active,
             active as f64 * (4 + std::mem::size_of::<random::Placement>()) as f64 / 1048576.);
-        // `grasses.pck` is an Angelica container, not a retail v2 PCK: its
-        // entries sit behind the 0x4dca23ef prefix with no `fdfdfeee` guard
-        // words, so `pck::directory` rejects it outright. Both containers are
-        // tried, and a pack that fails both leaves the placements in place
-        // without geometry rather than failing the whole load.
-        let mut archive = match File::open(element.join("grasses.pck")) {
-            Ok(file) => file,
-            Err(error) => {
-                eprintln!(
-                    "grass geometry unavailable ({}): {error}",
-                    element.display()
-                );
-                return Ok(Self {
-                    areas,
-                    types: scene.grass_types.clone(),
-                    models: Vec::new(),
-                    textures: HashMap::new(),
-                    texture_mips: HashMap::new(),
-                });
-            }
-        };
-        let directory = match pck::directory(&mut archive) {
-            Ok(entries) => Ok(entries),
-            Err(v2) => match crate::angelica_pck::directory(&mut archive) {
-                Ok(entries) => Ok(entries),
-                Err(angelica) => Err(format!(
-                    "grasses.pck is neither container: v2: {v2}; Angelica: {angelica}"
-                )),
-            },
-        };
-        let entries: HashMap<_, _> = match directory {
-            Ok(entries) => entries
-                .into_iter()
-                .map(|e| (e.name.to_lowercase(), e))
-                .collect(),
-            Err(error) => {
-                eprintln!("grass geometry unavailable: {error}");
-                return Ok(Self {
-                    areas,
-                    types: scene.grass_types.clone(),
-                    models: Vec::new(),
-                    textures: HashMap::new(),
-                    texture_mips: HashMap::new(),
-                });
-            }
-        };
+        let mut archive = File::open(element.join("grasses.pck")).map_err(|e| e.to_string())?;
+        let (dir_entries, entry_index) = pck::normalized_index_arc(&mut archive)?;
         let mut models = Vec::with_capacity(scene.grass_types.len());
         let mut textures = HashMap::new();
         let mut texture_mips = HashMap::new();
@@ -773,7 +724,8 @@ impl Grass {
                     .grass_types
                     .chunks(chunk_size)
                     .map(|chunk| {
-                        let entries = &entries;
+                        let dir_entries = &dir_entries;
+                        let entry_index = &entry_index;
                         let archive = &archive;
                         s.spawn(move || {
                             chunk.iter().map(|t| {
@@ -785,8 +737,9 @@ impl Grass {
                                 let mut name = t.path.to_lowercase();
                                 let mut skip = false;
                                 if name.ends_with(".mod") {
-                                    match entries
+                                    match entry_index
                                         .get(&name)
+                                        .map(|&i| &dir_entries[i])
                                         .ok_or_else(|| "missing MOXTMODEL".to_string())
                                            .and_then(|e| {
                                                pck::read_entry_at(archive, e)
@@ -809,7 +762,7 @@ impl Grass {
                                 if skip {
                                     None
                                 } else {
-                                    match entries.get(&name) {
+                                    match entry_index.get(&name).map(|&i| &dir_entries[i]) {
                                         Some(e) => match pck::read_entry_at(archive, e)
                                             .map_err(|e| e.to_string())
                                             .and_then(|bytes| parse_model(&bytes, &name))
@@ -837,35 +790,79 @@ impl Grass {
                 models.extend(chunk);
             }
         }
+        let mut unique_tex: Vec<(String, Option<&pck::Entry>)> = Vec::new();
+        let mut seen_tex: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for m in models.iter().flatten() {
             for mesh in &m.meshes {
-                if !textures.contains_key(&mesh.texture) {
+                if !textures.contains_key(&mesh.texture) && seen_tex.insert(mesh.texture.as_str()) {
                     let alt = mesh.texture.replace("/textures/", "/");
-                    // One retail asset names its DDS with a space while the
-                    // matching archive member uses an underscore.
                     let spaced = mesh.texture.replace(' ', "_");
-                    let entry = entries
+                    let entry = entry_index
                         .get(&mesh.texture)
-                        .or_else(|| entries.get(&alt))
-                        .or_else(|| entries.get(&spaced));
-                    if let Some(entry) = entry {
-                        if let Ok(bytes) = pck::read_entry(&mut archive, entry) {
-                            if let Ok(img) = image::load_from_memory(&bytes) {
-                                textures.insert(mesh.texture.clone(), img.into_rgba8());
-                                match crate::vegetation_textures::authored_lower_mips(&bytes) {
-                                    Ok(mips) => {
-                                        texture_mips.insert(mesh.texture.clone(), mips);
-                                    }
-                                    Err(e) => eprintln!(
-                                        "Grass texture {} authored mips unavailable: {e}",
-                                        mesh.texture
-                                    ),
-                                }
-                                continue;
-                            }
+                        .or_else(|| entry_index.get(&alt))
+                        .or_else(|| entry_index.get(&spaced))
+                        .map(|&i| &dir_entries[i]);
+                    unique_tex.push((mesh.texture.clone(), entry));
+                }
+            }
+        }
+        if !unique_tex.is_empty() {
+            let tex_workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(32)
+                .min(unique_tex.len());
+            let decode_one = |(tex_name, entry): &(String, Option<&pck::Entry>),
+                              archive_ref: &File| {
+                if let Some(entry) = entry {
+                    if let Ok(bytes) = pck::read_entry_at(archive_ref, entry) {
+                        if let Ok(img) = image::load_from_memory(&bytes) {
+                            let mips = crate::vegetation_textures::authored_lower_mips(&bytes);
+                            return (tex_name.clone(), Some((img.into_rgba8(), mips)));
                         }
                     }
-                    warnings.insert(mesh.texture.clone());
+                }
+                (tex_name.clone(), None)
+            };
+            let decoded: Vec<_> = if tex_workers > 1 {
+                let chunk_size = unique_tex.len().div_ceil(tex_workers);
+                let archive_ref = &archive;
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = unique_tex
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            s.spawn(move || {
+                                chunk
+                                    .iter()
+                                    .map(|item| decode_one(item, archive_ref))
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .flat_map(|h| h.join().unwrap())
+                        .collect()
+                })
+            } else {
+                unique_tex
+                    .iter()
+                    .map(|item| decode_one(item, &archive))
+                    .collect()
+            };
+            for (tex_name, outcome) in decoded {
+                if let Some((img, mips)) = outcome {
+                    textures.insert(tex_name.clone(), img);
+                    match mips {
+                        Ok(mips) => {
+                            texture_mips.insert(tex_name, mips);
+                        }
+                        Err(e) => {
+                            eprintln!("Grass texture {tex_name} authored mips unavailable: {e}")
+                        }
+                    }
+                } else {
+                    warnings.insert(tex_name);
                 }
             }
         }

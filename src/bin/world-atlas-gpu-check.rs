@@ -47,6 +47,7 @@ const SIDE: usize = 4096;
 fn page(right: bool, shared: bool) -> Page {
     // Coincident triangles deliberately make submission order observable.
     let positions = [[-1., -1., 0.], [1., -1., 0.], [-1., 1., 0.]];
+    let vertex_count = positions.len() as u32;
     let vertices = positions
         .into_iter()
         .map(|pos| gpu::Vertex {
@@ -79,6 +80,8 @@ fn page(right: bool, shared: bool) -> Page {
         placements: vec![world_objects::PlacementRange {
             start: 0,
             end: 3,
+            vertex_start: 0,
+            vertex_end: vertex_count,
             export_id: 1,
             order: u64::from(right),
             visibility: scenery_visibility::Visibility {

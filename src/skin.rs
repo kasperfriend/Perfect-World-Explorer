@@ -104,7 +104,20 @@ impl<'a> Reader<'a> {
         if bad {
             return Err("invalid skin string".into());
         }
-        Ok(s.trim_end_matches('\0').replace('\\', "/"))
+        let trimmed = s.trim_end_matches('\0');
+        let mut out = String::with_capacity(trimmed.len());
+        out.push_str(trimmed);
+        if out.as_bytes().contains(&b'\\') {
+            // SAFETY: replacing ASCII '\\' with ASCII '/' preserves UTF-8 validity.
+            unsafe {
+                for b in out.as_bytes_mut() {
+                    if *b == b'\\' {
+                        *b = b'/';
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
     fn cstring(&mut self) -> Result<String, String> {
         let rest = &self.data[self.pos..];
@@ -165,17 +178,17 @@ impl Skin {
         if morph_skin + morph_rigid + supple + muscle != 0 {
             return Err("morph, supple and muscle skin meshes are not supported yet".into());
         }
-        let mut bones = Vec::new();
+        let mut bones = Vec::with_capacity(if version >= 9 { bone_count } else { 0 });
         if version >= 9 {
             for _ in 0..bone_count {
                 bones.push(r.string()?);
             }
         }
-        let mut textures = Vec::new();
+        let mut textures = Vec::with_capacity(tex_count);
         for _ in 0..tex_count {
             textures.push(r.string()?);
         }
-        let mut materials = Vec::new();
+        let mut materials = Vec::with_capacity(material_count);
         for _ in 0..material_count {
             if !binary {
                 return Err("text skin materials unsupported".into());
@@ -197,7 +210,7 @@ impl Skin {
                 two_sided,
             });
         }
-        let mut meshes = Vec::new();
+        let mut meshes = Vec::with_capacity(skin + rigid);
         for index in 0..skin + rigid {
             let is_rigid = index >= skin;
             let name = r.string()?;

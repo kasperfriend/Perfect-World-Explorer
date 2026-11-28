@@ -839,33 +839,22 @@ impl SkyGpu {
         // night swap is to the overcast set, darkened by the regional light
         // record exactly as the client's lighting record does.
         let selection = sky_selection_from_configs(element);
-        let mut frames = Vec::new();
         let mut day_set = 0usize;
         let mut night_set = 1usize;
-        let mut load_layer = |key: &str, fallback: &str| -> Result<image::RgbaImage, String> {
-            let key = if entries.contains_key(key) {
-                key.to_string()
+        // Collect all 9 sky layers + 2 disc layers + 4 glow layers up front and
+        // read/decode/resize them concurrently across CPU cores via `read_entry_at`.
+        let mut sky_requests: Vec<(String, pck::Entry)> = Vec::with_capacity(9);
+        let resolve_sky = |key: &str, fallback: &str| -> Result<(String, pck::Entry), String> {
+            let resolved = if entries.contains_key(key) {
+                key
             } else {
                 eprintln!("configured sky texture {key} absent; using {fallback}");
-                fallback.to_string()
+                fallback
             };
             let entry = entries
-                .get(&key)
-                .ok_or_else(|| format!("missing client sky texture {key}"))?;
-            let bytes = pck::read_entry(&mut file, entry)?;
-            let img = image::load_from_memory(&bytes)
-                .map_err(|e| format!("{key}: {e}"))?
-                .to_rgba8();
-            if img.width() != 512 || img.height() != 512 {
-                Ok(image::imageops::resize(
-                    &img,
-                    512,
-                    512,
-                    image::imageops::FilterType::Triangle,
-                ))
-            } else {
-                Ok(img)
-            }
+                .get(resolved)
+                .ok_or_else(|| format!("missing client sky texture {resolved}"))?;
+            Ok((key.to_owned(), entry.clone()))
         };
         if let Some(sel) = selection {
             day_set = sel.day.min(sel.sets.len().saturating_sub(1));
@@ -878,81 +867,109 @@ impl SkyGpu {
                 ];
                 for (path, fallback) in paths {
                     let key = sky_pack_key(path);
-                    frames.push(load_layer(&key, fallback)?);
+                    sky_requests.push(resolve_sky(&key, fallback)?);
                 }
             }
         } else {
-            // No readable sky.lst: keep the shipped default environment. All
-            // three set slots hold the configured `clear` art, so the transition
-            // is a visual no-op rather than a wrong texture.
             let configured = read_sky_images(element);
             for _ in 0..3 {
                 for (slot, name) in ATLAS_ORDER.iter().enumerate() {
                     let key = sky_pack_key(&configured[slot]);
                     let fallback = format!("textures/sky/clear/{name}");
-                    frames.push(load_layer(&key, &fallback)?);
+                    sky_requests.push(resolve_sky(&key, &fallback)?);
                 }
             }
         }
-        // The atlas must always hold nine sky layers even if a `sky.lst` row is
-        // short; pad with the clear set so `set * 3` stays valid.
-        while frames.len() < 9 {
-            let name = ATLAS_ORDER[frames.len() % 3];
+        while sky_requests.len() < 9 {
+            let name = ATLAS_ORDER[sky_requests.len() % 3];
             let fallback = format!("textures/sky/clear/{name}");
-            frames.push(load_layer(&fallback, &fallback)?);
+            sky_requests.push(resolve_sky(&fallback, &fallback)?);
         }
-        // Extra layers are the client sun and moon discs; absent optional assets
-        // stay transparent so the world still loads.
         let disc_textures = [
             ("textures/nature/sun.bmp", image::ImageFormat::Bmp),
             ("textures/nature/moon.tga", image::ImageFormat::Tga),
         ];
-        let mut disc_layers = [false; 2];
-        for (i, (name, format)) in disc_textures.into_iter().enumerate() {
-            let decoded = entries
-                .get(name)
-                .and_then(|entry| pck::read_entry(&mut file, entry).ok())
-                .and_then(|bytes| image::load_from_memory_with_format(&bytes, format).ok())
-                .map(|img| {
-                    image::imageops::resize(
-                        &img.to_rgba8(),
-                        512,
-                        512,
-                        image::imageops::FilterType::Triangle,
-                    )
-                });
-            disc_layers[i] = decoded.is_some();
-            frames.push(decoded.unwrap_or_else(|| image::RgbaImage::new(512, 512)));
-        }
-        // Layers 11..14 are the client's own glow/flare textures:
-        // 11 `sunshine.bmp` (the sun's 2:1 anamorphic streak),
-        // 12 `moonflare.bmp` (the moon's circular halo),
-        // 13 `sunflare.bmp` and 14 `flares.bmp` (the flare-chain sprites).
-        // `CECSunMoon::Init` loads all four and `ps/solarflare_14` sums six
-        // flare-alpha samples at weight 0.4; the shader below reproduces that
-        // six-sample sum with these textures. The quad sizes are viewer
-        // approximations; the textures and the 0.4 weight are the client's.
         let glow_textures = [
             ("textures/nature/sunshine.bmp", image::ImageFormat::Bmp),
             ("textures/nature/moonflare.bmp", image::ImageFormat::Bmp),
             ("textures/nature/sunflare.bmp", image::ImageFormat::Bmp),
             ("textures/nature/flares.bmp", image::ImageFormat::Bmp),
         ];
+        let optional_requests: Vec<(Option<pck::Entry>, image::ImageFormat)> = disc_textures
+            .into_iter()
+            .chain(glow_textures)
+            .map(|(name, fmt)| (entries.get(name).cloned(), fmt))
+            .collect();
+
+        let (sky_decoded, optional_decoded) = std::thread::scope(
+            |s| -> Result<(Vec<image::RgbaImage>, Vec<Option<image::RgbaImage>>), String> {
+                let file_ref = &file;
+                let sky_handles: Vec<_> = sky_requests
+                    .iter()
+                    .map(|(key, entry)| {
+                        s.spawn(move || -> Result<image::RgbaImage, String> {
+                            let bytes =
+                                pck::read_entry_at(file_ref, entry).map_err(|e| e.to_string())?;
+                            let img = image::load_from_memory(&bytes)
+                                .map_err(|e| format!("{key}: {e}"))?
+                                .to_rgba8();
+                            if img.width() != 512 || img.height() != 512 {
+                                Ok(image::imageops::resize(
+                                    &img,
+                                    512,
+                                    512,
+                                    image::imageops::FilterType::Triangle,
+                                ))
+                            } else {
+                                Ok(img)
+                            }
+                        })
+                    })
+                    .collect();
+                let opt_handles: Vec<_> = optional_requests
+                    .iter()
+                    .map(|(entry_opt, fmt)| {
+                        let fmt = *fmt;
+                        s.spawn(move || -> Option<image::RgbaImage> {
+                            let entry = entry_opt.as_ref()?;
+                            let bytes = pck::read_entry_at(file_ref, entry).ok()?;
+                            let img = image::load_from_memory_with_format(&bytes, fmt)
+                                .ok()?
+                                .to_rgba8();
+                            if img.width() != 512 || img.height() != 512 {
+                                Some(image::imageops::resize(
+                                    &img,
+                                    512,
+                                    512,
+                                    image::imageops::FilterType::Triangle,
+                                ))
+                            } else {
+                                Some(img)
+                            }
+                        })
+                    })
+                    .collect();
+                let mut sky_out = Vec::with_capacity(sky_handles.len());
+                for h in sky_handles {
+                    sky_out.push(h.join().unwrap()?);
+                }
+                let mut opt_out = Vec::with_capacity(opt_handles.len());
+                for h in opt_handles {
+                    opt_out.push(h.join().unwrap());
+                }
+                Ok((sky_out, opt_out))
+            },
+        )?;
+
+        let mut frames = sky_decoded;
+        let mut disc_layers = [false; 2];
         let mut glow_layers = [false; 4];
-        for (i, (name, format)) in glow_textures.into_iter().enumerate() {
-            let decoded = entries
-                .get(name)
-                .and_then(|entry| pck::read_entry(&mut file, entry).ok())
-                .and_then(|bytes| image::load_from_memory_with_format(&bytes, format).ok())
-                .map(|img| {
-                    image::imageops::resize(
-                        &img.to_rgba8(),
-                        512,
-                        512,
-                        image::imageops::FilterType::Triangle,
-                    )
-                });
-            glow_layers[i] = decoded.is_some();
+        for (idx, decoded) in optional_decoded.into_iter().enumerate() {
+            if idx < 2 {
+                disc_layers[idx] = decoded.is_some();
+            } else {
+                glow_layers[idx - 2] = decoded.is_some();
+            }
             frames.push(decoded.unwrap_or_else(|| image::RgbaImage::new(512, 512)));
         }
         let glow_center = glow_lookup_center(&frames[9], &frames[11]);
@@ -1240,21 +1257,19 @@ impl SkyGpu {
         sets: (i32, i32, f32),
         reflected: bool,
     ) {
+        let inv_h = 1.0 / h.max(1) as f32;
+        let aspect = w as f32 * inv_h;
+        let sun_half = sun_ndc_half(FOV_DEGREES);
         let view = Mat4::look_to_rh(Vec3::ZERO, direction, Vec3::Y);
         let projection = Mat4::from_scale(Vec3::new(-1., 1., 1.))
-            * Mat4::perspective_rh(
-                FOV_DEGREES.to_radians(),
-                w as f32 / h.max(1) as f32,
-                1.,
-                16000.,
-            );
+            * Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 1., 16000.);
         // Reflect every world-space camera ray about the water plane. Mirroring
         // only the forward vector loses the inverted vertical screen basis.
         let inv = sky_inverse(projection, view, reflected);
         let (flare_ndc, flare_weight) = flare_lanes(projection, view, frame.sun, reflected);
         // The chain hangs on the painted disc's centre, which is one half-extent
         // below the point the quad is emitted from (two halves at full night).
-        let flare_ndc = flare_anchor(flare_ndc, sun_ndc_half(FOV_DEGREES), frame.night_weight);
+        let flare_ndc = flare_anchor(flare_ndc, sun_half, frame.night_weight);
         let uniform = Uniform {
             inv: inv.to_cols_array_2d(),
             time: [
@@ -1271,7 +1286,7 @@ impl SkyGpu {
                 frame.background[0],
                 frame.background[1],
                 frame.background[2],
-                sun_ndc_half(FOV_DEGREES),
+                sun_half,
             ],
             tint: [
                 frame.tint[0],
@@ -1279,7 +1294,7 @@ impl SkyGpu {
                 frame.tint[2],
                 // The screen aspect the flare chain needs to keep its sprites
                 // round in NDC, where x and y span different angles.
-                w as f32 / h.max(1) as f32,
+                aspect,
             ],
             // `sets.w` carries the night strength into `celestial` (the sun's
             // `1 + 2 * n` swell and the recovered shine ramp).

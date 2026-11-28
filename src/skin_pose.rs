@@ -18,11 +18,13 @@ pub fn deform(
     joints: [u8; 4],
     palette: &[Mat4],
 ) -> Result<PosedVertex, &'static str> {
-    if !position
-        .iter()
-        .chain(normal.iter())
-        .chain(first_weights.iter())
-        .all(|v| v.is_finite())
+    let pos_v = Vec3::from_array(position);
+    let nrm_v = Vec3::from_array(normal);
+    if !pos_v.is_finite()
+        || !nrm_v.is_finite()
+        || !first_weights[0].is_finite()
+        || !first_weights[1].is_finite()
+        || !first_weights[2].is_finite()
     {
         return Err("nonfinite skin vertex");
     }
@@ -30,7 +32,7 @@ pub fn deform(
         first_weights[0],
         first_weights[1],
         first_weights[2],
-        1. - first_weights.iter().sum::<f32>(),
+        1. - (first_weights[0] + first_weights[1] + first_weights[2]),
     ];
     let mut p = Vec3::ZERO;
     let mut n = Vec3::ZERO;
@@ -41,11 +43,12 @@ pub fn deform(
         if !m.is_finite() {
             return Err("nonfinite skin matrix");
         }
-        if weights[i] == 0.0 {
+        let w = weights[i];
+        if w == 0.0 {
             continue;
         }
-        p += (*m * Vec4::from((Vec3::from_array(position), 1.))).truncate() * weights[i];
-        n += (*m * Vec4::from((Vec3::from_array(normal), 0.))).truncate() * weights[i];
+        p += m.transform_point3(pos_v) * w;
+        n += m.transform_vector3(nrm_v) * w;
     }
     if !p.is_finite() || !n.is_finite() {
         return Err("nonfinite deformed vertex");

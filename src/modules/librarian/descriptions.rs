@@ -26,7 +26,7 @@ pub fn numeric_pairs(bytes: &[u8]) -> HashMap<u32, u32> {
 
 pub fn keyed_strings(bytes: &[u8]) -> HashMap<u32, String> {
     let text = decode(bytes);
-    let mut result = HashMap::new();
+    let mut result = HashMap::with_capacity(text.len() / 32);
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('#') || line.starts_with('/') {
@@ -42,9 +42,12 @@ pub fn keyed_strings(bytes: &[u8]) -> HashMap<u32, String> {
             continue;
         };
         result.entry(id).or_insert_with(|| {
-            line[start + 1..start + 1 + end]
-                .replace("\\r", "\n")
-                .replace("\\n", "\n")
+            let slice = &line[start + 1..start + 1 + end];
+            if !slice.contains('\\') {
+                slice.to_owned()
+            } else {
+                slice.replace("\\r", "\n").replace("\\n", "\n")
+            }
         });
     }
     result
@@ -52,12 +55,15 @@ pub fn keyed_strings(bytes: &[u8]) -> HashMap<u32, String> {
 
 /// The game's colour escape is a caret followed by exactly six hex digits.
 pub fn plain_text(text: &str) -> String {
-    let mut result = String::new();
-    let mut chars = text.chars().peekable();
+    if !text.contains('^') {
+        return text.to_owned();
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars();
     while let Some(ch) = chars.next() {
         if ch == '^' {
-            let next: String = chars.clone().take(6).collect();
-            if next.len() == 6 && next.bytes().all(|c| c.is_ascii_hexdigit()) {
+            let rest = chars.as_str().as_bytes();
+            if rest.len() >= 6 && rest[..6].iter().all(|c| c.is_ascii_hexdigit()) {
                 for _ in 0..6 {
                     chars.next();
                 }

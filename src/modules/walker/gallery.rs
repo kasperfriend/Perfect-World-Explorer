@@ -162,10 +162,10 @@ impl Gallery {
         dt_ms: f32,
         map: Option<&MapSpace>,
     ) -> Result<Vec<gfx_player::EffectQuad>, String> {
-        let mut out = Vec::new();
         if !self.enabled {
-            return Ok(out);
+            return Ok(Vec::new());
         }
+        let mut out = Vec::with_capacity(self.spawns.len() * 4);
         for spawn in &mut self.spawns {
             // One ground query per spawn per frame, at the position the row put
             // it: the owner raycasts from its own placement (`0x6e53f0`), so a

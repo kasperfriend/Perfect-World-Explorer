@@ -100,7 +100,21 @@ impl LodConfig {
     /// Level for a block centred at `centre` in world XZ. Block availability
     /// (`block+0x74`) is the caller's business; see `window_lod`.
     pub fn level_at(&self, cam: [f32; 2], centre: [f32; 2]) -> u8 {
-        self.level(self.block_distance(cam, centre))
+        let dx = centre[0] - cam[0];
+        let dz = centre[1] - cam[1];
+        let dist_sq = dx * dx + dz * dz;
+        let offset = self.block_size * HALF_DIAGONAL;
+        let near_lim = self.near * self.block_scale + offset;
+        if near_lim > 0.0 && dist_sq < near_lim * near_lim {
+            3
+        } else {
+            let far_lim = self.far * self.block_scale + offset;
+            if far_lim > 0.0 && dist_sq < far_lim * far_lim {
+                2
+            } else {
+                1
+            }
+        }
     }
 }
 
@@ -190,7 +204,7 @@ pub fn edge_cases(own: u8, neighbours: [Option<u8>; 4]) -> [u8; 4] {
 pub struct BlockSurface {
     /// Grid coordinates (0..=CELLS) of each vertex.
     pub grid: Vec<[u32; 2]>,
-    pub indices: Vec<u32>,
+    pub indices: std::sync::Arc<[u32]>,
     /// Interior cells (as the native per-level index grid) and edge ring cells.
     pub interior_cells: usize,
     pub ring_cells: usize,
@@ -216,15 +230,45 @@ impl BlockSurface {
 /// `step ..= cells-step` at `step` resolution; the four edge rings join the
 /// block boundary, whose nodes sit at `edge_stride` spacing, to that interior.
 /// The two adjacent rings together fill each corner cell exactly once.
+/// Return the immutable, lazily-built surface for a terrain LOD/edge variant.
+///
+/// There are only 243 possible combinations (three levels and 3^4 edge
+/// stitch patterns). Terrain-window rebuilds revisit these combinations for
+/// thousands of blocks, so retain each triangulation instead of rebuilding its
+/// vertex/index topology on every camera crossing. The cache is process-wide,
+/// thread-safe, and initializes each variant only when first requested.
+pub fn block_surface_cached(level: u8, cases: [u8; 4]) -> &'static BlockSurface {
+    static SURFACES: std::sync::OnceLock<Vec<std::sync::OnceLock<BlockSurface>>> =
+        std::sync::OnceLock::new();
+    let level = level.clamp(1, MAX_LEVEL);
+    let cases = cases.map(|case| case.min(2));
+    let slot = (level as usize - 1) * 81
+        + cases[0] as usize * 27
+        + cases[1] as usize * 9
+        + cases[2] as usize * 3
+        + cases[3] as usize;
+    SURFACES.get_or_init(|| (0..243).map(|_| std::sync::OnceLock::new()).collect())[slot]
+        .get_or_init(|| build_block_surface(level, cases))
+}
+
+/// Owned compatibility wrapper for callers that need to modify or consume a
+/// surface. Hot terrain residency code should use block_surface_cached.
 pub fn block_surface(level: u8, cases: [u8; 4]) -> BlockSurface {
+    block_surface_cached(level, cases).clone()
+}
+
+fn build_block_surface(level: u8, cases: [u8; 4]) -> BlockSurface {
     let level = level.clamp(1, MAX_LEVEL);
     let s = step(level);
     let u = CELLS / s; // block edge in step units
     let mut b = SurfaceBuilder {
         s,
-        grid: Vec::new(),
-        index_of: Default::default(),
-        indices: Vec::new(),
+        grid: Vec::with_capacity((u + 1) * (u + 1)),
+        // The surface's integer grid is dense and bounded (at most 33x33).
+        // A direct index table avoids allocating and hashing a HashMap for
+        // every block/LOD combination generated during terrain rebuilds.
+        index_of: vec![u32::MAX; (u + 1) * (u + 1)],
+        indices: Vec::with_capacity(u * u * 6),
     };
     // Interior: `q x q` cells at `step`, spanning 1 ..= u-1 in step units.
     let q = interior_cells(level);
@@ -275,27 +319,27 @@ pub fn block_surface(level: u8, cases: [u8; 4]) -> BlockSurface {
             let oa = outer(a, &mut b);
             // Inner nodes shared with the neighbouring segment: both ends are
             // included, except the two corners of the ring (t = 0 and t = u,
-            // which belong to the perpendicular rings).
-            let chain: Vec<u32> = (a..=e)
-                .filter(|&t| t >= 1 && t <= u - 1)
-                .map(|t| inner(t, &mut b))
-                .collect();
+            // which belong to the perpendicular rings). Stream the tiny chain
+            // directly into the fan instead of allocating a Vec for every ring
+            // segment generated during LOD/edge rebuilds.
+            let mut previous = None;
+            for t in (a..=e).filter(|&t| t >= 1 && t <= u - 1) {
+                let current = inner(t, &mut b);
+                if let Some(last) = previous {
+                    b.tri(oa, last, current);
+                }
+                previous = Some(current);
+            }
             let oe = outer(e, &mut b);
-            // `chain` is never empty: the ring's two end corners are the only
-            // step units excluded and every segment keeps at least one.
-            debug_assert!(!chain.is_empty(), "ring segment {a}..{e} has no inner node");
-            for w in chain.windows(2) {
-                b.tri(oa, w[0], w[1]);
-            }
-            if let Some(&last) = chain.last() {
-                b.tri(oa, last, oe);
-            }
+            // At least one interior node remains in every segment.
+            let last = previous.expect("ring segment must contain an inner node");
+            b.tri(oa, last, oe);
             a = e;
         }
     }
     BlockSurface {
         grid: b.grid,
-        indices: b.indices,
+        indices: b.indices.into(),
         interior_cells: q * q,
         ring_cells: u * u - q * q,
     }
@@ -304,19 +348,22 @@ pub fn block_surface(level: u8, cases: [u8; 4]) -> BlockSurface {
 struct SurfaceBuilder {
     s: usize,
     grid: Vec<[u32; 2]>,
-    index_of: std::collections::HashMap<(usize, usize), u32>,
+    index_of: Vec<u32>,
     indices: Vec<u32>,
 }
 
 impl SurfaceBuilder {
     /// Vertex for the block-step coordinate `(i, j)`.
     fn v(&mut self, i: usize, j: usize) -> u32 {
-        if let Some(&index) = self.index_of.get(&(i, j)) {
-            return index;
+        let width = CELLS / self.s + 1;
+        let slot = j * width + i;
+        let existing = self.index_of[slot];
+        if existing != u32::MAX {
+            return existing;
         }
         let index = self.grid.len() as u32;
         self.grid.push([(i * self.s) as u32, (j * self.s) as u32]);
-        self.index_of.insert((i, j), index);
+        self.index_of[slot] = index;
         index
     }
     fn tri(&mut self, a: u32, b: u32, c: u32) {
@@ -676,6 +723,29 @@ mod tests {
         let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
         let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
         !(neg && pos)
+    }
+
+    #[test]
+    fn cached_surface_variants_are_stable_and_match_owned_surfaces() {
+        for level in 1..=MAX_LEVEL {
+            for encoded in 0..81 {
+                let cases = [
+                    encoded / 27 % 3,
+                    encoded / 9 % 3,
+                    encoded / 3 % 3,
+                    encoded % 3,
+                ];
+                let cached = block_surface_cached(level, cases);
+                assert!(std::ptr::eq(cached, block_surface_cached(level, cases)));
+                assert_eq!(cached.grid, block_surface(level, cases).grid);
+                assert_eq!(cached.indices, block_surface(level, cases).indices);
+            }
+        }
+        // Invalid edge values are clamped to the same canonical cache entry.
+        assert!(std::ptr::eq(
+            block_surface_cached(3, [9, 0, 0, 0]),
+            block_surface_cached(3, [2, 0, 0, 0]),
+        ));
     }
 
     #[test]

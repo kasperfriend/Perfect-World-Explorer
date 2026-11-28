@@ -105,9 +105,21 @@ impl Builder {
     }
     pub fn finish(self) -> Data {
         let mut data = Data::default();
+        let (vcap, icap, ncap) = self
+            .groups
+            .values()
+            .filter(|g| !g.instances.is_empty())
+            .fold((0usize, 0usize, 0usize), |(v, i, n), g| {
+                (
+                    v + g.vertices.len(),
+                    i + g.indices.len(),
+                    n + g.instances.len(),
+                )
+            });
         data.batches.reserve(self.groups.len());
-        data.instances
-            .reserve(self.groups.values().map(|g| g.instances.len()).sum());
+        data.vertices.reserve(vcap);
+        data.indices.reserve(icap);
+        data.instances.reserve(ncap);
         for (_, g) in self.groups {
             if g.instances.is_empty() {
                 continue;
@@ -224,11 +236,11 @@ impl Gpu {
         // placement's own height, so the instance carries that slot and the
         // mesh vertex keeps its weight.
         source = source.replacen(marker,"o.grass_area=area_center; o.grass_scale_y=i.grass_scale_y; o.grass_fade=1.; let original=pos; let sight=bitcast<f32>(i.diffuse); if camera.grass_eye.w>0.5 && sight>0. && sight<10000. {let delta=pos-camera.grass_eye.xyz; o.grass_fade=max(1.-dot(delta,delta)/(sight*sight),0.);} let weight=bitcast<f32>(i.night_diffuse); if camera.grass_wind.y>0.5 && weight>=0. && weight<100. {let slot=i32(round(extra.z))%80; let wrapped=select(slot,slot+80,slot<0); let history_index=u32(wrapped); pos+=camera.grass_history[history_index].xyz*weight;} if camera.lod.w>0.01 && weight>0.001 && weight<100. {let w_xz=pos.xz-vec2<f32>(camera.grass_wind.z,camera.grass_wind.w); let w_dy=pos.y-camera.lod.z; let is_fly=camera.lod.w>1.5; let rad=select(2.8,5.2,is_fly); let d2=dot(w_xz,w_xz); if d2<rad*rad && w_dy>-1.8 && w_dy<select(2.6,6.5,is_fly) {let d=sqrt(max(d2,1e-4)); let fall=1.-d/rad; let push=fall*fall*clamp(weight,0.,1.5)*select(1.15,0.65,is_fly); let dir_xz=w_xz/d; pos.x+=dir_xz.x*push; pos.z+=dir_xz.y*push; pos.y-=push*0.38;}} o.grass_refraction=1.; if camera.clip.y<0. {o.grass_refraction=grass_refraction_transmittance(original,pos,camera.grass_eye.xyz,camera.clip.x);} o.pos=camera.matrix*vec4<f32>(pos,1.);",1);
-        let marker = "tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9)";
+        let marker = "raw_tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9)";
         assert!(source.contains(marker));
         source = source.replacen(
             marker,
-            "tex.a*i.grass_fade<=select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9)",
+            "raw_tex.a*i.grass_fade<=select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9)",
             1,
         );
         let marker = "let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));";

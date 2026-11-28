@@ -122,12 +122,19 @@ pub fn client_transition(
     let a = (1.0 - (f64::from(phase) - f64::from(bias)) / f64::from(remaining)).min(1.0) as f32;
     let b = (f64::from(phase) / f64::from(remaining)).min(1.0) as f32;
     let span = (255.0_f64 - f64::from(alpha)) as f32;
-    let alpha_primary = (f64::from(alpha)
-        + f64::from(span) * (1.0 - f64::from(a)).powf(f64::from(exponent)))
-        as f32;
-    let alpha_secondary = (f64::from(alpha)
-        + f64::from(span) * (1.0 - f64::from(b)).powf(f64::from(exponent)))
-        as f32;
+    let exp_f64 = f64::from(exponent);
+    let curve = |x: f32| -> f64 {
+        let base = 1.0 - f64::from(x);
+        if base <= 0.0 && exp_f64 > 0.0 {
+            0.0
+        } else if exp_f64 == 1.0 {
+            base
+        } else {
+            base.powf(exp_f64)
+        }
+    };
+    let alpha_primary = (f64::from(alpha) + f64::from(span) * curve(a)) as f32;
+    let alpha_secondary = (f64::from(alpha) + f64::from(span) * curve(b)) as f32;
     Some(ClientTransition {
         primary: nearest - 1,
         secondary: Some(nearest),
