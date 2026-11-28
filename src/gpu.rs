@@ -3103,23 +3103,13 @@ impl Renderer {
             } else {
                 1.
             });
-        // Preserve PR #44's resident-window fog fit. Authored regional fog
-        // can extend far beyond the terrain currently loaded around the camera;
-        // without this cap, the horizon is fogged but nearby terrain stays clear.
-        // Keep the authored colour and clamp only the outdoor distance range.
+        // Outdoor fog is a camera-space horizon, never a function of map edges
+        // or the optional terrain-residency window. Keep regional colour and
+        // nearer authored ranges, but prevent long regional ranges from moving
+        // the fog boundary all the way to the edge of a fully rendered world.
         let mut active_fog = camera.active_fog();
-        if active_fog.enabled && camera.underwater_depth <= 0. {
-            if let Some(cap) = self.resident_bounds().and_then(|bounds| {
-                crate::terrain_cutoff::fog_cap(
-                    bounds,
-                    camera.pos.to_array(),
-                    w as f32 / h.max(1) as f32,
-                )
-            }) {
-                let range = crate::terrain_cutoff::fit_fog(active_fog.start, active_fog.end, cap);
-                active_fog.start = range[0];
-                active_fog.end = range[1];
-            }
+        if camera.underwater_depth <= 0. {
+            active_fog = crate::fog_matrix::camera_relative_outdoor_fog(active_fog);
         }
         let (mut fog_range, fog_color) = (active_fog.range(), active_fog.color4());
         // Uniform fog_range.w is the terrain day/night factor; the shader reads
@@ -4460,10 +4450,9 @@ impl Renderer {
             return;
         };
         // --- The frame parameters.
-        // Use the exact fog range/color already published to raster passes.
-        // That snapshot includes the user's enable gate and (when terrain
-        // cutoff is active) the resident-window fog cap. Re-sampling the raw
-        // camera fog here made RT and raster disagree at the world boundary.
+        // Use the exact camera-relative fog range/color already published to
+        // raster passes. This keeps RT and raster on the same horizon, without
+        // deriving fog distance from terrain residency or world bounds.
         let fog_range = crate::modules::raywatcher::frame::effective_fog_range(
             self.frame.active_fog_range[2] > 0.5,
             self.frame.active_fog_range[0],

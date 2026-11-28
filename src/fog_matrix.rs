@@ -79,6 +79,39 @@ pub fn camera_fog(camera_underwater: bool, atmospheric: bool, air: Fog, water: F
     }
 }
 
+/// The outdoor camera horizon is independent of map bounds and terrain
+/// residency. EC-BSD regions still own the fog colour and any nearer authored
+/// interval, but an authored end beyond this distance would leave the viewer's
+/// complete-world horizon clear until the map itself ended. PR #44's outdoor
+/// fallback is the stable camera-space interval used when a region has no fog.
+pub const CAMERA_OUTDOOR_FOG_START: f32 = 60.;
+pub const CAMERA_OUTDOOR_FOG_END: f32 = 400.;
+
+/// Keep outdoor fog in front of the camera even when the selected region's
+/// authored range extends beyond the viewer horizon. Preserve the region's
+/// colour and its start when that start is already inside the horizon.
+pub fn camera_relative_outdoor_fog(mut fog: Fog) -> Fog {
+    if !fog.enabled {
+        return fog;
+    }
+    if !fog.start.is_finite()
+        || !fog.end.is_finite()
+        || fog.start < 0.
+        || fog.end <= fog.start
+    {
+        fog.start = CAMERA_OUTDOOR_FOG_START;
+        fog.end = CAMERA_OUTDOOR_FOG_END;
+        return fog;
+    }
+
+    fog.end = fog.end.min(CAMERA_OUTDOOR_FOG_END);
+    if fog.start >= fog.end {
+        fog.start = CAMERA_OUTDOOR_FOG_START;
+        fog.end = CAMERA_OUTDOOR_FOG_END;
+    }
+    fog
+}
+
 /// Per-plane clipped refraction (`0x7cc6ac`): the water fog color with the
 /// recovered plane-relative range. `start`/`end` come from the traced
 /// `refraction_fog_range` (eye-to-plane height and 55% of the regional
@@ -551,6 +584,44 @@ mod tests {
         // Both former gaps are recovered: the water surface binds its own
         // fog triple and the waves add none of their own.
         assert!(gaps.is_empty(), "unexpected gaps: {gaps:?}");
+    }
+
+    #[test]
+    fn outdoor_fog_horizon_is_camera_relative_and_preserves_region_colour() {
+        let authored = Fog {
+            start: 2500.,
+            end: 12000.,
+            color: [0.12, 0.34, 0.56],
+            enabled: true,
+        };
+        let limited = camera_relative_outdoor_fog(authored);
+        assert_eq!(limited.start, CAMERA_OUTDOOR_FOG_START);
+        assert_eq!(limited.end, CAMERA_OUTDOOR_FOG_END);
+        assert_eq!(limited.color, authored.color);
+        assert!(limited.enabled);
+
+        let nearer = Fog {
+            start: 120.,
+            end: 800.,
+            ..authored
+        };
+        let limited_near = camera_relative_outdoor_fog(nearer);
+        assert_eq!(limited_near.start, 120.);
+        assert_eq!(limited_near.end, CAMERA_OUTDOOR_FOG_END);
+        assert_eq!(limited_near.color, authored.color);
+
+        let already_near = Fog {
+            start: 20.,
+            end: 200.,
+            ..authored
+        };
+        assert_eq!(camera_relative_outdoor_fog(already_near), already_near);
+
+        let disabled = Fog {
+            enabled: false,
+            ..authored
+        };
+        assert_eq!(camera_relative_outdoor_fog(disabled), disabled);
     }
 
     #[test]
