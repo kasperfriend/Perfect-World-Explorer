@@ -5105,9 +5105,6 @@ impl Renderer {
         let terrain_run_count = terrain_runs.len();
         let far_terrain_run_count = far_terrain_runs.len();
         let span_count = spans.len();
-        drop(terrain_runs);
-        drop(far_terrain_runs);
-        drop(spans);
         // One indirect record per run, so the terrain itself is one call per mesh
         // instead of one call per run.
         self.queue_main_runs();
