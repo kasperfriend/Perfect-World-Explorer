@@ -5414,6 +5414,27 @@ mod tests {
     }
 
     #[test]
+    fn place_at_camera_uses_the_requested_asset_and_camera_position() {
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element"),
+            None,
+            "a01".into(),
+        );
+        editor.place_asset_at_camera(
+            "models.pck::models/test.ecm".into(),
+            Vec3::new(12.0, 34.0, 56.0),
+        );
+        assert_eq!(editor.project.objects.len(), 1);
+        assert_eq!(editor.project.objects[0].position, [12.0, 34.0, 56.0]);
+        assert_eq!(
+            editor.project.objects[0].asset,
+            "models.pck::models/test.ecm"
+        );
+        assert_eq!(editor.selected_placement, Some(0));
+        assert_eq!(editor.cursor, CursorMode::Select);
+    }
+
+    #[test]
     fn source_gizmo_target_survives_missing_hierarchy_row_index() {
         let mut editor = Architect::new(
             PathBuf::from("/client/element"),
