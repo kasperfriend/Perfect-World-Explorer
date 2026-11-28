@@ -3329,15 +3329,24 @@ impl Architect {
                                 .logarithmic(true)
                                 .text("Uniform scale"),
                         );
-                        ui.horizontal(|ui| {
-                            ui.label("Scale XYZ");
-                            for axis in 0..3 {
-                                ui.add(egui::DragValue::new(&mut object.scale_axes[axis])
-                                    .speed(0.02)
-                                    .clamp_range(0.01..=100.0)
-                                    .prefix(["X ", "Y ", "Z "][axis]));
-                            }
+                        let axis_scale_supported = {
+                            let path = object.asset.to_ascii_lowercase();
+                            path.ends_with(".ecm") || path.ends_with(".smd") || path.ends_with(".bmd")
+                        };
+                        ui.add_enabled_ui(axis_scale_supported, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Scale XYZ");
+                                for axis in 0..3 {
+                                    ui.add(egui::DragValue::new(&mut object.scale_axes[axis])
+                                        .speed(0.02)
+                                        .clamp_range(0.01..=100.0)
+                                        .prefix(["X ", "Y ", "Z "][axis]));
+                                }
+                            });
                         });
+                        if !axis_scale_supported {
+                            ui.label(egui::RichText::new("This native handler currently supports uniform scale only.").small().weak());
+                        }
                         if ui.button("Duplicate custom placement").clicked() {
                             duplicate_placement = Some(object.clone());
                         }
@@ -3556,6 +3565,10 @@ impl Architect {
             ) {
                 if let Some(object) = self.project.objects.get(index) {
                     let origin = Vec3::from_array(object.position);
+                    let axis_scale_supported = {
+                        let path = object.asset.to_ascii_lowercase();
+                        path.ends_with(".ecm") || path.ends_with(".smd") || path.ends_with(".bmd")
+                    };
                     let project_point = |point: Vec3| {
                         let clip = view_projection.project_point3(point);
                         (clip.is_finite() && (0.0..=1.0).contains(&clip.z)).then(|| {
@@ -3588,7 +3601,7 @@ impl Architect {
                             })
                         };
                         match self.transform_mode {
-                            TransformMode::Move | TransformMode::Scale => {
+                            TransformMode::Move => {
                                 for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
                                     if axis_end(axis).is_some_and(|end| {
                                         let segment = end - center;
@@ -3600,6 +3613,19 @@ impl Architect {
                                     }
                                 }
                             }
+                            TransformMode::Scale if axis_scale_supported => {
+                                for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                                    if axis_end(axis).is_some_and(|end| {
+                                        let segment = end - center;
+                                        let t = ((pointer - center).dot(segment) / segment.length_sq().max(0.001)).clamp(0.0, 1.0);
+                                        (center + segment * t).distance(pointer) <= 12.0
+                                    }) {
+                                        axis_pick = Some(axis_index);
+                                        break;
+                                    }
+                                }
+                            }
+                            TransformMode::Scale => {}
                             TransformMode::Rotate => {
                                 for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
                                     let ring = Self::gizmo_ring_points(origin, axis, gizmo_radius, screen, view_projection);
@@ -4247,6 +4273,10 @@ impl Architect {
                 })
             };
             if let Some(center) = project_point(origin) {
+                let axis_scale_supported = {
+                    let path = object.asset.to_ascii_lowercase();
+                    path.ends_with(".ecm") || path.ends_with(".smd") || path.ends_with(".bmd")
+                };
                 let painter = ctx.layer_painter(egui::LayerId::new(
                     egui::Order::Foreground,
                     egui::Id::new("architect_transform_gizmo"),
@@ -4287,7 +4317,7 @@ impl Architect {
                             }
                         }
                     }
-                    TransformMode::Scale => {
+                    TransformMode::Scale if axis_scale_supported => {
                         for (axis, color) in axes {
                             if let Some(end) = axis_end(axis) {
                                 painter.line_segment([center, end], egui::Stroke::new(4., color));
@@ -4298,6 +4328,9 @@ impl Architect {
                                 );
                             }
                         }
+                    }
+                    TransformMode::Scale => {
+                        painter.circle_stroke(center, 20.0, egui::Stroke::new(3.0, egui::Color32::WHITE));
                     }
                 }
             }
