@@ -153,6 +153,7 @@ pub struct Architect {
     object_drag_start_position: [f32; 3],
     object_drag_start_hit: Option<[f32; 3]>,
     object_drag_start_axis_parameter: Option<f32>,
+    object_drag_start_rotation_vector: Option<[f32; 3]>,
     object_drag_group: Vec<(usize, [f32; 3])>,
     object_drag_snapshot: Option<Vec<PlacedObject>>,
     marquee_start: Option<egui::Pos2>,
@@ -257,6 +258,7 @@ impl Architect {
             object_drag_start_position: [0.; 3],
             object_drag_start_hit: None,
             object_drag_start_axis_parameter: None,
+            object_drag_start_rotation_vector: None,
             object_drag_group: Vec::new(),
             object_drag_snapshot: None,
             marquee_start: None,
@@ -820,6 +822,7 @@ impl Architect {
         self.object_drag_start_pointer = None;
         self.object_drag_start_hit = None;
         self.object_drag_start_axis_parameter = None;
+        self.object_drag_start_rotation_vector = None;
         self.object_drag_group.clear();
         self.object_drag_snapshot = None;
         self.marquee_start = None;
@@ -2348,6 +2351,69 @@ impl Architect {
         (ray_distance >= 0. && axis_distance.is_finite()).then_some(axis_distance)
     }
 
+    fn ray_plane_point(
+        pointer: egui::Pos2,
+        viewport: egui::Rect,
+        view_projection: glam::Mat4,
+        origin: Vec3,
+        normal: Vec3,
+    ) -> Option<Vec3> {
+        let uv = egui::vec2(
+            (pointer.x - viewport.left()) / viewport.width().max(1.) * 2. - 1.,
+            1. - (pointer.y - viewport.top()) / viewport.height().max(1.) * 2.,
+        );
+        let inverse = view_projection.inverse();
+        if !inverse.is_finite() { return None; }
+        let near = inverse.project_point3(Vec3::new(uv.x, uv.y, 1.));
+        let far = inverse.project_point3(Vec3::new(uv.x, uv.y, 0.));
+        let direction = (far - near).normalize_or_zero();
+        let normal = normal.normalize_or_zero();
+        let denominator = direction.dot(normal);
+        if !near.is_finite() || !direction.is_finite()
+            || direction.length_squared() < 0.5
+            || normal.length_squared() < 0.5
+            || denominator.abs() < 1e-5 { return None; }
+        let distance = (origin - near).dot(normal) / denominator;
+        (distance >= 0.).then_some(near + direction * distance)
+    }
+
+    fn gizmo_ring_points(
+        origin: Vec3,
+        normal: Vec3,
+        radius: f32,
+        viewport: egui::Rect,
+        view_projection: glam::Mat4,
+    ) -> Vec<egui::Pos2> {
+        let normal = normal.normalize_or_zero();
+        if normal.length_squared() < 0.5 || !radius.is_finite() || radius <= 0. {
+            return Vec::new();
+        }
+        let reference = if normal.dot(Vec3::Y).abs() < 0.92 { Vec3::Y } else { Vec3::X };
+        let tangent = normal.cross(reference).normalize_or_zero();
+        let bitangent = normal.cross(tangent).normalize_or_zero();
+        let mut points = Vec::with_capacity(65);
+        for step in 0..=64 {
+            let angle = step as f32 * std::f32::consts::TAU / 64.;
+            let world = origin + tangent * (angle.cos() * radius) + bitangent * (angle.sin() * radius);
+            let clip = view_projection.project_point3(world);
+            if clip.is_finite() {
+                points.push(egui::pos2(
+                    viewport.left() + (clip.x + 1.) * 0.5 * viewport.width(),
+                    viewport.top() + (1. - clip.y) * 0.5 * viewport.height(),
+                ));
+            }
+        }
+        points
+    }
+
+    fn distance_to_polyline(point: egui::Pos2, points: &[egui::Pos2]) -> f32 {
+        points.windows(2).map(|pair| {
+            let segment = pair[1] - pair[0];
+            let t = ((point - pair[0]).dot(segment) / segment.length_sq().max(0.001)).clamp(0., 1.);
+            (pair[0] + segment * t).distance(point)
+        }).fold(f32::INFINITY, f32::min)
+    }
+
     fn terrain_hit(
         pointer: egui::Pos2,
         viewport: egui::Rect,
@@ -3438,27 +3504,20 @@ impl Architect {
                         })
                     };
                     if let Some(center) = project_point(origin) {
+                        let gizmo_radius = (camera.distance(origin) * 0.045).clamp(0.5, 10.);
                         let axis_end = |axis: Vec3| {
-                            project_direction_point(origin + axis).map(|projected| {
+                            project_direction_point(origin + axis * gizmo_radius).map(|projected| {
                                 let direction = projected - center;
-                                let direction = if direction.length_sq() > 0.0001 {
-                                    direction.normalized()
-                                } else {
-                                    egui::Vec2::ZERO
-                                };
+                                let direction = if direction.length_sq() > 0.0001 { direction.normalized() } else { egui::Vec2::ZERO };
                                 center + direction * 76.0
                             })
                         };
                         match self.transform_mode {
                             TransformMode::Move | TransformMode::Scale => {
-                                for (axis_index, axis) in
-                                    [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate()
-                                {
+                                for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
                                     if axis_end(axis).is_some_and(|end| {
                                         let segment = end - center;
-                                        let t = ((pointer - center).dot(segment)
-                                            / segment.length_sq().max(0.001))
-                                        .clamp(0.0, 1.0);
+                                        let t = ((pointer - center).dot(segment) / segment.length_sq().max(0.001)).clamp(0.0, 1.0);
                                         (center + segment * t).distance(pointer) <= 12.0
                                     }) {
                                         axis_pick = Some(axis_index);
@@ -3467,13 +3526,12 @@ impl Architect {
                                 }
                             }
                             TransformMode::Rotate => {
-                                let distance = center.distance(pointer);
-                                if (distance - 54.0).abs() <= 10.0 {
-                                    axis_pick = Some(1);
-                                } else if (distance - 69.0).abs() <= 10.0 {
-                                    axis_pick = Some(0);
-                                } else if (distance - 39.0).abs() <= 10.0 {
-                                    axis_pick = Some(2);
+                                for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                                    let ring = Self::gizmo_ring_points(origin, axis, gizmo_radius, screen, view_projection);
+                                    if Self::distance_to_polyline(pointer, &ring) <= 9.0 {
+                                        axis_pick = Some(axis_index);
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -3685,6 +3743,14 @@ impl Architect {
             self.object_drag_axis = axis_pick;
             self.object_drag_group.clear();
             self.object_drag_start_hit = hit.map(|position| position.to_array());
+            self.object_drag_start_rotation_vector = if self.transform_mode == TransformMode::Rotate {
+                pointer.and_then(|pointer| {
+                    let axis = [Vec3::X, Vec3::Y, Vec3::Z][self.object_drag_axis.unwrap_or(1).min(2)];
+                    Self::ray_plane_point(pointer, screen, view_projection,
+                        Vec3::from_array(self.object_drag_start_position), axis)
+                        .map(|point| (point - Vec3::from_array(self.object_drag_start_position)).normalize_or_zero().to_array())
+                })
+            } else { None };
             self.object_drag_start_axis_parameter = pointer.and_then(|pointer| {
                 let axis = match self.object_drag_axis {
                     Some(0) => Some(Vec3::X),
@@ -3895,20 +3961,27 @@ impl Architect {
                     }
                 }
                 TransformMode::Rotate => {
-                    if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer)
-                    {
-                        let axis = self.object_drag_axis.unwrap_or(1);
+                    if let (Some(start_vector), Some(current)) = (
+                        self.object_drag_start_rotation_vector,
+                        pointer.and_then(|pointer| {
+                            let axis = [Vec3::X, Vec3::Y, Vec3::Z][self.object_drag_axis.unwrap_or(1).min(2)];
+                            Self::ray_plane_point(pointer, screen, view_projection,
+                                Vec3::from_array(self.object_drag_start_position), axis)
+                                .map(|point| (point - Vec3::from_array(self.object_drag_start_position)).normalize_or_zero().to_array())
+                        }),
+                    ) {
+                        let axis = self.object_drag_axis.unwrap_or(1).min(2);
                         let center = Vec3::from_array(self.object_drag_start_position);
                         let clip = view_projection.project_point3(center);
                         let center_screen = egui::pos2(
                             screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
                             screen.top() + (1. - clip.y) * 0.5 * screen.height(),
                         );
-                        let start_angle =
-                            (start.y - center_screen.y).atan2(start.x - center_screen.x);
-                        let current_angle =
-                            (current.y - center_screen.y).atan2(current.x - center_screen.x);
-                        let angle = Self::wrapped_angle_delta(start_angle, current_angle);
+                        let start_vector = Vec3::from_array(start_vector).normalize_or_zero();
+                        let current_vector = Vec3::from_array(current).normalize_or_zero();
+                        let axis_vector = [Vec3::X, Vec3::Y, Vec3::Z][axis];
+                        let angle = start_vector.cross(current_vector).dot(axis_vector)
+                            .atan2(start_vector.dot(current_vector));
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
                                 let original = self
@@ -3961,6 +4034,7 @@ impl Architect {
             self.object_drag_group.clear();
             self.object_drag_start_hit = None;
         self.object_drag_start_axis_parameter = None;
+        self.object_drag_start_rotation_vector = None;
             self.object_dragging = false;
             self.object_drag_axis = None;
             self.object_drag_start_pointer = None;
@@ -4104,10 +4178,13 @@ impl Architect {
                         }
                     }
                     TransformMode::Rotate => {
-                        for (radius, color) in
-                            [(69.0, axes[0].1), (54.0, axes[1].1), (39.0, axes[2].1)]
-                        {
-                            painter.circle_stroke(center, radius, egui::Stroke::new(3.0, color));
+                        let radius = (camera.distance(origin) * 0.045).clamp(0.5, 10.);
+                        for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                            let mut points = Self::gizmo_ring_points(origin, axis, radius, screen, view_projection);
+                            if points.len() >= 3 {
+                                points.push(points[0]);
+                                painter.add(egui::Shape::line(points, egui::Stroke::new(3.0, axes[axis_index].1)));
+                            }
                         }
                     }
                     TransformMode::Scale => {
@@ -4739,6 +4816,7 @@ mod tests {
             object_drag_start_position: [0.; 3],
             object_drag_start_hit: None,
             object_drag_start_axis_parameter: None,
+            object_drag_start_rotation_vector: None,
             object_drag_group: Vec::new(),
             object_drag_snapshot: None,
             marquee_start: None,
