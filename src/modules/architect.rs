@@ -4077,19 +4077,45 @@ impl Architect {
                     }
                 }
                 TransformMode::Scale => {
-                    if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer)
-                    {
-                        let factor = (-(current.y - start.y) * 0.01).exp().clamp(0.05, 20.0);
+                    if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer) {
+                        let axis = self.object_drag_axis;
+                        let factor = if let Some(axis_index) = axis {
+                            let axis_vector = [Vec3::X, Vec3::Y, Vec3::Z][axis_index.min(2)];
+                            let clip_origin = view_projection.project_point3(pivot);
+                            let clip_end = view_projection.project_point3(
+                                pivot + axis_vector * (camera.distance(pivot) * 0.045).clamp(0.5, 10.)
+                            );
+                            let to_screen = |clip: Vec3| egui::pos2(
+                                screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
+                                screen.top() + (1. - clip.y) * 0.5 * screen.height(),
+                            );
+                            let direction = (to_screen(clip_end) - to_screen(clip_origin)).normalized();
+                            (((current - start).dot(direction)) * 0.015).exp().clamp(0.05, 20.0)
+                        } else {
+                            (-(current.y - start.y) * 0.01).exp().clamp(0.05, 20.0)
+                        };
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
-                                if let Some(original) = self
-                                    .object_drag_snapshot
-                                    .as_ref()
-                                    .and_then(|items| items.get(index))
-                                {
-                                    object.scale = (original.scale * factor).clamp(0.01, 100.0);
+                                if let Some(original) = self.object_drag_snapshot.as_ref().and_then(|items| items.get(index)) {
                                     let relative = Vec3::from_array(original.position) - pivot;
-                                    object.position = (pivot + relative * factor).to_array();
+                                    if let Some(axis_index) = axis {
+                                        let axis_index = axis_index.min(2);
+                                        object.scale = original.scale;
+                                        object.scale_axes = original.scale_axes;
+                                        object.scale_axes[axis_index] =
+                                            (original.scale_axes[axis_index] * factor).clamp(0.01, 100.0);
+                                        if self.object_drag_group.len() > 1 {
+                                            let mut scaled = relative.to_array();
+                                            scaled[axis_index] *= factor;
+                                            object.position = (pivot + Vec3::from_array(scaled)).to_array();
+                                        } else {
+                                            object.position = original.position;
+                                        }
+                                    } else {
+                                        object.scale = (original.scale * factor).clamp(0.01, 100.0);
+                                        object.scale_axes = original.scale_axes;
+                                        object.position = (pivot + relative * factor).to_array();
+                                    }
                                 }
                             }
                         }
