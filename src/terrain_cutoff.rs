@@ -101,8 +101,10 @@ mod residency_tests {
             assert!(cap < 448. * diagonal_cos);
             let [start, end] = fit_fog(300., 500., cap);
             assert!(start < end && end <= cap);
-            assert!(start <= end * 0.75);
+            assert!(start <= end * 0.25);
         }
+        assert_eq!(fit_fog(10., 500., 100.), [10., 100.]);
+        assert_eq!(fit_fog(300., 500., 100.), [25., 100.]);
         assert_eq!(fog_cap([-1., 1., -1., 1.], [5., 0., 0.], 1.), None);
     }
 }
@@ -124,11 +126,12 @@ pub fn fog_cap(bounds: [f32; 4], eye: [f32; 3], aspect: f32) -> Option<f32> {
     Some((distance_to_edge / diagonal * 0.95).max(0.01))
 }
 
-/// Move the fog start inward with the fitted end. An authored start beyond the
-/// resident window would leave local terrain clear until its far edge.
+/// Fit the fog interval to residency without reducing it to a narrow edge band.
+/// An authored start beyond the resident window would leave local terrain clear
+/// until its far edge, so start the blend at one quarter of the fitted horizon.
 pub fn fit_fog(start: f32, end: f32, cap: f32) -> [f32; 2] {
     let end = end.min(cap).max(0.01);
-    [start.min(end * 0.75), end]
+    [start.min(end * 0.25), end]
 }
 
 /// Visit only cells intersecting residency, instead of scanning a whole ocean
