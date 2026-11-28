@@ -152,6 +152,7 @@ pub struct Architect {
     object_drag_start_pointer: Option<egui::Pos2>,
     object_drag_start_position: [f32; 3],
     object_drag_start_hit: Option<[f32; 3]>,
+    object_drag_start_axis_parameter: Option<f32>,
     object_drag_group: Vec<(usize, [f32; 3])>,
     object_drag_snapshot: Option<Vec<PlacedObject>>,
     marquee_start: Option<egui::Pos2>,
@@ -255,6 +256,7 @@ impl Architect {
             object_drag_start_pointer: None,
             object_drag_start_position: [0.; 3],
             object_drag_start_hit: None,
+            object_drag_start_axis_parameter: None,
             object_drag_group: Vec::new(),
             object_drag_snapshot: None,
             marquee_start: None,
@@ -817,6 +819,7 @@ impl Architect {
         self.object_drag_axis = None;
         self.object_drag_start_pointer = None;
         self.object_drag_start_hit = None;
+        self.object_drag_start_axis_parameter = None;
         self.object_drag_group.clear();
         self.object_drag_snapshot = None;
         self.marquee_start = None;
@@ -2290,6 +2293,45 @@ impl Architect {
         (distance >= 0. && distance.is_finite()).then(|| near + direction * distance)
     }
 
+    /// Closest point on a world-space axis to the pointer's camera ray.
+    /// Returns signed distance along the axis from its origin.
+    fn ray_axis_parameter(
+        pointer: egui::Pos2,
+        viewport: egui::Rect,
+        view_projection: glam::Mat4,
+        origin: Vec3,
+        axis: Vec3,
+    ) -> Option<f32> {
+        let uv = egui::vec2(
+            (pointer.x - viewport.left()) / viewport.width().max(1.) * 2. - 1.,
+            1. - (pointer.y - viewport.top()) / viewport.height().max(1.) * 2.,
+        );
+        let inverse = view_projection.inverse();
+        if !inverse.is_finite() {
+            return None;
+        }
+        let near = inverse.project_point3(Vec3::new(uv.x, uv.y, 1.));
+        let far = inverse.project_point3(Vec3::new(uv.x, uv.y, 0.));
+        let direction = (far - near).normalize_or_zero();
+        let axis = axis.normalize_or_zero();
+        if !near.is_finite()
+            || !direction.is_finite()
+            || direction.length_squared() < 0.5
+            || axis.length_squared() < 0.5
+        {
+            return None;
+        }
+        let offset = near - origin;
+        let dot = direction.dot(axis);
+        let denominator = 1. - dot * dot;
+        if denominator.abs() < 1e-4 {
+            return None;
+        }
+        let ray_distance = (dot * axis.dot(offset) - direction.dot(offset)) / denominator;
+        let axis_distance = (axis.dot(offset) - dot * direction.dot(offset)) / denominator;
+        (ray_distance >= 0. && axis_distance.is_finite()).then_some(axis_distance)
+    }
+
     fn terrain_hit(
         pointer: egui::Pos2,
         viewport: egui::Rect,
@@ -3624,6 +3666,19 @@ impl Architect {
             self.object_drag_axis = axis_pick;
             self.object_drag_group.clear();
             self.object_drag_start_hit = hit.map(|position| position.to_array());
+            self.object_drag_start_axis_parameter = pointer.and_then(|pointer| {
+                let axis = match self.object_drag_axis {
+                    Some(0) => Some(Vec3::X),
+                    Some(1) => Some(Vec3::Y),
+                    Some(2) => Some(Vec3::Z),
+                    _ => None,
+                }?;
+                let object = self.selected_placement
+                    .and_then(|index| self.project.objects.get(index))?;
+                Self::ray_axis_parameter(
+                    pointer, screen, view_projection, Vec3::from_array(object.position), axis,
+                )
+            });
             let selected_is_unlocked = self
                 .selected_placement
                 .and_then(|index| self.project.objects.get(index))
@@ -3770,18 +3825,14 @@ impl Architect {
                 TransformMode::Move => {
                     if !self.object_drag_group.is_empty() {
                         let delta = match self.object_drag_axis {
-                            Some(0) => self
-                                .object_drag_start_hit
-                                .zip(hit)
-                                .map(|(start, current)| Vec3::X * (current[0] - start[0])),
-                            Some(1) => self
-                                .object_drag_start_pointer
-                                .zip(pointer)
-                                .map(|(start, current)| Vec3::Y * (-(current.y - start.y) * 0.1)),
-                            Some(2) => self
-                                .object_drag_start_hit
-                                .zip(hit)
-                                .map(|(start, current)| Vec3::Z * (current[2] - start[2])),
+                            Some(axis_index @ 0..=2) => {
+                                let axis = [Vec3::X, Vec3::Y, Vec3::Z][axis_index];
+                                self.object_drag_start_axis_parameter
+                                    .zip(pointer.and_then(|pointer| Self::ray_axis_parameter(
+                                        pointer, screen, view_projection, pivot, axis,
+                                    )))
+                                    .map(|(start, current)| axis * (current - start))
+                            }
                             _ => self
                                 .object_drag_start_hit
                                 .zip(hit)
@@ -3798,22 +3849,17 @@ impl Architect {
                     } else if let Some(index) = self.selected_placement {
                         if let Some(object) = self.project.objects.get_mut(index) {
                             match self.object_drag_axis {
-                                Some(0) => {
-                                    if let Some(hit) = hit {
-                                        object.position[0] = hit.x + self.object_drag_xz_offset[0];
-                                    }
-                                }
-                                Some(1) => {
-                                    if let (Some(start), Some(current)) =
-                                        (self.object_drag_start_pointer, pointer)
-                                    {
-                                        object.position[1] = self.object_drag_start_position[1]
-                                            - (current.y - start.y) * 0.1;
-                                    }
-                                }
-                                Some(2) => {
-                                    if let Some(hit) = hit {
-                                        object.position[2] = hit.z + self.object_drag_xz_offset[1];
+                                Some(axis_index @ 0..=2) => {
+                                    let axis = [Vec3::X, Vec3::Y, Vec3::Z][axis_index];
+                                    if let (Some(start), Some(current)) = (
+                                        self.object_drag_start_axis_parameter,
+                                        pointer.and_then(|pointer| Self::ray_axis_parameter(
+                                            pointer, screen, view_projection,
+                                            Vec3::from_array(self.object_drag_start_position), axis,
+                                        )),
+                                    ) {
+                                        object.position = (Vec3::from_array(self.object_drag_start_position)
+                                            + axis * (current - start)).to_array();
                                     }
                                 }
                                 _ => {
@@ -3833,7 +3879,23 @@ impl Architect {
                     if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer)
                     {
                         let axis = self.object_drag_axis.unwrap_or(1);
-                        let angle = (current.x - start.x - (current.y - start.y) * 0.35) * 0.01;
+                        let center = Vec3::from_array(self.object_drag_start_position);
+                        let clip = view_projection.project_point3(center);
+                        let center_screen = egui::pos2(
+                            screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
+                            screen.top() + (1. - clip.y) * 0.5 * screen.height(),
+                        );
+                        let start_angle =
+                            (start.y - center_screen.y).atan2(start.x - center_screen.x);
+                        let current_angle =
+                            (current.y - center_screen.y).atan2(current.x - center_screen.x);
+                        let mut angle = current_angle - start_angle;
+                        if angle > std::f32::consts::PI {
+                            angle -= std::f32::consts::TAU;
+                        }
+                        if angle < -std::f32::consts::PI {
+                            angle += std::f32::consts::TAU;
+                        }
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
                                 let original = self
@@ -3885,6 +3947,7 @@ impl Architect {
             }
             self.object_drag_group.clear();
             self.object_drag_start_hit = None;
+        self.object_drag_start_axis_parameter = None;
             self.object_dragging = false;
             self.object_drag_axis = None;
             self.object_drag_start_pointer = None;
@@ -4662,6 +4725,7 @@ mod tests {
             object_drag_start_pointer: None,
             object_drag_start_position: [0.; 3],
             object_drag_start_hit: None,
+            object_drag_start_axis_parameter: None,
             object_drag_group: Vec::new(),
             object_drag_snapshot: None,
             marquee_start: None,
@@ -4735,6 +4799,28 @@ mod tests {
             editor.renderer_bmd_asset_path("/client/element/litmodels/a01/1/litmodel_42.bmd"),
             Some("litmodels/a01/1/litmodel_42.bmd".into())
         );
+    }
+
+    #[test]
+    fn ray_axis_parameter_is_finite_for_a_center_ray_and_horizontal_axis() {
+        let viewport = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(100.0, 100.0),
+        );
+        let projection = glam::Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0);
+        let view = glam::Mat4::look_at_rh(
+            Vec3::new(0.0, 0.0, 10.0),
+            Vec3::ZERO,
+            Vec3::Y,
+        );
+        let value = Architect::ray_axis_parameter(
+            egui::pos2(50.0, 50.0),
+            viewport,
+            projection * view,
+            Vec3::ZERO,
+            Vec3::X,
+        );
+        assert!(value.is_some_and(|distance| distance.abs() < 0.01));
     }
 
     #[test]
