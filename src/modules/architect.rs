@@ -3816,14 +3816,6 @@ impl Architect {
             self.object_drag_axis = axis_pick;
             self.object_drag_group.clear();
             self.object_drag_start_hit = hit.map(|position| position.to_array());
-            self.object_drag_start_rotation_vector = if self.transform_mode == TransformMode::Rotate {
-                pointer.and_then(|pointer| {
-                    let axis = [Vec3::X, Vec3::Y, Vec3::Z][self.object_drag_axis.unwrap_or(1).min(2)];
-                    Self::ray_plane_point(pointer, screen, view_projection,
-                        Vec3::from_array(self.object_drag_start_position), axis)
-                        .map(|point| (point - Vec3::from_array(self.object_drag_start_position)).normalize_or_zero().to_array())
-                })
-            } else { None };
             self.object_drag_start_axis_parameter = pointer.and_then(|pointer| {
                 let axis = match self.object_drag_axis {
                     Some(0) => Some(Vec3::X),
@@ -3872,6 +3864,16 @@ impl Architect {
                     self.object_drag_xz_offset = [position[0] - hit.x, position[2] - hit.z];
                 }
             }
+            self.object_drag_start_rotation_vector = if self.transform_mode == TransformMode::Rotate {
+                pointer.and_then(|pointer| {
+                    let axis = [Vec3::X, Vec3::Y, Vec3::Z][self.object_drag_axis.unwrap_or(1).min(2)];
+                    let origin = Vec3::from_array(self.object_drag_start_position);
+                    Self::ray_plane_point(pointer, screen, view_projection, origin, axis)
+                        .map(|point| (point - origin).normalize_or_zero().to_array())
+                })
+            } else {
+                None
+            };
         }
         if self.marquee_start.is_some()
             && down
