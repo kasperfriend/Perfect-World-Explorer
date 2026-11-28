@@ -1388,6 +1388,22 @@ impl Architect {
         Some(path)
     }
 
+    fn fallback_selection_bounds(asset: &str) -> ([f32; 3], [f32; 3]) {
+        let path = asset.to_ascii_lowercase();
+        let (half_x, half_y, half_z) = if path.contains("tree") {
+            (2.0, 10.0, 2.0)
+        } else if path.contains("litmodels/") || path.contains("building")
+            || path.contains("house") || path.contains("gate") || path.contains("wall")
+        {
+            (6.0, 8.0, 6.0)
+        } else if path.ends_with(".gfx") || path.contains("effect") {
+            (1.5, 1.5, 1.5)
+        } else {
+            (2.0, 3.0, 2.0)
+        };
+        ([-half_x, 0.0, -half_z], [half_x, half_y * 2.0, half_z])
+    }
+
     fn renderer_bounds_key(&self, asset: &str) -> Option<String> {
         self.renderer_model_asset_path(asset)
             .or_else(|| self.renderer_bmd_asset_path(asset))
@@ -2013,6 +2029,7 @@ impl Architect {
     /// depth is reverse-Z (larger values are nearer), matching the viewer's
     /// projection and the GPU depth test.
     fn pick_source_scene(
+        &self,
         pointer: egui::Pos2,
         screen: egui::Rect,
         view_projection: glam::Mat4,
@@ -2028,7 +2045,36 @@ impl Architect {
                     screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
                     screen.top() + (1. - clip.y) * 0.5 * screen.height(),
                 );
-                let score = point.distance(pointer) / Self::source_pick_radius(asset);
+                let bounds_score = self
+                    .renderer_bounds_key(asset)
+                    .and_then(|key| self.preview_bounds.get(&key).copied())
+                    .and_then(|(min, max)| {
+                        let mut rect = egui::Rect::NOTHING;
+                        let mut projected_count = 0usize;
+                        for bits in 0..8 {
+                            let local = Vec3::new(
+                                if bits & 1 == 0 { min[0] } else { max[0] },
+                                if bits & 2 == 0 { min[1] } else { max[1] },
+                                if bits & 4 == 0 { min[2] } else { max[2] },
+                            );
+                            let clip = view_projection.project_point3(Vec3::from_array(position) + local);
+                            if clip.is_finite() && (0.0..=1.0).contains(&clip.z) {
+                                rect.extend_with(egui::pos2(
+                                    screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
+                                    screen.top() + (1. - clip.y) * 0.5 * screen.height(),
+                                ));
+                                projected_count += 1;
+                            }
+                        }
+                        (projected_count > 0).then_some(rect.expand(10.0))
+                    });
+                let score = if let Some(rect) = bounds_score {
+                    let dx = (rect.left() - pointer.x).max(0.0).max(pointer.x - rect.right());
+                    let dy = (rect.top() - pointer.y).max(0.0).max(pointer.y - rect.bottom());
+                    dx.hypot(dy) / 14.0
+                } else {
+                    point.distance(pointer) / Self::source_pick_radius(asset)
+                };
                 if score <= 1.0
                     && nearest_scene
                         .as_ref()
@@ -3622,7 +3668,7 @@ impl Architect {
                         && axis_pick.is_none()
                     {
                         pointer.and_then(|pointer| {
-                            Self::pick_source_scene(
+                            self.pick_source_scene(
                                 pointer,
                                 screen,
                                 view_projection,
@@ -4246,12 +4292,10 @@ impl Architect {
             // Use the exact mesh bounds for this asset. If the mesh has not
             // been loaded yet, omit the outline rather than draw a misleading
             // guessed-size box that can be wildly wrong for PW models.
-            let Some((min, max)) = self
+            let (min, max) = self
                 .renderer_bounds_key(&asset)
                 .and_then(|path| self.preview_bounds.get(&path).copied())
-            else {
-                continue;
-            };
+                .unwrap_or_else(|| Self::fallback_selection_bounds(&asset));
             let (local_min, local_max) = (Vec3::from_array(min), Vec3::from_array(max));
             let center = Vec3::from_array(position);
             let rotation =
