@@ -3041,7 +3041,6 @@ impl Renderer {
             self.sky
                 .update(&self.queue, direction, w, h, frame, reflected_sets, true);
         }
-        let resident_bounds = self.resident_bounds();
         // Use the actual uploaded window. The native window shifts at map
         // edges; recomputing a clamped camera square discarded the wrong area.
         let win = self.lod.window;
@@ -5389,7 +5388,7 @@ impl Renderer {
                     frame.elapsed,
                     camera.far,
                     camera.underwater_depth,
-                    camera.active_fog(),
+                    camera.active_environment_fog(),
                     false, // no screen-space fog; scene geometry uses material fog
                     false,
                     camera.bloom,
@@ -5472,7 +5471,7 @@ impl Renderer {
                     frame.elapsed,
                     camera.far,
                     camera.underwater_depth,
-                    camera.active_fog(),
+                    camera.active_environment_fog(),
                     false, // no screen-space fog; scene geometry uses material fog
                     false,
                     camera.bloom,
@@ -5902,7 +5901,7 @@ impl Renderer {
                 frame.elapsed,
                 camera.far,
                 camera.underwater_depth,
-                camera.active_fog(),
+                camera.active_environment_fog(),
                 false, // no screen-space fog; scene geometry uses material fog
                 false,
                 camera.bloom,
@@ -6094,6 +6093,22 @@ impl Camera {
             )
         }
     }
+    /// Preserve the legacy post-processing API's environment fog type while
+    /// sharing the exact same camera-relative distance and colour as raster.
+    /// Density remains the authored environment value for the post shader.
+    fn active_environment_fog(&self) -> crate::environment::Fog {
+        let active = self.active_fog();
+        let mut fog = if self.underwater_depth > 0. {
+            self.underwater_fog
+        } else {
+            self.air_fog
+        };
+        fog.start = active.start;
+        fog.end = active.end;
+        fog.color = active.color;
+        fog
+    }
+
     fn fog_uniform(&self) -> ([f32; 4], [f32; 4]) {
         let f = self.active_fog();
         (f.range(), f.color4())
