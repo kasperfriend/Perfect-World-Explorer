@@ -62,6 +62,8 @@ struct PlacedObject {
     position: [f32; 3],
     rotation: [f32; 3],
     scale: f32,
+    /// Per-local-axis multiplier layered over the uniform scale.
+    scale_axes: [f32; 3],
 }
 
 #[derive(Clone, Debug)]
@@ -394,6 +396,7 @@ impl Architect {
                     .all(|v| v.is_finite())
                 || !object.scale.is_finite()
                 || object.scale <= 0.
+                || !object.scale_axes.iter().all(|value| value.is_finite() && *value > 0. && *value <= 1000.)
             {
                 return Err("Project contains an invalid object asset or transform".into());
             }
@@ -407,7 +410,7 @@ impl Architect {
                 return Err("Project contains an invalid terrain operation".into());
             }
         }
-        let mut out = String::from("PWE_ARCHITECT\t2\n");
+        let mut out = String::from("PWE_ARCHITECT\t3\n");
         out.push_str(&format!("name\t{}\n", Self::encode(&self.project.name)));
         out.push_str(&format!(
             "source_map\t{}\n",
@@ -415,7 +418,7 @@ impl Architect {
         ));
         for object in &self.project.objects {
             out.push_str(&format!(
-                "object\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
+                "object\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
                 Self::encode(&object.asset),
                 Self::encode(&object.name),
                 Self::encode(&object.group),
@@ -427,7 +430,10 @@ impl Architect {
                 object.rotation[0],
                 object.rotation[1],
                 object.rotation[2],
-                object.scale
+                object.scale,
+                object.scale_axes[0],
+                object.scale_axes[1],
+                object.scale_axes[2]
             ));
         }
         for stroke in &self.project.strokes {
@@ -500,6 +506,7 @@ impl Architect {
         let version = match lines.next() {
             Some("PWE_ARCHITECT\t1") => 1,
             Some("PWE_ARCHITECT\t2") => 2,
+            Some("PWE_ARCHITECT\t3") => 3,
             _ => return Err("unsupported Architect project version".into()),
         };
         let mut project = Project::default();
@@ -510,7 +517,8 @@ impl Architect {
                 "source_map" if fields.len() == 2 => project.source_map = Self::decode(fields[1])?,
                 "object"
                     if (version == 1 && fields.len() == 9)
-                        || (version == 2 && fields.len() == 13) =>
+                        || (version == 2 && fields.len() == 13)
+                        || (version == 3 && fields.len() == 16) =>
                 {
                     if project.objects.len() >= 100_000 {
                         return Err("Architect project has too many object placements".into());
@@ -540,7 +548,7 @@ impl Architect {
                     if name.trim().is_empty() || name.len() > 1024 || group.len() > 1024 {
                         return Err("invalid object name or hierarchy group".into());
                     }
-                    let mut n = [0f32; 7];
+                    let mut n = [0f32; 10];
                     for (slot, value) in n.iter_mut().zip(numbers) {
                         *slot = value.parse().map_err(|_| {
                             format!("invalid object number on line {}", line_no + 2)
@@ -558,6 +566,9 @@ impl Architect {
                         position: [n[0], n[1], n[2]],
                         rotation: [n[3], n[4], n[5]],
                         scale: n[6].clamp(0.01, 1000.),
+                        scale_axes: if version >= 3 {
+                            [n[7].clamp(0.01, 1000.), n[8].clamp(0.01, 1000.), n[9].clamp(0.01, 1000.)]
+                        } else { [1.; 3] },
                     });
                 }
                 "stroke" if fields.len() == 7 => {
@@ -1775,6 +1786,7 @@ impl Architect {
             position,
             rotation: [0.; 3],
             scale: 1.,
+            scale_axes: [1.; 3],
         });
         self.object_history_action = true;
         self.push_object_undo(before);
@@ -1843,6 +1855,7 @@ impl Architect {
                 position,
                 rotation: [0.; 3],
                 scale: 1.,
+                scale_axes: [1.; 3],
             });
             created.push(index);
         }
@@ -1915,6 +1928,7 @@ impl Architect {
                     position,
                     rotation: [0.; 3],
                     scale: 1.,
+                    scale_axes: [1.; 3],
                 });
             }
         }
@@ -4536,6 +4550,7 @@ mod tests {
             position: [1., 2., 3.],
             rotation: [0.; 3],
             scale: 1.,
+            scale_axes: [1.; 3],
         };
         editor.project.objects.push(original.clone());
         let before = editor.project.objects.clone();
@@ -4584,6 +4599,7 @@ mod tests {
             position: [10.0, 20.0, 30.0],
             rotation: [0.1, 0.2, 0.3],
             scale: 1.75,
+            scale_axes: [1.; 3],
         });
         editor.selected_placement = Some(0);
 
@@ -4686,6 +4702,7 @@ mod tests {
             position: [0.; 3],
             rotation: [0.; 3],
             scale: 1.,
+            scale_axes: [1.; 3],
         });
         assert!(editor.renderer_placements().is_empty());
         editor.project.source_map = "a01".into();
@@ -4785,6 +4802,7 @@ mod tests {
                 position: [1., 2., 3.],
                 rotation: [0.1, 0.2, 0.3],
                 scale: 1.25,
+                scale_axes: [1.; 3],
             }],
             strokes: vec![TerrainStroke {
                 mode: BrushMode::Smooth,
@@ -5044,6 +5062,7 @@ mod tests {
             position: [10.0, 20.0, 30.0],
             rotation: [0.0, 1.25, 0.0],
             scale: 1.75,
+            scale_axes: [1.; 3],
         });
 
         let placements = editor.renderer_tree_placements();
@@ -5089,6 +5108,7 @@ mod tests {
             position: [10.0, 20.0, 30.0],
             rotation: [0.0, std::f32::consts::FRAC_PI_2, 0.0],
             scale: 2.0,
+            scale_axes: [1.; 3],
         });
 
         let placements = editor.renderer_scenery_placements();
