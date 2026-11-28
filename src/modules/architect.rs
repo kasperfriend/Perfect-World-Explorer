@@ -4330,13 +4330,18 @@ impl Architect {
             })
             .collect::<Vec<_>>();
         if outline_items.is_empty() {
-            if let (Some(asset), Some(position)) = (
-                self.selected_asset
-                    .as_ref()
-                    .filter(|_| self.selected_scene_object.is_some()),
-                self.selected_scene_transform,
-            ) {
-                outline_items.push((asset.clone(), position, 1.0, [1.; 3], [0.; 3]));
+            for (asset, position) in self.multi_scene_items.values() {
+                outline_items.push((asset.clone(), *position, 1.0, [1.; 3], [0.; 3]));
+            }
+            if outline_items.is_empty() {
+                if let (Some(asset), Some(position)) = (
+                    self.selected_asset
+                        .as_ref()
+                        .filter(|_| self.selected_scene_object.is_some()),
+                    self.selected_scene_transform,
+                ) {
+                    outline_items.push((asset.clone(), position, 1.0, [1.; 3], [0.; 3]));
+                }
             }
         }
         let outline_painter = ctx.layer_painter(egui::LayerId::new(
