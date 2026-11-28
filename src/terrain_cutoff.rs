@@ -79,6 +79,45 @@ mod residency_tests {
         assert!(contains(None, [10000., 1., 0.]));
     }
 }
+    #[test]
+    fn fog_cap_covers_wide_screen_corners_and_fit_moves_start_inside_window() {
+        for aspect in [1., 16. / 9., 32. / 9.] {
+            let cap = fog_cap([-448., 512., -448., 512.], [0., 300., 0.], aspect).unwrap();
+            let diagonal_cos =
+                1. / (1. + 35f32.to_radians().tan().powi(2) * (1. + aspect * aspect)).sqrt();
+            assert!(cap < 448. * diagonal_cos);
+            let [start, end] = fit_fog(300., 500., cap);
+            assert!(start < end && end <= cap);
+            assert!(start <= end * 0.75);
+        }
+        assert_eq!(fog_cap([-1., 1., -1., 1.], [5., 0., 0.], 1.), None);
+    }
+}
+
+
+/// Conservative view-space fog limit for the resident XZ rectangle. Account
+/// for the screen-corner ray, not just the centre ray, so the entire visible
+/// boundary is covered by the fitted fog interval. This is a viewer adaptation,
+/// not a recovered native-client fog equation.
+pub fn fog_cap(bounds: [f32; 4], eye: [f32; 3], aspect: f32) -> Option<f32> {
+    if !contains(Some(bounds), eye) {
+        return None;
+    }
+    let distance_to_edge = (eye[0] - bounds[0])
+        .min(bounds[1] - eye[0])
+        .min(eye[2] - bounds[2])
+        .min(bounds[3] - eye[2]);
+    let half_fov_tangent = 35f32.to_radians().tan();
+    let diagonal = (1. + half_fov_tangent.powi(2) * (1. + aspect.max(0.01).powi(2))).sqrt();
+    Some((distance_to_edge / diagonal * 0.95).max(0.01))
+}
+
+/// Move the fog start inward with the fitted end. An authored start beyond the
+/// resident window would leave local terrain clear until its far edge.
+pub fn fit_fog(start: f32, end: f32, cap: f32) -> [f32; 2] {
+    let end = end.min(cap).max(0.01);
+    [start.min(end * 0.75), end]
+}
 
 /// Visit only cells intersecting residency, instead of scanning a whole ocean
 /// on every near-mesh rebuild. Origin is the area's left/top corner in XZ.
