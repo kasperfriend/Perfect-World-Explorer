@@ -5891,6 +5891,7 @@ mod tests {
             archive_details: Vec::new(),
             archive_choices: Vec::new(),
             archive_view_filter: 0,
+            asset_browser_open: true,
             project_name: project.name.clone(),
             selected_project: None,
             selected_map: project.source_map.clone(),
