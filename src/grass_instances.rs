@@ -241,18 +241,18 @@ impl Gpu {
         // Retail 0x652e84: without a complete day/night pair, stage 0
         // SELECTARG1 keeps the texture RGB and stage 1 is disabled. It is not
         // an invitation to add a provisional directional-light multiplier.
-        let fallback="let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.pos.w),1.);";
+        let fallback="let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.world),1.);";
         assert!(source.contains(fallback));
-        source = source.replacen(fallback, "return vec4<f32>(fogged(tex.rgb,i.pos.w),1.);", 1);
+        source = source.replacen(fallback, "return vec4<f32>(fogged(tex.rgb,i.world),1.);", 1);
         if light_layout.is_some() {
             // Patch the scene fragment's final return so the lightmapped branch
             // samples the authored day/night pair; without this the grass keeps
             // the unlit texture and GRASS_LIGHT_WGSL is dead code.
-            let marker = "return vec4<f32>(fogged(tex.rgb,i.pos.w),1.);";
+            let marker = "return vec4<f32>(fogged(tex.rgb,i.world),1.);";
             assert!(source.contains(marker));
             source = source.replacen(
                 marker,
-                "if camera.sun.w>=0. {return vec4<f32>(grass_pass_fog(grass_lighting(i.world,i.grass_area,raw_tex.rgb),i.pos.w,i.grass_refraction),1.);} let g_light=select(vec3<f32>(1.),(camera.light.x+camera.light.y*0.5)*camera.light.zww,camera.light.x+camera.light.y>0.001); return vec4<f32>(grass_pass_fog(tex.rgb*g_light,i.pos.w,i.grass_refraction),1.);",
+                "if camera.sun.w>=0. {return vec4<f32>(grass_pass_fog(grass_lighting(i.world,i.grass_area,raw_tex.rgb),i.world,i.grass_refraction),1.);} let g_light=select(vec3<f32>(1.),(camera.light.x+camera.light.y*0.5)*camera.light.zww,camera.light.x+camera.light.y>0.001); return vec4<f32>(grass_pass_fog(tex.rgb*g_light,i.world,i.grass_refraction),1.);",
                 1,
             );
             source.push_str(GRASS_LIGHT_WGSL);
@@ -260,8 +260,8 @@ impl Gpu {
         // Ordinary grass retains table fog. Only the water-plane-clipped
         // refraction pass interpolates the recovered exponential vertex fog.
         source = source.replace(
-            "fogged(tex.rgb,i.pos.w)",
-            "grass_pass_fog(tex.rgb,i.pos.w,i.grass_refraction)",
+            "fogged(tex.rgb,i.world)",
+            "grass_pass_fog(tex.rgb,i.world,i.grass_refraction)",
         );
         source.push_str(refraction_fog::WGSL);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -579,7 +579,7 @@ mod tests {
         // `grass_lighting`; assert the source keeps that injection.
         let source = include_str!("grass_instances.rs");
         assert!(source.contains(
-            "if camera.sun.w>=0. {return vec4<f32>(grass_pass_fog(grass_lighting(i.world,i.grass_area,raw_tex.rgb),i.pos.w,i.grass_refraction),1.);}"
+            "if camera.sun.w>=0. {return vec4<f32>(grass_pass_fog(grass_lighting(i.world,i.grass_area,raw_tex.rgb),i.world,i.grass_refraction),1.);}"
         ));
     }
 
