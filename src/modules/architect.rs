@@ -1100,7 +1100,7 @@ impl Architect {
                     let mut max = Vec3::splat(f32::NEG_INFINITY);
                     for vertex in model.meshes.iter().flat_map(|mesh| &mesh.vertices) {
                         let (position, _) =
-                            crate::gpu::editor_bmd_vertex_transform(&model, &identity, vertex, 1.0);
+                            crate::gpu::editor_bmd_vertex_transform(&model, &identity, vertex, [1.0; 3]);
                         if position.is_finite() {
                             min = min.min(position);
                             max = max.max(position);
