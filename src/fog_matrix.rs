@@ -79,31 +79,6 @@ pub fn camera_fog(camera_underwater: bool, atmospheric: bool, air: Fog, water: F
     }
 }
 
-/// Fit enabled outdoor fog to the actual terrain window rendered this frame.
-///
-/// This intentionally does not consult the optional terrain-cutoff setting:
-/// the renderer has a finite LOD window in either mode, and an authored fog
-/// interval longer than that window leaves the local scene clear until its far
-/// edge. Returns the camera-space cap for diagnostics when fitting is possible.
-/// Underwater fog is kept separate by the caller.
-pub fn fit_to_terrain_window(
-    mut fog: Fog,
-    bounds: [f32; 4],
-    eye: [f32; 3],
-    aspect: f32,
-) -> (Fog, Option<f32>) {
-    if !fog.enabled {
-        return (fog, None);
-    }
-    let Some(cap) = crate::terrain_cutoff::fog_cap(bounds, eye, aspect) else {
-        return (fog, None);
-    };
-    let [start, end] = crate::terrain_cutoff::fit_fog(fog.start, fog.end, cap);
-    fog.start = start;
-    fog.end = end;
-    (fog, Some(cap))
-}
-
 /// Per-plane clipped refraction (`0x7cc6ac`): the water fog color with the
 /// recovered plane-relative range. `start`/`end` come from the traced
 /// `refraction_fog_range` (eye-to-plane height and 55% of the regional
@@ -576,32 +551,6 @@ mod tests {
         // Both former gaps are recovered: the water surface binds its own
         // fog triple and the waves add none of their own.
         assert!(gaps.is_empty(), "unexpected gaps: {gaps:?}");
-    }
-
-    #[test]
-    fn outdoor_fog_is_fitted_to_the_live_terrain_window_without_cutoff_gate() {
-        let authored = Fog {
-            start: 350.,
-            end: 1000.,
-            color: [0.3, 0.38, 0.39],
-            enabled: true,
-        };
-        let bounds = [512., 1472., -2816., -1856.];
-        let eye = [984.441, 417.205, -2357.926];
-        let aspect = 3440. / 1369.;
-        let (fitted, cap) = fit_to_terrain_window(authored, bounds, eye, aspect);
-        let cap = cap.expect("camera is inside the frame's live terrain window");
-        assert!(fitted.start < authored.start);
-        assert!(fitted.end < authored.end);
-        assert!(fitted.start < fitted.end && fitted.end <= cap);
-        assert_eq!(fitted.color, authored.color);
-        assert!(fitted.enabled);
-
-        let disabled = Fog { enabled: false, ..authored };
-        assert_eq!(
-            fit_to_terrain_window(disabled, bounds, eye, aspect),
-            (disabled, None)
-        );
     }
 
     #[test]
