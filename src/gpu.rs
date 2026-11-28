@@ -274,6 +274,92 @@ fn water_view_scissor(
     Some([px0 as u32, py0 as u32, rw.max(1), rh.max(1)])
 }
 
+/// A compact prediction of fragment fog factors across the resident terrain window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FogDepthProbe {
+    camera_xz_depth: f32,
+    window_center_depth: f32,
+    min_depth: f32,
+    min_at: [f32; 2],
+    min_factor: f32,
+    max_depth: f32,
+    max_at: [f32; 2],
+    max_factor: f32,
+}
+
+/// Keep the logged CPU prediction identical to the linear shader fog equation.
+fn fog_factor_at_depth(view_depth: f32, range: [f32; 4]) -> f32 {
+    if range[2] < 0.5 {
+        return 0.;
+    }
+    let span = range[1] - range[0];
+    if span.abs() < 0.001 {
+        if view_depth >= range[1] {
+            1.
+        } else {
+            0.
+        }
+    } else {
+        ((view_depth - range[0]) / span).clamp(0., 1.)
+    }
+}
+
+/// Probe the 3x3 terrain-window footprint, plus the camera's XZ location, with
+/// exactly the same clip-space W transform used by the terrain fragment shader.
+fn fog_depth_probe(
+    matrix: Mat4,
+    bounds: [f32; 4],
+    eye: [f32; 3],
+    plane_y: f32,
+    range: [f32; 4],
+) -> FogDepthProbe {
+    let [x0, x1, z0, z1] = bounds;
+    let xm = (x0 + x1) * 0.5;
+    let zm = (z0 + z1) * 0.5;
+    let points = [
+        [x0, z0],
+        [xm, z0],
+        [x1, z0],
+        [x0, zm],
+        [xm, zm],
+        [x1, zm],
+        [x0, z1],
+        [xm, z1],
+        [x1, z1],
+        [eye[0], eye[2]],
+    ];
+    let depth_at = |xz: [f32; 2]| {
+        (matrix * Vec4::new(xz[0], plane_y, xz[1], 1.)).w.max(0.)
+    };
+    let camera_xz_depth = depth_at([eye[0], eye[2]]);
+    let window_center_depth = depth_at([xm, zm]);
+    let mut min_depth = f32::INFINITY;
+    let mut max_depth = f32::NEG_INFINITY;
+    let mut min_at = [0.; 2];
+    let mut max_at = [0.; 2];
+    for point in points {
+        let depth = depth_at(point);
+        if depth < min_depth {
+            min_depth = depth;
+            min_at = point;
+        }
+        if depth > max_depth {
+            max_depth = depth;
+            max_at = point;
+        }
+    }
+    FogDepthProbe {
+        camera_xz_depth,
+        window_center_depth,
+        min_depth,
+        min_at,
+        min_factor: fog_factor_at_depth(min_depth, range),
+        max_depth,
+        max_at,
+        max_factor: fog_factor_at_depth(max_depth, range),
+    }
+}
+
 /// Everything the top-down minimap's pixels can depend on.
 ///
 /// `minimap_matrix` builds the orthographic window from the camera's ground
@@ -343,11 +429,6 @@ fn water_debug() -> bool {
 fn grass_debug() -> bool {
     static SLOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     env_switch(&SLOT, "PW_GRASS_DEBUG")
-}
-/// `PW_FOG_DEBUG`: render a red/green comparison of fragment fog depth sources.
-fn fog_debug() -> bool {
-    static SLOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    env_switch(&SLOT, "PW_FOG_DEBUG")
 }
 
 /// Where a slider's "default" tick sits on its track, `0..1`.
@@ -1754,7 +1835,7 @@ struct Camera { matrix: mat4x4<f32>, direction: vec4<f32>, clip: vec4<f32>, boun
 fn fog_view_depth(world:vec3<f32>)->f32 {
  // Re-evaluate clip-space W from the perspective-correct world position.
  // This is the camera-space forward depth, independent of fragment builtin W.
- return abs((camera.matrix*vec4<f32>(world,1.)).w);
+ return max((camera.matrix*vec4<f32>(world,1.)).w,0.);
 }
 fn fog_factor(view_z:f32)->f32 {
  if camera.fog_range.z<0.5 {return 0.;}
@@ -1797,7 +1878,7 @@ fn bmd_baked_rgb(day:u32, night:u32, night_factor:f32)->vec3<u32> {
  if i.kind>4.5 { let d=normalize(camera.direction.xyz); let az=atan2(d.z,d.x); let el=asin(clamp(d.y,-1.,1.)); let rho=i.color.w; let q=vec3<f32>(cos(el)*i.normal.x-sin(el)*i.normal.z,i.normal.y,sin(el)*i.normal.x+cos(el)*i.normal.z); let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. { v=i.normal; }pos+=vec3<f32>(v.x,v.z,v.y);norm=vec3<f32>(0.,1.,0.); }
  o.pos=camera.matrix*vec4<f32>(pos,1.);o.bmd_refraction=1.;if camera.clip.y<0. && i.kind>1.5 && i.kind<2.5 {o.bmd_refraction=bmd_refraction_transmittance(pos);}o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;let baked_rgb=vec3<f32>(bmd_baked_rgb(i.diffuse,i.night_diffuse,1.-camera.direction.w))/255.;let bmd_ndl=max(dot(normalize(norm),normalize(camera.sun.xyz)),0.);let bmd_rt=vec3<f32>((camera.light.x+camera.light.y*bmd_ndl)*0.5)*camera.light.zww;o.diffuse=select(baked_rgb,bmd_rt,camera.sun.w<0.);o.opacity=f32((i.diffuse>>24u)&255u)/255.;return o; }
 fn sdr_blend_band(kind:f32)->bool { return (kind>2.01 && kind<2.03)||(kind>2.11 && kind<2.13); }
-fn fs_body(i:VOut, front:bool)->vec4<f32> { if camera.lod.z>0.5 { let builtin_depth=1./max(i.pos.w,0.0000001); let matrix_depth=fog_view_depth(i.world); let builtin_factor=fog_factor(builtin_depth); let matrix_factor=fog_factor(matrix_depth); let disagreement=clamp(abs(builtin_depth-matrix_depth)/max(matrix_depth,1.),0.,1.); return vec4<f32>(builtin_factor,matrix_factor,disagreement,1.); } if ((i.kind>1.05 && i.kind<1.15) || (i.kind>1.5 && i.kind<2.05)) && camera.clip.w == 0. && (front == (camera.clip.z != 0.)) {discard;} if camera.clip.y != 0.0 && (i.world.y-camera.clip.x)*camera.clip.y < 0.0 {discard;} if i.kind>0.5 && i.kind<1.05 {return vec4<f32>(fogged(i.color.rgb,i.world),1.);} if i.kind>1.05 && i.kind<1.25 {return vec4<f32>(bmd_pass_fog(clamp(i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.)),i.world,i.bmd_refraction),1.);} let uv_dx=dpdx(i.uv);let uv_dy=dpdy(i.uv);var uv=i.uv; if i.kind>1.5 {let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(uv_dx*dims),length(uv_dy*dims)),1.)),0.,7.);let border=0.5*exp2(mip);let half_pixel=min(vec2<f32>(border)/dims,scale*0.499);let sdr_v=select(0.,-0.5*camera.grass_wind.x,sdr_blend_band(i.kind));let local=fract((i.uv-i.color.xy)/scale+vec2<f32>(0.,sdr_v))*scale;uv=i.color.xy+clamp(local,half_pixel,scale-half_pixel);} let raw_tex=textureSampleGrad(atlas,atlas_sampler,uv,uv_dx*camera.lod.y,uv_dy*camera.lod.y);let encoded=raw_tex.rgb;let linear=select(encoded/12.92,pow((encoded+0.055)/1.055,vec3<f32>(2.4)),encoded>vec3<f32>(0.04045));let tex=vec4<f32>(linear,raw_tex.a);if !sdr_blend_band(i.kind) && ((i.kind>1.5 && i.kind<2.5) || i.kind>3.5) && tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9) {discard;} if i.kind>1.5 && i.kind<2.5 {let c=clamp(raw_tex.rgb*i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.));let rgb=select(c/12.92,pow((c+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));return vec4<f32>(bmd_pass_fog(rgb,i.world,i.bmd_refraction),select(1.,raw_tex.a*i.opacity,sdr_blend_band(i.kind)));} let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.world),1.); }
+fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || (i.kind>1.5 && i.kind<2.05)) && camera.clip.w == 0. && (front == (camera.clip.z != 0.)) {discard;} if camera.clip.y != 0.0 && (i.world.y-camera.clip.x)*camera.clip.y < 0.0 {discard;} if i.kind>0.5 && i.kind<1.05 {return vec4<f32>(fogged(i.color.rgb,i.world),1.);} if i.kind>1.05 && i.kind<1.25 {return vec4<f32>(bmd_pass_fog(clamp(i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.)),i.world,i.bmd_refraction),1.);} let uv_dx=dpdx(i.uv);let uv_dy=dpdy(i.uv);var uv=i.uv; if i.kind>1.5 {let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(uv_dx*dims),length(uv_dy*dims)),1.)),0.,7.);let border=0.5*exp2(mip);let half_pixel=min(vec2<f32>(border)/dims,scale*0.499);let sdr_v=select(0.,-0.5*camera.grass_wind.x,sdr_blend_band(i.kind));let local=fract((i.uv-i.color.xy)/scale+vec2<f32>(0.,sdr_v))*scale;uv=i.color.xy+clamp(local,half_pixel,scale-half_pixel);} let raw_tex=textureSampleGrad(atlas,atlas_sampler,uv,uv_dx*camera.lod.y,uv_dy*camera.lod.y);let encoded=raw_tex.rgb;let linear=select(encoded/12.92,pow((encoded+0.055)/1.055,vec3<f32>(2.4)),encoded>vec3<f32>(0.04045));let tex=vec4<f32>(linear,raw_tex.a);if !sdr_blend_band(i.kind) && ((i.kind>1.5 && i.kind<2.5) || i.kind>3.5) && tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9) {discard;} if i.kind>1.5 && i.kind<2.5 {let c=clamp(raw_tex.rgb*i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.));let rgb=select(c/12.92,pow((c+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));return vec4<f32>(bmd_pass_fog(rgb,i.world,i.bmd_refraction),select(1.,raw_tex.a*i.opacity,sdr_blend_band(i.kind)));} let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.world),1.); }
 @fragment fn fs(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
 @fragment fn fs_sdr(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if !sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
 "#;
@@ -5206,7 +5287,7 @@ impl Renderer {
             [
                 crate::render_scale::mip_bias(),
                 crate::render_scale::mip_gradient_scale(),
-                if fog_debug() { 1. } else { 0. },
+                0.,
                 0.,
             ],
         );
@@ -5220,13 +5301,31 @@ impl Renderer {
             && fog_window_cap.is_some();
         let fog_fit_changed = (frame.active_fog_range[0] - camera.active_fog().start).abs() > 0.01
             || (frame.active_fog_range[1] - camera.active_fog().end).abs() > 0.01;
+        // Sample the exact camera-space depth the terrain shader evaluates at a
+        // 3x3 grid over the resident window, plus the camera's XZ position. The
+        // two Y planes bracket the common camera-to-ground offset without
+        // requiring any environment variable or visual diagnostic mode.
+        let fog_probe_eye = fog_depth_probe(
+            matrix,
+            frame.bounds,
+            camera.pos.to_array(),
+            camera.pos.y,
+            frame.active_fog_range,
+        );
+        let fog_probe_eye_minus_160 = fog_depth_probe(
+            matrix,
+            frame.bounds,
+            camera.pos.to_array(),
+            camera.pos.y - 160.,
+            frame.active_fog_range,
+        );
         // A focused capture for the long-standing outdoor-fog regression. Keep
         // the authored source, camera-selected result and bytes sent to the
         // terrain shader in one timestamped record so they can be compared
         // without guessing which stage changed the values.
         crate::diag!(
             FogCheck,
-            "camera=({:.3},{:.3},{:.3}) yaw={:.6} pitch={:.6} far={:.3} viewport={}x{} underwater_depth={:.3} atmospheric_fog={} air_authored=(start={:.3},end={:.3},color={:?},density={:.6}) underwater_authored=(start={:.3},end={:.3},color={:?},density={:.6}) active_camera=(enabled={},start={:.3},end={:.3},color={:?}) frame_fog_range={:?} frame_active_fog_range={:?} frame_fog_color={:?} frame_active_fog_color={:?} gpu_uniform_fog_range={:?} gpu_uniform_fog_color={:?} main_pass_fogged={} matrix_cols={:?} daylight={:.4} terrain_cutoff={} fog_window_cap={:?} fog_fit_expected={} fog_fit_changed={} fog_debug_mode={} bounds={:?} terrain_runs={} far_terrain_runs={} spans={} water_batches={} use_post={} water_reflections={} bloom={} sharpen={} reset_history={} depth_contract=terrain_fs_uses_camera_matrix_world_position_depth",
+            "camera=({:.3},{:.3},{:.3}) yaw={:.6} pitch={:.6} far={:.3} viewport={}x{} underwater_depth={:.3} atmospheric_fog={} air_authored=(start={:.3},end={:.3},color={:?},density={:.6}) underwater_authored=(start={:.3},end={:.3},color={:?},density={:.6}) active_camera=(enabled={},start={:.3},end={:.3},color={:?}) frame_fog_range={:?} frame_active_fog_range={:?} frame_fog_color={:?} frame_active_fog_color={:?} gpu_uniform_fog_range={:?} gpu_uniform_fog_color={:?} main_pass_fogged={} matrix_cols={:?} daylight={:.4} terrain_cutoff={} fog_window_cap={:?} fog_fit_expected={} fog_fit_changed={} fog_depth_probe_eye={:?} fog_depth_probe_eye_minus_160={:?} bounds={:?} terrain_runs={} far_terrain_runs={} spans={} water_batches={} use_post={} water_reflections={} bloom={} sharpen={} reset_history={} depth_contract=terrain_fs_uses_camera_matrix_world_position_depth",
             camera.pos.x, camera.pos.y, camera.pos.z, camera.yaw, camera.pitch,
             camera.far, w, h, camera.underwater_depth, camera.atmospheric_fog,
             camera.air_fog.start, camera.air_fog.end, camera.air_fog.color, camera.air_fog.density,
@@ -5234,7 +5333,7 @@ impl Renderer {
             camera.active_fog().enabled, camera.active_fog().start, camera.active_fog().end, camera.active_fog().color,
             frame.fog_range, frame.active_fog_range, frame.fog_color, frame.active_fog_color,
             normal.fog_range, normal.fog_color, camera.active_fog().enabled, matrix.to_cols_array(),
-            daylight, self.detail.terrain_cutoff, fog_window_cap, fog_fit_expected, fog_fit_changed, fog_debug(), frame.bounds, terrain_run_count, far_terrain_run_count, span_count,
+            daylight, self.detail.terrain_cutoff, fog_window_cap, fog_fit_expected, fog_fit_changed, fog_probe_eye, fog_probe_eye_minus_160, frame.bounds, terrain_run_count, far_terrain_run_count, span_count,
             self.water_batches.len(), use_post, camera.water_reflections, camera.bloom,
             camera.sharpen, reset_history
         );
@@ -10196,12 +10295,29 @@ mod frame_snapshot_tests {
     }
 
     #[test]
-    fn fog_debug_switch_is_published_to_the_main_camera_uniform() {
-        let src = source();
-        assert!(src.contains("fn fog_debug()"));
-        assert!(src.contains("if fog_debug() { 1. } else { 0. }"));
-        assert!(src.contains("fog_debug_mode={}"));
-        assert!(src.contains("camera.lod.z>0.5"));
+    fn fog_depth_probe_reports_camera_space_window_depth_and_fog_factor() {
+        let eye = Vec3::new(0., 100., 0.);
+        let matrix = Mat4::from_scale(Vec3::new(-1., 1., 1.))
+            * Mat4::perspective_rh(
+                CAMERA_FOV_Y_RADIANS,
+                16. / 9.,
+                16000.,
+                CAMERA_NEAR,
+            )
+            * Mat4::look_to_rh(eye, Vec3::NEG_Z, Vec3::Y);
+        let probe = fog_depth_probe(
+            matrix,
+            [-100., 100., -100., -500.],
+            eye.to_array(),
+            eye.y,
+            [50., 100., 1., 0.],
+        );
+        assert!(probe.camera_xz_depth.abs() < 0.01);
+        assert!((probe.window_center_depth - 300.).abs() < 0.1);
+        assert!(probe.min_depth < probe.window_center_depth);
+        assert!(probe.max_depth > probe.window_center_depth);
+        assert_eq!(probe.min_factor, 0.);
+        assert_eq!(probe.max_factor, 1.);
     }
 
     #[test]
