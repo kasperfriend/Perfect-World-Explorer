@@ -5179,14 +5179,14 @@ impl Renderer {
         // without guessing which stage changed the values.
         crate::diag!(
             FogCheck,
-            "camera=({:.3},{:.3},{:.3}) yaw={:.6} pitch={:.6} far={:.3} viewport={}x{} underwater_depth={:.3} atmospheric_fog={} air_authored=(start={:.3},end={:.3},color={:?},density={:.6}) underwater_authored=(start={:.3},end={:.3},color={:?},density={:.6}) active_camera=(enabled={},start={:.3},end={:.3},color={:?}) frame_fog_range={:?} frame_active_fog_range={:?} frame_fog_color={:?} frame_active_fog_color={:?} gpu_uniform_fog_range={:?} gpu_uniform_fog_color={:?} main_pass={:?} matrix_cols={:?} daylight={:.4} bounds={:?} terrain_runs={} far_terrain_runs={} spans={} water_batches={} use_post={} water_reflections={} bloom={} sharpen={} reset_history={} depth_contract=terrain_fs_uses_inverse_interpolated_builtin_position_w",
+            "camera=({:.3},{:.3},{:.3}) yaw={:.6} pitch={:.6} far={:.3} viewport={}x{} underwater_depth={:.3} atmospheric_fog={} air_authored=(start={:.3},end={:.3},color={:?},density={:.6}) underwater_authored=(start={:.3},end={:.3},color={:?},density={:.6}) active_camera=(enabled={},start={:.3},end={:.3},color={:?}) frame_fog_range={:?} frame_active_fog_range={:?} frame_fog_color={:?} frame_active_fog_color={:?} gpu_uniform_fog_range={:?} gpu_uniform_fog_color={:?} main_pass_fogged={} matrix_cols={:?} daylight={:.4} bounds={:?} terrain_runs={} far_terrain_runs={} spans={} water_batches={} use_post={} water_reflections={} bloom={} sharpen={} reset_history={} depth_contract=terrain_fs_uses_inverse_interpolated_builtin_position_w",
             camera.pos.x, camera.pos.y, camera.pos.z, camera.yaw, camera.pitch,
             camera.far, w, h, camera.underwater_depth, camera.atmospheric_fog,
             camera.air_fog.start, camera.air_fog.end, camera.air_fog.color, camera.air_fog.density,
             camera.underwater_fog.start, camera.underwater_fog.end, camera.underwater_fog.color, camera.underwater_fog.density,
             camera.active_fog().enabled, camera.active_fog().start, camera.active_fog().end, camera.active_fog().color,
             frame.fog_range, frame.active_fog_range, frame.fog_color, frame.active_fog_color,
-            normal.fog_range, normal.fog_color, main_pass, matrix.to_cols_array(),
+            normal.fog_range, normal.fog_color, camera.active_fog().enabled, matrix.to_cols_array(),
             daylight, frame.bounds, terrain_runs.len(), far_terrain_runs.len(), spans.len(),
             self.water_batches.len(), use_post, camera.water_reflections, camera.bloom,
             camera.sharpen, reset_history
