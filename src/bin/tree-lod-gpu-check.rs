@@ -1,5 +1,14 @@
 //! Synthetic GPU regression: identical LOD snapshots must not flicker or double-darken.
 #![allow(dead_code)]
+// `water.rs`, `far_trees_gpu.rs` and the grass loader report through
+// `crate::diag!`; a `#[path]` module set is its own crate root, so the stub
+// supplies it. See `support/diag_stub.rs`.
+#[macro_use]
+#[path = "support/diag_stub.rs"]
+mod diag_stub;
+#[allow(unused_imports)]
+pub use diag_stub::diagnostics;
+
 #[path = "../dxt.rs"]
 mod dxt;
 #[path = "../far_trees_gpu.rs"]
@@ -14,6 +23,8 @@ mod model_dds;
 mod pck;
 #[path = "../scene.rs"]
 mod scene;
+#[path = "../speedtree_version.rs"]
+mod speedtree_version;
 #[path = "../tree_lod.rs"]
 mod tree_lod;
 #[path = "../trees.rs"]
@@ -107,6 +118,9 @@ pub fn run(authored_mips: bool) {
             tree_type: 0,
             position: [0., 0., 0.],
         }],
+        // These trees are here because the check put them here: the map did not
+        // switch them off, so there is no reason to show.
+        off_reason: None,
     };
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
@@ -254,22 +268,9 @@ pub fn run(authored_mips: bool) {
             uni[382] = 0.;
             queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&uni));
         }
-        renderer.update_resident_lods(
-            &device,
-            &queue,
-            [dist, 0., 0.],
-            1.,
-            bounds,
-            [
-                [1., 0., 0., 1.0e9],
-                [-1., 0., 0., 1.0e9],
-                [0., 1., 0., 1.0e9],
-                [0., -1., 0., 1.0e9],
-                [0., 0., 1., 1.0e9],
-                [0., 0., -1., 1.0e9],
-            ],
-            None,
-        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.update_resident_lods(&queue, &mut encoder, [dist, 0., 0.], 1., bounds);
+        queue.submit(Some(encoder.finish()));
         let (count, bytes) = renderer.residency_stats();
         // The instance buffer keeps every (group, level) slice: two `vec4`s per
         // record, three levels per group.
@@ -534,7 +535,11 @@ fn multi_group(device: &wgpu::Device, queue: &wgpu::Queue) {
             position: [0., 0., 0.],
         })
         .collect();
-    let trees = trees::Trees { types, placements };
+    let trees = trees::Trees {
+        types,
+        placements,
+        off_reason: None,
+    };
     // The LOD pass never reads the camera uniform; the forest only has to bind
     // one, so nothing here is drawn through it.
     let camera = device.create_buffer(&wgpu::BufferDescriptor {
@@ -555,22 +560,9 @@ fn multi_group(device: &wgpu::Device, queue: &wgpu::Queue) {
     let heights = renderer.group_heights();
     assert_eq!(heights.len(), 3, "three tree types, three groups");
     for dist in [20f32, 40., 120., 300., 1000., 3000., 12000.] {
-        renderer.update_resident_lods(
-            device,
-            queue,
-            [dist, 0., 0.],
-            1.,
-            None,
-            [
-                [1., 0., 0., 1.0e9],
-                [-1., 0., 0., 1.0e9],
-                [0., 1., 0., 1.0e9],
-                [0., -1., 0., 1.0e9],
-                [0., 0., 1., 1.0e9],
-                [0., 0., -1., 1.0e9],
-            ],
-            None,
-        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.update_resident_lods(queue, &mut encoder, [dist, 0., 0.], 1., None);
+        queue.submit(Some(encoder.finish()));
         let counts = renderer.lod_instance_counts(device, queue);
         assert_eq!(
             counts.len(),

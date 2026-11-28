@@ -237,6 +237,11 @@ impl Librarian {
         }
         let mut assets = LibrarianAssets::open(&self.root);
         let elements = assets.read_elements_data();
+        // The data version is the `(elements, tasks)` pair. `visit_v27_records`
+        // already refuses a foreign layout with the version it found, so a
+        // client on another revision that the folder scan reported as loadable
+        // fails here with "elements.data is v29 …" rather than with a bare hex
+        // word or a silently shifted table.
         let mut npc_database = npcs::Database::default();
         let mut npc_error = None;
         if let Ok(bytes) = &elements {
@@ -588,7 +593,7 @@ impl State {
                     })
                 })
                 .collect();
-            majors.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            majors.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
             majors.dedup_by_key(|entry| entry.0);
             if !majors.is_empty() {
                 egui::ComboBox::from_label("Type")
@@ -637,7 +642,7 @@ impl State {
                     })
                 })
                 .collect();
-            subtypes.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            subtypes.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
             subtypes.dedup_by_key(|entry| entry.0);
             if !subtypes.is_empty() {
                 egui::ComboBox::from_label("Subtype")

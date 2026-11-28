@@ -258,20 +258,16 @@ impl Database {
     }
     pub fn suites_for(&self, id: u32) -> Vec<(u32, String, Vec<u32>)> {
         let mut result = Vec::new();
-        if id == 0 {
-            return result;
-        }
         for (suite_id, record) in &self.suites {
-            if !(0..12).any(|index| number(record, 72 + index * 4) == id) {
-                continue;
-            }
             let members: Vec<u32> = (0..12)
                 .map(|index| number(record, 72 + index * 4))
                 .filter(|member| *member != 0)
                 .collect();
-            result.push((*suite_id, wide(record, 4), members));
+            if members.contains(&id) {
+                result.push((*suite_id, wide(record, 4), members));
+            }
         }
-        result.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+        result.sort_by(|a, b| a.1.cmp(&b.1));
         result
     }
 }
@@ -282,7 +278,19 @@ mod tests {
     #[test]
     fn rejects_unknown_and_truncated_files() {
         assert!(Database::parse_v27(&[]).is_err());
-        assert!(Database::parse_v27(&0x3000_001au32.to_le_bytes()).is_err());
+        // A neighbouring revision is refused with its own version number, so
+        // the Librarian can say "v26" instead of "unexpected hex word".
+        // `Database` has no `Debug`, so match rather than `unwrap_err()`.
+        let error = match Database::parse_v27(&0x3000_001au32.to_le_bytes()) {
+            Ok(_) => panic!("a v26 file must not parse as v27"),
+            Err(error) => error,
+        };
+        assert!(error.contains("v26"), "{error}");
+        assert!(error.contains("not the v27 layout"), "{error}");
+        assert!(
+            !error.contains("0x3000"),
+            "family marker is not part of the version: {error}"
+        );
         let mut data = 0x3000_001bu32.to_le_bytes().to_vec();
         data.extend_from_slice(&0u32.to_le_bytes());
         data.extend_from_slice(&u32::MAX.to_le_bytes());

@@ -6,7 +6,7 @@ from compare_component_leaves import leaf_hashes
 def fixture():
     u = lambda v: struct.pack('<I', v)
     f = lambda v: struct.pack('<f', v)
-    return (b'PWCOMP01' + u(0) * 5 + u(0) + u(0) + u(1) + u(1)
+    return (b'PWCOMP02' + u(0) * 5 + u(0) + u(0) + u(1) + u(1)
             + b''.join(f(float(i)) for i in range(6)) + u(4)
             + b''.join(f(float(i)) for i in range(24)))
 

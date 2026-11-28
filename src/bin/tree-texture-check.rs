@@ -7,6 +7,8 @@ mod model_dds;
 mod pck;
 #[path = "../scene.rs"]
 mod scene;
+#[path = "../speedtree_version.rs"]
+mod speedtree_version;
 #[path = "../trees.rs"]
 mod trees;
 #[path = "../vegetation_textures.rs"]

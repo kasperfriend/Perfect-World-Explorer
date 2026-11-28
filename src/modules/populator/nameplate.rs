@@ -273,6 +273,33 @@ fn system_font_folders() -> Vec<PathBuf> {
     folders
 }
 
+/// The client's own CJK font, for the whole interface rather than one label.
+///
+/// The viewer's egui context starts with the built-in Latin faces only, so any
+/// HUD string the client authored in Chinese draws as one tofu box per glyph —
+/// the zone banner over a Chinese-named area shows `Entering \u{25a1}\u{25a1}\u{25a1}`.
+/// Nameplates installed this font for themselves, which is why the overhead
+/// names read correctly while the banner did not. Registering it once on the
+/// shared context puts it behind the default faces for every widget, and it
+/// stays the last resort so Latin text keeps the built-in metrics.
+pub fn install_client_cjk(ctx: &egui::Context, element: &Path) {
+    let Some(file) = client_cjk_font(element) else {
+        return;
+    };
+    const KEY: &str = "pw-client-cjk-ui";
+    super::super::extend_fonts(ctx, |fonts| {
+        if fonts.font_data.contains_key(KEY) {
+            return;
+        }
+        fonts
+            .font_data
+            .insert(KEY.into(), egui::FontData::from_owned(file.bytes));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(KEY.into());
+        }
+    });
+}
+
 /// A font the client itself ships, read from the element folder or `fonts.pck`.
 fn client_cjk_font(element: &Path) -> Option<FontFile> {
     for (name, entry) in CLIENT_FALLBACKS {
@@ -343,6 +370,7 @@ mod tests {
     fn the_shipped_client_archive_names_the_same_overhead_font() {
         let element = Path::new("google_drive/pw142/element");
         if !element.join("configs.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("configs.pck"));
             return;
         }
         let (family, size) = read_font_table(element).expect("configs/fonts.txt parses");

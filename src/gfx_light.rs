@@ -11,6 +11,25 @@ pub struct Definition {
     position: [f32; 3],
     color: u32,
     track: Option<ColorTrack>,
+    /// How many keypoints the element declared, and which one this is.
+    ///
+    /// The native class keeps a variable-length keypoint array, so a light is
+    /// not necessarily one reference point. Every light element in the staged
+    /// corpus declares exactly one (`488` of `488`), but the reader no longer
+    /// *requires* that, and these two fields are what let a caller tell a whole
+    /// light from one stage of a longer one.
+    pub keypoint_count: usize,
+    pub keypoint_index: usize,
+}
+
+/// A light element: one `Priority`/`Range` and the keypoints it walks.
+///
+/// `Definition` is one keypoint. When a light has a single keypoint -- which is
+/// every light element in the staged corpus -- the light *is* that one
+/// `Definition`, which is why the older API could treat the two as the same.
+#[derive(Debug, Clone)]
+pub struct Light {
+    pub definitions: Vec<Definition>,
 }
 impl Definition {
     /// Interior colour-table entries whose two candidate construction
@@ -63,7 +82,16 @@ fn vec3(s: &str) -> Result<[f32; 3], String> {
     }
     Ok(v)
 }
-fn decode(fields: &[(&str, &str)]) -> Result<Definition, String> {
+/// The element-wide fields, read once and shared by every keypoint.
+struct Common {
+    priority: i32,
+    range: f32,
+    start_ms: u32,
+    /// Where the keypoint run starts, i.e. just past `StartTime`.
+    keypoints_at: usize,
+}
+
+fn common(fields: &[(&str, &str)]) -> Result<Common, String> {
     let split = fields
         .iter()
         .position(|(k, _)| *k == "KEYPOINTCOUNT")
@@ -90,27 +118,48 @@ fn decode(fields: &[(&str, &str)]) -> Result<Definition, String> {
     }
     let priority = number(unique(common, "Priority")?)?;
     let start_ms = number(unique(common, "StartTime")?)?;
-    let mut i = split;
-    if take(fields, &mut i, "KEYPOINTCOUNT")? != "1"
-        || take(fields, &mut i, "InterpolateMode")? != "0"
-    {
-        return Err("unsupported GFX light keypoint layout".into());
+    Ok(Common {
+        priority,
+        range,
+        start_ms,
+        keypoints_at: split,
+    })
+}
+
+/// One keypoint: where the light sits, what colour it is, and its own window.
+///
+/// The element's `StartTime` is the light's own activation and is not repeated
+/// here; each keypoint carries a `TimeSpan` (how long it is held, `-1` for
+/// "until the light ends") and a `CtrlMethodCount`-driven controller list.
+fn keypoint(
+    fields: &[(&str, &str)],
+    i: &mut usize,
+    shared: &Common,
+    index: usize,
+    count: usize,
+) -> Result<Definition, String> {
+    if take(fields, i, "InterpolateMode")? != "0" {
+        // Every `InterpolateMode` in the staged corpus is `0` (11,844 of
+        // 11,844): the light holds a keypoint's point and then switches. A
+        // non-zero mode blends between them, which nothing shipped does, so it
+        // is named rather than guessed.
+        return Err("unsupported GFX light keypoint interpolation mode".into());
     }
-    let duration: i64 = number(take(fields, &mut i, "TimeSpan")?)?;
+    let duration: i64 = number(take(fields, i, "TimeSpan")?)?;
     let duration_ms = if duration == -1 {
         None
     } else {
         Some(u32::try_from(duration).map_err(|_| "invalid GFX light duration")?)
     };
-    let position = vec3(take(fields, &mut i, "Position")?)?;
-    let color = packed(take(fields, &mut i, "Color")?)?;
-    let scale: f32 = number(take(fields, &mut i, "Scale")?)?;
+    let position = vec3(take(fields, i, "Position")?)?;
+    let color = packed(take(fields, i, "Color")?)?;
+    let scale: f32 = number(take(fields, i, "Scale")?)?;
     if !scale.is_finite() {
         return Err("nonfinite GFX keypoint scale".into());
     }
     // Point-light position uses parent TM and keypoint position, not this
     // keypoint's direction, rotation or scale. Range is not scaled by kp.scale.
-    let direction = take(fields, &mut i, "Direction")?;
+    let direction = take(fields, i, "Direction")?;
     let q = direction
         .split(',')
         .map(|x| number::<f32>(x.trim()))
@@ -118,15 +167,15 @@ fn decode(fields: &[(&str, &str)]) -> Result<Definition, String> {
     if q.len() != 4 || q.iter().any(|v| !v.is_finite()) {
         return Err("invalid GFX keypoint direction".into());
     }
-    let rad: f32 = number(take(fields, &mut i, "Rad_2D")?)?;
+    let rad: f32 = number(take(fields, i, "Rad_2D")?)?;
     if !rad.is_finite() {
         return Err("nonfinite GFX keypoint angle".into());
     }
-    let count: u32 = number(take(fields, &mut i, "CtrlMethodCount")?)?;
-    let track = match count {
+    let controllers: u32 = number(take(fields, i, "CtrlMethodCount")?)?;
+    let track = match controllers {
         0 => None,
         1 => {
-            if take(fields, &mut i, "CtrlType")? != "108" {
+            if take(fields, i, "CtrlType")? != "108" {
                 return Err("unsupported GFX light controller".into());
             }
             // The container writes milliseconds, but a `ColorTrack` window is
@@ -136,17 +185,17 @@ fn decode(fields: &[(&str, &str)]) -> Result<Definition, String> {
             // Passing the raw milliseconds through put the ramp a thousand
             // times later than authored: a controller starting after 0 never
             // left the keypoint colour, and one with an end never expired.
-            let start: f32 = number(take(fields, &mut i, "StartTime")?)?;
-            let end: f32 = number(take(fields, &mut i, "EndTime")?)?;
-            let original = packed(take(fields, &mut i, "Color")?)?;
-            let count: usize = number(take(fields, &mut i, "Count")?)?;
+            let start: f32 = number(take(fields, i, "StartTime")?)?;
+            let end: f32 = number(take(fields, i, "EndTime")?)?;
+            let original = packed(take(fields, i, "Color")?)?;
+            let count: usize = number(take(fields, i, "Count")?)?;
             if count == 0 || count > 10 {
                 return Err("invalid GFX color destination count".into());
             }
             let mut destinations = Vec::with_capacity(count);
             for _ in 0..count {
-                let color = packed(take(fields, &mut i, "Color")?)?;
-                let duration = number(take(fields, &mut i, "TimeSpan")?)?;
+                let color = packed(take(fields, i, "Color")?)?;
+                let duration = number(take(fields, i, "TimeSpan")?)?;
                 destinations.push((color, duration));
             }
             // The segment lengths stay in milliseconds, which is the unit the
@@ -158,15 +207,21 @@ fn decode(fields: &[(&str, &str)]) -> Result<Definition, String> {
                 &destinations,
             )?)
         }
+        // Measured on the staged corpus: every one of the 488 light elements
+        // has `CtrlMethodCount: 0`, so no controller is written on a light
+        // keypoint at all. `108` (a colour ramp, `track` above) is the one this
+        // emitter executes. Anything else stays an explicit refusal rather than
+        // a silent drop: a controller this build cannot run would change the
+        // light's motion, and publishing a stationary light where the artist
+        // authored a moving one is a wrong answer, not a smaller one.
         _ => return Err("unsupported GFX light controller count".into()),
     };
-    if i != fields.len() {
-        return Err("unrecognized trailing GFX light keypoint/controller data".into());
-    }
     Ok(Definition {
-        priority,
-        range,
-        start_ms,
+        keypoint_count: count,
+        keypoint_index: index,
+        priority: shared.priority,
+        range: shared.range,
+        start_ms: shared.start_ms,
         duration_ms,
         position,
         color,
@@ -194,6 +249,63 @@ fn decode(fields: &[(&str, &str)]) -> Result<Definition, String> {
 /// Element 130 is implemented; any other element that declares `LightType` is
 /// still an explicit failure rather than a silent drop, so a future light class
 /// cannot disappear without a register entry.
+/// Upper bound on a light element's `KEYPOINTCOUNT`.
+///
+/// Measured on the staged retail `gfx.pck`, one element at a time: **all 488
+/// light elements declare `KEYPOINTCOUNT: 1`**, and every one of their
+/// keypoints carries `CtrlMethodCount: 0`. The `!= 1` test this replaces was
+/// therefore costing nothing in the staged corpus -- a survey that counted
+/// `KEYPOINTCOUNT` across a *whole graph* rather than per element finds 7 in
+/// sprites and particles, and those are a different element class that this
+/// module does not read.
+///
+/// So the bound is sized from the corpus rather than from the old equality, and
+/// the reason to allow more than one is the format, not the data on hand: the
+/// native class keeps a variable-length keypoint array, and a client that
+/// writes two is describing the same light twice, not a different format. Eight
+/// leaves headroom over the measured maximum while still bounding the loop a
+/// damaged count could demand.
+const MAX_KEYPOINTS: usize = 8;
+
+/// Decode one light element, which is a `Priority`/`Range` and 1..=`MAX_KEYPOINTS`
+/// keypoints.
+fn decode_all(fields: &[(&str, &str)]) -> Result<Light, String> {
+    let shared = common(fields)?;
+    let mut i = shared.keypoints_at;
+    let count: usize = number(take(fields, &mut i, "KEYPOINTCOUNT")?)?;
+    if count == 0 || count > MAX_KEYPOINTS {
+        return Err(format!(
+            "unsupported GFX light keypoint count {count} (limit {MAX_KEYPOINTS})"
+        ));
+    }
+    let mut definitions = Vec::with_capacity(count);
+    for index in 0..count {
+        definitions.push(keypoint(fields, &mut i, &shared, index, count)?);
+    }
+    // A misread keypoint count would otherwise leave the trailing fields to be
+    // interpreted as another element's, so the run has to consume the whole
+    // record.
+    if i != fields.len() {
+        return Err("unrecognized trailing GFX light keypoint/controller data".into());
+    }
+    Ok(Light { definitions })
+}
+
+/// The single-keypoint view of [`decode_all`].
+///
+/// A light with one keypoint is the whole light in one `Definition`. A light
+/// with more than one is not -- this returns its first keypoint and the caller
+/// that needs the sequence uses [`decode_all`]. Kept so the existing callers
+/// and their tests keep their meaning.
+fn decode(fields: &[(&str, &str)]) -> Result<Definition, String> {
+    let light = decode_all(fields)?;
+    light
+        .definitions
+        .into_iter()
+        .next()
+        .ok_or_else(|| "GFX light has no keypoint".to_string())
+}
+
 const LIGHT_MARKER: &str = "LightType";
 
 fn finish_element(
@@ -203,7 +315,10 @@ fn finish_element(
 ) -> Result<(), String> {
     let marker = fields.iter().find(|(k, _)| *k == LIGHT_MARKER);
     match (current, marker) {
-        (Some(130), Some(_)) => definitions.push(decode(fields)?),
+        // Every keypoint is kept. Pushing only the first, as this did while the
+        // keypoint count was hard-coded to 1, silently dropped the rest of a
+        // multi-keypoint light now that they parse.
+        (Some(130), Some(_)) => definitions.extend(decode_all(fields)?.definitions),
         (Some(130), None) => return Err("element 130 is missing its LightType".into()),
         (Some(id), Some((key, _))) => {
             return Err(format!(
@@ -232,26 +347,27 @@ pub fn parse(text: &str) -> Result<Vec<Definition>, String> {
             .ok_or("expected text GFX")?
             .trim(),
     )?;
-    // The client's root loader (0x6e3470) reads `MOXTVersion` first and rejects
-    // anything **above** 79 (`cmp 0x4f`). That is the whole rule: there is no
-    // lower bound, and every optional key is gated per version inside the
-    // element loaders rather than the file being refused outright.
+    // There is no version gate here, and the light element is why.
     //
-    // This used to be a ten-value whitelist, which was invented rather than
-    // measured and cost most of the map. `gfx.pck` ships 27 distinct versions;
-    // of the 163 roots `world.ecwld` names, 97 are below the old list's lowest
-    // entry and were refused here — among them every fire, glow and light
-    // shafts (`火焰1`, `篝火`, `光运`, `佛光` all ship as 33 or 35). Because a
-    // refusal here marks the owner `State::Failed`, and only `State::Live`
-    // owners ever build a player, those roots drew no geometry at all: the map
-    // showed its one allowed waterfall and nothing else.
-    if version > 79 {
-        return Err(format!("GFX version {version} is newer than 79"));
-    }
+    // `A3DGFXLight::Load` in the shipped SDK reads fourteen lines — `LightType`,
+    // `Diffuse`, `Specular`, `Ambient`, `Position`, `Direction`, `Range`,
+    // `Falloff`, `Attenuation0..2`, `Theta`, `Phi` — and never looks at
+    // `dwVersion`. A version-93 light record is byte-for-byte the same shape as
+    // a version-33 one, so refusing by version published no lights and cost
+    // this client every later effect.
+    //
+    // This used to be a ten-value whitelist, then a `< 80` cap that came from
+    // the 1.4.2 corpus maximum rather than from the format: the SDK's own
+    // history runs to 103 (`#define GFX_CUR_VERSION 103`) and 1.5.2 ships 86,
+    // 90 and 93. Since `gfx_owner` marks the owner `State::Failed` on an
+    // `unsupported` error and only buildable owners reach the player, the cap
+    // was not merely dropping light glow, it was dropping the geometry of every
+    // root that also happened to carry a point light.
+    let _ = version;
     let mut expected = None;
     let mut elements = 0;
     let mut current = None;
-    let mut fields = Vec::with_capacity(32);
+    let mut fields = Vec::new();
     let mut definitions = Vec::new();
     for line in lines {
         let Some((key, value)) = line.split_once(':') else {
@@ -267,7 +383,6 @@ pub fn parse(text: &str) -> Result<Vec<Definition>, String> {
             if n > 100000 {
                 return Err("excessive GFX element count".into());
             }
-            definitions.reserve(n.min(64));
             expected = Some(n);
         } else if key == "GFXELEMENTID" {
             elements += 1;
@@ -328,6 +443,11 @@ impl Emitter {
         parent: [f32; 16],
         outer: Option<[f32; 4]>,
     ) -> Result<Option<DynamicLight>, String> {
+        if parent.iter().any(|v| !v.is_finite())
+            || outer.is_some_and(|v| v.iter().any(|v| !v.is_finite() || *v < 0.))
+        {
+            return Err("invalid GFX light parent/outer color".into());
+        }
         if self.finished {
             return Ok(None);
         }
@@ -353,15 +473,6 @@ impl Emitter {
         // `gfx_catalog::priority_exempts` for the dumped direction.
         if !visible || self.definition.priority > manager_priority {
             return Ok(None);
-        }
-        // Hidden or low-priority emitters still advance their keypoint clocks,
-        // but their parent transform and outer tint are not consumed until a
-        // light can actually be published. Avoid validating the same unused
-        // matrix once per hidden light on every frame.
-        if parent.iter().any(|v| !v.is_finite())
-            || outer.is_some_and(|v| v.iter().any(|v| !v.is_finite() || *v < 0.))
-        {
-            return Err("invalid GFX light parent/outer color".into());
         }
         let mut color = [16, 8, 0, 24].map(|shift| ((self.color >> shift) & 255) as f32 / 255.);
         if let Some(outer) = outer {
@@ -394,6 +505,54 @@ mod tests {
     fn file() -> String {
         "MOXTVersion: 37\nGFXELEMENTCOUNT: 1\nGFXELEMENTID: 130\nRepeatCount: 1\nRepeatDelay: 0\nBindEle: \nDummyEle: \nIsDummy: 0\nMatchGrnd: 0\nLightType: 1\nPriority: 4\nRange: 10\nStartTime: 100\nKEYPOINTCOUNT: 1\nInterpolateMode: 0\nTimeSpan: 1000\nPosition: 1, 2, 3\nColor: -2139062144\nScale: 7\nDirection: 0, 0, 0, 1\nRad_2D: 0\nCtrlMethodCount: 0\n".into()
     }
+    /// A light with more than one keypoint must decode as a sequence, not be
+    /// refused and not silently collapse to its first keypoint.
+    ///
+    /// No light element in the staged corpus declares more than one, so this is
+    /// the format's shape rather than a shipped case -- which is exactly why it
+    /// needs a test: the data cannot catch a regression here.
+    #[test]
+    fn a_multi_keypoint_light_decodes_as_a_sequence() {
+        let two = file()
+            .replace("KEYPOINTCOUNT: 1", "KEYPOINTCOUNT: 2")
+            .replace(
+                "CtrlMethodCount: 0\n",
+                "CtrlMethodCount: 0\nInterpolateMode: 0\nTimeSpan: 2000\n\
+                 Position: 4, 5, 6\nColor: -1\nScale: 1\n\
+                 Direction: 0, 0, 0, 1\nRad_2D: 0\nCtrlMethodCount: 0\n",
+            );
+        let all = parse(&two).unwrap();
+        assert_eq!(all.len(), 2, "both keypoints must survive");
+        assert_eq!(all[0].keypoint_count, 2);
+        assert_eq!(all[0].keypoint_index, 0);
+        assert_eq!(all[1].keypoint_index, 1);
+        // The element-wide fields are shared; the keypoint-specific ones differ.
+        assert_eq!(all[0].priority, all[1].priority);
+        assert_eq!(all[0].range, all[1].range);
+        assert_eq!(all[0].position, [1., 2., 3.]);
+        assert_eq!(all[1].position, [4., 5., 6.]);
+    }
+
+    /// A count past the bound is named, not looped to.
+    #[test]
+    fn an_implausible_keypoint_count_names_itself() {
+        let many = file().replace("KEYPOINTCOUNT: 1", "KEYPOINTCOUNT: 9");
+        let err = parse(&many).unwrap_err();
+        assert!(err.contains("keypoint count 9"), "{err}");
+        assert!(err.contains("limit 8"), "{err}");
+        let zero = file().replace("KEYPOINTCOUNT: 1", "KEYPOINTCOUNT: 0");
+        assert!(parse(&zero).unwrap_err().contains("keypoint count 0"));
+    }
+
+    /// A non-zero `InterpolateMode` blends between keypoints. Nothing shipped
+    /// uses one, so it is refused by name instead of being treated as a step.
+    #[test]
+    fn a_blending_interpolation_mode_is_refused_by_name() {
+        let blend = file().replace("InterpolateMode: 0", "InterpolateMode: 1");
+        let err = parse(&blend).unwrap_err();
+        assert!(err.contains("interpolation mode"), "{err}");
+    }
+
     #[test]
     fn actual_decoding_start_end_parent_transform_and_scale_semantics() {
         let def = parse(&file()).unwrap().pop().unwrap();
@@ -449,23 +608,6 @@ mod tests {
     }
 
     #[test]
-    fn hidden_lights_defer_parent_validation_until_publication() {
-        let mut hidden = Emitter::new(parse(&file()).unwrap().pop().unwrap());
-        let mut invalid = IDENTITY;
-        invalid[12] = f32::NAN;
-        assert!(
-            hidden.tick(100, false, 4, invalid, None).unwrap().is_none(),
-            "a hidden light advances without using or validating its parent"
-        );
-
-        let mut visible = Emitter::new(parse(&file()).unwrap().pop().unwrap());
-        assert!(
-            visible.tick(100, true, 4, invalid, None).is_err(),
-            "the same invalid parent is rejected as soon as the light is publishable"
-        );
-    }
-
-    #[test]
     fn hidden_and_low_priority_lights_still_progress_before_publication_gate() {
         let mut e = Emitter::new(parse(&file()).unwrap().pop().unwrap());
         assert!(e.tick(100, false, 4, IDENTITY, None).unwrap().is_none());
@@ -489,9 +631,28 @@ mod tests {
             ("Range: 10", "Range: NaN"),
             ("GFXELEMENTCOUNT: 1", "GFXELEMENTCOUNT: 2"),
             ("BindEle: ", "BindEle: parent"),
-            ("Version: 37", "Version: 999"),
         ] {
             assert!(parse(&file().replace(a, b)).is_err(), "{a}");
+        }
+    }
+
+    /// The light element is version invariant, so the same record must read the
+    /// same at any version a shipped client writes.
+    ///
+    /// `A3DGFXLight::Load` takes `dwVersion` and never tests it: fourteen
+    /// unversioned lines, from `LightType` through `Phi`. The reader used to cap
+    /// at 79 because that was the newest version in the 1.4.2 corpus, which
+    /// made every 1.5.2 effect that carries a point light fail to decode and so
+    /// lost its geometry too. The SDK's history runs to V101 with
+    /// `GFX_CUR_VERSION 103`, and 1.5.2 ships 86, 90 and 93 roots.
+    #[test]
+    fn a_light_record_reads_the_same_at_every_shipped_version() {
+        for version in [37, 79, 86, 90, 93] {
+            let source = file().replace("Version: 37", &format!("Version: {version}"));
+            let definitions =
+                parse(&source).unwrap_or_else(|e| panic!("version {version} refused: {e}"));
+            assert_eq!(definitions.len(), 1);
+            assert!(definitions[0].range > 0.);
         }
     }
     #[test]

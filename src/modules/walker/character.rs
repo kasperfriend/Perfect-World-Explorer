@@ -1488,6 +1488,7 @@ mod tests {
     fn authentic_starter_designs_cover_every_native_class_and_gender() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("configs.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("configs.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1528,6 +1529,7 @@ mod tests {
     fn clearing_one_starter_slot_only_removes_that_armor_piece() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1554,6 +1556,7 @@ mod tests {
     fn authentic_walkers_load_tideborn_with_starter_armor_and_animation() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1632,6 +1635,7 @@ mod tests {
     fn authentic_mount_animates_rider_and_pet_with_independent_native_clips() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1716,6 +1720,7 @@ mod tests {
     fn ancient_boa_resolves_combined_run_and_uses_native_pet_shader() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1786,6 +1791,7 @@ mod tests {
     fn every_authentic_ride_model_has_native_skin_and_locomotion() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1869,6 +1875,7 @@ mod tests {
     fn authentic_flight_animates_body_and_child_after_takeoff() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();

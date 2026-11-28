@@ -178,10 +178,7 @@ impl CharacterGfx {
     /// Resolve against the exact pose used by the character meshes. Hidden
     /// travel models contribute no effects, just as they contribute no meshes.
     pub fn quads(&self, assembly: &Character, pose: &CharacterPose) -> Result<Vec<Quad>, String> {
-        if self.effects.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut quads = Vec::with_capacity(self.effects.len());
+        let mut quads = Vec::new();
         for effect in &self.effects {
             let Kind::Static(root) = &effect.kind else {
                 continue;
@@ -208,10 +205,7 @@ impl CharacterGfx {
         dt_ms: f32,
         map: Option<&MapSpace>,
     ) -> Result<Vec<gfx_player::EffectQuad>, String> {
-        if self.effects.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::with_capacity(self.effects.len() * 4);
+        let mut out = Vec::new();
         for effect in &mut self.effects {
             // Resolved first: `parent_of` reads the whole effect, which cannot
             // overlap the mutable borrow of its runtime below.
@@ -389,6 +383,7 @@ mod tests {
     fn authentic_static_weapon_event_loads_and_action_events_stay_excluded() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();

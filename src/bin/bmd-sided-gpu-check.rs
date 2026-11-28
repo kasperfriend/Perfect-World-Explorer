@@ -42,10 +42,21 @@ fn main() {
         .next()
         .unwrap();
     // Six quads: 0 single-sided CCW, 1 single-sided CW (index order reversed),
-    // 2 two-sided CCW, 3 two-sided CW, 4 single-sided placed by a mirrored
-    // basis (negative determinant: positions mirrored in X), 5 two-sided
-    // mirrored. The mirrored quads emulate `x = y.cross(z)` for an ornament
-    // whose placed basis has a negative determinant.
+    // 2 two-sided CCW, 3 two-sided CW, 4 single-sided with mirrored positions
+    // and the authored index order, 5 two-sided mirrored.
+    //
+    // "Mirrored" here is positions reflected in X with the indices left alone,
+    // which is what a negative `Model.scale` component produces. It is *not* the
+    // placement basis: both builders normalize `dir` and `up` before crossing
+    // them, so `dir.cross(up)` is right-handed for every input and the scale is
+    // the only thing that can mirror a mesh.
+    //
+    // Quad 4 being culled is client parity, not a defect. The client's per-mesh
+    // submit (`0x7b9ca0`) reads one byte of state, `mesh+0x26c` (`0x7a98c5`),
+    // to set `CULLMODE(1)` (`0x7a98cf`), and its index rebase at
+    // `0x7b9fbc..0x7b9fe1` only adds the vertex base -- it never reorders, so a
+    // mirrored single-sided mesh really does swap `front_facing` and really is
+    // dropped. Nothing compensates for mirroring anywhere in that path.
     let source = format!(
         "{source}\n{}\n",
         r#"

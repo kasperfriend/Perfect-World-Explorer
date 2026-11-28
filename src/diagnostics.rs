@@ -205,9 +205,11 @@ pub enum Channel {
     AudioState = 35,
     /// Complete outdoor-fog diagnostic snapshot: source, selected, active and uploaded state.
     FogCheck = 36,
+    /// Sound elements inside a playing effect root (distinct from backend audio state).
+    EffectSounds = 37,
 }
 
-pub const CHANNELS: usize = 37;
+pub const CHANNELS: usize = 38;
 
 impl Channel {
     pub const ALL: [Channel; CHANNELS] = [
@@ -248,6 +250,7 @@ impl Channel {
         Self::TimingCamera,
         Self::AudioState,
         Self::FogCheck,
+        Self::EffectSounds,
     ];
 
     pub fn index(self) -> usize {
@@ -268,6 +271,7 @@ impl Channel {
             | Self::EffectTrails
             | Self::EffectModels
             | Self::EffectLights
+            | Self::EffectSounds
             | Self::EffectCulling
             | Self::EffectClock
             | Self::EffectDecals
@@ -314,6 +318,7 @@ impl Channel {
             | Self::EffectTrails
             | Self::EffectModels
             | Self::EffectLights
+            | Self::EffectSounds
             | Self::EffectGround => "Sub-elements",
             Self::EffectProblems => "Diagnosis",
             Self::SceneEffects | Self::SceneOrnaments | Self::SceneSounds => "Placements",
@@ -344,6 +349,7 @@ impl Channel {
             Self::EffectParticles => "effect-particles",
             Self::EffectTrails => "effect-trails",
             Self::EffectModels => "effect-models",
+            Self::EffectSounds => "effect-sounds",
             Self::EffectLights => "effect-lights",
             Self::EffectCulling => "effect-culling",
             Self::EffectClock => "effect-clock",
@@ -386,6 +392,7 @@ impl Channel {
             Self::EffectParticles => "Particles: spawns, volume, direction",
             Self::EffectTrails => "Trails, ribbons, fractals, waves",
             Self::EffectModels => "Model elements: file and placement",
+            Self::EffectSounds => "Sound elements: path, volume, 2D, loop",
             Self::EffectLights => "Lights a root publishes",
             Self::EffectCulling => "Activation radius and visibility",
             Self::EffectClock => "Clocks, loops, play speed, binds",
@@ -420,6 +427,14 @@ impl Channel {
     /// to read the source first.
     pub fn help(self) -> &'static str {
         match self {
+            Self::EffectSounds => {
+                "Every sound element (170) a playing root carries: the authored \
+                 paths, volume, the Force2D flag and the IsLoop flag, with the \
+                 root and the placed position. Nothing plays these -- world audio \
+                 is `world_audio.rs`, which reads the EC-BLD sound records -- so \
+                 this channel is how the gap is measured per root instead of \
+                 being one number on a status line."
+            }
             Self::EffectRoots => {
                 "Each effect root the world places, as the loader sees it: path, \
                  key, record position/direction/up/scale/alpha/play speed, the \
@@ -607,11 +622,13 @@ impl Channel {
                 | Self::EffectTrails
                 | Self::EffectModels
                 | Self::EffectLights
+                | Self::EffectSounds
                 | Self::EffectCulling
                 | Self::EffectClock
                 | Self::EffectDecals
                 | Self::EffectProblems
                 | Self::SceneEffects
+                | Self::SceneWater
                 | Self::ModelQueue
                 | Self::RenderEffects
                 | Self::RenderWater
@@ -637,6 +654,7 @@ impl Channel {
             | Self::EffectElements
             | Self::EffectTextures
             | Self::EffectModels
+            | Self::EffectSounds
             | Self::EffectProblems
             | Self::SceneEffects
             | Self::SceneOrnaments
@@ -727,6 +745,7 @@ const SUB_ELEMENTS: &[Channel] = &[
     Channel::EffectTrails,
     Channel::EffectModels,
     Channel::EffectLights,
+    Channel::EffectSounds,
     Channel::EffectGround,
     // Same reason as the cards group: "is the ring turning" is a clock question.
     Channel::EffectClock,
@@ -874,7 +893,7 @@ const MAX_FILE_BYTES: u64 = 8 << 20;
 /// in a loop decides to do.
 const BUDGET_PER_SECOND: f32 = 200.;
 /// How much the budget may hold, so a single load can still dump a whole census
-/// (the map's effect records are 2,275 lines) and still be the whole census.
+/// (the map's effect records are 2,971 lines) and still be the whole census.
 const BUDGET_BURST: f32 = 4000.;
 
 struct Inner {
@@ -1064,11 +1083,14 @@ pub fn mask_from_keys(keys: &str) -> u64 {
 /// once at startup and by the headless preview, so one environment variable is
 /// enough to make a build say what it is doing.
 pub fn apply_env() {
-    let Some(keys) = std::env::var_os("PWE_LOG") else {
-        return;
-    };
-    let keys = keys.to_string_lossy();
-    let mask = mask_from_keys(&keys) | MASK.load(Ordering::Relaxed);
+    let mut mask = MASK.load(Ordering::Relaxed);
+    if let Some(keys) = std::env::var_os("PWE_LOG") {
+        let keys = keys.to_string_lossy();
+        mask |= mask_from_keys(&keys);
+    }
+    if std::env::var_os("PWE_BMD_COLOUR_LOG").is_some_and(|v| v == "1") {
+        mask |= 1u64 << Channel::SceneOrnaments.index();
+    }
     if mask != 0 {
         set_mask(mask);
     }
@@ -1342,7 +1364,7 @@ fn shorten(line: &str, limit: usize) -> String {
 
 /// Every channel file in the folder, in channel order, with its size.
 fn channel_files(dir: &Path) -> Vec<(Channel, PathBuf, u64)> {
-    let mut out = Vec::with_capacity(16);
+    let mut out = Vec::new();
     for channel in Channel::ALL {
         if !channel.wired() {
             continue;
@@ -2494,6 +2516,38 @@ mod tests {
         assert!(dir.ends_with("pwe-logs"));
     }
 
+    /// `SceneWater` is emitted from `water.rs` and `gpu.rs`, so leaving it out
+    /// of `wired()` meant the "Everything" preset never enabled it. A capture
+    /// of a map with no water then contained no `scene-water` file at all, and
+    /// "the water is missing" could not be told apart from "nobody asked for
+    /// the water to be logged" -- which is exactly how the 1.8.4 report read.
+    #[test]
+    fn the_water_channels_are_included_by_the_everything_preset() {
+        for channel in [Channel::SceneWater, Channel::RenderWater] {
+            assert!(
+                channel.wired(),
+                "{} is emitted, so a bulk switch must be able to tick it",
+                channel.key()
+            );
+            assert!(
+                all_wired_mask() & (1u64 << channel.index()) != 0,
+                "{} must be in the Everything mask",
+                channel.key()
+            );
+        }
+        let everything = PRESETS
+            .iter()
+            .find(|preset| preset.name == "Everything")
+            .expect("the Everything preset exists");
+        for channel in [Channel::SceneWater, Channel::RenderWater] {
+            assert!(
+                everything.keys().contains(&channel.key()),
+                "Everything must produce a {} file",
+                channel.key()
+            );
+        }
+    }
+
     #[test]
     fn nothing_that_cannot_write_is_ticked_by_a_bulk_switch() {
         let wired = all_wired_mask().count_ones() as usize;
@@ -2556,7 +2610,10 @@ mod tests {
         assert!(text.contains("client root X"), "{text}");
         assert!(text.contains("effect-roots"), "{text}");
         assert!(text.contains("a root"), "{text}");
-        assert!(text.contains("of 37 on"), "{text}");
+        assert!(
+            text.contains(&format!("of {CHANNELS} on")),
+            "report must name the live channel count {CHANNELS}: {text}"
+        );
         set_mask(0);
         let _ = std::fs::remove_dir_all(&dir);
     }

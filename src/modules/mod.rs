@@ -20,11 +20,19 @@ use winit::keyboard::KeyCode;
 
 // Several modules install client fonts. Preserve earlier registrations, even
 // when more than one module installs a font during the same egui frame.
+//
+// The first call must not read the current definitions. `ctx.fonts()` panics
+// with "No fonts available until first call to `Context::run()`" until the
+// context has drawn once, and the interface font is installed right after the
+// context is made — before the window ever runs a frame. Starting from
+// `FontDefinitions::default()` is the same set `Context::default()` installs,
+// so the first registration is equivalent, and any later one still layers on
+// the stored copy.
 fn extend_fonts(ctx: &egui::Context, extend: impl FnOnce(&mut egui::FontDefinitions)) {
     let id = egui::Id::new("module_shared_font_definitions");
     let mut definitions = ctx
         .data_mut(|data| data.get_temp::<egui::FontDefinitions>(id))
-        .unwrap_or_else(|| ctx.fonts(|fonts| fonts.lock().fonts.definitions().clone()));
+        .unwrap_or_default();
     extend(&mut definitions);
     ctx.data_mut(|data| data.insert_temp(id, definitions.clone()));
     ctx.set_fonts(definitions);
@@ -594,22 +602,9 @@ impl Modules {
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         frame: model_draw_gpu::Frame,
-        include_effects: bool,
     ) {
-        self.walker.render(
-            device,
-            queue,
-            format,
-            encoder,
-            target,
-            depth,
-            frame,
-            include_effects,
-        );
-    }
-
-    pub fn render_walker_effects<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        self.walker.render_effects(pass);
+        self.walker
+            .render(device, queue, format, encoder, target, depth, frame);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -746,4 +741,10 @@ mod tests {
             after
         );
     }
+}
+
+/// Register the client's CJK font on the shared egui context so HUD strings the
+/// client authored in Chinese render instead of drawing one tofu box per glyph.
+pub fn install_client_cjk(ctx: &egui::Context, element: &std::path::Path) {
+    populator::install_client_cjk(ctx, element);
 }

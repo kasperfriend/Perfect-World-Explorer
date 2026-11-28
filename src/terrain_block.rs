@@ -25,6 +25,14 @@
 
 const MAGIC: u32 = 0x5442_4b42;
 
+/// T2BK layout revisions this reader implements.
+///
+/// The header grows at 3, 4 and 6, and the pre-v5 flag byte is read as a
+/// has-data byte. Every `.t2bk` surveyed across all six staged clients is
+/// version 6 (`tools/version-gates.py`), so the top of the range is what
+/// shipped data uses.
+pub const KNOWN_VERSIONS: std::ops::RangeInclusive<u32> = 2..=6;
+
 /// Per-vertex RGBA section present after the normals.
 pub const FLAG_VERTEX_COLOUR: u8 = 0x1;
 /// Heights and normals are zlib-compressed.
@@ -65,6 +73,121 @@ fn u32at(b: &[u8], p: usize) -> Result<u32, String> {
     ))
 }
 
+/// The fields of a `.trn2` header that place the map in the world.
+///
+/// ## There is no world transform here
+///
+/// An instance map ships its own `.trn2`, and the question was whether reading
+/// its `precinct.clt` polygons needs a translation applied first -- whether the
+/// map is authored around the origin and placed somewhere in the world by a
+/// matrix stored in the terrain header. It is not. The header is 96 bytes of
+/// geometry and counters:
+///
+/// | offset | field | measured (`a37.trn2`, 3,457 B) |
+/// |---|---|---|
+/// | 0  | magic `2NRT` (`0x54524e32`) | — |
+/// | 4  | version | 1 |
+/// | 8  | width in metres | 6,144.0 |
+/// | 12 | length in metres | 3,072.0 |
+/// | 16 | block size in metres | 64.0 |
+/// | 20 | cells per block edge | 32 |
+/// | 24 | block count | 4,608 (= 48 x 96) |
+/// | 28, 32 | rows, columns | 48, 96 |
+/// | 36..76 | section counts and offsets | — |
+/// | 68 | grid spacing in metres | 2.0 |
+/// | 76, 80 | loader id, loader offset | 1, 3,282 |
+///
+/// Every word either matches the map's own geometry or indexes the sections
+/// that follow, and dwords 84..96 are zero in both staged copies of `a37.trn2`.
+/// So there is **no stored translation, rotation or scale** for placing the map
+/// in the world, and nothing left over in the header that could be one.
+///
+/// What that does *not* settle is the coordinate frame itself. The extent here
+/// is x 0..6,144 and z 0..3,072 (48 rows x 96 columns x 64 m), while the zone
+/// polygons in the world's `precinct.clt` reach z = 5,637 and negative x. Two
+/// readings remain open: the polygons are in a frame whose origin is not the
+/// terrain corner (a centred or offset frame, which would still need no
+/// per-map transform because every map would share it), or there is a shared
+/// world offset this header does not carry. The instance `.trn2` matching its
+/// own `.ecwld` exactly (same 48 x 96 x 64 m in both) is what rules out a
+/// *per-instance* placement; the frame origin is a separate question and is
+/// recorded as open in `Findings/Unsupported-client-paths.md` rather than
+/// guessed at here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Trn2Header {
+    pub version: u32,
+    pub width: f32,
+    pub length: f32,
+    pub block_size: f32,
+    pub grid: u32,
+    pub blocks: u32,
+    pub rows: u32,
+    pub columns: u32,
+    pub grid_spacing: f32,
+}
+
+/// Read and sanity-check a `.trn2` header.
+pub fn trn2_header(data: &[u8]) -> Result<Trn2Header, String> {
+    const MAGIC: u32 = 0x5452_4e32; // "2NRT"
+    if u32at(data, 0)? != MAGIC {
+        return Err("invalid TRN2".into());
+    }
+    let f = |p: usize| -> Result<f32, String> { Ok(f32::from_bits(u32at(data, p)?)) };
+    let header = Trn2Header {
+        version: u32at(data, 4)?,
+        width: f(8)?,
+        length: f(12)?,
+        block_size: f(16)?,
+        grid: u32at(data, 20)?,
+        blocks: u32at(data, 24)?,
+        rows: u32at(data, 28)?,
+        columns: u32at(data, 32)?,
+        grid_spacing: f(68)?,
+    };
+    if header.version > 1 {
+        return Err(format!("unsupported TRN2 version {}", header.version));
+    }
+    for (name, value) in [
+        ("width", header.width),
+        ("length", header.length),
+        ("block size", header.block_size),
+        ("grid spacing", header.grid_spacing),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(format!("invalid TRN2 {name} {value}"));
+        }
+    }
+    if header.grid == 0
+        || header.rows == 0
+        || header.columns == 0
+        || header.rows.checked_mul(header.columns) != Some(header.blocks)
+    {
+        return Err("TRN2 block grid does not add up".into());
+    }
+    Ok(header)
+}
+
+/// Whether a world-space point lies inside a map's own terrain extent.
+///
+/// **The frame is centred on the origin, and this was measured, not assumed.**
+/// The extent words are sizes, not a corner: a map `width` x `length` covers
+/// `-width/2 ..= width/2` in x and the same in z. The measurement that settles
+/// it is `world.ecwld`, whose 7,737 placed records fill the centred box to
+/// 99.5 % in x and 97.5 % in z with **0** points outside it; if the box were
+/// anchored at a corner, every one of the 5,461 world units of negative z would
+/// be outside. The same holds for the `a37` and `a07` instances (0 outside) and
+/// for the 383 zone centres of the world's `precinct.clt` (0 outside, 92.3 % of
+/// half-width). See `Findings/Unsupported-client-paths.md`.
+///
+/// An earlier version of this function tested `0.0..=width`, which made every
+/// genuinely-placed point in the negative half fail. Nothing caught it because
+/// the only caller was a test asserting a point that happened to be positive.
+pub fn contains_world_point(header: &Trn2Header, x: f32, z: f32) -> bool {
+    let half_width = header.width / 2.0;
+    let half_length = header.length / 2.0;
+    (-half_width..=half_width).contains(&x) && (-half_length..=half_length).contains(&z)
+}
+
 /// Parse the offset table and derive every block's section ranges.
 ///
 /// `grid` is the cell count per block edge (`world.trn2` header dword @20); it is
@@ -75,8 +198,24 @@ pub fn layout(data: &[u8], grid: usize) -> Result<Layout, String> {
         return Err("invalid T2BK".into());
     }
     let version = u32at(data, 4)?;
-    if !(2..=6).contains(&version) {
-        return Err(format!("unsupported T2BK version {version}"));
+    // Versions 2..=6 are the layout revisions this reader was built against:
+    // the header grows at 3, 4 and 6, and the pre-v5 flag byte is read as a
+    // has-data byte. Above 6 there is no recovered layout, and guessing one
+    // would silently shift every section offset below.
+    //
+    // Surveyed, not assumed: every `.t2bk` staged from the 1.3.1, 1.3.6, 1.4.2,
+    // 1.4.4, 1.5.2 and 1.8.4 installs is version 6
+    // (`tools/version-gates.py`). So the top of the range is what shipped data
+    // uses, and a version above it is a client this reader has never seen
+    // rather than a client it ought to handle. `main.rs` consults the same
+    // range, so the scan and the loader cannot disagree about a block.
+    if !KNOWN_VERSIONS.contains(&version) {
+        return Err(format!(
+            "unsupported T2BK version {version} (this build reads {}..={}); \
+             the block is skipped by name, not the map",
+            KNOWN_VERSIONS.start(),
+            KNOWN_VERSIONS.end()
+        ));
     }
     let count = u32at(data, 8)? as usize;
     let flags = if version < 5 {
@@ -171,6 +310,85 @@ pub fn layout(data: &[u8], grid: usize) -> Result<Layout, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The staged instance header, verbatim: these are the bytes of
+    /// `a37.trn2`'s first 96 bytes, and the test asserts what the doc comment
+    /// above claims about them.
+    fn a37_header() -> Vec<u8> {
+        let mut b = vec![0u8; 96];
+        b[0..4].copy_from_slice(&0x5452_4e32u32.to_le_bytes());
+        for (offset, value) in [
+            (4usize, 1u32),
+            (8, 6144.0f32.to_bits()),
+            (12, 3072.0f32.to_bits()),
+            (16, 64.0f32.to_bits()),
+            (20, 32),
+            (24, 4608),
+            (28, 48),
+            (32, 96),
+            (68, 2.0f32.to_bits()),
+            (76, 1),
+            (80, 3282),
+        ] {
+            b[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn trn2_header_has_no_world_transform() {
+        let header = trn2_header(&a37_header()).unwrap();
+        assert_eq!(header.width, 6144.0);
+        assert_eq!(header.length, 3072.0);
+        assert_eq!((header.rows, header.columns, header.blocks), (48, 96, 4608));
+        assert_eq!(header.grid, 32);
+        // The header describes the map's own extent and nothing else: the tail
+        // words are zero, so there is no matrix hidden in it. The frame is
+        // centred on the origin, which is measured on the neighbouring
+        // `world.ecwld` rather than read out of this header -- see
+        // `contains_world_point`.
+        assert_eq!(header.width * header.length, 6144.0 * 3072.0);
+        // Inside, on both sides of the origin.
+        assert!(contains_world_point(&header, 3070.3, 1500.0));
+        assert!(contains_world_point(&header, -3070.3, -1500.0));
+        assert!(contains_world_point(&header, 0.0, 0.0));
+        assert!(
+            contains_world_point(&header, -3072.0, -1536.0),
+            "the corner is inside"
+        );
+        // Outside by a hair, in each direction.
+        assert!(!contains_world_point(&header, 3072.1, 0.0));
+        assert!(!contains_world_point(&header, 0.0, -1536.1));
+        // The mistake the old corner-anchored version made: a point a precinct
+        // polygon really names on the neighbouring world must not read as
+        // "outside this map's extent".
+        assert!(
+            contains_world_point(&header, -1936.0, -428.3),
+            "a37's own placement"
+        );
+        let bytes = a37_header();
+        assert_eq!(
+            &bytes[84..96],
+            &[0u8; 12],
+            "nothing follows the loader offset"
+        );
+    }
+
+    #[test]
+    fn trn2_header_rejects_nonsense() {
+        let mut b = a37_header();
+        b[0] = 0;
+        assert!(trn2_header(&b).is_err());
+        let mut b = a37_header();
+        b[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert!(trn2_header(&b).unwrap_err().contains("version 2"));
+        let mut b = a37_header();
+        b[28..32].copy_from_slice(&47u32.to_le_bytes());
+        assert!(trn2_header(&b).is_err(), "rows x columns must be the count");
+        let mut b = a37_header();
+        b[8..12].copy_from_slice(&f32::NAN.to_bits().to_le_bytes());
+        assert!(trn2_header(&b).is_err());
+    }
+
     use super::*;
 
     /// Build a synthetic T2BK with uncompressible filler of the given sizes.

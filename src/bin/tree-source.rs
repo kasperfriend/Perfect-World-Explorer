@@ -5,6 +5,9 @@ mod pck;
 #[allow(dead_code)]
 #[path = "../scene.rs"]
 mod scene;
+// `tree_source.rs` counts the placements it loses, through `crate::load_status`.
+#[path = "../load_status.rs"]
+mod load_status;
 #[path = "../tree_source.rs"]
 mod tree_source;
 fn main() {

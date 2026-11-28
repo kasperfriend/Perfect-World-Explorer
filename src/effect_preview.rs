@@ -518,12 +518,7 @@ fn ruler_vertices(min: [f32; 3], max: [f32; 3]) -> (Vec<LineVertex>, f32) {
     (lines, spacing)
 }
 
-fn ruler(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    shot: Shot,
-    stats: &Stats,
-) -> (Ruler, f32) {
+fn ruler(device: &wgpu::Device, queue: &wgpu::Queue, shot: Shot, stats: &Stats) -> (Ruler, f32) {
     let (vertices, spacing) = ruler_vertices(stats.min, stats.max);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("effect preview ruler"),
@@ -801,8 +796,10 @@ fn quad_edges(quads: &[crate::gfx_player::EffectQuad]) -> (f32, f32) {
         // it reported a square 404-unit ring as `404 x 571` and a 71.83 x 2514
         // shaft as `71.83 x 2515.07` — which is exactly the signature of the
         // diagonal (x sqrt 2 for a square).
-        let width = (glam::Vec3::from_array(corners[1]) - glam::Vec3::from_array(corners[0])).length();
-        let height = (glam::Vec3::from_array(corners[2]) - glam::Vec3::from_array(corners[0])).length();
+        let width =
+            (glam::Vec3::from_array(corners[1]) - glam::Vec3::from_array(corners[0])).length();
+        let height =
+            (glam::Vec3::from_array(corners[2]) - glam::Vec3::from_array(corners[0])).length();
         if !width.is_finite() || !height.is_finite() {
             continue;
         }
@@ -876,10 +873,7 @@ impl Card {
             destination: quad.destination_blend,
             depth: quad.depth_test,
             uv0: quad.uv[0],
-            uv_span: [
-                quad.uv[1][0] - quad.uv[0][0],
-                quad.uv[2][1] - quad.uv[0][1],
-            ],
+            uv_span: [quad.uv[1][0] - quad.uv[0][0], quad.uv[2][1] - quad.uv[0][1]],
         })
     }
 }
@@ -929,7 +923,11 @@ fn dump_quads(quads: &[crate::gfx_player::EffectQuad], limit: usize) -> Vec<Stri
         ));
     }
     let mut cards: Vec<Card> = quads.iter().filter_map(Card::of).collect();
-    cards.sort_by(|a, b| b.long.partial_cmp(&a.long).unwrap_or(std::cmp::Ordering::Equal));
+    cards.sort_by(|a, b| {
+        b.long
+            .partial_cmp(&a.long)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for card in cards.iter().take(limit) {
         lines.push(format!(
             "- card {:.2} x {:.2} at ({:.1}, {:.1}, {:.1}) axis ({:.2}, {:.2}, {:.2}) \
@@ -1321,9 +1319,10 @@ mod tests {
                 std::collections::BTreeMap::new();
             for block in &scene.blocks {
                 for record in &block.effects {
-                    let entry = by_root
-                        .entry(record.path.as_str())
-                        .or_insert((0, f32::MAX, f32::MIN));
+                    let entry =
+                        by_root
+                            .entry(record.path.as_str())
+                            .or_insert((0, f32::MAX, f32::MIN));
                     entry.0 += 1;
                     entry.1 = entry.1.min(record.scale);
                     entry.2 = entry.2.max(record.scale);
@@ -1399,18 +1398,12 @@ mod tests {
                 };
                 for (azimuth, elevation) in &angles {
                     for zoom in &zooms {
-                        let shot = framing_shot_at(
-                            fitted.0, fitted.1, size, *azimuth, *elevation, *zoom,
-                        );
+                        let shot =
+                            framing_shot_at(fitted.0, fitted.1, size, *azimuth, *elevation, *zoom);
                         for time in &frames {
                             let name = format!(
                                 "{:02}-{:05}-{:04}ms-az{:.0}el{:.0}-z{:.2}.png",
-                                shots,
-                                record.export_id,
-                                *time as i64,
-                                *azimuth,
-                                *elevation,
-                                *zoom
+                                shots, record.export_id, *time as i64, *azimuth, *elevation, *zoom
                             );
                             let path = out.join(&name);
                             // One world per time: the clock then reads as the

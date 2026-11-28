@@ -247,19 +247,25 @@ fn parse_instance_text(text: &str) -> Vec<InstanceRecord> {
         let Some(open) = (i + 1..lines.len().min(i + 4)).find(|&j| lines[j] == "{") else {
             continue;
         };
-        let mut fields = [""; 3];
-        let mut field_count = 0usize;
+        let mut fields = Vec::new();
         for candidate in lines.iter().skip(open + 1).take(8) {
             if *candidate == "}" {
                 break;
             }
-            fields[field_count] = *candidate;
-            field_count += 1;
-            if field_count == 3 {
+            fields.push(*candidate);
+            if fields.len() == 3 {
                 break;
             }
         }
-        if field_count < 3 {
+        if fields.len() < 3 {
+            crate::load_status::dropped(
+                crate::load_status::Category::Instances,
+                format!(
+                    "instance list line {}: {} field(s) where the record needs 3",
+                    i + 1,
+                    fields.len()
+                ),
+            );
             continue;
         }
         let Some(id) = fields[0]
@@ -267,9 +273,28 @@ fn parse_instance_text(text: &str) -> Vec<InstanceRecord> {
             .next()
             .and_then(|v| v.parse::<u32>().ok())
         else {
+            // A malformed instance line used to vanish here. That is one
+            // instance the player cannot enter, reported as nothing at all, so
+            // it is counted with the line that lost it.
+            crate::load_status::dropped(
+                crate::load_status::Category::Instances,
+                format!(
+                    "instance list line {}: no numeric id in {:?}",
+                    i + 1,
+                    fields[0]
+                ),
+            );
             continue;
         };
         let Some(path) = quoted(fields[1]).and_then(|p| map_id_from_path(&p)) else {
+            crate::load_status::dropped(
+                crate::load_status::Category::Instances,
+                format!(
+                    "instance list line {}: no map path in {:?}",
+                    i + 1,
+                    fields[1]
+                ),
+            );
             continue;
         };
         let (rows, cols) = parse_pair(fields[2]).unwrap_or((1, 1));
@@ -398,8 +423,21 @@ pub fn element_from_map_dir(dir: &Path) -> PathBuf {
 }
 
 fn first_zone_name(dir: &Path) -> Option<String> {
-    let bytes = fs::read(dir.join("precinct.clt")).ok()?;
-    let text = decode_client_text(&bytes).ok()?;
+    let path = dir.join("precinct.clt");
+    let bytes = fs::read(&path).ok()?;
+    let text = match decode_client_text(&bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            crate::load_status::dropped(
+                crate::load_status::Category::ZoneNames,
+                format!(
+                    "{}: cannot decode precinct zone name: {error}",
+                    path.display()
+                ),
+            );
+            return None;
+        }
+    };
     for line in text.lines().map(strip_comment).map(str::trim) {
         if let Some(name) = quoted(line) {
             let name = name.trim().to_string();
@@ -407,7 +445,12 @@ fn first_zone_name(dir: &Path) -> Option<String> {
                 // Many instance precincts name sub-zones as "Map - Quarter".
                 // The common prefix is a better map label than one quarter.
                 let short = name.split(" - ").next().unwrap_or(&name).trim();
-                return Some(short.to_string());
+                // The map picker draws with egui's Latin faces, so an instance
+                // whose first zone is Chinese would show a label nobody can
+                // read. The instance alias table answers where the world zone
+                // table has no row; an unknown name still stays as authored
+                // because the tooltip is better than a blank.
+                return Some(crate::world_place_names::english(short).to_string());
             }
         }
     }
@@ -461,7 +504,7 @@ fn pretty_id(id: &str) -> String {
 /// Well-known English map labels. The client name is still retained in `name`
 /// and shown in the tooltip; this table only keeps the combo box legible when a
 /// client's instance names use glyphs the default egui font does not embed.
-fn english_name(id: &str) -> Option<&'static str> {
+pub fn english_name(id: &str) -> Option<&'static str> {
     Some(match id.to_ascii_lowercase().as_str() {
         "world" => "Perfect World — Mainland",
         "login" => "Character Selection",
@@ -603,7 +646,7 @@ pub fn discover(element: &Path) -> Catalog {
             }
         }
     }
-    maps.sort_by_cached_key(sort_key);
+    maps.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
     Catalog { maps, warning }
 }
 
@@ -927,6 +970,39 @@ mod tests {
         assert_eq!(decode_client_text(&utf16).unwrap(), utf8);
         let (gbk, _, _) = encoding_rs::GBK.encode("完美大陆");
         assert_eq!(decode_client_text(&gbk).unwrap(), "完美大陆");
+    }
+
+    #[test]
+    fn invalid_gbk_zone_name_falls_back_and_counts_a_named_loss() {
+        let _guard = crate::load_status::test_guard();
+        crate::load_status::reset();
+        static UNIQUE: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "pwe-invalid-zone-gbk-{}-{}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let dir = root.join("maps/bad_zone");
+        fs::create_dir_all(&dir).unwrap();
+        for ext in ["trn2", "ecwld", "ecbsd"] {
+            fs::write(dir.join(format!("bad_zone.{ext}")), []).unwrap();
+        }
+        // An incomplete GBK lead byte cannot supply a localized name. The map
+        // remains selectable under its folder-derived fallback, while the
+        // ZoneNames counter carries a reason with the exact sidecar path.
+        fs::write(dir.join("precinct.clt"), [0x81]).unwrap();
+        let map = WorldMap::from_dir(&dir, &HashMap::new()).unwrap();
+        assert_eq!(map.name, "Bad Zone");
+        assert_eq!(
+            crate::load_status::dropped_count(crate::load_status::Category::ZoneNames),
+            1
+        );
+        let reasons = crate::load_status::reasons(crate::load_status::Category::ZoneNames);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("precinct.clt"), "{}", reasons[0]);
+        assert!(reasons[0].contains("cannot decode precinct zone name"));
+        crate::load_status::reset();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

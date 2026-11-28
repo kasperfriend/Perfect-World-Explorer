@@ -252,34 +252,17 @@ impl Browser {
             })
             .inner;
         if first || changed {
-            let q = if self.query.is_ascii() {
-                self.query.to_ascii_lowercase()
-            } else {
-                self.query.to_lowercase()
-            };
-            if q.is_empty() {
-                self.matches = (0..catalog.len()).collect();
-            } else {
-                let q_ascii = q.is_ascii();
-                let qb = q.as_bytes();
-                let contains_ci = |haystack: &str| -> bool {
-                    if q_ascii && haystack.is_ascii() {
-                        haystack
-                            .as_bytes()
-                            .windows(qb.len())
-                            .any(|w| w.eq_ignore_ascii_case(qb))
-                    } else {
-                        haystack.to_lowercase().contains(&q)
-                    }
-                };
-                self.matches = catalog
-                    .entries()
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, e)| contains_ci(&self.labels[*i].text) || contains_ci(&e.path))
-                    .map(|(i, _)| i)
-                    .collect();
-            }
+            let q = self.query.to_lowercase();
+            self.matches = catalog
+                .entries()
+                .iter()
+                .enumerate()
+                .filter(|(i, e)| {
+                    self.labels[*i].text.to_lowercase().contains(&q)
+                        || e.path.to_lowercase().contains(&q)
+                })
+                .map(|(i, _)| i)
+                .collect();
         }
         ui.label(format!(
             "{} of {} effects",
@@ -559,6 +542,8 @@ mod tests {
         pack.extend((276u32 ^ mask ^ 0x59374231).to_le_bytes());
         pack.extend(record);
         let mut footer = [0u8; 280];
+        let desc = b"Angelica File Package, Perfect World Co. Ltd.";
+        footer[16..16 + desc.len()].copy_from_slice(desc);
         for (offset, value) in [
             (0, 0xfdfdfeee),
             (8, directory ^ mask),

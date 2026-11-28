@@ -3,8 +3,13 @@
 #[path = "../bmd.rs"]
 mod bmd;
 // The baked draw-state table is shared with the production scenery path.
+#[path = "../angelica_pck.rs"]
+#[allow(dead_code)]
+mod angelica_pck;
 #[path = "../bmd_baked.rs"]
 mod bmd_baked;
+#[path = "support/diag_stub.rs"]
+mod diag_stub;
 #[path = "../objects.rs"]
 mod objects;
 #[path = "../pck.rs"]
@@ -17,6 +22,7 @@ mod scenery_visibility;
 mod texture_atlas;
 #[path = "../texture_resolution.rs"]
 mod texture_resolution;
+pub use diag_stub::diagnostics;
 #[path = "../world_objects.rs"]
 mod world_objects;
 #[path = "../world_page_cache.rs"]
@@ -41,7 +47,6 @@ const SIDE: usize = 4096;
 fn page(right: bool, shared: bool) -> Page {
     // Coincident triangles deliberately make submission order observable.
     let positions = [[-1., -1., 0.], [1., -1., 0.], [-1., 1., 0.]];
-    let vertex_count = positions.len() as u32;
     let vertices = positions
         .into_iter()
         .map(|pos| gpu::Vertex {
@@ -74,8 +79,6 @@ fn page(right: bool, shared: bool) -> Page {
         placements: vec![world_objects::PlacementRange {
             start: 0,
             end: 3,
-            vertex_start: 0,
-            vertex_end: vertex_count,
             export_id: 1,
             order: u64::from(right),
             visibility: scenery_visibility::Visibility {

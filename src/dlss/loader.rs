@@ -479,7 +479,7 @@ impl NgxCore {
                     let name = path
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default();
+                        .unwrap_or_else(|| "<unnamed SDK module>".to_string());
                     failures.push(format!("{name}: {error}"));
                 }
             }
@@ -524,7 +524,7 @@ impl NgxCore {
             .filter(|helper| !same_file(helper, path))
             .and_then(|helper| load_module(helper, &[]).ok())
             .map(|(handle, _)| handle);
-        let mut core = Self {
+        let core = Self {
             _handle: handle,
             path: path.to_string_lossy().into_owned(),
             create_feature: unsafe { read_function(exports[1]) },
@@ -1017,7 +1017,7 @@ fn log_feature_module(path: &Path) {
             "[NGX] this DLSS build ({}) predates DLSS 4: replace sdk\\nvngx_dlss.dll and \
              sdk\\nvngx_dlssg.dll with the 310.x release (NVIDIA/DLSS, \
              lib/Windows_x86_64/rel/)",
-            version.unwrap_or_default()
+            version.unwrap_or_else(|| "unknown version".to_string())
         ));
     }
     let parameters = parameter_exports(path);
@@ -1143,8 +1143,14 @@ fn exported_names(path: &Path) -> Vec<String> {
     let Ok(bytes) = std::fs::read(path) else {
         return Vec::new();
     };
-    let mut names: Vec<String> = parse(&bytes)
-        .unwrap_or_default()
+    let Some(parsed) = parse(&bytes) else {
+        super::diag(&format!(
+            "[NGX] unable to parse PE exports from {}",
+            path.display()
+        ));
+        return Vec::new();
+    };
+    let mut names: Vec<String> = parsed
         .into_iter()
         .filter(|name| name.starts_with("NVSDK_NGX_"))
         .collect();
@@ -1566,7 +1572,12 @@ fn is_writable(dir: &Path) -> bool {
     let probe = dir.join(format!("write-probe-{}.tmp", std::process::id()));
     match std::fs::write(&probe, b"ngx") {
         Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
+            if let Err(error) = std::fs::remove_file(&probe) {
+                super::diag(&format!(
+                    "[NGX] could not remove write probe {}: {error}",
+                    probe.display()
+                ));
+            }
             true
         }
         Err(_) => false,

@@ -227,6 +227,20 @@ fn minimap_matrix(x: f32, z: f32, range: f32) -> Mat4 {
 /// plane at or behind the eye (a plane that runs past the camera has no finite
 /// screen rectangle), a rectangle that covers most of the target anyway, or a
 /// target too small to bother with.
+/// Narrow a water view's CPU/GPU culling frustum to the exact scissor
+/// rectangle that the surface can sample. The scissor still clips rasterization;
+/// this additionally avoids submitting and vertex-processing objects outside it.
+fn water_scissor_ndc_rect(extent: (u32, u32), scissor: Option<[u32; 4]>) -> Option<[f32; 4]> {
+    let [x, y, width, height] = scissor?;
+    let (w, h) = (extent.0.max(1) as f32, extent.1.max(1) as f32);
+    Some([
+        2. * x as f32 / w - 1.,
+        2. * (x + width) as f32 / w - 1.,
+        1. - 2. * (y + height) as f32 / h,
+        1. - 2. * y as f32 / h,
+    ])
+}
+
 fn water_view_scissor(
     matrix: Mat4,
     w: u32,
@@ -356,32 +370,6 @@ fn fog_depth_probe(
         max_at,
         max_factor: fog_factor_at_depth(max_depth, range),
     }
-}
-
-/// Narrow a water view's CPU/GPU culling frustum to the exact scissor
-/// rectangle that the surface can sample. The scissor still clips rasterization;
-/// this additionally avoids submitting and vertex-processing objects outside it.
-fn water_scissor_ndc_rect(extent: (u32, u32), scissor: Option<[u32; 4]>) -> Option<[f32; 4]> {
-    let [x, y, width, height] = scissor?;
-    let (w, h) = (extent.0.max(1) as f32, extent.1.max(1) as f32);
-    Some([
-        2. * x as f32 / w - 1.,
-        2. * (x + width) as f32 / w - 1.,
-        1. - 2. * (y + height) as f32 / h,
-        1. - 2. * y as f32 / h,
-    ])
-}
-
-fn water_view_frustum(
-    matrix: Mat4,
-    extent: (u32, u32),
-    scissor: Option<[u32; 4]>,
-    fallback: [[f32; 4]; 6],
-) -> [[f32; 4]; 6] {
-    let Some(rect) = water_scissor_ndc_rect(extent, scissor) else {
-        return fallback;
-    };
-    crate::world_objects::frustum_planes_from_matrix_rect(matrix.to_cols_array(), rect)
 }
 
 /// Everything the top-down minimap's pixels can depend on.
@@ -620,7 +608,8 @@ impl FrameBudget {
             use std::fmt::Write;
             let mut stages = String::new();
             for (name, ms) in STAGE_NAMES.iter().zip(self.stage_ms) {
-                let _ = write!(stages, "; {name} {:.2} ms", ms / self.frames as f64);
+                write!(stages, "; {name} {:.2} ms", ms / self.frames as f64)
+                    .expect("writing diagnostic text to String is infallible");
             }
             // Only mentioned when it happened, so the line stays the same shape
             // for a view with no water in it.
@@ -1043,11 +1032,8 @@ fn build(
     // `0x77e250`: the resident set follows the window. Blocks that enter are
     // meshed at the level `0x77e360` picked, blocks whose level changed are
     // re-meshed, and blocks the window leaves release their geometry.
-    let heights_ref = &t.heights;
-    let width = t.width;
-    let height = t.height;
-    let grid_spacing = t.grid_spacing;
-    let census = residency.update_stitched_parallel(
+    let mut terrain_reader = t.heights.reader();
+    let census = residency.update_stitched(
         &win,
         |x, y| {
             (
@@ -1055,20 +1041,20 @@ fn build(
                 levels.cases[(y - win.y0) * (win.x1 - win.x0) + x - win.x0],
             )
         },
-        |x, y, level, cases| {
-            let mut reader = heights_ref.reader();
-            let surface = crate::terrain_lod::block_surface_cached(level, cases);
+        |x, y, level| {
+            let cases = levels.cases[(y - win.y0) * (win.x1 - win.x0) + (x - win.x0)];
+            let surface = crate::terrain_lod::block_surface(level, cases);
             let mut block_vertices = Vec::with_capacity(surface.grid.len());
             let mut low = [f32::INFINITY; 3];
             let mut high = [f32::NEG_INFINITY; 3];
             for g in &surface.grid {
                 let (cell_x, cell_y, at) =
                     sample(x * TILE + g[0] as usize, y * TILE + g[1] as usize);
-                let (h_val, n) = reader.cell(at)?;
+                let (height, n) = terrain_reader.cell(at)?;
                 let pos = [
-                    (cell_x as f32 - width as f32 * 0.5) * grid_spacing,
-                    h_val,
-                    (height as f32 * 0.5 - cell_y as f32) * grid_spacing,
+                    (cell_x as f32 - t.width as f32 * 0.5) * t.grid_spacing,
+                    height,
+                    (t.height as f32 * 0.5 - cell_y as f32) * t.grid_spacing,
                 ];
                 for axis in 0..3 {
                     low[axis] = low[axis].min(pos[axis]);
@@ -1086,12 +1072,11 @@ fn build(
             }
             Ok((
                 block_vertices,
-                surface.indices.clone(),
+                surface.indices,
                 [low[0], low[1], low[2], high[0], high[1], high[2]],
             ))
         },
     )?;
-    let mut terrain_reader = t.heights.reader();
     let spans = residency.append(&win, &mut vertices, &mut indices);
     // A channel line, not `eprintln!`: this runs on every block-window crossing,
     // and a synchronous console write per crossing costs more than the append it
@@ -1370,17 +1355,9 @@ fn build(
     // zero-fill, the pixel copies, the mip generation and — on the render
     // thread — the upload.
     let grass_atlas_key = grass_layout.value();
-    let grass_atlas_changed = grass_atlas_key != grass_atlas_hint && !grass_copies.is_empty();
+    let grass_atlas_changed = grass_atlas_key != grass_atlas_hint;
     let (atlas, grass_mips) = if grass_atlas_changed {
-        // Allocate only the rows actually packed into the grass atlas (multiple
-        // of 128 for mip alignment) instead of zeroing 64 MiB (4096x4096x4).
-        let used_grass_rows = grass_copies
-            .iter()
-            .map(|(slot, _, _)| slot.y + slot.h)
-            .max()
-            .unwrap_or(0);
-        let grass_rows = ((used_grass_rows + 127) & !127).clamp(128, ATLAS);
-        let mut atlas = vec![0u8; ATLAS * grass_rows * 4];
+        let mut atlas = vec![0u8; ATLAS * ATLAS * 4];
         for (slot, texture, authored) in &grass_copies {
             let Some(img) = t.grass.textures.get(texture) else {
                 continue;
@@ -1465,13 +1442,16 @@ fn build(
                 && crate::terrain_cutoff::contains(resident_bounds, t.objects.ornaments[i].position)
         })
         .collect();
-    if skip_local_scenery {
-        // Whole-world GPU pages now own all scenery; drop local CPU-cached
-        // ornament meshes and decoded RGBA textures (often 100-512+ MiB RAM).
-        // They reload on demand if whole-world mode is later turned off.
-        t.objects.release_resident_caches();
-    } else {
-        t.objects.load_ids(&ornament_ids)?;
+    // One unreadable prop must not blank the map. `load_ids` already resolves
+    // each model independently and negative-caches the ones it cannot, so an
+    // error here is about the set, not about one model; report it and draw what
+    // did load.
+    if let Err(error) = t.objects.load_ids(&ornament_ids) {
+        crate::diag!(
+            TimingLoad,
+            "Local scenery object load stopped early: {error}"
+        );
+        eprintln!("Local scenery object load stopped early: {error}");
     }
     let tree_lod_scale = lod_scale(detail.scenery_quality, Class::Trees);
     if skip_local_scenery {
@@ -1577,12 +1557,32 @@ fn build(
         }
         texture_slots.insert(key.clone(), (i, slot));
     }
+    let (available, unavailable, first_problems) = t.objects.model_census();
     crate::diag!(
         TimingLoad,
-        "Local scenery: {} source-resolution textures in {} GPU pages",
+        "Local scenery: {} source-resolution textures in {} GPU pages; {} ornament placement(s) in the map, {} selected here, {} drawable, {} names this client cannot resolve",
         requested.len(),
-        pages.len()
+        pages.len(),
+        t.objects.ornaments.len(),
+        ornament_ids.len(),
+        available,
+        unavailable
     );
+    // Name what is missing. A map whose buildings are absent because its archive
+    // is not indexed, or because every name resolves nowhere, reads exactly like
+    // a map that authors no buildings -- and this line is the difference.
+    for example in first_problems {
+        crate::diag!(TimingLoad, "Local scenery unresolved: {example}");
+    }
+    if !ornament_ids.is_empty() && available == 0 {
+        let line = format!(
+            "{} ornament placements are in view but none of their models resolved: {} distinct names unavailable",
+            ornament_ids.len(),
+            unavailable
+        );
+        crate::diag!(TimingLoad, "Local scenery: {line}");
+        eprintln!("{line}");
+    }
     for id in ornament_ids {
         let Some(model) = t.objects.get(id) else {
             continue;
@@ -1608,9 +1608,8 @@ fn build(
             ) {
                 Ok(state) => state.kind,
                 Err(e) => {
-                    // Explicit error, not a silently dropped mesh: the BMD
-                    // parser names every unrecovered version before this point.
-                    return Err(format!("unsupported baked mesh {}: {e}", mesh.name));
+                    eprintln!("Skipping unsupported baked mesh {}: {e}", mesh.name);
+                    continue;
                 }
             };
             if crate::objects::SdrUvAnim::from_texture_path(&mesh.texture)
@@ -1649,8 +1648,6 @@ fn build(
                 page.placements.push(crate::world_objects::PlacementRange {
                     start: range_start,
                     end: range_end,
-                    vertex_start: base,
-                    vertex_end: base + mesh.vertices.len() as u32,
                     export_id: t.objects.ornaments[id].export_id,
                     order: 0,
                     visibility,
@@ -1685,9 +1682,9 @@ fn build(
     }
     // Keep opaque indices separate so water can sample reflected/refracted scene passes.
     let water_start = indices.len() as u32;
+    let mut water_batches: Vec<WaterBatch> = Vec::new();
     let mut areas: Vec<_> = t.water.iter().collect();
-    areas.sort_unstable_by(|a, b| a.height.total_cmp(&b.height));
-    let mut water_batches: Vec<WaterBatch> = Vec::with_capacity(areas.len());
+    areas.sort_by(|a, b| a.height.total_cmp(&b.height));
     // The water records had no channel of their own: `SceneWater` and
     // `RenderWater` were declared in the Logging tab and emitted nowhere, so a
     // report could not say whether the map carries a water surface where the
@@ -1695,12 +1692,30 @@ fn build(
     // (`src/water.rs`), so a fall cannot be one of these: an empty list around
     // the fall proves the surface is the static-mesh water of
     // A3DTerrainWater.cpp:67-84, which this loader does not read yet.
+    // A map can reference thousands of water records and still hand the
+    // renderer a handful of areas if the reader drops them (the 1.3.1 world
+    // references 9,204 references over 72 patches). One line per rebuild says
+    // what arrived, so "the water is missing" is answerable from the log rather
+    // than from the picture.
+    crate::diag!(
+        SceneWater,
+        "{} water areas, {} cells, {} of them wet",
+        areas.len(),
+        areas.iter().map(|a| a.mask.len()).sum::<usize>(),
+        areas
+            .iter()
+            .map(|a| a.mask.iter().filter(|&&m| m != 0).count())
+            .sum::<usize>()
+    );
     for a in &areas {
         let cells = a.mask.iter().filter(|&&m| m != 0).count();
+        // `wet` is the authored mask's non-zero count, which is a depth/shore
+        // signal; the drawn surface covers every cell, because the client draws
+        // the area's whole grid (`wet=265 of 336` is not 21% missing water).
         crate::diag!(
             RenderWater,
             "export={} colour=0x{:08x} simple={} height={:.3} grid={:.3} cells={}x{} \
-             wet={} of {} centre=({:.2},{:.2},{:.2}) shore_waves={}",
+             wet={} of {} (all drawn) centre=({:.2},{:.2},{:.2}) shore_waves={}",
             a.export_id,
             a.color,
             a.simple,
@@ -1741,9 +1756,13 @@ fn build(
         );
         for row in row0..row1 {
             for col in col0..col1 {
-                if a.mask[row * a.columns + col] & 1 == 0 {
-                    continue;
-                }
+                // Every cell of the area's grid is water. The authored mask is a
+                // depth/shore value, not a footprint: the client's
+                // `A3DWaterArea::IsInWater` (`0x781c50`) threshold-tests an
+                // interpolated height, so a zero byte is a shallow cell *inside*
+                // the surface, not a hole in it. Skipping zero cells here is what
+                // left ~21% of the 512 m x 672 m open-water area missing in both
+                // the 1.3.6 and 1.5.2 runs (`wet=265 of 336`).
                 let x = a.center[0] - hx + col as f32 * a.grid_size;
                 let z = a.center[2] + hz - row as f32 * a.grid_size;
                 let s = a.grid_size;
@@ -1921,10 +1940,10 @@ fn bmd_baked_rgb(day:u32, night:u32, night_factor:f32)->vec3<u32> {
  return (a*(255u-w)+b*w)>>vec3<u32>(8u);
 }
 @vertex fn vs(i:VIn)->VOut { var o:VOut; var pos=i.pos; var norm=i.normal;
- if i.kind>4.5 { let rho=i.color.w; var v=i.normal; if rho<=1000. { let d=normalize(camera.direction.xyz); let az=atan2(d.z,d.x); let el=asin(clamp(d.y,-1.,1.)); let ce=cos(el); let se=sin(el); let q=vec3<f32>(ce*i.normal.x-se*i.normal.z,i.normal.y,se*i.normal.x+ce*i.normal.z); let a=az+rho; let ca=cos(a); let sa=sin(a); v=vec3<f32>(ca*q.x-sa*q.y,sa*q.x+ca*q.y,q.z); } pos+=vec3<f32>(v.x,v.z,v.y);norm=vec3<f32>(0.,1.,0.); }
+ if i.kind>4.5 { let d=normalize(camera.direction.xyz); let az=atan2(d.z,d.x); let el=asin(clamp(d.y,-1.,1.)); let rho=i.color.w; let q=vec3<f32>(cos(el)*i.normal.x-sin(el)*i.normal.z,i.normal.y,sin(el)*i.normal.x+cos(el)*i.normal.z); let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. { v=i.normal; }pos+=vec3<f32>(v.x,v.z,v.y);norm=vec3<f32>(0.,1.,0.); }
  o.pos=camera.matrix*vec4<f32>(pos,1.);o.bmd_refraction=1.;if camera.clip.y<0. && i.kind>1.5 && i.kind<2.5 {o.bmd_refraction=bmd_refraction_transmittance(pos);}o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;let baked_rgb=vec3<f32>(bmd_baked_rgb(i.diffuse,i.night_diffuse,1.-camera.direction.w))/255.;let bmd_ndl=max(dot(normalize(norm),normalize(camera.sun.xyz)),0.);let bmd_rt=vec3<f32>((camera.light.x+camera.light.y*bmd_ndl)*0.5)*camera.light.zww;o.diffuse=select(baked_rgb,bmd_rt,camera.sun.w<0.);o.opacity=f32((i.diffuse>>24u)&255u)/255.;return o; }
 fn sdr_blend_band(kind:f32)->bool { return (kind>2.01 && kind<2.03)||(kind>2.11 && kind<2.13); }
-fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || (i.kind>1.5 && i.kind<2.05)) && camera.clip.w == 0. && (front == (camera.clip.z != 0.)) {discard;} if camera.clip.y != 0.0 && (i.world.y-camera.clip.x)*camera.clip.y < 0.0 {discard;} if i.kind>0.5 && i.kind<1.05 {return vec4<f32>(fogged(i.color.rgb,i.world),1.);} if i.kind>1.05 && i.kind<1.25 {return vec4<f32>(bmd_pass_fog(clamp(i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.)),i.world,i.bmd_refraction),1.);} let uv_dx=dpdx(i.uv);let uv_dy=dpdy(i.uv);var uv=i.uv; if i.kind>1.5 {let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));let dims=vec2<f32>(textureDimensions(atlas));let border=0.5*clamp(max(length(uv_dx*dims),length(uv_dy*dims)),1.,128.);let half_pixel=min(vec2<f32>(border)/dims,scale*0.499);let sdr_v=select(0.,-0.5*camera.grass_wind.x,sdr_blend_band(i.kind));let local=fract((i.uv-i.color.xy)/scale+vec2<f32>(0.,sdr_v))*scale;uv=i.color.xy+clamp(local,half_pixel,scale-half_pixel);} let raw_tex=textureSampleGrad(atlas,atlas_sampler,uv,uv_dx*camera.lod.y,uv_dy*camera.lod.y);let encoded=raw_tex.rgb;let linear=select(encoded/12.92,pow((encoded+0.055)/1.055,vec3<f32>(2.4)),encoded>vec3<f32>(0.04045));if !sdr_blend_band(i.kind) && ((i.kind>1.5 && i.kind<2.5) || i.kind>3.5) && raw_tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9) {discard;}let tex=vec4<f32>(linear,raw_tex.a); if i.kind>1.5 && i.kind<2.5 {let c=clamp(raw_tex.rgb*i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.));let rgb=select(c/12.92,pow((c+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));return vec4<f32>(bmd_pass_fog(rgb,i.world,i.bmd_refraction),select(1.,raw_tex.a*i.opacity,sdr_blend_band(i.kind)));} let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.world),1.); }
+fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || (i.kind>1.5 && i.kind<2.05)) && camera.clip.w == 0. && (front == (camera.clip.z != 0.)) {discard;} if camera.clip.y != 0.0 && (i.world.y-camera.clip.x)*camera.clip.y < 0.0 {discard;} if i.kind>0.5 && i.kind<1.05 {return vec4<f32>(fogged(i.color.rgb,i.world),1.);} if i.kind>1.05 && i.kind<1.25 {return vec4<f32>(bmd_pass_fog(clamp(i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.)),i.world,i.bmd_refraction),1.);} let uv_dx=dpdx(i.uv);let uv_dy=dpdy(i.uv);var uv=i.uv; if i.kind>1.5 {let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(uv_dx*dims),length(uv_dy*dims)),1.)),0.,7.);let border=0.5*exp2(mip);let half_pixel=min(vec2<f32>(border)/dims,scale*0.499);let sdr_v=select(0.,-0.5*camera.grass_wind.x,sdr_blend_band(i.kind));let local=fract((i.uv-i.color.xy)/scale+vec2<f32>(0.,sdr_v))*scale;uv=i.color.xy+clamp(local,half_pixel,scale-half_pixel);} let raw_tex=textureSampleGrad(atlas,atlas_sampler,uv,uv_dx*camera.lod.y,uv_dy*camera.lod.y);let encoded=raw_tex.rgb;let linear=select(encoded/12.92,pow((encoded+0.055)/1.055,vec3<f32>(2.4)),encoded>vec3<f32>(0.04045));let tex=vec4<f32>(linear,raw_tex.a);if !sdr_blend_band(i.kind) && ((i.kind>1.5 && i.kind<2.5) || i.kind>3.5) && raw_tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9) {discard;} if i.kind>1.5 && i.kind<2.5 {let c=clamp(raw_tex.rgb*i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.));let rgb=select(c/12.92,pow((c+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));return vec4<f32>(bmd_pass_fog(rgb,i.world,i.bmd_refraction),select(1.,raw_tex.a*i.opacity,sdr_blend_band(i.kind)));} let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.world),1.); }
 @fragment fn fs(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
 @fragment fn fs_sdr(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if !sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
 "#;
@@ -2020,16 +2039,8 @@ struct Renderer {
     /// the pages whose content did not change instead of re-uploading them.
     local_page_keys: Vec<u64>,
     world_pages: Vec<crate::world_objects::GpuPage>,
-    /// Shared append-only geometry allocations for streamed world pages.
-    world_geometry_arena: crate::world_objects::WorldGeometryArena,
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
     world_draw_cmds: [crate::world_objects::WorldDrawList; crate::world_objects::WORLD_VIEWS],
-    /// Separate scratch/buffer lifetimes let the opaque and SDR indirect
-    /// buffers remain borrowed by one render pass at the same time.
-    world_draw_scratch: [std::cell::RefCell<crate::world_objects::WorldDrawScratch>; 2],
-    /// Reused upload staging pages; all whole-world geometry copies are
-    /// encoded together and submitted once per frame.
-    world_upload_belt: wgpu::util::StagingBelt,
     world_done: bool,
     /// The scenery half of the drawn mesh was left out because the whole-world
     /// preload owns it. Unlike `world_done` this describes the *mesh*, so the
@@ -2089,12 +2100,6 @@ struct Renderer {
     index_capacity: u64,
     count: u32,
     depth: wgpu::Texture,
-    /// Main/reflection/refraction Hi-Z storage is reused sequentially per view.
-    /// A small storage fallback keeps the tree compute bind group valid when a
-    /// viewport exceeds the adapter's storage-buffer binding limit.
-    hiz: Option<crate::hiz::Pyramid>,
-    _hiz_fallback_texture: wgpu::Texture,
-    hiz_fallback_view: wgpu::TextureView,
     /// Object-motion attachment for the shared motion-vector pass: `rg` pixel
     /// motion, `a` coverage, `b` spare, at render extent. Cleared every frame and
     /// written only by the passes that know an object's own motion
@@ -2104,7 +2109,6 @@ struct Renderer {
     #[allow(dead_code)]
     object_mv: wgpu::Texture,
     object_mv_view: wgpu::TextureView,
-    object_mv_enabled: bool,
     center: (isize, isize),
 }
 
@@ -2238,47 +2242,15 @@ pub fn ten_class_placements(t: &Terrain) -> Vec<crate::scenery_visibility::Place
 /// intermediates stay at the full window size and are resized separately.
 fn resize_world_targets(renderer: &mut Renderer, w: u32, h: u32) {
     renderer.depth = depth(&renderer.device, w, h);
-    let hiz_depth_view = renderer.depth.create_view(&Default::default());
-    renderer.hiz = match crate::hiz::Pyramid::new_half_resolution(&renderer.device, w, h) {
-        Ok(mut pyramid) => {
-            pyramid.set_depth_view(&renderer.device, &hiz_depth_view);
-            Some(pyramid)
-        }
-        Err(error) => {
-            eprintln!(
-                "Hi-Z disabled after resize; frustum-only tree culling remains active: {error}"
-            );
-            None
-        }
-    };
-    renderer.far_trees.set_hiz_view(
-        &renderer.device,
-        renderer
-            .hiz
-            .as_ref()
-            .map_or(&renderer.hiz_fallback_view, |p| p.view()),
-    );
-    if renderer.object_mv_enabled {
-        let (object_mv, object_mv_view) = object_mv_target(&renderer.device, w, h);
-        renderer.object_mv = object_mv;
-        renderer.object_mv_view = object_mv_view;
-    }
+    let (object_mv, object_mv_view) = object_mv_target(&renderer.device, w, h);
+    renderer.object_mv = object_mv;
+    renderer.object_mv_view = object_mv_view;
     // Sky keeps its dummy depth — sampling the real depth in the same
     // pass that writes it is a feedback hazard.
     renderer.water.resize(&renderer.device, w, h);
     renderer.post.resize(&renderer.device, w, h);
 }
 impl Renderer {
-    fn set_object_mv_enabled(&mut self, enabled: bool, w: u32, h: u32) {
-        if self.object_mv_enabled == enabled {
-            return;
-        }
-        self.object_mv_enabled = enabled;
-        let (ow, oh) = if enabled { (w, h) } else { (1, 1) };
-        let (object_mv, object_mv_view) = object_mv_target(&self.device, ow, oh);
-        self.object_mv = object_mv;
-        self.object_mv_view = object_mv_view;
-    }
     fn resident_bounds(&self) -> Option<[f32; 4]> {
         let win = self.lod.window;
         self.detail.terrain_cutoff.then(|| {
@@ -2345,22 +2317,14 @@ impl Renderer {
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        // Maps without grass areas (dungeons, interiors, dry instances) use a
-        // 1x1 dummy texture instead of an unused 4096x4096x8-mip (85.3 MiB) atlas.
-        let has_grass = !t.grass.areas.is_empty();
-        let (grass_atlas_dim, grass_atlas_mips) = if has_grass {
-            (ATLAS as u32, 8u32)
-        } else {
-            (1u32, 1u32)
-        };
         let atlas = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("world material atlas with grass mips"),
             size: wgpu::Extent3d {
-                width: grass_atlas_dim,
-                height: grass_atlas_dim,
+                width: ATLAS as u32,
+                height: ATLAS as u32,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: grass_atlas_mips,
+            mip_level_count: 8,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             // D3D8 samples/filter authored color bytes without automatic sRGB decode.
@@ -2444,441 +2408,62 @@ impl Renderer {
             ],
         });
         let depth_tex = depth(&device, w, h);
-        let hiz_depth_view = depth_tex.create_view(&Default::default());
-        let hiz = match crate::hiz::Pyramid::new_half_resolution(&device, w, h) {
-            Ok(mut pyramid) => {
-                pyramid.set_depth_view(&device, &hiz_depth_view);
-                eprintln!(
-                    "Initialized reversed-Z Hi-Z pyramid: {}x{} ({} levels, {} bytes)",
-                    w,
-                    h,
-                    pyramid.levels().len(),
-                    pyramid.memory_size()
-                );
-                Some(pyramid)
+        let sky = crate::sky_gpu::SkyGpu::new(&device, &queue, format, &t.element)?;
+        let weather =
+            crate::weather_gpu::WeatherGpu::new(&device, &queue, &t.element, format, &t.water);
+        let cloud = t.cloud_surface.as_deref().and_then(|surface| {
+            match crate::cloud_gpu::CloudGpu::new(&device, &queue, format, &t.element, surface) {
+                Ok(cloud) => {
+                    eprintln!("Initialized indexed world cloud billboards from world.cld");
+                    Some(cloud)
+                }
+                Err(error) => {
+                    eprintln!("World cloud renderer unavailable: {error}");
+                    None
+                }
             }
-            Err(error) => {
-                eprintln!(
-                    "Hi-Z occlusion unavailable; retaining frustum-only tree culling: {error}"
-                );
-                None
-            }
-        };
-        let hiz_fallback_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Hi-Z disabled fallback texture"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
         });
-        let hiz_fallback_view = hiz_fallback_texture.create_view(&Default::default());
-        let terrain_upload = m
-            .terrain_upload
-            .take()
-            .ok_or("initial terrain upload missing")?;
-        // Take owned model assets and initial local pages before spawning the
-        // parallel GPU initialization scope so shader/pipeline compilation,
-        // texture mip generation, post-processing setup, local scenery uploads,
-        // and world model/effect installation all overlap across CPU cores.
-        let initial_model_assets = if std::env::var_os("PW_DISABLE_WORLD_MODELS").is_none() {
-            Some(std::mem::take(&mut t.models))
-        } else {
-            None
-        };
-        let local_page_keys = m.local_page_keys;
-        let initial_local_pages = std::mem::take(&mut m.local_pages);
-        let (
-            sky,
-            weather,
-            cloud,
-            water,
-            simple_water,
-            shore,
-            far_trees,
-            terrain_gpu,
-            pipeline,
-            scenery_pipeline,
-            sdr_blend_pipeline,
-            post,
-            local_pages,
-            models,
-        ) = std::thread::scope(|s| -> Result<_, String> {
-            let device_ref = &device;
-            let queue_ref = &queue;
-            let layout_ref = &layout;
-            let sampler_ref = &sampler;
-            let uniform_ref = &uniform;
-            let reflected_ref = &reflected_uniform;
-            let t_ref = &*t;
-            let upload_ref = &terrain_upload;
-
-            let sky_task = s.spawn(move || {
-                crate::sky_gpu::SkyGpu::new(device_ref, queue_ref, format, &t_ref.element)
-            });
-            let weather_cloud_task = s.spawn(move || {
-                let weather = crate::weather_gpu::WeatherGpu::new(
-                    device_ref,
-                    queue_ref,
-                    &t_ref.element,
-                    format,
-                    &t_ref.water,
-                );
-                let cloud = t_ref.cloud_surface.as_deref().and_then(|surface| {
-                    match crate::cloud_gpu::CloudGpu::new(
-                        device_ref,
-                        queue_ref,
-                        format,
-                        &t_ref.element,
-                        surface,
-                    ) {
-                        Ok(cloud) => {
-                            eprintln!("Initialized indexed world cloud billboards from world.cld");
-                            Some(cloud)
-                        }
-                        Err(error) => {
-                            eprintln!("World cloud renderer unavailable: {error}");
-                            None
-                        }
-                    }
-                });
-                (weather, cloud)
-            });
-            let water_task = s.spawn(move || {
-                let water = crate::water_gpu::WaterGpu::new_for_map(
-                    device_ref,
-                    queue_ref,
-                    format,
-                    w,
-                    h,
-                    &t_ref.water_normals,
-                    !t_ref.water.is_empty(),
-                );
-                let simple_water = crate::simple_water_gpu::SimpleWaterGpu::new_for_map(
-                    device_ref,
-                    queue_ref,
-                    format,
-                    &t_ref.water_simple_frames,
-                    !t_ref.water.is_empty(),
-                );
-                let shore = match crate::shore_gpu::ShoreGpu::new(
-                    device_ref,
-                    queue_ref,
-                    format,
-                    &t_ref.element,
-                    &t_ref.water,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("Shoreline waves unavailable: {e}");
-                        None
-                    }
-                };
-                (water, simple_water, shore)
-            });
-            let trees_task = s.spawn(move || {
-                crate::far_trees_gpu::FarTrees::new(
-                    device_ref,
-                    queue_ref,
-                    format,
-                    &t_ref.trees,
-                    uniform_ref,
-                    reflected_ref,
-                    vegetation_authored_mips,
-                )
-            });
-            let world_pipelines_task = s.spawn(move || {
-                let shader = device_ref.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("world WGSL"),
-                    source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-                });
-                let pl = device_ref.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: None,
-                    bind_group_layouts: &[layout_ref],
-                    push_constant_ranges: &[],
-                });
-                const ATTR: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x2,3=>Float32x4,4=>Float32,5=>Uint32,7=>Uint32];
-                let pipeline = device_ref.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("world GPU pipeline"),
-                    layout: Some(&pl),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: "vs",
-                        buffers: &[wgpu::VertexBufferLayout {
-                            array_stride: std::mem::size_of::<Vertex>() as u64,
-                            step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &ATTR,
-                        }],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: "fs",
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        cull_mode: None,
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth32Float,
-                        depth_write_enabled: true,
-                        depth_compare: wgpu::CompareFunction::Greater,
-                        stencil: Default::default(),
-                        bias: Default::default(),
-                    }),
-                    multisample: Default::default(),
-                    multiview: None,
-                });
-                let scenery_pipeline =
-                    device_ref.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                        label: Some("scenery GPU pipeline"),
-                        layout: Some(&pl),
-                        vertex: wgpu::VertexState {
-                            module: &shader,
-                            entry_point: "vs",
-                            buffers: &[wgpu::VertexBufferLayout {
-                                array_stride: std::mem::size_of::<Vertex>() as u64,
-                                step_mode: wgpu::VertexStepMode::Vertex,
-                                attributes: &ATTR,
-                            }],
-                        },
-                        fragment: Some(wgpu::FragmentState {
-                            module: &shader,
-                            entry_point: "fs",
-                            targets: &[Some(wgpu::ColorTargetState {
-                                format,
-                                blend: None,
-                                write_mask: wgpu::ColorWrites::ALL,
-                            })],
-                        }),
-                        primitive: wgpu::PrimitiveState {
-                            cull_mode: None,
-                            ..Default::default()
-                        },
-                        depth_stencil: Some(wgpu::DepthStencilState {
-                            format: wgpu::TextureFormat::Depth32Float,
-                            depth_write_enabled: true,
-                            depth_compare: wgpu::CompareFunction::GreaterEqual,
-                            stencil: Default::default(),
-                            bias: Default::default(),
-                        }),
-                        multisample: Default::default(),
-                        multiview: None,
-                    });
-                let sdr_blend_pipeline =
-                    device_ref.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                        label: Some("sdr blend GPU pipeline"),
-                        layout: Some(&pl),
-                        vertex: wgpu::VertexState {
-                            module: &shader,
-                            entry_point: "vs",
-                            buffers: &[wgpu::VertexBufferLayout {
-                                array_stride: std::mem::size_of::<Vertex>() as u64,
-                                step_mode: wgpu::VertexStepMode::Vertex,
-                                attributes: &ATTR,
-                            }],
-                        },
-                        fragment: Some(wgpu::FragmentState {
-                            module: &shader,
-                            entry_point: "fs_sdr",
-                            targets: &[Some(wgpu::ColorTargetState {
-                                format,
-                                blend: Some(wgpu::BlendState {
-                                    color: wgpu::BlendComponent {
-                                        src_factor: wgpu::BlendFactor::SrcAlpha,
-                                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                        operation: wgpu::BlendOperation::Add,
-                                    },
-                                    alpha: wgpu::BlendComponent {
-                                        src_factor: wgpu::BlendFactor::One,
-                                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                        operation: wgpu::BlendOperation::Add,
-                                    },
-                                }),
-                                write_mask: wgpu::ColorWrites::ALL,
-                            })],
-                        }),
-                        primitive: wgpu::PrimitiveState {
-                            cull_mode: None,
-                            ..Default::default()
-                        },
-                        depth_stencil: Some(wgpu::DepthStencilState {
-                            format: wgpu::TextureFormat::Depth32Float,
-                            depth_write_enabled: false,
-                            depth_compare: wgpu::CompareFunction::GreaterEqual,
-                            stencil: Default::default(),
-                            bias: Default::default(),
-                        }),
-                        multisample: Default::default(),
-                        multiview: None,
-                    });
-                (pipeline, scenery_pipeline, sdr_blend_pipeline)
-            });
-            let post_task =
-                s.spawn(move || crate::post_gpu::PostGpu::new(device_ref, format, w, h));
-            let local_pages_task = s.spawn(move || {
-                let mut uploaded: Vec<crate::world_objects::GpuPage> =
-                    Vec::with_capacity(initial_local_pages.len());
-                if initial_local_pages.len() <= 1 {
-                    for page in initial_local_pages {
-                        uploaded.push(crate::world_objects::GpuPage::upload(
-                            device_ref,
-                            queue_ref,
-                            layout_ref,
-                            sampler_ref,
-                            uniform_ref,
-                            reflected_ref,
-                            page,
-                        ));
-                    }
-                } else {
-                    // A page can contain a large texture atlas and seven mip
-                    // levels. Spawning one OS thread per page made startup
-                    // oversubscribe the CPU and multiplied peak upload memory
-                    // when a map had many local pages. Keep the uploads parallel,
-                    // but bound concurrency and preserve source-page order.
-                    let worker_count = std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(1)
-                        .min(4)
-                        .min(initial_local_pages.len());
-                    if worker_count <= 1 {
-                        for page in initial_local_pages {
-                            uploaded.push(crate::world_objects::GpuPage::upload(
-                                device_ref,
-                                queue_ref,
-                                layout_ref,
-                                sampler_ref,
-                                uniform_ref,
-                                reflected_ref,
-                                page,
-                            ));
-                        }
-                    } else {
-                        let batch_size = initial_local_pages.len().div_ceil(worker_count);
-                        let mut pages = initial_local_pages.into_iter();
-                        let mut batches = Vec::with_capacity(worker_count);
-                        loop {
-                            let batch: Vec<_> = pages.by_ref().take(batch_size).collect();
-                            if batch.is_empty() {
-                                break;
-                            }
-                            batches.push(batch);
-                        }
-                        std::thread::scope(|ps| {
-                            let handles: Vec<_> = batches
-                                .into_iter()
-                                .map(|batch| {
-                                    ps.spawn(move || {
-                                        batch
-                                            .into_iter()
-                                            .map(|page| {
-                                                crate::world_objects::GpuPage::upload(
-                                                    device_ref,
-                                                    queue_ref,
-                                                    layout_ref,
-                                                    sampler_ref,
-                                                    uniform_ref,
-                                                    reflected_ref,
-                                                    page,
-                                                )
-                                            })
-                                            .collect::<Vec<_>>()
-                                    })
-                                })
-                                .collect();
-                            for handle in handles {
-                                uploaded.extend(handle.join().unwrap());
-                            }
-                        });
-                    }
+        let water =
+            crate::water_gpu::WaterGpu::new(&device, &queue, format, w, h, &t.water_normals);
+        let simple_water = crate::simple_water_gpu::SimpleWaterGpu::new(
+            &device,
+            &queue,
+            format,
+            &t.water_simple_frames,
+        );
+        let shore =
+            match crate::shore_gpu::ShoreGpu::new(&device, &queue, format, &t.element, &t.water) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Shoreline waves unavailable: {e}");
+                    None
                 }
-                uploaded
-            });
-            let terrain_task = s.spawn(move || {
-                crate::terrain_gpu::TerrainGpu::new(
-                    device_ref,
-                    queue_ref,
-                    format,
-                    t_ref,
-                    upload_ref,
-                    uniform_ref,
-                    reflected_ref,
-                )
-            });
-            // Run `world_models_gpu::World` initialization on the calling thread
-            // (its archive reader closures are `!Send`) while all other GPU
-            // subsystems, pipelines, terrain uploads, and local scenery pages
-            // initialize concurrently on worker threads.
-            let models = initial_model_assets.map(|assets| {
-                let mut world = match crate::world_models_gpu::World::new(
-                    device_ref,
-                    format,
-                    assets,
-                    &t_ref.element,
-                ) {
-                    Ok(world) => world,
-                    Err(error) => {
-                        eprintln!(
-                            "World models unavailable ({error}); world effects continue"
-                        );
-                        crate::world_models_gpu::World::without_models(device_ref, format)
-                    }
-                };
-                match world.attach_gfx_archive(&t_ref.element) {
-                    Ok(()) => {}
-                    Err(e) => eprintln!("World FX light roots unavailable: {e}"),
-                }
-                let effects = world.install_scene_effects(&t_ref.scene);
-                let events = world.install_model_events();
-                eprintln!(
-                    "Installed {effects} scene effects and {events} model events (light producers and animated roots)"
-                );
-                for failure in world.gfx_failures() {
-                    eprintln!("FX light: {failure}");
-                }
-                world
-            });
-            let terrain_gpu = terrain_task.join().unwrap()?;
-            let sky = sky_task.join().unwrap()?;
-            let (weather, cloud) = weather_cloud_task.join().unwrap();
-            let (water, simple_water, shore) = water_task.join().unwrap();
-            let mut far_trees = trees_task.join().unwrap();
-            far_trees.set_hiz_view(
-                &device,
-                hiz.as_ref().map_or(&hiz_fallback_view, |p| p.view()),
-            );
-            let (pipeline, scenery_pipeline, sdr_blend_pipeline) =
-                world_pipelines_task.join().unwrap();
-            let post = post_task.join().unwrap();
-            let local_pages = local_pages_task.join().unwrap();
-            Ok((
-                sky,
-                weather,
-                cloud,
-                water,
-                simple_water,
-                shore,
-                far_trees,
-                terrain_gpu,
-                pipeline,
-                scenery_pipeline,
-                sdr_blend_pipeline,
-                post,
-                local_pages,
-                models,
-            ))
-        })?;
+            };
+        let far_trees = crate::far_trees_gpu::FarTrees::new(
+            &device,
+            &queue,
+            format,
+            &t.trees,
+            &uniform,
+            &reflected_uniform,
+            vegetation_authored_mips,
+        );
+        // The forest is built once, and a type it could not build takes every
+        // one of its placements with it, so what it produced belongs in a log
+        // channel rather than only on stderr: "the trees only appear when I am
+        // close" is answerable from this line alone. The 1.4.4 report is the
+        // case that motivated it.
+        let (tree_instances, tree_bytes) = far_trees.residency_stats();
+        crate::diag!(
+            TimingLoad,
+            "Tree LOD forest: {} placements across {} batches, {} types built of {} \
+             authored ({} KiB instance buffer)",
+            tree_instances,
+            far_trees.batch_count(),
+            far_trees.group_count(),
+            t.scene.tree_types.len(),
+            tree_bytes / 1024
+        );
         // Immutable tree meshes/motion samples and water frames now live on
         // the GPU. The streaming worker never reads these sources again.
         t.trees.types.clear();
@@ -2886,26 +2471,193 @@ impl Renderer {
         t.trees.placements.clear();
         t.trees.placements.shrink_to_fit();
         t.water_normals.clear();
-        t.water_normals.shrink_to_fit();
         t.water_simple_frames.clear();
-        t.water_simple_frames.shrink_to_fit();
-        if !vegetation_authored_mips {
-            t.grass.texture_mips.clear();
-            t.grass.texture_mips.shrink_to_fit();
-        }
-        if t.grass.areas.is_empty() {
-            t.grass.textures.clear();
-            t.grass.textures.shrink_to_fit();
-            t.grass.models.clear();
-            t.grass.models.shrink_to_fit();
-        }
-        t.grass.areas.shrink_to_fit();
-        t.water.shrink_to_fit();
+        let terrain_upload = m
+            .terrain_upload
+            .take()
+            .ok_or("initial terrain upload missing")?;
+        let terrain_gpu = crate::terrain_gpu::TerrainGpu::new(
+            &device,
+            &queue,
+            format,
+            t,
+            &terrain_upload,
+            &uniform,
+            &reflected_uniform,
+        )?;
         // Material masks and DDS buffers are no longer needed once uploaded.
+        // Flush staging before adding native-size scenery pages to cap peak memory.
         drop(terrain_upload);
         t.materials.release_gpu_source();
         t.heights.trim();
         queue.submit(std::iter::empty());
+        device.poll(wgpu::Maintain::Wait);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("world WGSL"),
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        const ATTR: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x2,3=>Float32x4,4=>Float32,5=>Uint32,7=>Uint32];
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("world GPU pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &ATTR,
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Greater,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+        });
+        // Static scenery shares the client's single depth buffer with the
+        // terrain, which is submitted first (`terrain_end..local_end`). Under
+        // the reversed projection the client's fixed-point `LESSEQUAL` test
+        // becomes `Greater`/`GreaterEqual`, and the tie rule matters: a
+        // duplicate baked triangle submitted after an identical one must win,
+        // exactly as a second draw at equal depth passes `LESSEQUAL`. Nothing
+        // in the baked path changes `ZFUNC` or `ZBIAS` (the only `ZBIAS` writes
+        // are the effect path's 2/0 pair at 0x417453 and 0x417471). Only the
+        // comparand differs from `pipeline`; the shader and layout are the same.
+        let scenery_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("scenery GPU pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &ATTR,
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // Baked scenery is an alpha-test cutout, not a blend. The
+                    // 1.4.2 client enables `ALPHABLENDENABLE(1)` in all four
+                    // scenery passes (`0x42b5a5`, `0x42bc17`, `0x42c32e`,
+                    // `0x42c650`) and leaves `ZWRITEENABLE` on, so in the
+                    // client an alpha-0 texel still occupies the depth buffer.
+                    // Reproducing that here broke the viewer: the water pass is
+                    // depth-tested against this buffer, so a transparent lily
+                    // pad card occluded water as a solid square, and a canopy
+                    // card hid the canopy behind it through its transparent
+                    // gaps. The shared shader discards texels below the cutout
+                    // threshold (`tex.a < …`) so they write neither colour nor
+                    // depth; survivors are opaque and write depth as before.
+                    // Keeping a blend here would write depth for the surviving
+                    // partial-alpha texels against the pre-water colour, so the
+                    // pass stays unblended (as it was before the blend change).
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+        });
+        // The client's baked-water law, for the one band the cutout above
+        // renders wrong. The `.sdr.` water/lava curtains (the downward-scroll
+        // scripts `瀑布`, `瀑布细长`, `青云山小瀑布`, `岩浆`, kind 2.02/2.12)
+        // are `ALPHABLENDENABLE(1)` with `SRCALPHA`/`INVSRCALPHA` and surface
+        // alpha `texture.a * diffuse.a` in the client (bmd_baked.rs header,
+        // `0x7a9785` `ALPHAOP(4)` = `MODULATE`), so their translucent texels
+        // show the scene through the sheet. The shared cutout draws them
+        // opaque instead — the reported "waterfalls are a white plain texture
+        // with no transparency". This pipeline draws JUST that band (the
+        // `fs_sdr` entry discards every other kind) with the client's blend,
+        // after the whole scenery range has finished. Depth write is off
+        // here: the client leaves `ZWRITEENABLE` on and gets away with it by
+        // mesh order, but this pass runs last, and a depth-writing translucent
+        // card is exactly the lily-pad/canopy failure the cutout exists to
+        // avoid (see the `scenery_pipeline` note). Depth *test* is unchanged,
+        // so nearer geometry still occludes the sheet.
+        let sdr_blend_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sdr blend GPU pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &ATTR,
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_sdr",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+        });
         // Sized once and kept: a block-window update rewrites the same geometry
         // through `queue.write_buffer` and only reallocates when the mesh grows.
         let vertex_capacity =
@@ -2943,7 +2695,70 @@ impl Renderer {
             Some(&terrain_gpu.grass_light_layout),
         );
         let d = depth_tex;
-        let (object_mv, object_mv_view) = object_mv_target(&device, 1, 1);
+        let (object_mv, object_mv_view) = object_mv_target(&device, w, h);
+        let post = crate::post_gpu::PostGpu::new(&device, format, w, h);
+        let local_page_keys = m.local_page_keys;
+        let local_pages = m
+            .local_pages
+            .into_iter()
+            .map(|page| {
+                crate::world_objects::GpuPage::upload(
+                    &device,
+                    &queue,
+                    &layout,
+                    &sampler,
+                    &uniform,
+                    &reflected_uniform,
+                    page,
+                )
+            })
+            .collect();
+        // The verified ordinary world queue is enabled by default. Unsupported
+        // material/effect paths remain explicit instance failures, not stand-ins.
+        // The world's effects must not depend on the map placing an EC model.
+        // A block may author waterfalls, fire or glows and no animated model at
+        // all, and the effect half of this object has nothing to do with the
+        // model assets. Only the opt-out and a genuinely missing archive decide
+        // whether the object is built; the model queue inside it is skipped
+        // lazily when there are no instances.
+        let models = if std::env::var_os("PW_DISABLE_WORLD_MODELS").is_none() {
+            let assets = std::mem::take(&mut t.models);
+            // `models.pck` holds the model textures; the effect roots come from
+            // `gfx.pck` below. A map that ships no EC model still gets its
+            // effects, so a missing model archive costs the model queue and
+            // never the waterfalls.
+            let mut world =
+                match crate::world_models_gpu::World::new(&device, format, assets, &t.element) {
+                    Ok(world) => world,
+                    Err(error) => {
+                        eprintln!("World models unavailable ({error}); world effects continue");
+                        crate::world_models_gpu::World::without_models(&device, format)
+                    }
+                };
+            // Actual world effect owners: the ECWLD placements and the hook-free
+            // ECM EventType-100 roots publish into the same scene-light grid the
+            // receiving models query, and the same owners now play their animated
+            // roots — the waterfalls, torch fire, mist and glows the map authors —
+            // into the world pass. A missing archive is a reported failure, not a
+            // silent removal of either half.
+            match world.attach_gfx_archive(&t.element) {
+                Ok(()) => {}
+                Err(e) => eprintln!("World FX light roots unavailable: {e}"),
+            }
+            // A placement the reader or the owner queue rejects is a reported
+            // absence on the status line, not a refused world.
+            let effects = world.install_scene_effects(&t.scene);
+            let events = world.install_model_events();
+            eprintln!(
+                "Installed {effects} scene effects and {events} model events (light producers and animated roots)"
+            );
+            for failure in world.gfx_failures() {
+                eprintln!("FX light: {failure}");
+            }
+            Some(world)
+        } else {
+            None
+        };
         // Install the day/night pair the client's own `autoscene.cfg` names
         // (`sky_id_day = 0`, `sky_id_night = 1` for this build) after the
         // `sky.lst` rows have been loaded. The machine starts on the day set;
@@ -3004,14 +2819,9 @@ impl Renderer {
             local_pages,
             local_page_keys,
             world_pages: Vec::new(),
-            world_geometry_arena: crate::world_objects::WorldGeometryArena::default(),
             world_draw_cmds: std::array::from_fn(|_| {
                 crate::world_objects::WorldDrawList::default()
             }),
-            world_draw_scratch: std::array::from_fn(|_| {
-                std::cell::RefCell::new(crate::world_objects::WorldDrawScratch::default())
-            }),
-            world_upload_belt: wgpu::util::StagingBelt::new(16 * 1024 * 1024),
             world_done: false,
             local_scenery_skipped: m.local_scenery_skipped,
             layout,
@@ -3045,12 +2855,8 @@ impl Renderer {
             index_capacity,
             count,
             depth: d,
-            hiz,
-            _hiz_fallback_texture: hiz_fallback_texture,
-            hiz_fallback_view,
             object_mv,
             object_mv_view,
-            object_mv_enabled: false,
             center: m.center,
             lod: m.lod,
             spans: m.spans,
@@ -3676,12 +3482,10 @@ impl Renderer {
         view_runs: ViewRuns,
         terrain_depth_source: Option<&wgpu::Texture>,
         clear_color: Option<wgpu::Color>,
-        cull: &crate::world_objects::CullParams,
+        frustum: &[[f32; 4]; 6],
         // The water's extra views are read only by the water surface, inside
         // `water_view_scissor`'s rectangle. `None` draws the whole attachment.
         scissor: Option<[u32; 4]>,
-        view_projection: Mat4,
-        use_hiz: bool,
     ) {
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
@@ -3749,162 +3553,8 @@ impl Renderer {
         if let Some(source) = terrain_depth_source {
             self.water.copy_terrain_depth(e, source);
         }
-        // Terrain is already in depth. Add static opaque scenery before building
-        // Hi-Z so mountains, buildings and large world objects can also occlude
-        // far-tree candidates. The standard scenery shader retains alpha cutout
-        // handling; blended SDR materials are deliberately excluded.
-        let world_slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
-        let local_end = if self.world_done {
-            self.object_start
-        } else {
-            self.water_start
-        };
-        let has_sdr = local_end > self.terrain_end
-            || if self.world_done {
-                self.world_draw_cmds[world_slot].chunks.iter().any(|c| {
-                    c.has_sdr
-                        && crate::world_objects::aabb_survives_clip(cull.clip_plane, c.min, c.max)
-                        && crate::world_objects::aabb_in_frustum(&cull.frustum, c.min, c.max)
-                })
-            } else {
-                !self.local_pages.is_empty()
-            };
-
-        let [opaque_scratch_cell, sdr_scratch_cell] = &self.world_draw_scratch;
-        let mut opaque_world_scratch = opaque_scratch_cell.borrow_mut();
-        let mut sdr_world_scratch = sdr_scratch_cell.borrow_mut();
-        let multi_draw_count = self
-            .device
-            .features()
-            .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
-        if self.world_done && multi_draw_count {
-            let commands = &self.world_draw_cmds[world_slot];
-            crate::world_objects::GpuPage::encode_world_culling(
-                &self.device,
-                e,
-                &self.queue,
-                commands,
-                cull,
-                world_slot,
-                false,
-                multi_draw_count,
-                &mut opaque_world_scratch,
-            );
-            if has_sdr {
-                crate::world_objects::GpuPage::encode_world_culling(
-                    &self.device,
-                    e,
-                    &self.queue,
-                    commands,
-                    cull,
-                    world_slot,
-                    true,
-                    multi_draw_count,
-                    &mut sdr_world_scratch,
-                );
-            }
-        }
-
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("opaque scenery occluders after terrain"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        if let Some([x, y, w, h]) = scissor {
-            p.set_scissor_rect(x, y, w, h);
-        }
-        p.set_pipeline(&self.scenery_pipeline);
-        p.set_bind_group(0, bind, &[]);
-        p.set_vertex_buffer(0, self.vertex.slice(..));
-        p.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
-        if local_end > self.terrain_end {
-            p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
-        }
-        if !self.world_done {
-            for page in &self.local_pages {
-                page.draw_selected_culled(&mut p, reflected, pass_kind, cull, false);
-            }
-        }
-        // Avoid drawing both the local preload and its final world pages:
-        // their coplanar duplicates otherwise cause depth flicker.
-        if self.world_done {
-            crate::world_objects::GpuPage::draw_world_culled(
-                &self.world_pages,
-                &self.world_draw_cmds[world_slot],
-                &mut p,
-                reflected,
-                cull,
-                false,
-                &self.device,
-                &self.queue,
-                self.device
-                    .features()
-                    .contains(wgpu::Features::MULTI_DRAW_INDIRECT),
-                world_slot,
-                &mut opaque_world_scratch,
-            );
-        }
-        drop(p);
-        drop(opaque_world_scratch);
-
-        // The view-local hierarchy now contains depth-writing terrain and
-        // opaque static scenery only. It excludes transparent curtains, water,
-        // particles and animated receiving-model effects. Generate and consume
-        // it in this command buffer so no prior-frame visibility can leak across
-        // camera cuts, streaming changes or a different water view.
-        if !ui_test() && !skip_trees_test() {
-            let pyramid = if use_hiz { self.hiz.as_ref() } else { None };
-            if let Some(pyramid) = pyramid {
-                pyramid.encode(&self.device, e, depth);
-            }
-            let (mips, extent) = match pyramid {
-                Some(pyramid) => (
-                    pyramid.shader_mips(),
-                    Some((
-                        pyramid.extent().0,
-                        pyramid.extent().1,
-                        pyramid.levels().len() as u32,
-                    )),
-                ),
-                None => ([[1, 1, 0, 0]; 16], None),
-            };
-            self.far_trees.encode_resident_lods(
-                &self.device,
-                &self.queue,
-                e,
-                cull.eye,
-                self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
-                self.resident_bounds(),
-                cull.frustum,
-                cull.clip_plane,
-                view_projection.to_cols_array_2d(),
-                mips,
-                extent,
-            );
-        }
-
-        // Tree candidates are tested against the completed opaque hierarchy.
-        // Trees and grass are drawn afterwards, so candidate geometry cannot
-        // occlude itself or another candidate. With Hi-Z unavailable, the same
-        // compute pass retains its frustum/LOD-only fallback.
-        let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("trees grass and blended scenery"),
+            label: Some("opaque scenery after terrain"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 resolve_target: None,
@@ -3932,39 +3582,65 @@ impl Renderer {
         }
         self.grass
             .draw(&mut p, bind, Some(&self.terrain_gpu.grass_light_bind));
-
-        // Blended SDR curtains do not write depth and must never become Hi-Z
-        // occluders. Keep them in their existing post-opaque composition slot.
-        if has_sdr {
-            p.set_pipeline(&self.sdr_blend_pipeline);
-            if local_end > self.terrain_end {
-                p.set_bind_group(0, bind, &[]);
-                p.set_vertex_buffer(0, self.vertex.slice(..));
-                p.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
-                p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
+        p.set_pipeline(&self.scenery_pipeline);
+        p.set_bind_group(0, bind, &[]);
+        p.set_vertex_buffer(0, self.vertex.slice(..));
+        p.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
+        let local_end = if self.world_done {
+            self.object_start
+        } else {
+            self.water_start
+        };
+        p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
+        if !self.world_done {
+            for page in &self.local_pages {
+                page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, false);
             }
-            if !self.world_done {
-                for page in &self.local_pages {
-                    page.draw_selected_culled(&mut p, reflected, pass_kind, cull, true);
-                }
+        }
+        // Do not submit world pages on top of the same locally streamed
+        // ornaments while preload is in progress: the coplanar duplicates
+        // caused depth flicker. Switch atomically only after all pages arrive.
+        if self.world_done {
+            // The view's commands were folded once when the world finished
+            // loading: its placements are frozen, so nothing here is per-frame
+            // work beyond the page binds and the draws themselves.
+            let slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
+            crate::world_objects::GpuPage::draw_world_culled(
+                &self.world_pages,
+                &self.world_draw_cmds[slot],
+                &mut p,
+                reflected,
+                frustum,
+                false,
+            );
+        }
+        // The `.sdr.` water/lava curtains draw in their own blended pass over
+        // the finished scene: `fs_sdr` keeps only kind 2.02/2.12 and drops
+        // every other fragment, so replaying the same ranges is free, and the
+        // `fs` entry dropped those kinds in the pass above so the sheet is
+        // never drawn twice. Order is terrain/streamed, then pages, exactly as
+        // the unblended pass above — the sheet blends over the whole world
+        // once, the client's visible result for a curtain.
+        p.set_pipeline(&self.sdr_blend_pipeline);
+        p.set_bind_group(0, bind, &[]);
+        p.set_vertex_buffer(0, self.vertex.slice(..));
+        p.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
+        p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
+        if !self.world_done {
+            for page in &self.local_pages {
+                page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, true);
             }
-            if self.world_done {
-                crate::world_objects::GpuPage::draw_world_culled(
-                    &self.world_pages,
-                    &self.world_draw_cmds[world_slot],
-                    &mut p,
-                    reflected,
-                    cull,
-                    true,
-                    &self.device,
-                    &self.queue,
-                    self.device
-                        .features()
-                        .contains(wgpu::Features::MULTI_DRAW_INDIRECT),
-                    world_slot,
-                    &mut sdr_world_scratch,
-                );
-            }
+        }
+        if self.world_done {
+            let slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
+            crate::world_objects::GpuPage::draw_world_culled(
+                &self.world_pages,
+                &self.world_draw_cmds[slot],
+                &mut p,
+                reflected,
+                frustum,
+                true,
+            );
         }
     }
     fn draw_models(
@@ -4057,57 +3733,27 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            // In the main view, blended effect quads are deferred until after
-            // water surfaces and shoreline waves so opaque/refracted water does
-            // not overwrite effects that overlap water without writing depth.
-            if matches!(view, Pass::Main) {
-                models.draw_models_only(&mut pass);
-            } else {
-                models.draw(&mut pass);
-            }
+            models.draw(&mut pass);
         }
-    }
-
-    /// Draws main-view blended world effects and Walker character effects
-    /// after water surfaces and shoreline waves, depth-tested against the
-    /// full scene depth buffer (including water depth), followed by effect
-    /// motion vectors.
-    fn draw_post_water_effects(
-        &mut self,
-        target_raw: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
-        uniform: &Uniform,
-        camera: &Camera,
-        unjittered_vp: Mat4,
-        refresh_world_view: bool,
-    ) {
-        let has_world_effects = self
-            .models
-            .as_ref()
-            .is_some_and(|models| models.has_effect_quads());
-        let has_walker = self.modules.walker_active();
-        if !has_world_effects && !has_walker {
-            return;
-        }
-        if has_world_effects && refresh_world_view {
-            let light = camera.regional_light.or(self.retained_regional_light);
-            let frame = receiving_model_frame(uniform, camera, light);
-            if let Some(models) = &mut self.models {
-                models.refresh_effects_view(&self.device, &self.queue, frame);
-            }
-        }
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
+        // The sheets' own motion, in a pass of its own: their vector goes into the
+        // object-motion attachment, which the shared pass substitutes where a
+        // producer claims a pixel, and no depth is written. Published here, before
+        // any later view rewrites the frame block and the bucket order, and before
+        // the water and the add-ons are drawn, so nothing they draw is rejected
+        // behind a sheet (`docs/blockers.md` B-26).
+        if matches!(view, Pass::Main) {
+            let size = self.object_mv.size();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("post-water world and walker effects"),
+                label: Some("world effect sheet motion"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_raw,
+                    view: &self.object_mv_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
+                // Tested, never written: a sheet behind a wall claims nothing.
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: depth,
                     depth_ops: Some(wgpu::Operations {
@@ -4119,49 +3765,13 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            if let Some(models) = &self.models {
-                models.draw_effects(&mut pass);
-            }
-            if has_walker {
-                self.modules.render_walker_effects(&mut pass);
-            }
+            models.draw_effect_motion(
+                &self.queue,
+                &mut pass,
+                unjittered_vp.to_cols_array_2d(),
+                (size.width, size.height),
+            );
         }
-        if self.object_mv_enabled {
-            if let Some(models) = &mut self.models {
-                if models.has_effect_quads() {
-                    let size = self.object_mv.size();
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("world effect sheet motion"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &self.object_mv_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        // Tested against full scene+water depth, never written.
-                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                            view: depth,
-                            depth_ops: Some(wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            }),
-                            stencil_ops: None,
-                        }),
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    models.draw_effect_motion(
-                        &self.queue,
-                        &mut pass,
-                        unjittered_vp.to_cols_array_2d(),
-                        (size.width, size.height),
-                    );
-                }
-            }
-        }
-        self.queue.submit(Some(encoder.finish()));
     }
 
     /// The host player is not an ornamental EC model: WaterEffect 0 must not
@@ -4207,7 +3817,6 @@ impl Renderer {
                     target,
                     depth,
                     frame,
-                    !matches!(view, Pass::Main),
                 );
             }
             if population && matches!(view, Pass::Main) {
@@ -4269,7 +3878,6 @@ impl Renderer {
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
         let frustum = crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array());
-        let map_cull = crate::world_objects::CullParams::frustum_only(frustum);
         let mut e = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -4291,11 +3899,9 @@ impl Renderer {
             view_runs,
             None,
             None,
-            &map_cull,
+            &frustum,
             // The map image is read as a whole, so there is nothing to scissor.
             None,
-            matrix,
-            false,
         );
         {
             let mut pass = e.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -4349,6 +3955,23 @@ impl Renderer {
             Some(&self.far_terrain_runs),
         );
     }
+    /// Culls both terrain meshes to the top-down map's window and queues those
+    /// records. `matrix` is the map's orthographic projection.
+    fn queue_map_runs(&mut self, matrix: Mat4) {
+        crate::terrain_residency::visible_runs_into(
+            &self.spans,
+            matrix,
+            &mut self.map_terrain_runs,
+        );
+        self.terrain_gpu
+            .visible_far_runs_into(matrix, &mut self.map_far_runs);
+        self.terrain_gpu.prepare_runs(
+            &self.device,
+            &self.queue,
+            Some(&self.map_terrain_runs),
+            Some(&self.map_far_runs),
+        );
+    }
     /// Queue only the terrain blocks the water surface can sample. This
     /// prevents water's small scissor rectangle from still submitting the
     /// entire main-view terrain set.
@@ -4387,55 +4010,22 @@ impl Renderer {
         );
     }
 
-    /// Queue the mirrored terrain, additionally constrained to the water
-    /// surface's sampled screen rectangle.
-    fn queue_reflected_runs(
-        &mut self,
-        matrix: Mat4,
-        extent: (u32, u32),
-        scissor: Option<[u32; 4]>,
-    ) {
-        if let Some(rect) = water_scissor_ndc_rect(extent, scissor) {
-            crate::terrain_residency::visible_runs_rect_into(
-                &self.spans,
-                matrix,
-                rect,
-                &mut self.reflected_terrain_runs,
-            );
-            self.terrain_gpu
-                .visible_far_runs_rect_into(matrix, rect, &mut self.reflected_far_runs);
-        } else {
-            crate::terrain_residency::visible_runs_into(
-                &self.spans,
-                matrix,
-                &mut self.reflected_terrain_runs,
-            );
-            self.terrain_gpu
-                .visible_far_runs_into(matrix, &mut self.reflected_far_runs);
-        }
+    /// Culls both terrain meshes for the water reflection's mirrored view
+    /// (`matrix * flip`) and queues those records. The symmetry plane is the
+    /// water height, so this runs once per reflected submit.
+    fn queue_reflected_runs(&mut self, matrix: Mat4) {
+        crate::terrain_residency::visible_runs_into(
+            &self.spans,
+            matrix,
+            &mut self.reflected_terrain_runs,
+        );
+        self.terrain_gpu
+            .visible_far_runs_into(matrix, &mut self.reflected_far_runs);
         self.terrain_gpu.prepare_runs(
             &self.device,
             &self.queue,
             Some(&self.reflected_terrain_runs),
             Some(&self.reflected_far_runs),
-        );
-    }
-
-    /// Culls both terrain meshes to the top-down map's window and queues those
-    /// records. `matrix` is the map's orthographic projection.
-    fn queue_map_runs(&mut self, matrix: Mat4) {
-        crate::terrain_residency::visible_runs_into(
-            &self.spans,
-            matrix,
-            &mut self.map_terrain_runs,
-        );
-        self.terrain_gpu
-            .visible_far_runs_into(matrix, &mut self.map_far_runs);
-        self.terrain_gpu.prepare_runs(
-            &self.device,
-            &self.queue,
-            Some(&self.map_terrain_runs),
-            Some(&self.map_far_runs),
         );
     }
     /// Decide this frame's ray traces and tell the raster pass which original
@@ -4758,15 +4348,27 @@ impl Renderer {
                     suspect_pages.len()
                 );
                 for (_, line) in suspect_pages {
-                    let _ = writeln!(report, "{line}");
+                    writeln!(report, "{line}")
+                        .expect("writing diagnostic text to String is infallible");
                 }
             }
-            let _ = writeln!(report, "\n[SpeedTree / FarTrees]");
+            writeln!(report, "\n[SpeedTree / FarTrees]")
+                .expect("writing diagnostic text to String is infallible");
             report.push_str(&self.far_trees.diagnostics_report(camera.pos, detail_radius));
             let log_dir =
                 crate::diagnostics::dir().unwrap_or_else(crate::diagnostics::default_log_dir);
-            let _ = std::fs::create_dir_all(&log_dir);
-            let _ = std::fs::write(log_dir.join("raywatcher-diag.log"), report);
+            let log_path = log_dir.join("raywatcher-diag.log");
+            if let Err(error) = std::fs::create_dir_all(&log_dir) {
+                eprintln!(
+                    "[Raywatcher] cannot create diagnostics directory {}: {error}",
+                    log_dir.display()
+                );
+            } else if let Err(error) = std::fs::write(&log_path, report) {
+                eprintln!(
+                    "[Raywatcher] cannot write diagnostics report {}: {error}",
+                    log_path.display()
+                );
+            }
         }
         if self.raywatcher_harvest.needs_frustum_rebuild(
             config,
@@ -4776,8 +4378,7 @@ impl Renderer {
             content_hash,
         ) && !self.raywatcher_harvest.is_building_in_background()
         {
-            use crate::modules::raywatcher::harvest::{Frustum, MeshTriangle, WaterSurface};
-            let _ = Frustum::from_view_projection(matrix);
+            use crate::modules::raywatcher::harvest::{MeshTriangle, WaterSurface};
             // Keep a focused nearest-first real-mesh bubble around the camera
             // (covering both on-screen and off-screen reflected buildings) with a
             // bounded triangle budget so BLAS/BVH rebuilds stay hitch-free while
@@ -5743,14 +5344,19 @@ impl Renderer {
         // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
         // the same block walk the client runs before the level rule.
         // Both buffers are reused: this runs for every view of every frame.
-        crate::terrain_residency::visible_runs_into(&self.spans, matrix, &mut self.terrain_runs);
-        self.terrain_gpu
-            .visible_far_runs_into(matrix, &mut self.far_terrain_runs);
+        let spans = &self.spans;
+        let terrain_runs = &mut self.terrain_runs;
+        let terrain_gpu = &self.terrain_gpu;
+        let far_terrain_runs = &mut self.far_terrain_runs;
+        std::thread::scope(|s| {
+            s.spawn(|| crate::terrain_residency::visible_runs_into(spans, matrix, terrain_runs));
+            s.spawn(|| terrain_gpu.visible_far_runs_into(matrix, far_terrain_runs));
+        });
         // Snapshot counts before releasing the disjoint field borrows; the
         // renderer's following &mut self calls must not overlap these borrows.
-        let terrain_run_count = self.terrain_runs.len();
-        let far_terrain_run_count = self.far_terrain_runs.len();
-        let span_count = self.spans.len();
+        let terrain_run_count = terrain_runs.len();
+        let far_terrain_run_count = far_terrain_runs.len();
+        let span_count = spans.len();
         // One indirect record per run, so the terrain itself is one call per mesh
         // instead of one call per run.
         self.queue_main_runs();
@@ -5789,9 +5395,6 @@ impl Renderer {
             camera.underwater_depth > 0.,
             camera.client_gamma,
         );
-        self.post.set_scene_active(&self.device, w, h, use_post);
-        self.water
-            .set_reflections(&self.device, w, h, camera.water_reflections);
         let post_view = if use_post {
             Some(self.post.scene_view())
         } else {
@@ -5925,10 +5528,20 @@ impl Renderer {
         // with the ones the reprojection pass writes.
         let unjittered_vp = camera.matrix(w, h, camera.far);
         let mut e = self.device.create_command_encoder(&Default::default());
+        // Tree LOD is a compute pass whose indirect arguments are consumed by
+        // the main scene draw below. Record it into this frame encoder rather
+        // than submitting a separate command buffer before rendering.
+        self.far_trees.update_resident_lods(
+            &self.queue,
+            &mut e,
+            camera.pos.to_array(),
+            self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
+            resident_bounds,
+        );
         // The object-motion attachment is cleared here, before any pass that may
         // write it, so a frame with no producer still hands the motion-vector
         // pass a zeroed surface instead of the previous frame's vectors.
-        if self.object_mv_enabled {
+        {
             let _ = e.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("object motion clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -5961,14 +5574,6 @@ impl Renderer {
                 .cloned(),
         );
         let has_visible_complex_water = visible.iter().any(|b| !b.simple);
-        let proj_scale = 0.5 * h.max(1) as f32 / (CAMERA_FOV_Y_RADIANS * 0.5).tan();
-        let main_cull = crate::world_objects::CullParams {
-            frustum,
-            eye: camera.pos.to_array(),
-            proj_scale,
-            min_screen_px: 1.5,
-            clip_plane: None,
-        };
         // The main depth is copied into the water's `terrain_depth` for the edge
         // reconstruction, which only the water surface reads (and only when it is
         // above the plane). No water plane on screen, no reader.
@@ -5989,10 +5594,8 @@ impl Renderer {
                 None
             },
             None,
-            &main_cull,
+            &frustum,
             None,
-            matrix,
-            true,
         );
         let model_target = self.water.scene_raw();
         self.draw_models(
@@ -6050,7 +5653,7 @@ impl Renderer {
             camera.active_fog(),
             normal.clip,
             main_weather,
-            self.object_mv_enabled,
+            true,
             reset_history,
         );
         // Two full-resolution copies that only the water and the post chain can
@@ -6077,14 +5680,6 @@ impl Renderer {
         lap(STAGE_MAIN, &mut stage_ms, &mut lap_at);
         // Diagnostic mode for exercising window/input UI on memory-limited software GPUs.
         if ui_test() {
-            self.draw_post_water_effects(
-                scene_target_raw,
-                &scene_depth,
-                &normal,
-                camera,
-                unjittered_vp,
-                false,
-            );
             if use_post {
                 self.post.render(
                     &self.device,
@@ -6113,12 +5708,10 @@ impl Renderer {
 
         // The reflection texture is reused only after its previous water draw is
         // submitted. Each distinct height gets its own mirror and clip plane.
-        if visible.len() > 1 {
-            visible.sort_unstable_by(|a, b| {
-                b.distance_squared(camera.pos)
-                    .total_cmp(&a.distance_squared(camera.pos))
-            });
-        }
+        visible.sort_by(|a, b| {
+            b.distance_squared(camera.pos)
+                .total_cmp(&a.distance_squared(camera.pos))
+        });
         if water_debug() {
             static LOG_ONCE: std::sync::Once = std::sync::Once::new();
             LOG_ONCE.call_once(|| {
@@ -6170,14 +5763,6 @@ impl Renderer {
                     frame.fog_color,
                 );
             }
-            self.draw_post_water_effects(
-                scene_target_raw,
-                &scene_depth,
-                &normal,
-                camera,
-                unjittered_vp,
-                false,
-            );
             if use_post {
                 self.post.render(
                     &self.device,
@@ -6248,10 +5833,8 @@ impl Renderer {
                 self.water_scissored += 1;
                 self.water_scissor_cover += (sw as f32 * sh as f32) / (w as f32 * h as f32);
             }
-            let refraction_frustum =
-                water_view_frustum(matrix, (w, h), refraction_scissor, frustum);
-            // A previous plane's reflection left its mirrored records in the
-            // buffer; the refraction passes below draw through the main matrix.
+            // Queue only the terrain blocks sampled by this water plane. The
+            // water edge pass and both refraction branches consume these runs.
             self.queue_water_main_runs(matrix, (w, h), refraction_scissor);
             if camera.pos.y > plane {
                 // Client 0x7cc6ac-0x7cc8b5: render below this plane into
@@ -6293,13 +5876,6 @@ impl Renderer {
                     }
                 };
                 let fog = camera.underwater_fog.color;
-                let uw_refr_cull = crate::world_objects::CullParams {
-                    frustum: refraction_frustum,
-                    eye: camera.pos.to_array(),
-                    proj_scale,
-                    min_screen_px: 4.0,
-                    clip_plane: Some((plane, -1.0)),
-                };
                 let mut re = self.device.create_command_encoder(&Default::default());
                 self.draw_opaque(
                     &mut re,
@@ -6320,10 +5896,8 @@ impl Renderer {
                         b: linear(fog[2]),
                         a: 1.,
                     }),
-                    &uw_refr_cull,
+                    &frustum,
                     refraction_scissor,
-                    matrix,
-                    false, // Water views are already surface-scissored; skip full Hi-Z.
                 );
                 let model_view = self.water.refraction_raw();
                 self.draw_addons(
@@ -6364,13 +5938,6 @@ impl Renderer {
                 above.fog_color = above_fog.color4();
                 self.queue
                     .write_buffer(&self.reflected_uniform, 0, bytemuck::bytes_of(&above));
-                let above_refr_cull = crate::world_objects::CullParams {
-                    frustum: refraction_frustum,
-                    eye: camera.pos.to_array(),
-                    proj_scale,
-                    min_screen_px: 4.0,
-                    clip_plane: Some((plane, 1.0)),
-                };
                 let mut re = self.device.create_command_encoder(&Default::default());
                 self.draw_opaque(
                     &mut re,
@@ -6385,10 +5952,8 @@ impl Renderer {
                     ViewRuns::Water,
                     None,
                     None,
-                    &above_refr_cull,
+                    &frustum,
                     refraction_scissor,
-                    matrix,
-                    false, // Keep frustum/clip/LOD culling without per-tree Hi-Z sampling.
                 );
                 if let Some(cloud) = &self.cloud {
                     cloud.draw(
@@ -6440,7 +6005,7 @@ impl Renderer {
                         camera,
                         Pass::Refraction,
                         false,
-                        &refraction_frustum,
+                        &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
                         unjittered_vp,
                     );
                 }
@@ -6520,18 +6085,7 @@ impl Renderer {
             };
             self.queue
                 .write_buffer(&self.reflected_uniform, 0, bytemuck::bytes_of(&reflected));
-            let reflection_scissor =
-                water_view_scissor(matrix * flip, w, h, batch.bounds, plane, water_margin);
-            self.queue_reflected_runs(matrix * flip, (w, h), reflection_scissor);
-            let reflection_frustum =
-                water_view_frustum(matrix * flip, (w, h), reflection_scissor, reflected_frustum);
-            let refl_cull = crate::world_objects::CullParams {
-                frustum: reflection_frustum,
-                eye: [camera.pos.x, 2.0 * plane - camera.pos.y, camera.pos.z],
-                proj_scale,
-                min_screen_px: 4.0,
-                clip_plane: Some((plane, reflected.clip[1])),
-            };
+            self.queue_reflected_runs(matrix * flip);
             let mut e = self.device.create_command_encoder(&Default::default());
             self.draw_opaque(
                 &mut e,
@@ -6547,12 +6101,10 @@ impl Renderer {
                 ViewRuns::Reflected,
                 None,
                 None,
-                &refl_cull,
+                &reflected_frustum,
                 // The mirror is read at `screen ± 0.25` by the same surface, so
                 // the same rectangle applies through the mirrored matrix.
-                reflection_scissor,
-                matrix * flip,
-                false, // The water mirror is scissored; frustum/clip culling is enough.
+                water_view_scissor(matrix * flip, w, h, batch.bounds, plane, water_margin),
             );
             if let Some(cloud) = &self.cloud {
                 cloud.draw(
@@ -6599,7 +6151,7 @@ impl Renderer {
                 camera,
                 Pass::Reflection,
                 false,
-                &reflection_frustum,
+                &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
                 unjittered_vp,
             );
             self.draw_addons(
@@ -6641,14 +6193,6 @@ impl Renderer {
                 frame.fog_color,
             );
         }
-        self.draw_post_water_effects(
-            scene_target_raw,
-            &scene_depth,
-            &normal,
-            camera,
-            unjittered_vp,
-            !self.visible_water_batches.is_empty(),
-        );
         if use_post {
             self.post.render(
                 &self.device,
@@ -7548,7 +7092,6 @@ async fn adapter(
                 required_features: a.features()
                     & (wgpu::Features::TEXTURE_COMPRESSION_BC
                         | wgpu::Features::MULTI_DRAW_INDIRECT
-                        | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
                         | wgpu::Features::INDIRECT_FIRST_INSTANCE),
                 required_limits,
             },
@@ -7893,25 +7436,39 @@ pub fn run(
         ) {
             Ok(mut list) => {
                 if list.is_empty() {
+                    // A map with no `world_targets.txt` still has precinct
+                    // zones, and those are the real destinations: each one's
+                    // authored centre, or a point inside its own polygon when
+                    // the file is version 6 and carries no centre line. A zone
+                    // with neither cannot be flown to, so it is skipped rather
+                    // than listed as a blank row.
                     if let Some(zones) = &ui_zones {
                         let mut fallback_id = 90_000u32;
                         for zone in &zones.zones {
-                            if let Some(position) = zone.center {
-                                list.push(crate::navigation::Destination {
-                                    id: fallback_id,
-                                    name: zone.name.clone(),
-                                    position,
-                                });
-                                fallback_id += 1;
+                            let name = zone.name.trim();
+                            let Some(position) = zone.fallback_position() else {
+                                continue;
+                            };
+                            if name.is_empty() {
+                                continue;
                             }
+                            list.push(crate::navigation::Destination {
+                                id: fallback_id,
+                                name: crate::world_place_names::english(name).to_string(),
+                                position,
+                            });
+                            fallback_id += 1;
                         }
                     }
                 }
                 if list.is_empty() {
+                    // Last resort, and it must still be on the ground: the old
+                    // fixed +30 above the origin dropped the camera into empty
+                    // sky on maps whose terrain does not start at zero.
                     list.push(crate::navigation::Destination {
                         id: 0,
                         name: format!("{} centre", current_map.display_name),
-                        position: [0., map_space.ground(0., 0.) + 30., 0.],
+                        position: [0., map_space.ground(0., 0.) + 3., 0.],
                     });
                 }
                 Ok(list)
@@ -7929,7 +7486,7 @@ pub fn run(
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(|value| value.clamp(1, 250))
-        .unwrap_or(100);
+        .unwrap_or(40);
     // The expensive atlas and scene rebuild runs off the UI thread. At most one
     // request is in flight; once it completes, the latest camera position is used.
     let (width, height, spacing) = (t.width, t.height, t.grid_spacing);
@@ -7940,6 +7497,9 @@ pub fn run(
     // almost never changes them.
     // The last element says whether the whole-world preload owns the scenery, so
     // the worker can leave the local half of the mesh out (see `build`).
+    // Taken before `t` is moved into the streaming thread below, so the UI can
+    // still find the client's fonts.
+    let element_dir = t.element.clone();
     let (request_tx, request_rx) =
         std::sync::mpsc::channel::<(f32, f32, DetailSettings, u64, bool)>();
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<MeshData, String>>(1);
@@ -7971,6 +7531,14 @@ pub fn run(
         })
         .map_err(|e| format!("cannot start world streaming thread: {e}"))?;
     let egui_ctx = egui::Context::default();
+    // The interface is drawn with egui's built-in Latin faces, and a zone name,
+    // an item name or a message straight out of the client is Chinese. Without
+    // the client's own font each such glyph is a tofu box: `Entering` over a
+    // Chinese-named area read `Entering _ _ _`, three boxes for three
+    // characters. Nameplates installed a CJK face for their own labels only,
+    // which is why overhead names were fine and the banner was not. The face is
+    // registered on the first frame -- see `ui_fonts_installed` below.
+    let mut ui_fonts_installed = false;
     let mut egui_state = egui_winit::State::new(
         egui_ctx.clone(),
         egui::ViewportId::ROOT,
@@ -8029,7 +7597,28 @@ pub fn run(
             1408u32,
         )
     };
-    let mut full_map_target: Option<(wgpu::Texture, wgpu::TextureView, egui::TextureId)> = None;
+    let full_map_texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("selected-world overhead map"),
+        size: wgpu::Extent3d {
+            width: full_map_width,
+            height: full_map_height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let full_map_view = full_map_texture.create_view(&Default::default());
+    let full_depth_tex = depth(&renderer.device, full_map_width, full_map_height);
+    let full_map_depth = full_depth_tex.create_view(&Default::default());
+    let full_map_id = egui_renderer.register_native_texture(
+        &renderer.device,
+        &full_map_view,
+        wgpu::FilterMode::Linear,
+    );
     // Client map artwork, loaded on demand in a worker thread. The world map and
     // the minimap come from different asset sets (`surfaces/maps/` and
     // `surfaces/minimaps/world/`), so each keeps its own texture and its own
@@ -8837,7 +8426,16 @@ pub fn run(
                     // atlases nothing samples. Crossing into or out of that
                     // state changes what the mesh should contain, so it is part
                     // of the staleness test and not just of the request.
-                    let skip_local_scenery = renderer.world_done;
+                    // The preload takes the scenery over only once it has
+                    // pages to draw. `world_done` is raised on the worker's
+                    // `Done` message, which can arrive with zero pages — a
+                    // client whose ornament models this build cannot resolve
+                    // produces exactly that. Keying the hand-over on it alone
+                    // released every local page while the whole-world path had
+                    // nothing to put in their place, which is the 1.5.2 report
+                    // of a world with no buildings at all.
+                    let skip_local_scenery =
+                        renderer.world_done && !renderer.world_pages.is_empty();
                     let stale = match &aim {
                         Some(aim) => {
                             aim != &renderer.lod
@@ -8866,7 +8464,7 @@ pub fn run(
                     world_audio.update(settings.effects_enabled,settings.effects_volume,camera.pos.to_array(),camera.yaw,crate::environment::night_factor(settings.time_of_day));
                     if zone_check.elapsed()>=std::time::Duration::from_millis(350){
                         zone_check=Instant::now();let zone=ui_zones.as_ref().and_then(|z|z.find(camera.pos.x,camera.pos.z));
-                        if (!zone_initialized || zone!=last_zone) && settings.show_zone_entry {if let Some(i)=zone {if let Some(db)=&ui_zones {let name=db.zones[i].name.trim();if !name.is_empty(){zone_banner=Some((name.to_string(),Instant::now()));}}}}
+                        if (!zone_initialized || zone!=last_zone) && settings.show_zone_entry {if let Some(i)=zone {if let Some(db)=&ui_zones {let name=crate::world_place_names::english(db.zones[i].name.trim());if !name.is_empty(){zone_banner=Some((name.to_string(),Instant::now()));}}}}
                         zone_initialized=true;last_zone=zone;
                     }
                     if !settings.show_zone_entry {zone_banner=None;}
@@ -8876,12 +8474,10 @@ pub fn run(
                     if want_world != world_enabled {
                         world_enabled=want_world;
                         if let Some(c)=world_cancel.take(){c.store(true,std::sync::atomic::Ordering::Relaxed);}
-                        world_rx=None;renderer.world_pages.clear();renderer.world_geometry_arena.reset();renderer.world_pages.shrink_to_fit();renderer.world_draw_cmds=Default::default();renderer.world_done=false;
+                        world_rx=None;renderer.world_pages.clear();renderer.world_draw_cmds=Default::default();renderer.world_done=false;
                         if world_enabled {
-                         // Each in-flight whole-world Page carries up to ~85 MiB of 4096^2 RGBA + mips;
-                         // keeping 4/2 pages buffered saturates GPU upload while cutting peak RAM spikes by ~500-680 MiB.
                          let (tx, rx) = std::sync::mpsc::sync_channel(
-                             if crate::objects::unbounded_textures() { 8 } else { 4 },
+                             if crate::objects::unbounded_textures() { 8 } else { 2 },
                          );
                          let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
@@ -8897,11 +8493,6 @@ pub fn run(
                     // frame pacing for faster scenery readiness.
                     let upload_deadline = std::time::Instant::now()
                         + std::time::Duration::from_millis(world_upload_budget_ms);
-                    let mut upload_encoder = renderer.device.create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor {
-                            label: Some("whole-world batched geometry uploads"),
-                        },
-                    );
                     let mut uploaded_this_frame = 0usize;
                     while uploaded_this_frame < 64
                         && (uploaded_this_frame == 0 || std::time::Instant::now() < upload_deadline)
@@ -8910,7 +8501,7 @@ pub fn run(
                             Ok(crate::world_objects::Message::Page(page)) => {
                                 let processed = page.processed;
                                 let upload_started = std::time::Instant::now();
-                                let uploaded = crate::world_objects::GpuPage::upload_world_ref_staged(
+                                let uploaded = crate::world_objects::GpuPage::upload_world(
                                     &renderer.device,
                                     &renderer.queue,
                                     &renderer.layout,
@@ -8918,10 +8509,7 @@ pub fn run(
                                     &renderer.uniform,
                                     &renderer.reflected_uniform,
                                     &renderer.world_pages,
-                                    &mut renderer.world_geometry_arena,
-                                    &mut renderer.world_upload_belt,
-                                    &mut upload_encoder,
-                                    &page,
+                                    page,
                                 );
                                 let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
                                 renderer.world_pages.push(uploaded);
@@ -8929,7 +8517,7 @@ pub fn run(
                                 world_status = format!(
                                     "Loading: {processed}/{} objects, {} GPU chunks (latest upload {:.1} ms)",
                                     whole_ornaments.len(),
-                                    renderer.world_geometry_arena.chunk_count(),
+                                    renderer.world_pages.len(),
                                     upload_ms
                                 );
                                 if world_last_log_at.elapsed() >= std::time::Duration::from_secs(1)
@@ -8942,8 +8530,6 @@ pub fn run(
                             }
                             Ok(crate::world_objects::Message::CacheInvalid) => {
                                 renderer.world_pages.clear();
-                                renderer.world_geometry_arena.reset();
-                                renderer.world_pages.shrink_to_fit();
                                 renderer.world_draw_cmds = Default::default();
                                 world_status = String::from("World cache invalid; rebuilding pages...");
                             }
@@ -8953,6 +8539,38 @@ pub fn run(
                                 stats,
                                 world_draw_cmds,
                             }) => {
+                                // A preload that finished with nothing to draw
+                                // has not taken the scenery over. Leaving
+                                // `world_done` set made the renderer skip every
+                                // local page for the rest of the session while
+                                // the whole-world path drew an empty list, and
+                                // said so only on stderr — the 1.5.2 report of
+                                // a world with no buildings is that state. The
+                                // local pages have to survive this branch, so
+                                // the check runs before they are released.
+                                if renderer.world_pages.is_empty() {
+                                    renderer.world_done = false;
+                                    renderer.world_draw_cmds = Default::default();
+                                    world_rx = None;
+                                    world_cancel = None;
+                                    world_started_at = None;
+                                    let unavailable = stats.unavailable_models.len();
+                                    let unavailable_detail = if unavailable == 0 {
+                                        String::new()
+                                    } else {
+                                        format!(
+                                            "; {unavailable} unavailable scenery models: {}",
+                                            stats.unavailable_examples.join("; ")
+                                        )
+                                    };
+                                    world_status = format!(
+                                        "World preload built no pages; local scenery kept ({processed} objects processed, {skipped} without a usable mesh; {}{unavailable_detail})",
+                                        stats.status_line(),
+                                    );
+                                    crate::diag!(TimingLoad, "{world_status}");
+                                    eprintln!("{world_status}");
+                                    break;
+                                }
                                 renderer.world_draw_cmds = world_draw_cmds;
                                 for page in &mut renderer.world_pages {
                                     page.release_cpu_ranges();
@@ -8981,8 +8599,9 @@ pub fn run(
                                         stats.unavailable_examples.join("; ")
                                     )
                                 };
+                                let counters_line = stats.status_line();
                                 world_status = format!(
-                                    "Loaded {processed} objects in {:.1}s{}; {skipped} meshes use fallback texture; {} geometry chunks ({} pages); {load_detail}{unavailable_detail}",
+                                    "Loaded {processed} objects in {:.1}s{}; {skipped} meshes use fallback texture; {} geometry chunks ({} pages); {counters_line}; {load_detail}{unavailable_detail}",
                                     elapsed.unwrap_or_default(),
                                     if stats.cache_hit { " (warm page cache)" } else { "" },
                                     renderer.world_pages.len(),
@@ -8999,15 +8618,6 @@ pub fn run(
                             }
                             Err(_) => break,
                         }
-                    }
-                    if uploaded_this_frame > 0 {
-                        // All vertex/index copies from this frame share the
-                        // staging belt and one command submission. Texture
-                        // writes queued above are ordered before this submit.
-                        renderer.world_upload_belt.finish();
-                        renderer.queue.submit(Some(upload_encoder.finish()));
-                        renderer.world_upload_belt.recall();
-                        renderer.device.poll(wgpu::Maintain::Poll);
                     }
                 }
                     camera.far = if world_enabled {settings.far.max(32000.)} else {settings.far};
@@ -9203,20 +8813,10 @@ pub fn run(
                             // stay sharp regardless of the 3D resolution scale.
                             let composed_view=if whole_frame_gamma {Some(display_gamma.as_ref().unwrap().view())} else if let Some(encode)=present_encode.as_ref() {Some(encode.view())} else {None};
                             let scene_view=composed_view.as_ref().unwrap_or(final_view);
-                            let need_object_mv = fsr_upscaler.is_some()
-                                || xess_upscaler.is_some()
-                                || dlss_upscaler.is_some()
-                                || framegen.is_some()
-                                || xess_framegen.is_some()
-                                || dlss_framegen.is_some();
-                            renderer.set_object_mv_enabled(need_object_mv, world_extent.0, world_extent.1);
-                            let direct_native_render = fg_views.is_none()
-                                && world_extent == (config.width, config.height)
-                                && fsr_upscaler.is_none()
-                                && xess_upscaler.is_none()
-                                && dlss_upscaler.is_none()
-                                && !(settings.upscaling == crate::UpscaleMethod::Fsr1
-                                    && crate::fsr1_eligible(world_extent, (config.width, config.height)));
+                            // Draw the world into the scaled offscreen target, then bilinearly
+                            // present it into `scene_view` before the UI pass loads that result.
+                            let world_view = render_scale.view();
+                            let world_raw_view = render_scale.raw_view();
                             // XeLL: the frame's render-submit phase opens before
                             // the first command list (world) is submitted.
                             if let Some(session) = latency.as_mut() {
@@ -9271,47 +8871,15 @@ pub fn run(
                             let ray_overrides = renderer
                                 .raywatcher_plan(world_extent, camera_jumped);
                             renderer.raywatcher_overrides = ray_overrides;
-                            let direct_native_render = direct_native_render && !renderer.raywatcher_frame_plan.trace;
-                            if direct_native_render {
-                                render_scale.release_frame();
-                                let scene_raw_view = if whole_frame_gamma {
-                                    display_gamma.as_ref().unwrap().raw_view()
-                                } else if let Some(encode) = present_encode.as_ref() {
-                                    encode.raw_view()
-                                } else {
-                                    frame
-                                        .as_ref()
-                                        .expect("a frame exists whenever the frame generation pipeline does not")
-                                        .texture
-                                        .create_view(&wgpu::TextureViewDescriptor {
-                                            format: Some(format.remove_srgb_suffix()),
-                                            ..Default::default()
-                                        })
-                                };
-                                renderer.render(
-                                    scene_view,
-                                    &scene_raw_view,
-                                    world_matrix,
-                                    &camera,
-                                    world_extent.0,
-                                    world_extent.1,
-                                    camera_jumped,
-                                );
-                            } else {
-                                // Draw the world into the scaled offscreen target, then present
-                                // it into `scene_view` before the UI pass loads that result.
-                                render_scale.ensure_frame(&renderer.device);
-                                let world_view = render_scale.view();
-                                let world_raw_view = render_scale.raw_view();
-                                renderer.render(
-                                    &world_view,
-                                    &world_raw_view,
-                                    world_matrix,
-                                    &camera,
-                                    world_extent.0,
-                                    world_extent.1,
-                                    camera_jumped,
-                                );
+                            renderer.render(
+                                &world_view,
+                                &world_raw_view,
+                                world_matrix,
+                                &camera,
+                                world_extent.0,
+                                world_extent.1,
+                                camera_jumped,
+                            );
                             // Raywatcher: the plan was decided before the world
                             // pass (so the effects it replaces never drew), and
                             // the trace runs now because it consumes the motion
@@ -9338,49 +8906,48 @@ pub fn run(
                                 );
                                 renderer.queue.submit(Some(ray_encoder.finish()));
                             }
-                                if let Some(fsr) = fsr_upscaler.as_mut() {
-                                    match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
-                                        Ok(()) => fsr.composite(&renderer.device, &renderer.queue, scene_view),
-                                        Err(error) => {
-                                            crate::fsr::diag(&format!("FSR failed, rendering at native resolution instead: {error}"));
-                                            fsr_fail_reason = Some(error);
-                                            fsr_upscaler = None;
-                                            fsr_failed = true;
-                                            render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
-                                        }
+                            if let Some(fsr) = fsr_upscaler.as_mut() {
+                                match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
+                                    Ok(()) => fsr.composite(&renderer.device, &renderer.queue, scene_view),
+                                    Err(error) => {
+                                        crate::fsr::diag(&format!("FSR failed, rendering at native resolution instead: {error}"));
+                                        fsr_fail_reason = Some(error);
+                                        fsr_upscaler = None;
+                                        fsr_failed = true;
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
                                     }
-                                } else if let Some(xess) = xess_upscaler.as_mut() {
-                                    match xess.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp) {
-                                        Ok(()) => xess.composite(&renderer.device, &renderer.queue, scene_view, settings.xess_sharpness),
-                                        Err(error) => {
-                                            crate::xess::diag(&format!("XeSS failed, rendering at native resolution instead: {error}"));
-                                            xess_fail_reason = Some(error);
-                                            xess_upscaler = None;
-                                            xess_failed = true;
-                                            render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
-                                        }
-                                    }
-                                } else if let Some(dlss) = dlss_upscaler.as_mut() {
-                                    match dlss.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp) {
-                                        Ok(()) => {
-                                            // A frame that evaluated proves the feature
-                                            // works, so the transient-failure budget is
-                                            // replenished instead of staying spent for
-                                            // the rest of the session.
-                                            dlss_retries = 0;
-                                            dlss.composite(&renderer.device, &renderer.queue, scene_view, settings.dlss_sharpness);
-                                        }
-                                        Err(error) => {
-                                            crate::dlss::diag(&format!("DLSS failed, rendering at native resolution instead: {error}"));
-                                            dlss_fail_reason = Some(error);
-                                            dlss_upscaler = None;
-                                            dlss_failed = true;
-                                            render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
-                                        }
-                                    }
-                                } else {
-                                    render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
                                 }
+                            } else if let Some(xess) = xess_upscaler.as_mut() {
+                                match xess.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp) {
+                                    Ok(()) => xess.composite(&renderer.device, &renderer.queue, scene_view, settings.xess_sharpness),
+                                    Err(error) => {
+                                        crate::xess::diag(&format!("XeSS failed, rendering at native resolution instead: {error}"));
+                                        xess_fail_reason = Some(error);
+                                        xess_upscaler = None;
+                                        xess_failed = true;
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                    }
+                                }
+                            } else if let Some(dlss) = dlss_upscaler.as_mut() {
+                                match dlss.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp) {
+                                    Ok(()) => {
+                                        // A frame that evaluated proves the feature
+                                        // works, so the transient-failure budget is
+                                        // replenished instead of staying spent for
+                                        // the rest of the session.
+                                        dlss_retries = 0;
+                                        dlss.composite(&renderer.device, &renderer.queue, scene_view, settings.dlss_sharpness);
+                                    }
+                                    Err(error) => {
+                                        crate::dlss::diag(&format!("DLSS failed, rendering at native resolution instead: {error}"));
+                                        dlss_fail_reason = Some(error);
+                                        dlss_upscaler = None;
+                                        dlss_failed = true;
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                    }
+                                }
+                            } else {
+                                render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
                             }
                             // When frame generation separates the UI from the scene,
                             // finish any gamma ramp / UNORM encode into `final_view`
@@ -9519,40 +9086,9 @@ pub fn run(
                                     last_minimap_key = Some(minimap_key);
                               }
                             }
-                            if menu_page==MenuPage::WorldMap && settings.world_map_style==MapStyle::Realistic {
-                                let mut needs_refresh = map_refresh.elapsed()>=std::time::Duration::from_secs(2);
-                                if full_map_target.is_none() {
-                                    let tex = renderer.device.create_texture(&wgpu::TextureDescriptor {
-                                        label: Some("selected-world overhead map"),
-                                        size: wgpu::Extent3d {
-                                            width: full_map_width,
-                                            height: full_map_height,
-                                            depth_or_array_layers: 1,
-                                        },
-                                        mip_level_count: 1,
-                                        sample_count: 1,
-                                        dimension: wgpu::TextureDimension::D2,
-                                        format,
-                                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                                        view_formats: &[],
-                                    });
-                                    let view = tex.create_view(&Default::default());
-                                    let id = egui_renderer.register_native_texture(
-                                        &renderer.device,
-                                        &view,
-                                        wgpu::FilterMode::Linear,
-                                    );
-                                    full_map_target = Some((tex, view, id));
-                                    needs_refresh = true;
-                                }
-                                if needs_refresh {
-                                    if let Some((_, ref full_map_view, _)) = full_map_target {
-                                        let full_depth_tex = depth(&renderer.device, full_map_width, full_map_height);
-                                        let full_map_depth = full_depth_tex.create_view(&Default::default());
-                                        renderer.render_minimap(full_map_view, &full_map_depth, &camera, 0., true);
-                                        map_refresh = Instant::now();
-                                    }
-                                }
+                            if menu_page==MenuPage::WorldMap && settings.world_map_style==MapStyle::Realistic && map_refresh.elapsed()>=std::time::Duration::from_secs(2) {
+                                renderer.render_minimap(&full_map_view,&full_map_depth,&camera,0.,true);
+                                map_refresh=Instant::now();
                             }
                             renderer.modules.prepare_librarian_preview(&renderer.device, &renderer.queue, &mut egui_renderer, format, menu_page==MenuPage::Modules);
                             // On-screen mark: the active upscaler / frame-generation
@@ -9726,6 +9262,18 @@ pub fn run(
                                 || xess_fg_failed
                                 || dlss_fg_failed;
                             if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
+                                // The interface font is installed here, on the
+                                // first frame, and not next to
+                                // `Context::default()`: `ctx.set_fonts` keys its
+                                // font atlas by pixels-per-point, which is only
+                                // known once a frame supplies it, and
+                                // `ctx.fonts()` panics until then. Doing it at
+                                // the first `run` is both valid and correctly
+                                // scaled, and costs one frame of Latin faces.
+                                if !ui_fonts_installed {
+                                    crate::modules::install_client_cjk(&egui_ctx, &element_dir);
+                                    ui_fonts_installed = true;
+                                }
                                 let input=egui_state.take_egui_input(&window);
                                 let output=egui_ctx.run(input,|ctx| {
                                     // A replacement-process handoff leaves this
@@ -10004,7 +9552,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                             ui.label(egui::RichText::new("North: up  |  East: right  |  Mouse wheel: zoom").small().strong());
                                             if settings.world_map_style==MapStyle::Realistic && !renderer.world_done {ui.horizontal_wrapped(|ui|{ui.label(egui::RichText::new("Distant scenery: ").small().weak());if settings.detail.terrain_cutoff {ui.label("Scenery follows the resident window");}else if settings.whole_world {ui.label(egui::RichText::new(&world_status).small().weak());}else if ui.button("Load whole world scenery").clicked(){settings.whole_world=true;}});}
                                             let remaining=(ui.available_height()-78.).max(100.);let visible_width=ui.available_width();let base_width=visible_width.min(remaining*map_aspect).max(120.);let image_size=egui::vec2(base_width*map_zoom,base_width*map_zoom/map_aspect);
-                                            let texture=if settings.world_map_style==MapStyle::Original {original_map_id.as_ref().map(|t|t.id())} else {full_map_target.as_ref().map(|(_,_,id)|*id)};
+                                            let texture=if settings.world_map_style==MapStyle::Original {original_map_id.as_ref().map(|t|t.id())} else {Some(full_map_id)};
                                             let mut zoom_anchor=None;
                                             let scroll=egui::ScrollArea::both().max_height(remaining).auto_shrink([false,false]).show(ui,|ui|{
                                                 if let Some(id)=texture {let response=ui.add(egui::Image::new((id,image_size)).sense(egui::Sense::click()));let rect=response.rect;
@@ -10546,7 +10094,7 @@ pub fn preview(
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(device, queue, fmt, width, height, mesh, &mut t, false)?;
     if std::env::var_os("PW_PREVIEW_WORLD_TEST").is_some() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let root = t.element.clone();
         let ornaments = t.objects.ornaments.clone();
         std::thread::spawn(move || {
@@ -10564,7 +10112,7 @@ pub fn preview(
                         "Preview uploaded world chunk: {} vertices",
                         page.vertices.len()
                     );
-                    let uploaded = crate::world_objects::GpuPage::upload_world_ref(
+                    let uploaded = crate::world_objects::GpuPage::upload_world(
                         &renderer.device,
                         &renderer.queue,
                         &renderer.layout,
@@ -10572,13 +10120,12 @@ pub fn preview(
                         &renderer.uniform,
                         &renderer.reflected_uniform,
                         &renderer.world_pages,
-                        &page,
+                        page,
                     );
                     renderer.world_pages.push(uploaded);
                 }
                 crate::world_objects::Message::CacheInvalid => {
                     renderer.world_pages.clear();
-                    renderer.world_geometry_arena.reset();
                 }
                 crate::world_objects::Message::Done {
                     processed,
@@ -10680,10 +10227,12 @@ pub fn preview(
                 )
             })
             .unwrap_or_else(|| "no world".into());
-        let on = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();
+        let on = read_target_pixels(&renderer, &target, width, height)
+            .map_err(|error| format!("effect A/B enabled readback failed: {error}"))?;
         cam.world_effects = false;
         draw(&mut renderer, &cam);
-        let off = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();
+        let off = read_target_pixels(&renderer, &target, width, height)
+            .map_err(|error| format!("effect A/B disabled readback failed: {error}"))?;
         cam.world_effects = true;
         let differing = on
             .chunks_exact(4)

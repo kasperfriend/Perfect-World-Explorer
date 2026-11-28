@@ -1,6 +1,8 @@
 //! Custom-painted native Windows launcher. Artwork is embedded in the executable.
 use std::{
     ffi::c_void,
+    fs,
+    path::PathBuf,
     sync::{Mutex, OnceLock},
 };
 type Handle = *mut c_void;
@@ -175,9 +177,71 @@ struct State {
     ready: bool,
     known: bool,
     low_memory: bool,
+    run_diagnostics: bool,
     hover: u8,
     focus: u8,
+    /// Version rows from the folder scan: the game build, then the `tasks.data`
+    /// and `elements.data` revisions. Exactly three, which is what the card has
+    /// room for.
+    rows: Vec<(String, String)>,
 }
+/// Where the launcher remembers its checkbox.
+///
+/// `windows_setup::settings_file` already owns `%LOCALAPPDATA%\PerfectWorldViewer`
+/// for the remembered client folder; the toggle lives beside it in its own
+/// file so neither write can truncate the other.
+fn settings_file() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|p| p.join("PerfectWorldViewer").join("low-memory"))
+}
+
+/// The stored form of the toggle: exactly `b"1"` or `b"0"`.
+///
+/// Anything else is not a value this code wrote, so it reads as "not set"
+/// rather than as false — the difference between a fresh install and a user
+/// who deliberately turned the option off is what `None` is for, and a
+/// half-written or hand-edited file must not silently pick one.
+fn decode(raw: &[u8]) -> Option<bool> {
+    match raw {
+        b"1" => Some(true),
+        b"0" => Some(false),
+        _ => None,
+    }
+}
+
+fn encode(value: bool) -> &'static [u8] {
+    if value {
+        b"1"
+    } else {
+        b"0"
+    }
+}
+
+fn load_low_memory() -> Option<bool> {
+    decode(&fs::read(settings_file()?).ok()?)
+}
+
+fn save_low_memory(value: bool) -> Result<(), String> {
+    let file = settings_file().ok_or("LOCALAPPDATA is not set")?;
+    fs::create_dir_all(file.parent().ok_or("Invalid settings path")?)
+        .map_err(|e| format!("Unable to save the low-memory setting: {e}"))?;
+    fs::write(file, encode(value))
+        .map_err(|e| format!("Unable to save the low-memory setting: {e}"))
+}
+
+/// Flip the toggle and persist it.
+///
+/// The in-memory state is updated first and the write failure is returned
+/// rather than swallowed, so the caller can say the checkbox did not stick
+/// instead of showing a tick that will be gone next launch.
+fn toggle_low_memory(state: &mut State) -> Result<(), String> {
+    let next = !state.low_memory;
+    save_low_memory(next)?;
+    state.low_memory = next;
+    Ok(())
+}
+
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| Mutex::new(State::default()))
@@ -205,10 +269,21 @@ pub fn initialize() {
             h,
         }
     });
+    restore_state();
+}
+
+/// The part of [`initialize`] that does not decode the artwork: reset the
+/// status and focus, and restore the persisted toggle.
+///
+/// Split out so the restore is testable without the embedded JPEG, which needs
+/// a real decoder (`image` is a stub in the offline harness); `initialize` is
+/// just this plus `ART`.
+fn restore_state() {
     if let Ok(mut s) = state().lock() {
         *s = State {
             status: "No client selected".into(),
             focus: 1,
+            low_memory: load_low_memory().unwrap_or(false),
             ..Default::default()
         };
     }
@@ -219,21 +294,159 @@ pub fn set_client(hwnd: Handle, status: &str, path: &str, ready: bool, known: bo
         s.path = path.into();
         s.ready = ready;
         s.known = known;
+        s.rows.clear();
     }
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
 }
+
+/// Install the result of a full folder scan: the one-line status plus the
+/// version rows drawn under it. The rows come from
+/// [`crate::client_detect::Scan::summary_rows`], the same values
+/// `--diagnose-client` prints, so the launcher and the diagnostic cannot drift
+/// apart.
+pub fn set_scan(
+    hwnd: Handle,
+    status: &str,
+    path: &str,
+    ready: bool,
+    known: bool,
+    rows: Vec<(String, String)>,
+) {
+    if let Ok(mut s) = state().lock() {
+        s.status = status.into();
+        s.path = path.into();
+        s.ready = ready;
+        s.known = known;
+        s.rows = rows;
+    }
+    unsafe {
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// `LOCALAPPDATA` is process-global and libtest runs tests in parallel
+    /// threads, so the three that set, remove and depend on it would race. This
+    /// is not theoretical: the launcher suite passed on this machine and failed
+    /// in CI on this exact step, because the ordering that happened to hold here
+    /// did not hold there. One lock, taken by every test that touches the
+    /// variable, makes the ordering explicit.
+    static ENV: Mutex<()> = Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The stored form is exactly `1` or `0`, and nothing else is a value.
+    #[test]
+    fn only_the_two_written_bytes_decode() {
+        assert_eq!(decode(b"1"), Some(true));
+        assert_eq!(decode(b"0"), Some(false));
+        assert_eq!(encode(true), b"1");
+        assert_eq!(encode(false), b"0");
+        // A fresh install has no file; a truncated or hand-edited one is not
+        // evidence of a choice either way.
+        assert_eq!(decode(b""), None);
+        assert_eq!(decode(b"true"), None);
+        assert_eq!(decode(b"01"), None);
+        assert_eq!(decode(b"1\n"), None);
+        assert_eq!(decode(b"\x00"), None);
+    }
+
+    #[test]
+    fn every_written_value_reads_back_as_itself() {
+        for value in [true, false] {
+            assert_eq!(decode(encode(value)), Some(value), "{value}");
+        }
+    }
+
+    /// Toggling persists: the value on disk after one click is the opposite of
+    /// the value in memory before it.
+    #[test]
+    fn a_toggle_writes_the_new_value_and_updates_the_state() {
+        let _guard = env_guard();
+        let mut state = State::default();
+        assert!(!state.low_memory);
+        // `save_low_memory` needs `LOCALAPPDATA`; point it at a temp directory
+        // so the test never touches the real profile.
+        let dir = std::env::temp_dir().join("pw-launcher-toggle-test");
+        fs::create_dir_all(&dir).unwrap();
+        // SAFETY: this test is the only reader of the variable in this binary.
+        unsafe { std::env::set_var("LOCALAPPDATA", &dir) };
+        toggle_low_memory(&mut state).unwrap();
+        assert!(state.low_memory);
+        assert_eq!(load_low_memory(), Some(true));
+        toggle_low_memory(&mut state).unwrap();
+        assert!(!state.low_memory);
+        assert_eq!(load_low_memory(), Some(false));
+        // A fresh read from the same file agrees with the surviving state.
+        assert_eq!(load_low_memory().unwrap(), state.low_memory);
+        unsafe { std::env::remove_var("LOCALAPPDATA") };
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `initialize()` is what puts the stored value back into the state, and it
+    /// is the half a toggle test cannot see: a build could write the file on
+    /// every click and still start unchecked.
+    #[test]
+    fn initialize_restores_the_stored_toggle() {
+        let _guard = env_guard();
+        let dir = std::env::temp_dir().join("pw-launcher-restore-test");
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("LOCALAPPDATA", &dir) };
+
+        // Nothing stored yet: the checkbox starts clear.
+        restore_state();
+        assert!(!low_memory());
+
+        save_low_memory(true).unwrap();
+        restore_state();
+        assert!(low_memory(), "a stored 1 must come back ticked");
+
+        save_low_memory(false).unwrap();
+        restore_state();
+        assert!(!low_memory());
+
+        // An unreadable value is not a choice, so it reads as clear.
+        fs::write(settings_file().unwrap(), b"garbage").unwrap();
+        restore_state();
+        assert!(!low_memory());
+
+        unsafe { std::env::remove_var("LOCALAPPDATA") };
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_environment_is_an_error_not_a_silent_default() {
+        let _guard = env_guard();
+        unsafe { std::env::remove_var("LOCALAPPDATA") };
+        assert!(save_low_memory(true).is_err());
+        assert_eq!(load_low_memory(), None);
+    }
+}
+
 pub fn low_memory() -> bool {
     state().lock().map(|s| s.low_memory).unwrap_or(false)
+}
+pub fn run_diagnostics() -> bool {
+    state().lock().map(|s| s.run_diagnostics).unwrap_or(false)
 }
 fn hit(x: i32, y: i32, ready: bool) -> u8 {
     if (54..284).contains(&x) && (362..410).contains(&y) {
         1
     } else if ready && (298..450).contains(&x) && (362..410).contains(&y) {
         2
-    } else if (54..420).contains(&x) && (444..474).contains(&y) {
+    } else if (54..420).contains(&x) && (444..470).contains(&y) {
         3
+    } else if (54..460).contains(&x) && (472..498).contains(&y) {
+        4
     } else {
         0
     }
@@ -257,7 +470,17 @@ pub fn click(hwnd: Handle, x: i32, y: i32) -> usize {
             1 => return 1,
             2 => return 2,
             3 => {
-                s.low_memory = !s.low_memory;
+                // A failed write must not leave the tick showing: the toggle
+                // reverts and the status line says why.
+                if let Err(e) = toggle_low_memory(&mut s) {
+                    s.status = e;
+                }
+                unsafe {
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+            }
+            4 => {
+                s.run_diagnostics = !s.run_diagnostics;
                 unsafe {
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
@@ -280,6 +503,7 @@ pub fn key(hwnd: Handle, k: usize) -> usize {
                         }
                     }
                     2 => 3,
+                    3 => 4,
                     _ => 1,
                 };
                 unsafe {
@@ -290,7 +514,15 @@ pub fn key(hwnd: Handle, k: usize) -> usize {
                 1 => return 1,
                 2 if s.ready => return 2,
                 3 => {
-                    s.low_memory = !s.low_memory;
+                    if let Err(e) = toggle_low_memory(&mut s) {
+                        s.status = e;
+                    }
+                    unsafe {
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    }
+                }
+                4 => {
+                    s.run_diagnostics = !s.run_diagnostics;
                     unsafe {
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     }
@@ -383,6 +615,20 @@ unsafe fn text(dc: Handle, x: i32, y: i32, s: &str, size: i32, weight: i32, colo
     // drawing any text at all. `text_width` and `rect` already leave their
     // cached font and brush alone for the same reason.
 }
+/// Keep one label/value row inside the launcher card, ending with an ellipsis
+/// so a truncated value is visibly truncated instead of silently wrong.
+fn compact_line(text: &str, width: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() > width {
+        format!(
+            "{}…",
+            chars[..width.saturating_sub(1)].iter().collect::<String>()
+        )
+    } else {
+        text.into()
+    }
+}
+
 fn compact(path: &str) -> String {
     let cs: Vec<char> = path.chars().collect();
     if cs.len() > 50 {
@@ -465,13 +711,16 @@ pub unsafe fn paint(hwnd: Handle) {
             400,
             rgb(151, 177, 184),
         );
-        // Client status card: low-contrast border and inset dark panel.
-        rect(dc, 54, 276, 397, 64, rgb(56, 94, 100));
-        rect(dc, 55, 277, 395, 62, rgb(14, 36, 44));
+        // Client status card: low-contrast border and inset dark panel. It is
+        // sized for the identity line, the folder path and exactly three version
+        // rows (game, elements, tasks), which end 40 pixels above the card's
+        // bottom edge so nothing is clipped or painted over the buttons.
+        rect(dc, 54, 252, 397, 104, rgb(56, 94, 100));
+        rect(dc, 55, 253, 395, 102, rgb(14, 36, 44));
         rect(
             dc,
             70,
-            292,
+            268,
             7,
             7,
             if s.ready && s.known {
@@ -481,16 +730,16 @@ pub unsafe fn paint(hwnd: Handle) {
             },
         );
         let title = if s.ready && s.known {
-            "DETECTED PW 1.4.2 CLIENT"
+            "DETECTED CLIENT"
         } else if s.ready {
-            "UNRECOGNIZED CLIENT BUILD"
+            "DETECTED CLIENT (UNVERIFIED BUILD)"
         } else {
             "GAME CLIENT"
         };
         text(
             dc,
             86,
-            284,
+            260,
             title,
             11,
             700,
@@ -505,7 +754,28 @@ pub unsafe fn paint(hwnd: Handle) {
         } else {
             compact(&s.path)
         };
-        text(dc, 70, 307, &desc, 12, 400, rgb(190, 209, 210));
+        text(dc, 70, 283, &desc, 12, 400, rgb(190, 209, 210));
+        // Version rows: the game build, then the elements.data and tasks.data
+        // revisions in that order. They move independently of the executable
+        // and make clients other than inspected 1.4.2 legible.
+        let mut y = 306;
+        for (label, value) in s.rows.iter().take(3) {
+            let line = if value.is_empty() {
+                label.clone()
+            } else {
+                format!("{label}  {value}")
+            };
+            text(
+                dc,
+                70,
+                y,
+                &compact_line(&line, 76),
+                11,
+                400,
+                rgb(151, 183, 186),
+            );
+            y += 14;
+        }
         let c = if s.hover == 1 || s.focus == 1 {
             rgb(134, 218, 205)
         } else {
@@ -537,6 +807,24 @@ pub unsafe fn paint(hwnd: Handle) {
             13,
             400,
             rgb(183, 206, 207),
+        );
+        rect(dc, 54, 476, 16, 16, rgb(112, 166, 165));
+        rect(dc, 55, 477, 14, 14, rgb(12, 39, 46));
+        if s.run_diagnostics {
+            text(dc, 56, 473, "✓", 14, 700, rgb(224, 192, 142));
+        }
+        text(
+            dc,
+            80,
+            474,
+            "Run all-worlds diagnostics before launch (slow)",
+            13,
+            400,
+            if s.run_diagnostics {
+                rgb(224, 192, 142)
+            } else {
+                rgb(183, 206, 207)
+            },
         );
         text(
             dc,

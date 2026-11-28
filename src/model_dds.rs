@@ -36,6 +36,15 @@ pub struct Uncompressed {
     pub bits: u32,
     /// Whether the header declares an alpha mask. RGB565 never does.
     pub has_alpha: bool,
+    /// `DDPF_LUMINANCE`: one channel repeated into R, G and B.
+    ///
+    /// Measured on the staged `textures.pck`: 59 members set pixel-format flags
+    /// `0x80000` with `bit_count` 16 and masks `000000ff` / `0000ff00`. They are
+    /// the `textures/water/caustic/` set, a grey caustic mask rather than a
+    /// colour image, and the reader refused every one of them -- which is a
+    /// whole caustic light pattern drawn as the flat white placeholder. The fix
+    /// is to widen the one channel that is there, not to invent colour.
+    pub luminance: bool,
 }
 
 #[derive(Debug)]
@@ -77,49 +86,71 @@ impl<'a> Dds<'a> {
             // must be 32 bits per pixel with the BGRA mask set. A 24-bit or
             // palettised surface is a different layout and stays unsupported.
             let rgb = word(80) & 0x40 != 0;
+            let luminance = word(80) & 0x80000 != 0;
             let bit_count = word(88);
             let (rmask, gmask, bmask, amask) = (word(92), word(96), word(100), word(104));
-            if !rgb {
-                return Err(format!(
-                    "unsupported uncompressed model DDS flags {:#x}",
-                    word(80)
-                ));
-            }
-            // Two authored layouts appear in `gfx.pck`: the D3D8 default 32-bit
-            // BGRA (with or without an alpha mask) and 16-bit RGB565 for small
-            // glow sprites.
-            let layout = if bit_count == 32 && (rmask, gmask, bmask) == (0xff0000, 0xff00, 0xff) {
-                if amask != 0 && amask != 0xff000000 {
+            // A one-channel surface: `textures/water/caustic/` in the staged
+            // pack, 16 bits with the sample in the low byte of each word.
+            // Narrower than a byte cannot be widened without knowing the
+            // author's scaling, so it stays a named refusal.
+            if luminance {
+                if bit_count != 16 && bit_count != 8 {
+                    return Err(format!("unsupported luminance model DDS: {bit_count} bits"));
+                }
+                let layout = Uncompressed {
+                    bits: bit_count,
+                    has_alpha: false,
+                    luminance: true,
+                };
+                (Format::Uncompressed(layout), bit_count as usize / 8)
+            } else {
+                if !rgb {
                     return Err(format!(
-                        "unsupported uncompressed model DDS alpha mask {amask:#x}"
+                        "unsupported uncompressed model DDS flags {:#x}",
+                        word(80)
                     ));
                 }
-                Uncompressed {
-                    bits: 32,
-                    has_alpha: amask == 0xff000000,
-                }
-            } else if bit_count == 16 && (rmask, gmask, bmask, amask) == (0x7c00, 0x3e0, 0x1f, 0) {
-                Uncompressed {
-                    bits: 16,
-                    has_alpha: false,
-                }
-            } else if bit_count == 24 && (rmask, gmask, bmask, amask) == (0xff0000, 0xff00, 0xff, 0)
-            {
-                // 24-bit BGR, no alpha byte stored. Still opaque.
-                Uncompressed {
-                    bits: 24,
-                    has_alpha: false,
-                }
-            } else {
-                return Err(format!(
-                    "unsupported uncompressed model DDS layout: bits {bit_count}, \
-                     masks {rmask:#x}/{gmask:#x}/{bmask:#x}/{amask:#x}"
-                ));
-            };
-            (
-                Format::Uncompressed(layout),
-                (layout.bits as usize).div_ceil(8),
-            )
+                // Three authored colour layouts: the D3D8 default 32-bit BGRA
+                // (with or without an alpha mask), 16-bit RGB565 for small glow
+                // sprites, and 24-bit BGR.
+                let layout = if bit_count == 32 && (rmask, gmask, bmask) == (0xff0000, 0xff00, 0xff)
+                {
+                    if amask != 0 && amask != 0xff000000 {
+                        return Err(format!(
+                            "unsupported uncompressed model DDS alpha mask {amask:#x}"
+                        ));
+                    }
+                    Uncompressed {
+                        bits: 32,
+                        has_alpha: amask == 0xff000000,
+                        luminance: false,
+                    }
+                } else if bit_count == 16
+                    && (rmask, gmask, bmask, amask) == (0x7c00, 0x3e0, 0x1f, 0)
+                {
+                    Uncompressed {
+                        bits: 16,
+                        has_alpha: false,
+                        luminance: false,
+                    }
+                } else if bit_count == 24
+                    && (rmask, gmask, bmask, amask) == (0xff0000, 0xff00, 0xff, 0)
+                {
+                    // 24-bit BGR, no alpha byte stored. Still opaque.
+                    Uncompressed {
+                        bits: 24,
+                        has_alpha: false,
+                        luminance: false,
+                    }
+                } else {
+                    return Err(format!(
+                        "unsupported uncompressed model DDS layout: bits {bit_count}, \
+                         masks {rmask:#x}/{gmask:#x}/{bmask:#x}/{amask:#x}"
+                    ));
+                };
+                let block_bytes = (layout.bits as usize).div_ceil(8);
+                (Format::Uncompressed(layout), block_bytes)
+            }
         };
         let (width, height) = (word(16), word(12));
         if width == 0 || height == 0 || width > 16384 || height > 16384 {
@@ -130,7 +161,7 @@ impl<'a> Dds<'a> {
         if count > max_count {
             return Err("model DDS mip count exceeds dimensions".into());
         }
-        let mut mips = Vec::with_capacity(count as usize);
+        let mut mips = Vec::new();
         let mut offset = 128usize;
         for i in 0..count {
             let w = (width >> i).max(1);
@@ -183,6 +214,66 @@ mod tests {
         }
         b
     }
+    /// A `DDPF_LUMINANCE` surface must parse as one channel, not be refused.
+    ///
+    /// The staged `textures.pck` ships 59 of them -- the whole
+    /// `textures/water/caustic/` set -- as 16 bits with masks `000000ff` /
+    /// `0000ff00`. Reading them as an ordinary uncompressed colour image would
+    /// mis-describe the data, and refusing them drew each caustic pattern as the
+    /// white placeholder.
+    #[test]
+    fn a_luminance_surface_is_one_channel_not_a_refusal() {
+        let mut b = vec![0u8; 128];
+        b[..4].copy_from_slice(b"DDS ");
+        for (o, v) in [
+            (4, 124u32),
+            (12, 4),
+            (16, 4),
+            (28, 1),
+            (76, 32),
+            (80, 0x80000), // DDPF_LUMINANCE
+            (88, 16),      // bit count
+            (92, 0xff),
+            (96, 0xff00),
+        ] {
+            b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        b.extend(vec![0x40u8; 4 * 4 * 2]);
+        let d = Dds::parse(&b).unwrap();
+        match d.format {
+            Format::Uncompressed(u) => {
+                assert_eq!(u.bits, 16);
+                assert!(u.luminance, "the surface must be marked one-channel");
+                assert!(!u.has_alpha);
+                // One channel is opaque; a grey mask has no transparency.
+                assert!(!d.format.alpha_texture());
+            }
+            other => panic!("expected an uncompressed layout, got {other:?}"),
+        }
+    }
+
+    /// And a width this build cannot widen stays a named refusal.
+    #[test]
+    fn an_unwidenable_luminance_width_is_named() {
+        let mut b = vec![0u8; 128];
+        b[..4].copy_from_slice(b"DDS ");
+        for (o, v) in [
+            (4, 124u32),
+            (12, 4),
+            (16, 4),
+            (28, 1),
+            (76, 32),
+            (80, 0x80000),
+            (88, 4),
+        ] {
+            b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        b.extend(vec![0u8; 64]);
+        let err = Dds::parse(&b).unwrap_err();
+        assert!(err.contains("luminance"), "{err}");
+        assert!(err.contains('4'), "{err}");
+    }
+
     #[test]
     fn retains_all_authored_levels_and_sub_block_mips() {
         for (tag, format, unit) in [
@@ -235,7 +326,8 @@ mod tests {
             d.format,
             Format::Uncompressed(Uncompressed {
                 bits: 32,
-                has_alpha: true
+                has_alpha: true,
+                luminance: false
             })
         );
         assert!(d.format.alpha_texture());
@@ -260,7 +352,8 @@ mod tests {
             d.format,
             Format::Uncompressed(Uncompressed {
                 bits: 16,
-                has_alpha: false
+                has_alpha: false,
+                luminance: false
             })
         );
         assert_eq!(d.mips[0].bytes.len(), 32);
@@ -270,7 +363,8 @@ mod tests {
             d.format,
             Format::Uncompressed(Uncompressed {
                 bits: 24,
-                has_alpha: false
+                has_alpha: false,
+                luminance: false
             })
         );
         assert_eq!(d.mips[0].bytes.len(), 48);

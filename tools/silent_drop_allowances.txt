@@ -1,0 +1,131 @@
+# Silent-drop allowances.
+#
+# One `path:line category note` per line. `category` is unreachable (the
+# site provably loses nothing) or named (the loss already reports). A site
+# here overrides the audit's judgement, so every line has to say why.
+#
+# These are all `let _ =` sites on results that are not content: an SDK
+# destroy call, an mpsc send whose receiver is a window that has closed, a
+# borrow reborrow. None of them can make a map draw nothing, which is the
+# failure the audit exists to find. `let _ =` on a *content* read is not
+# allowed here: it would be a Fix.
+
+src/model_dds.rs:191 unreachable bytes past the declared mip chain are ignored on purpose; a short file is refused above, so nothing is lost
+src/gfx_light.rs:366 unreachable the version gate was removed deliberately; `version` is kept only to document what used to gate the layout
+src/direct_storage.rs:195 unreachable the non-DirectStorage build's stub; there is no result to lose when the feature is compiled out
+src/latency.rs:309 unreachable an end-of-frame latency marker's return code is a driver status, not content; no loader category owns it
+src/objects.rs:273 unreachable OnceLock::set: a second logger would be a programming error, and the first is the one used
+src/gfx_file.rs:1395 unreachable `accurate_aabb` is intentionally unread: the flag describes a bound this build derives instead
+src/gfx_player.rs:1748 unreachable `root_path` is intentionally unread at this call site; the path is carried by the element
+src/gfx_player.rs:3349 unreachable let-else on a control that is not a Fractal: this loop asks for the Fractal, so another kind is not a loss
+src/xess/imp.rs:323 unreachable `queue` is kept alive past the call; no result
+src/xess/fg.rs:506 unreachable `queue` is kept alive past the call; no result
+src/windows_setup.rs:450 unreachable mpsc send to the UI: a closed receiver means the window is gone, and the work is moot
+src/windows_setup.rs:1299 unreachable mpsc ready signal: a closed receiver means the caller stopped waiting
+src/windows_setup.rs:1430 unreachable recv_timeout on a ready signal is advisory: the timeout is the point
+src/windows_setup.rs:1446 unreachable thread.join on a worker whose result is read through the channel above
+src/world_audio.rs:220 unreachable mpsc send to the mixer: a closed receiver means audio is shutting down
+src/world_audio.rs:222 unreachable `request` is dropped after a failed send, which is the same as the receiver being gone
+src/world_audio.rs:290 unreachable mpsc status to the UI: a closed receiver means the window is gone
+src/world_audio.rs:297 unreachable mpsc status to the UI: a closed receiver means the window is gone
+src/world_audio.rs:322 unreachable mpsc status to the UI: a closed receiver means the window is gone
+src/world_audio.rs:379 unreachable mpsc status to the UI: a closed receiver means the window is gone
+src/world_audio.rs:385 unreachable mpsc status to the UI: a closed receiver means the window is gone
+src/world_handoff.rs:200 unreachable mpsc progress to the UI: a closed receiver means the window is gone
+src/world_handoff.rs:231 unreachable mpsc ready to the UI: a closed receiver means the window is gone
+src/world_handoff.rs:235 unreachable child.kill on a process we are abandoning
+src/world_handoff.rs:236 unreachable child.wait after kill; the exit status of an abandoned child carries nothing
+src/world_handoff.rs:238 unreachable mpsc failure to the UI: a closed receiver means the window is gone
+src/world_handoff.rs:247 unreachable child.kill on a process we are abandoning
+src/world_handoff.rs:248 unreachable child.wait after kill; the exit status of an abandoned child carries nothing
+src/world_objects.rs:653 unreachable mpsc error to the UI: a closed receiver means the window is gone
+src/world_objects.rs:678 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
+src/world_objects.rs:687 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
+src/world_objects.rs:702 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
+src/world_objects.rs:718 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
+src/world_objects.rs:712 unreachable mpsc done to the UI: a closed receiver means the window is gone
+src/world_objects.rs:966 unreachable mpsc done to the UI: a closed receiver means the window is gone
+src/dlss/fg.rs:200 unreachable an SDK destroy call's status: the context is being torn down
+src/dlss/fg.rs:305 unreachable an SDK destroy call's status: the context is being torn down
+src/dlss/imp.rs:415 unreachable an SDK destroy call's status: the context is being torn down
+src/dlss/imp.rs:539 unreachable an SDK destroy call's status: the context is being torn down
+src/fsr/fg.rs:333 unreachable an SDK destroy call's status: the context is being torn down
+src/fsr/imp.rs:1179 unreachable an SDK destroy call's status: the context is being torn down
+src/xess/fg.rs:416 unreachable an SDK destroy call's status: the context is being torn down
+src/xess/fg.rs:477 unreachable an SDK destroy call's status: the context is being torn down
+src/xess/fg.rs:567 unreachable an SDK marker call's status: a marker is not content
+src/xess/fg.rs:834 unreachable an SDK destroy call's status: the context is being torn down
+src/xess/imp.rs:186 unreachable an SDK destroy call's status: the context is being torn down
+src/xess/xell.rs:197 unreachable an SDK latency-marker call's status: a marker is not content
+src/xess/xell.rs:204 unreachable an SDK destroy call's status: the context is being torn down
+src/gfx_file.rs:1564 unreachable an absent ShaderFile is the documented default for a pixel shader, not a lost value
+src/gfx_file.rs:1565 unreachable an absent ShaderTex is the documented default for a pixel shader, not a lost value
+src/gfx_file.rs:1615 unreachable an absent Name is the documented default; the element is still built and drawn
+src/gfx_file.rs:1620 unreachable an absent TexFile is the documented default; the caller names the fallback texture
+src/gfx_file.rs:1621 unreachable an absent BindEle is the documented default, i.e. unbound
+src/gfx_file.rs:1634 unreachable an absent DummyEle is the documented default, i.e. no dummy element
+src/gfx_file.rs:1871 unreachable an absent ModelPath is the documented default for a model element
+src/gfx_file.rs:1872 unreachable an absent ModelActName is the documented default, i.e. no action
+src/gfx_file.rs:1883 unreachable an absent Path is the documented default for a wave element
+src/gfx_file.rs:1476 unreachable peek past end of a token stream is end-of-input, not a lost value
+src/weather_gpu.rs:68 unreachable an absent size_variation is the documented default of a uniform effect
+src/weather_gpu.rs:70 unreachable an absent size_variation is the documented default of a uniform effect
+src/weather_gpu.rs:74 unreachable an absent count is the documented default of a uniform effect
+src/weather_gpu.rs:76 unreachable an absent count is the documented default of a uniform effect
+src/weather_gpu.rs:313 unreachable an absent field is the documented default of a uniform
+src/terrain_store.rs:412 unreachable a clock that predates 1970 gives zero nanoseconds; the nonce also carries a counter
+src/terrain_store.rs:631 unreachable a counter default for a fresh store; nothing is read
+src/world_page_cache.rs:130 unreachable a clock that predates 1970 gives zero; the temp name also carries a counter
+src/dlss/imp.rs:912 unreachable an absent SDK frame-generation option is the documented default value
+src/fsr/fg.rs:568 unreachable an absent SDK option is the documented default value
+src/fsr/fg.rs:578 unreachable an absent SDK option is the documented default value
+src/model_asset.rs:362 unreachable an absent optional field is the documented default of the record
+src/world_audio.rs:108 unreachable an absent optional field is the documented default of the setting
+src/load_status.rs:160 unreachable `reasons` returns Vec; unfit lock gives no reasons, which is the honest empty answer
+src/terrain_store.rs:483 unreachable a directory removal whose failure the next create reports
+src/terrain_store.rs:676 unreachable a cleanup unlink of a temp file
+src/terrain_store.rs:689 unreachable fmt::Write into String is infallible because String implements fmt::Write without I/O
+src/terrain_store.rs:859 unreachable a cleanup unlink of a temp file
+src/terrain_store.rs:861 unreachable a cleanup unlink of a temp file
+src/world_page_cache.rs:243 unreachable a cache eviction unlink; a failure is retried on the next write
+src/world_page_cache.rs:302 unreachable a cache eviction unlink; a failure is retried on the next write
+src/world_catalog.rs:90 unreachable an absent record set is the documented default: this instance simply has no list entry
+src/grass_random.rs:144 unreachable else-continue over a hash seed selection; every branch produces a seed
+# `continuation_path` returns None when there is no such continuation, and that
+# is the caller's answer, not a loss: the name is only built after the range
+# check above has already proven `n` is in range. A stem-less path cannot occur
+# because a package rejected every path without a file stem when it opened.
+src/pck.rs unreachable caller already range-checked n; the stem exists because Package::open rejects a path without one; code: let mut name = self.path.file_stem().unwrap_or_default().to_os_string();
+
+src/windows_setup.rs:1330 unreachable mpsc ready signal: a closed receiver means the caller stopped waiting
+src/world_handoff.rs:205 unreachable mpsc window-shown signal to the UI: a closed receiver means the window is gone
+src/loading_screen.rs:714 unreachable pre-epoch system clock falls back to zero duration for random seed
+src/windows_setup.rs:445 unreachable mpsc progress send to the UI: a closed receiver means the window is gone
+src/world_handoff.rs:117 unreachable an absent optional field is the documented default of the handoff request
+src/world_handoff.rs:127 unreachable an unlink of a stale marker
+src/world_handoff.rs:128 unreachable an unlink of a stale marker
+src/world_handoff.rs:129 unreachable an unlink of a stale marker
+src/world_handoff.rs:130 unreachable an unlink of a stale marker
+src/world_handoff.rs:146 unreachable an unlink of a stale marker
+src/world_handoff.rs:165 unreachable an unlink of a stale marker
+src/world_handoff.rs:276 unreachable an unlink of a stale marker
+src/world_handoff.rs:284 unreachable an unlink of a stale marker
+src/world_handoff.rs:292 unreachable an unlink of a stale marker
+src/world_handoff.rs:308 unreachable an unlink of a stale marker
+src/dlss/loader.rs unreachable NGX parameter names passed here are static SDK identifiers without NUL bytes; CString construction cannot fail; code: let name = std::ffi::CString::new(name).ok()?;
+src/fsr/imp.rs unreachable no provider override was selected, so an empty prefix is the intended diagnostic text; code: .unwrap_or_default()
+src/far_trees_gpu.rs unreachable fmt::Write into String is infallible because String implements fmt::Write without I/O; code: let _ = writeln!(
+src/far_trees_gpu.rs unreachable a species without an LOD0 diagnostic record has zero measured LOD0 foliage; the report's NO_FOLIAGE warning handles that absence; code: let d0 = sp.lod_diags.first().copied().unwrap_or_default();
+src/gfx_effect_gpu.rs unreachable an empty scratch pool is a cache miss; allocating an empty Vec is the pool's defined fallback; code: let mut verts = self.scratch_pool.pop().unwrap_or_default();
+src/gpu.rs unreachable fmt::Write into String is infallible because String implements fmt::Write without I/O; code: let _ = write!(
+src/gpu.rs unreachable fmt::Write into String is infallible because String implements fmt::Write without I/O; code: let _ = writeln!(
+src/gpu.rs unreachable a result sent to a viewer-owned worker receiver is intentionally discarded only when the receiving window has already gone away; code: let _ = tx.send(result);
+src/gpu.rs unreachable a result sent to a viewer-owned worker receiver is intentionally discarded only when the receiving window has already gone away; code: let _ = tx.send(r);
+src/gpu.rs unreachable this pass guard is intentionally dropped immediately to record the clear command; code: let _ = e.begin_render_pass(&wgpu::RenderPassDescriptor {
+src/gpu.rs unreachable cursor release is best-effort during focus loss/window teardown; code: let _ = window.set_cursor_grab(CursorGrabMode::None);
+src/gpu.rs unreachable this reborrow exists only to end the mutable borrow before queue submission; code: let _ = &mut pass;
+src/gpu.rs unreachable the harvest poll installs the completed scene in its cache; this temporary Arc clone is not content; code: let _ = self.raywatcher_harvest.poll_background_build();
+src/gpu.rs unreachable refusing an identical initial day/night pairing leaves the seeded sky transition state valid; code: let _ = sky_transition.author(
+src/dlss/loader.rs unreachable OnceLock::set can fail only when another initialisation already won; CORE.get below uses the live core singleton; code: let _ = CORE.set(core);
+src/fsr/imp.rs unreachable this implementation keeps the same queue parameter as the shared FSR constructor but builds the native queue from the DX12 device; code: let _ = queue;
+src/model_draw_gpu.rs:721 unreachable the let-else guard returns when no alpha receiver or indexed mesh is available; there is no drawable alpha mesh in that case

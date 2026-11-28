@@ -2,6 +2,36 @@
 
 const ELEMENTS_V27: u32 = 0x3000_001b;
 
+/// Why a file cannot be read as the v27 layout: the version number is the low
+/// half of the header, while the high half is a separate family marker. A
+/// different release is named by its own revision (v29, for example), not by
+/// appending the complete header word to the displayed version.
+pub(crate) fn unsupported_layout(version: u32) -> String {
+    let number = version & 0xffff;
+    let family = version >> 16;
+    if version == ELEMENTS_V27 {
+        return "elements.data v27 is the supported layout".into();
+    }
+    if family != 0x3000 {
+        return format!(
+            "elements.data 0x{version:08x} is not an elements file this build knows \
+             (family 0x{family:04x}, version {number}); the v27 reader expects family 0x3000"
+        );
+    }
+    format!(
+        "elements.data is v{number}, not the v27 layout this build reads; \
+         the record tables are version-specific and are not guessed"
+    )
+}
+
+/// The version number in an `elements.data` header, or `None` when the file is
+/// too short. Used by the folder scan and by the diagnostics below; it reads
+/// nothing else, so it works on any release.
+pub(crate) fn elements_version(bytes: &[u8]) -> Option<u32> {
+    let raw: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(raw) & 0xffff)
+}
+
 pub(crate) fn visit_v27_records(
     bytes: &[u8],
     mut visit: impl FnMut(usize, &[u8]) -> Result<(), String>,
@@ -9,9 +39,7 @@ pub(crate) fn visit_v27_records(
     let mut cursor = Cursor { bytes, pos: 0 };
     let version = cursor.u32()?;
     if version != ELEMENTS_V27 {
-        return Err(format!(
-            "unsupported elements.data version 0x{version:08x}; expected PW 1.4.2 v27"
-        ));
+        return Err(unsupported_layout(version));
     }
     let _timestamp = cursor.u32()?;
     for (section, size) in SECTION_SIZES.iter().copied().enumerate() {

@@ -169,7 +169,7 @@ Measured from the retail archives, not counted from the viewer:
 | `models.pck` entries | 40,753 | pack directory, version `0x20002` |
 | `models/npcs/` entries | 12,502 | `.ecm` 1,871, `.smd` 982, `.bon` 1,296, `.ski` 3,267, `.stck` 2,040, `.mphy` 65, `.dds` 2,927, plus 50 authoring leftovers (`.txt` 13, `.log` 31, `.his` 3, `.bmp` 2, `.ecp` 2, `.rar`, `.tmp`, `.bip`) |
 | placed rigs whose `.ecm`, `.smd` and `.bon` all resolve in the pack | 92 of 92 | no missing file among the 515 placements |
-| `elements.data` §58 `NPC_ESSENCE` | 2,838 templates | 852-byte records, v27 (`0x3000001b`) |
+| `elements.data` §58 `NPC_ESSENCE` | 2,838 templates | 852-byte records, v27 (raw header word `0x3000001b`) |
 | `task_npc.data` records | 1,572 | 515 placed + 1,057 template rows with no position |
 | distinct rigs behind the 515 placements | 92 | template `.ecm` path, case-folded |
 | rigs whose idle clip spans > 1 ms | 86 | SMD action range ÷ skeleton fps |

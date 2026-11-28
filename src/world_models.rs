@@ -1,7 +1,7 @@
 //! Retain ECWLD model placements and shared model dependencies. Loading an
 //! asset does not choose an action namespace or invent an animation schedule.
 use crate::{ecmodel, model_asset::ModelAsset, scene::SceneModel};
-use std::{collections::HashMap, fs::File, path::Path};
+use std::{collections::HashMap, path::Path};
 
 pub struct Instance {
     pub placement: SceneModel,
@@ -74,116 +74,22 @@ impl Assets {
         if placements.is_empty() {
             return Ok(Self::load_with(placements, |_| unreachable!()));
         }
-        let mut file =
-            File::open(element.join("models.pck")).map_err(|e| format!("models.pck: {e}"))?;
-        let dir = crate::pck::directory_arc(&mut file)?;
-        let mut entries: HashMap<String, usize> = HashMap::with_capacity(dir.len());
-        for (idx, entry) in dir.iter().enumerate() {
+        let mut package = crate::pck::Package::open(&element.join("models.pck"))
+            .map_err(|e| format!("models.pck: {e}"))?;
+        let dir = package.directory()?;
+        let mut entries = HashMap::with_capacity(dir.len());
+        for entry in dir {
             let name = ecmodel::normalize(&entry.name);
-            if entries.insert(name.clone(), idx).is_some() {
+            if entries.insert(name.clone(), entry).is_some() {
                 return Err(format!("duplicate normalized models.pck entry: {name}"));
             }
         }
-        // Deduplicate unique normalized ECM paths in first-seen order so we
-        // can load & parse all unique world models in parallel across all CPU
-        // cores while preserving exact deterministic asset/failure order.
-        let mut unique_paths: Vec<String> = Vec::new();
-        let mut seen: HashMap<String, usize> = HashMap::new();
-        for placement in &placements {
-            let path = ecmodel::normalize(&placement.path);
-            if !seen.contains_key(&path) {
-                let idx = unique_paths.len();
-                seen.insert(path.clone(), idx);
-                unique_paths.push(path);
-            }
-        }
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(32)
-            .min(unique_paths.len().max(1));
-        let loaded: Vec<Result<ModelAsset, String>> = if workers > 1 && unique_paths.len() >= 2 {
-            let chunk_size = unique_paths.len().div_ceil(workers);
-            let file_ref = &file;
-            let dir_ref = &dir;
-            let entries_ref = &entries;
-            std::thread::scope(|s| {
-                let handles: Vec<_> = unique_paths
-                    .chunks(chunk_size)
-                    .map(|chunk| {
-                        s.spawn(move || {
-                            let mut tracks = crate::model_asset::TrackCache::default();
-                            let mut read = |path: &str| -> Result<Vec<u8>, String> {
-                                let &idx = entries_ref
-                                    .get(path)
-                                    .ok_or_else(|| format!("missing models.pck entry: {path}"))?;
-                                crate::pck::read_entry_at(file_ref, &dir_ref[idx])
-                                    .map_err(|e| e.to_string())
-                            };
-                            chunk
-                                .iter()
-                                .map(|path| ModelAsset::load_cached(path, &mut read, &mut tracks))
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .flat_map(|h| h.join().unwrap())
-                    .collect()
-            })
-        } else {
-            let mut tracks = crate::model_asset::TrackCache::default();
-            let mut read = |path: &str| -> Result<Vec<u8>, String> {
-                let &idx = entries
-                    .get(path)
-                    .ok_or_else(|| format!("missing models.pck entry: {path}"))?;
-                crate::pck::read_entry_at(&file, &dir[idx]).map_err(|e| e.to_string())
-            };
-            unique_paths
-                .iter()
-                .map(|path| ModelAsset::load_cached(path, &mut read, &mut tracks))
-                .collect()
-        };
-        let mut result = Self {
-            assets: Vec::with_capacity(unique_paths.len()),
-            instances: Vec::with_capacity(placements.len()),
-            failures: Vec::new(),
-            unloaded: Vec::new(),
-        };
-        let mut slot_map: Vec<Option<usize>> = Vec::with_capacity(loaded.len());
-        for outcome in loaded {
-            match outcome {
-                Ok(asset) => {
-                    let index = result.assets.len();
-                    result.assets.push(asset);
-                    slot_map.push(Some(index));
-                }
-                Err(e) => {
-                    result.failures.push(e);
-                    slot_map.push(None);
-                }
-            }
-        }
-        for placement in placements {
-            let path = ecmodel::normalize(&placement.path);
-            let asset = seen.get(&path).and_then(|&u| slot_map[u]);
-            if let Some(asset) = asset {
-                let action = result.assets[asset]
-                    .descriptor
-                    .scene_action(&placement.action);
-                let playback = crate::model_playback::Playback::new(&result.assets[asset], action);
-                result.instances.push(Instance {
-                    placement,
-                    asset,
-                    action,
-                    playback,
-                });
-            } else {
-                result.unloaded.push(placement);
-            }
-        }
-        Ok(result)
+        Ok(Self::load_with(placements, |path| {
+            let entry = entries
+                .get(path)
+                .ok_or_else(|| format!("missing models.pck entry: {path}"))?;
+            package.read(entry)
+        }))
     }
 }
 /// 1.4.2 0x6d4304 -> 0x7b0d60 -> 0x788960. Normalize forward/up
@@ -200,6 +106,13 @@ pub fn transform(placement: &SceneModel) -> Result<glam::Mat4, String> {
     {
         return Err("invalid world model placement basis".into());
     }
+    // The version-13+ record carries a per-placement scale. It multiplies the
+    // basis, not the position: a static model stands where the map puts it and
+    // is drawn at the authored size.
+    if !placement.scale.is_finite() || placement.scale <= 0. {
+        return Err(format!("invalid world model scale {}", placement.scale));
+    }
+    let scale = placement.scale;
     let direction = direction.normalize();
     let up = up.normalize();
     let right = up.cross(direction);
@@ -207,9 +120,9 @@ pub fn transform(placement: &SceneModel) -> Result<glam::Mat4, String> {
         return Err("parallel world model placement axes".into());
     }
     Ok(glam::Mat4::from_cols(
-        right.normalize().extend(0.),
-        up.extend(0.),
-        direction.extend(0.),
+        (right.normalize() * scale).extend(0.),
+        (up * scale).extend(0.),
+        (direction * scale).extend(0.),
         position.extend(1.),
     ))
 }
@@ -224,6 +137,7 @@ mod tests {
             position: [10., 2., -3.],
             direction: [0., 0., 2.],
             up: [0., 2., 2.],
+            scale: 1.0,
             path: String::new(),
             action: String::new(),
         };
@@ -242,6 +156,48 @@ mod tests {
         assert!(transform(&p).is_err());
     }
     #[test]
+    fn the_authored_scale_sizes_the_basis_and_not_the_position() {
+        let p = SceneModel {
+            export_id: 1,
+            position: [10., 2., -3.],
+            direction: [0., 0., 1.],
+            up: [0., 1., 0.],
+            scale: 2.,
+            path: String::new(),
+            action: String::new(),
+        };
+        let m = transform(&p).unwrap();
+        // A doubled model is twice as wide, its axes twice as long, and it
+        // still stands exactly where the map placed it.
+        assert_eq!(m.w_axis.to_array(), [10., 2., -3., 1.]);
+        assert_eq!(m.x_axis.to_array(), [2., 0., 0., 0.]);
+        assert_eq!(m.y_axis.to_array(), [0., 2., 0., 0.]);
+        assert_eq!(m.z_axis.to_array(), [0., 0., 2., 0.]);
+        // The shipped values include exactly 1.0, the neutral scale, and the
+        // scale must be exactly linear in the basis: doubling it must double
+        // every axis and leave the position alone. An author who writes 2.0
+        // must get twice the model, not twice a rotation.
+        let mut p = p;
+        p.scale = 1.;
+        let one = transform(&p).unwrap();
+        assert_eq!(one.x_axis.to_array(), [1., 0., 0., 0.]);
+        p.scale = 2.;
+        let two = transform(&p).unwrap();
+        for (a, b) in one
+            .to_cols_array()
+            .into_iter()
+            .zip(two.to_cols_array().into_iter())
+        {
+            assert!((b - a * 2.).abs() < 1e-6 || (b - a).abs() < 1e-6);
+        }
+        // A scale of zero or less is not a size. Refuse it rather than
+        // collapsing the model to nothing or flipping it inside out.
+        for scale in [0., -1., f32::NAN] {
+            p.scale = scale;
+            assert!(transform(&p).is_err(), "scale {scale} was accepted");
+        }
+    }
+    #[test]
     fn failed_shared_assets_are_read_once_and_named() {
         let mut reads = 0;
         let placement = SceneModel {
@@ -249,6 +205,7 @@ mod tests {
             position: [0.; 3],
             direction: [0., 0., 1.],
             up: [0., 1., 0.],
+            scale: 1.0,
             path: "Models\\missing.ecm".into(),
             action: "visible".into(),
         };

@@ -1,5 +1,23 @@
 # World effects — the 9 November reports, and three decode errors behind them
 
+## Addendum: a second 1.8.4 world map
+
+A new Drive object, `world.ecwld` (2,848,200 bytes; SHA-256
+`c7d0895b7d9aa58d13b3a153c0a9f01fcdcaee7b7d6090cf33420fbb363d3ebb`), was
+parsed by the production `src/scene.rs` reader. It is ECWLD v17 and contains
+**3,542 effect placements in 282 distinct GFX-root paths**, not 2,275. The
+complete tree/effect record census, including all 59 tree types and every root
+path, is in [`docs/measured/184-world-tree-effect-audit.md`](../docs/measured/184-world-tree-effect-audit.md).
+
+The older 2,275-record measurements below have no byte identity recorded in
+this report, so they must not be used as the total for this newly identified
+Drive map. This addendum does not revalidate those earlier per-root findings
+against the 1.8.4 `gfx.pck`: that pack is not staged, no GPU render was run, and
+this is a placement-record audit rather than a GFX-graph or visual-parity audit.
+The read-only census was attempted again on 18 November 2026, but the staged
+`google_drive/world.ecwld` was absent in this checkout; the 3,542-record result
+below is the earlier recorded measurement, not a fresh run here.
+
 Second pass over the four reports left open by
 [`Every-effect-2026-11-08.md`](Every-effect-2026-11-08.md). The three defects this
 pass fixed are all **class-level** defects — they change what nearly every effect
