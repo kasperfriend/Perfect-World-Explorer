@@ -3629,10 +3629,12 @@ impl Architect {
                         // Prefer the projected mesh footprint over a small
                         // origin-only click radius. This makes tall/wide models
                         // selectable where their visible geometry actually is.
-                        let projected_bounds = self
-                            .renderer_bounds_key(&object.asset)
-                            .and_then(|path| self.preview_bounds.get(&path).copied())
-                            .and_then(|(min, max)| {
+                        let projected_bounds = {
+                            let (min, max) = self
+                                .renderer_bounds_key(&object.asset)
+                                .and_then(|path| self.preview_bounds.get(&path).copied())
+                                .unwrap_or_else(|| Self::fallback_selection_bounds(&object.asset));
+                            {
                                 let rotation = glam::Quat::from_euler(
                                     glam::EulerRot::XYZ,
                                     object.rotation[0],
@@ -3662,7 +3664,8 @@ impl Architect {
                                     }
                                 }
                                 (count > 0).then_some(rect.expand(8.0))
-                            });
+                            }
+                        };
                         let score = if let Some(rect) = projected_bounds {
                             let dx = if pointer.x < rect.left() {
                                 rect.left() - pointer.x
