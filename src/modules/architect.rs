@@ -1325,7 +1325,8 @@ impl Architect {
         let asset = self
             .hovered_asset
             .as_deref()
-            .or(self.selected_asset.as_deref());
+            .or(self.selected_asset.as_deref())
+            .map(str::to_owned);
         let Some(asset) = asset else {
             self.preview_message =
                 "Select a client asset to preview it or place it with its native world handler."
@@ -1334,7 +1335,7 @@ impl Architect {
             self.discard_bmd_preview();
             return;
         };
-        if self.renderer_effect_path(asset).is_some() {
+        if self.renderer_effect_path(&asset).is_some() {
             self.discard_native_preview();
             self.discard_bmd_preview();
             self.preview_message =
@@ -1342,7 +1343,7 @@ impl Architect {
                     .into();
             return;
         }
-        if let Some(path) = self.renderer_bmd_asset_path(asset) {
+        if let Some(path) = self.renderer_bmd_asset_path(&asset) {
             self.discard_native_preview();
             let needs_load = self.bmd_preview_path.as_deref() != Some(path.as_str());
             if needs_load {
@@ -1387,12 +1388,12 @@ impl Architect {
             return;
         }
         self.discard_bmd_preview();
-        if self.renderer_tree_type(asset).is_some() {
+        if self.renderer_tree_type(&asset).is_some() {
             self.discard_native_preview();
             self.preview_message = "SpeedTree uses the native vegetation renderer. Select Place to see its live LOD/material/wind preview in the world.".into();
             return;
         }
-        match self.preview_path_for_asset(asset) {
+        match self.preview_path_for_asset(&asset) {
             Ok(path) => {
                 let preview = self.preview.get_or_insert_with(|| {
                     crate::modules::librarian::preview3d::Preview::new(device, renderer, format)
