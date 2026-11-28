@@ -5748,9 +5748,9 @@ impl Renderer {
             .visible_far_runs_into(matrix, &mut self.far_terrain_runs);
         // Snapshot counts before releasing the disjoint field borrows; the
         // renderer's following &mut self calls must not overlap these borrows.
-        let terrain_run_count = terrain_runs.len();
-        let far_terrain_run_count = far_terrain_runs.len();
-        let span_count = spans.len();
+        let terrain_run_count = self.terrain_runs.len();
+        let far_terrain_run_count = self.far_terrain_runs.len();
+        let span_count = self.spans.len();
         // One indirect record per run, so the terrain itself is one call per mesh
         // instead of one call per run.
         self.queue_main_runs();
@@ -5925,16 +5925,6 @@ impl Renderer {
         // with the ones the reprojection pass writes.
         let unjittered_vp = camera.matrix(w, h, camera.far);
         let mut e = self.device.create_command_encoder(&Default::default());
-        // Tree LOD is a compute pass whose indirect arguments are consumed by
-        // the main scene draw below. Record it into this frame encoder rather
-        // than submitting a separate command buffer before rendering.
-        self.far_trees.update_resident_lods(
-            &self.queue,
-            &mut e,
-            camera.pos.to_array(),
-            self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
-            resident_bounds,
-        );
         // The object-motion attachment is cleared here, before any pass that may
         // write it, so a frame with no producer still hands the motion-vector
         // pass a zeroed surface instead of the previous frame's vectors.

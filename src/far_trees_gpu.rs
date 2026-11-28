@@ -2282,8 +2282,8 @@ impl FarTrees {
     /// pass. Production encodes this dispatch in the view's render command buffer.
     pub fn update_resident_lods(
         &self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
         camera: [f32; 3],
         scale: f32,
         bounds: Option<[f32; 4]>,

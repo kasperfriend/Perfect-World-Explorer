@@ -2186,7 +2186,7 @@ fn extract_page_rt(page: &Page, atlas_thumb: &AtlasThumb) -> (Arc<[RtMeshTriangl
 }
 
 
-pub /// Append-only storage shared by streamed whole-world pages.
+/// Append-only storage shared by streamed whole-world pages.
 pub struct WorldGeometryArena {
     chunks: Vec<WorldGeometryChunk>,
 }
