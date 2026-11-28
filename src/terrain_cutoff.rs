@@ -80,6 +80,19 @@ mod residency_tests {
     }
 
     #[test]
+    fn fog_report_window_fits_authored_range_before_the_resident_edge() {
+        let bounds = [512., 1472., -2816., -1856.];
+        let eye = [984.441, 417.205, -2357.926];
+        let aspect = 3440. / 1369.;
+        let cap = fog_cap(bounds, eye, aspect).expect("camera is within LOD window");
+        let [start, end] = fit_fog(350., 1000., cap);
+        assert!(cap < 350.);
+        assert!(start < 350.);
+        assert!(end < 1000. && end <= cap);
+        assert!(start < end);
+    }
+
+    #[test]
     fn fog_cap_covers_wide_screen_corners_and_fit_moves_start_inside_window() {
         for aspect in [1., 16. / 9., 32. / 9.] {
             let cap = fog_cap([-448., 512., -448., 512.], [0., 300., 0.], aspect).unwrap();
