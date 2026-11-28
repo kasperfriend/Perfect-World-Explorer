@@ -113,6 +113,7 @@ pub struct Architect {
     selected_asset: Option<String>,
     hovered_asset: Option<String>,
     preview_assets: crate::modules::librarian::archive::LibrarianAssets,
+    effect_catalog: Option<crate::gfx_catalog::Catalog>,
     preview: Option<crate::modules::librarian::preview3d::Preview>,
     /// Exact local-space bounds cached per loaded client mesh. Never substitute
     /// guessed class dimensions for an object's actual geometry.
@@ -217,6 +218,7 @@ impl Architect {
             selected_asset: None,
             hovered_asset: None,
             preview_assets,
+            effect_catalog: None,
             preview: None,
             preview_bounds: HashMap::new(),
             tree_types: Vec::new(),
@@ -269,6 +271,14 @@ impl Architect {
 
     pub fn active(&self) -> bool {
         self.enabled
+    }
+
+    pub fn set_effect_catalog(&mut self, catalog: crate::gfx_catalog::Catalog) {
+        self.effect_catalog = Some(catalog);
+    }
+
+    pub fn is_dragging_object(&self) -> bool {
+        self.object_dragging
     }
 
     pub fn set_active(&mut self, enabled: bool) {
@@ -1043,6 +1053,13 @@ impl Architect {
             self.preview_message = "Hover or select an ECM/SMD model to preview it.".into();
             return;
         };
+        if self.renderer_effect_path(asset).is_some() {
+            self.preview = None;
+            self.preview_message =
+                "GFX effect uses the native world effect handler and appears after placement."
+                    .into();
+            return;
+        }
         if let Some(path) = Self::renderer_bmd_path(asset, &self.current_map_id) {
             self.preview = None;
             let loaded = self
@@ -1336,6 +1353,31 @@ impl Architect {
             .or_else(|| Self::renderer_bmd_path(asset, &self.current_map_id))
     }
 
+    /// Resolve a GFX effect through the world's real effect catalogue. This is
+    /// deliberately not a mesh path: WorldModels owns the native GFX owner and
+    /// light-publication handler that plays it.
+    fn renderer_effect_path(&self, asset: &str) -> Option<String> {
+        let portable = self.portable_asset_path(asset);
+        let (archive, entry) = if let Some((archive, entry)) = portable.split_once("::") {
+            let name = Path::new(archive)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_ascii_lowercase())?;
+            (Some(name), entry)
+        } else {
+            let entry = portable.strip_prefix("element/").unwrap_or(&portable);
+            (None, entry)
+        };
+        if archive.as_deref().is_some_and(|name| name != "gfx.pck")
+            || !entry.to_ascii_lowercase().ends_with(".gfx")
+        {
+            return None;
+        }
+        self.effect_catalog
+            .as_ref()?
+            .find(entry)
+            .map(|effect| effect.path.clone())
+    }
+
     /// Every asset family with a native placement adapter. Keep this
     /// predicate shared by archive actions and placement validation so the UI
     /// never disables an object type that the renderer can actually consume.
@@ -1343,6 +1385,7 @@ impl Architect {
         Self::renderer_asset_path(asset).is_some()
             || Self::renderer_bmd_path(asset, &self.current_map_id).is_some()
             || self.renderer_tree_type(asset).is_some()
+            || self.renderer_effect_path(asset).is_some()
     }
 
     /// Route every asset-browser and source-scene selection through the same
@@ -1376,6 +1419,45 @@ impl Architect {
                         || path.ends_with(&format!("/{candidate}"))
                 })
         })
+    }
+
+    /// Project GFX roots for the native effect-owner queue. Effects are
+    /// synchronized only after a transform gesture ends so dragging does not
+    /// repeatedly destroy and reload the live effect.
+    pub fn renderer_effect_placements(&self) -> Vec<crate::world_models_gpu::EditorEffectPlacement> {
+        if !self.enabled
+            || (!self.project.source_map.is_empty()
+                && !self.current_map_id.is_empty()
+                && !self
+                    .project
+                    .source_map
+                    .eq_ignore_ascii_case(&self.current_map_id))
+        {
+            return Vec::new();
+        }
+        self.project
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(_, object)| object.visible)
+            .filter_map(|(index, object)| {
+                let path = self.renderer_effect_path(&object.asset)?;
+                if !object.position.iter().all(|value| value.is_finite())
+                    || !object.rotation.iter().all(|value| value.is_finite())
+                    || !object.scale.is_finite()
+                    || !(0.001..=1000.0).contains(&object.scale)
+                {
+                    return None;
+                }
+                Some(crate::world_models_gpu::EditorEffectPlacement {
+                    key: index as u64,
+                    path,
+                    position: object.position,
+                    rotation: object.rotation,
+                    scale: object.scale,
+                })
+            })
+            .collect()
     }
 
     /// Project SpeedTree instances for the native GPU instancer.
@@ -4519,6 +4601,7 @@ mod tests {
             preview_assets: crate::modules::librarian::archive::LibrarianAssets::open(Path::new(
                 "/client",
             )),
+            effect_catalog: None,
             preview: None,
             preview_bounds: HashMap::new(),
             tree_types: Vec::new(),
