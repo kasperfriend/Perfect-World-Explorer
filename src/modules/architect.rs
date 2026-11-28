@@ -125,6 +125,7 @@ pub struct Architect {
     preview: Option<crate::modules::librarian::preview3d::Preview>,
     bmd_preview: Option<crate::modules::librarian::preview3d::BmdPreview>,
     bmd_preview_path: Option<String>,
+    pending_preview_free: Vec<egui::TextureId>,
     /// Exact local-space bounds cached per loaded client mesh. Never substitute
     /// guessed class dimensions for an object's actual geometry.
     preview_bounds: HashMap<String, ([f32; 3], [f32; 3])>,
@@ -240,6 +241,7 @@ impl Architect {
             preview: None,
             bmd_preview: None,
             bmd_preview_path: None,
+            pending_preview_free: Vec::new(),
             preview_bounds: HashMap::new(),
             tree_types: Vec::new(),
             preview_message: "Hover or select an ECM/SMD model to preview it.".into(),
@@ -1291,6 +1293,19 @@ impl Architect {
         }
     }
 
+    fn discard_native_preview(&mut self) {
+        if let Some(preview) = self.preview.take() {
+            self.pending_preview_free.push(preview.target.texture_id);
+        }
+    }
+
+    fn discard_bmd_preview(&mut self) {
+        if let Some(preview) = self.bmd_preview.take() {
+            self.pending_preview_free.push(preview.texture_id);
+        }
+        self.bmd_preview_path = None;
+    }
+
     pub fn prepare_preview(
         &mut self,
         device: &wgpu::Device,
@@ -1298,6 +1313,9 @@ impl Architect {
         renderer: &mut egui_wgpu::Renderer,
         format: wgpu::TextureFormat,
     ) {
+        for texture_id in self.pending_preview_free.drain(..) {
+            renderer.free_texture(&texture_id);
+        }
         let asset = self
             .hovered_asset
             .as_deref()
@@ -1306,22 +1324,20 @@ impl Architect {
             self.preview_message =
                 "Select a client asset to preview it or place it with its native world handler."
                     .into();
-            self.preview = None;
-            self.bmd_preview = None;
-            self.bmd_preview_path = None;
+            self.discard_native_preview();
+            self.discard_bmd_preview();
             return;
         };
         if self.renderer_effect_path(asset).is_some() {
-            self.preview = None;
-            self.bmd_preview = None;
-            self.bmd_preview_path = None;
+            self.discard_native_preview();
+            self.discard_bmd_preview();
             self.preview_message =
                 "GFX effect uses the native world effect handler and appears after placement."
                     .into();
             return;
         }
         if let Some(path) = self.renderer_bmd_asset_path(asset) {
-            self.preview = None;
+            self.discard_native_preview();
             let needs_load = self.bmd_preview_path.as_deref() != Some(path.as_str());
             if needs_load {
                 self.bmd_preview_path = Some(path.clone());
@@ -1363,10 +1379,9 @@ impl Architect {
             }
             return;
         }
-        self.bmd_preview = None;
-        self.bmd_preview_path = None;
+        self.discard_bmd_preview();
         if self.renderer_tree_type(asset).is_some() {
-            self.preview = None;
+            self.discard_native_preview();
             self.preview_message = "SpeedTree uses the native vegetation renderer. Select Place to see its live LOD/material/wind preview in the world.".into();
             return;
         }
@@ -5755,6 +5770,7 @@ mod tests {
             preview: None,
             bmd_preview: None,
             bmd_preview_path: None,
+            pending_preview_free: Vec::new(),
             preview_bounds: HashMap::new(),
             tree_types: Vec::new(),
             preview_message: String::new(),
