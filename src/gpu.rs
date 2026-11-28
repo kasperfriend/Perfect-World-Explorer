@@ -5341,8 +5341,7 @@ impl Renderer {
         let rt_water_reflections = camera.water_reflections
             && camera.underwater_depth <= 0.0
             && self.raywatcher_overrides.reflection_pass;
-        let mut water_fog = frame.active_fog_range;
-        water_fog[3] = if rt_water_reflections { 1.0 } else { 0.0 };
+        let water_fog = crate::water_gpu::surface_fog_range(frame.fog_range, rt_water_reflections);
         self.water.update(
             &self.queue,
             &crate::water_gpu::WaterUniform {
@@ -5362,18 +5361,18 @@ impl Renderer {
                     crate::water_gpu::normal_offset_angle(frame.elapsed64),
                 ],
                 edge_mode: [if camera.water_reflections { 1. } else { 0. }, 0., 0., 0.],
-                // Water-surface fog: the client binds the region's own triple
-                // (white 100..400 above water, blue 10..60 below).
+                // Use the same effective (terrain-window-fitted) fog range and
+                // colour as terrain, so water disappears at the same view depth.
                 fog: water_fog,
-                fog_color: frame.active_fog_color,
+                fog_color: frame.fog_color,
             },
         );
         self.simple_water.update(
             &self.queue,
             matrix,
             frame.elapsed64,
-            frame.active_fog_range,
-            frame.active_fog_color,
+            frame.fog_range,
+            frame.fog_color,
         );
         let reflection = self.water.reflection();
         let reflect_depth = self.water.depth();
@@ -5619,8 +5618,8 @@ impl Renderer {
                     1. - daylight,
                     frame.elapsed,
                     self.resident_bounds(),
-                    frame.active_fog_range,
-                    frame.active_fog_color,
+                    frame.fog_range,
+                    frame.fog_color,
                 );
             }
             if use_post {
@@ -6048,8 +6047,8 @@ impl Renderer {
                 1. - daylight,
                 frame.elapsed,
                 self.resident_bounds(),
-                frame.active_fog_range,
-                frame.active_fog_color,
+                frame.fog_range,
+                frame.fog_color,
             );
         }
         if use_post {

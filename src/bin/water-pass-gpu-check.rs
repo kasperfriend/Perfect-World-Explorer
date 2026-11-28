@@ -140,10 +140,12 @@ fn main() {
                 _ => 1.,
             };
             let fog_on = case >= 7 && case != 10;
+            let mut view_matrix = glam::Mat4::IDENTITY * distance;
+            view_matrix.z_axis.w = 1.;
             water.update(
                 &queue,
                 &water_gpu::WaterUniform {
-                    matrix: (glam::Mat4::IDENTITY * distance).to_cols_array_2d(),
+                    matrix: view_matrix.to_cols_array_2d(),
                     inverse_matrix: glam::Mat4::from_translation(glam::Vec3::new(
                         0.,
                         if shallow { -0.33 } else { 0. },
@@ -363,8 +365,9 @@ fn main() {
                 } else {
                     (255. * (aq * (1. - edge) + mixed * edge)).round() as i32
                 };
+                let surface_view_depth = distance + 0.7;
                 let f = if fog_on {
-                    ((distance - 2.) / 4f32).clamp(0., 1.)
+                    ((surface_view_depth - 2.) / 4f32).clamp(0., 1.)
                 } else {
                     0.
                 };

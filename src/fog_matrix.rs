@@ -19,14 +19,11 @@
 //!   The small shoreline edge band retains its separate coverage/alpha path.
 //! * The below-surface scene (`0x7cca50`) is rendered with the *air* fog while
 //!   the camera is underwater; the underwater fog is restored afterwards.
-//! * The water surface and the shoreline waves keep table fog too. The client
-//!   refreshes the surface object's fog fields from the active region fog on
-//!   every update (`0x6bfa34`/`0x6bfa47` through the setters at `0x780990` and
-//!   `0x7809c0`) and rebinds them right before the draw
-//!   (`0x7ca9d9`/`0x7ca9e8`/`0x7ca9f7`, plus `0x7cb444`/`0x7cb502`/`0x7cb94e`
-//!   for the edge and refraction passes). Neither water shader carries fog
-//!   math: `wavevs.txt` writes `oFog = 1.0` and `waveblend.txt` has no fog
-//!   constants, so the pass state applies unchanged.
+//! * The water surface, alternate-water areas and shoreline waves use the same
+//!   effective main-view fog range as terrain, including the terrain-window fit.
+//!   Their shaders re-project world position with the main camera matrix and
+//!   apply the same linear view-Z start/end ramp; they do not use fragment
+//!   builtin W or the unfitted authored range.
 //!
 //! Transparent/alpha-tested variants inherit their class row: the recovered
 //! shaders return encoded material color and the client applied fog after the
@@ -171,7 +168,8 @@ pub enum Quantity {
 /// Which range/color pair the pass binds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RangeColor {
-    /// The camera's active regional fog (air or underwater).
+    /// The camera's effective regional fog (air or underwater), including
+    /// the main-view terrain-window fit.
     Camera,
     /// The air fog explicitly (below-surface scene while underwater).
     Air,
@@ -273,17 +271,15 @@ pub fn row(material: Material, pass: Pass) -> Row {
             true,
             "cloud_gpu receives the above-water secondary view's air fog",
         ),
-        // The water surface gap is described in the module documentation.
-        // The surface rebinds the object's fog fields right before its draw
-        // (0x7ca9d9..0x7ca9f7) and those fields hold the region fog
-        // (0x6bfa47); the shaders carry no fog math and water_vs writes no oFog,
-        // so the quantity is the engine table fog.
+        // WaterSurface uses the same effective/fitted camera range as terrain.
+        // The water fragment re-projects its interpolated world point through
+        // the shared view-projection matrix, just as terrain_gpu does.
         (WaterSurface, Main) => row_of(
             TableFogViewZ,
             Camera,
             false,
             true,
-            "0x6bfa47 refresh; 0x7cb502/0x7ca9f9 bind before the draw",
+            "water_gpu uses the terrain-fitted range and matrix * world view-Z",
         ),
         (WaterSurface, _) => row_of(
             Quantity::None,
@@ -292,16 +288,14 @@ pub fn row(material: Material, pass: Pass) -> Row {
             true,
             "water surface not submitted in this pass",
         ),
-        // Shoreline waves are drawn only into the main scene target.
-        // wavevs.txt writes oFog = c0.x = 1.0 ("set no fog") and waveblend.txt
-        // has no fog constants, so the waves add no fog of their own; they are
-        // drawn in the water pass under the same bound fog state.
+        // Shoreline waves are drawn only into the main scene target and use
+        // the same terrain-fitted fog range and matrix * world view-Z.
         (Shore, Main) => row_of(
             TableFogViewZ,
             Camera,
             false,
             true,
-            "wavevs.txt oFog=1.0; waveblend.txt has no fog; pass state shared",
+            "shore_gpu uses the terrain-fitted range and matrix * world view-Z",
         ),
         (Shore, _) => row_of(
             Quantity::None,
