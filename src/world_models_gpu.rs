@@ -707,12 +707,8 @@ impl World {
             );
             let direction = (rotation * glam::Vec3::Z).to_array();
             let up = (rotation * glam::Vec3::Y).to_array();
-            match gfx_owner::placement_transform(
-                placement.position,
-                direction,
-                up,
-                placement.scale,
-            ) {
+            match gfx_owner::placement_transform(placement.position, direction, up, placement.scale)
+            {
                 Ok(transform) => {
                     desired.insert(placement.key, (placement.path.clone(), transform));
                 }
@@ -727,11 +723,9 @@ impl World {
             .editor_effects
             .iter()
             .filter_map(|(key, (path, transform, identity))| {
-                let unchanged = desired
-                    .get(key)
-                    .is_some_and(|(next_path, next_transform)| {
-                        next_path == path && next_transform == transform
-                    });
+                let unchanged = desired.get(key).is_some_and(|(next_path, next_transform)| {
+                    next_path == path && next_transform == transform
+                });
                 (!unchanged).then_some((*key, *identity))
             })
             .collect::<Vec<_>>();
@@ -747,8 +741,7 @@ impl World {
             let origin = format!("Architect project placement {key}");
             match self.spawn_catalog_effect(&path, transform, &origin) {
                 Ok(identity) => {
-                    self.editor_effects
-                        .insert(key, (path, transform, identity));
+                    self.editor_effects.insert(key, (path, transform, identity));
                 }
                 Err(error) => {
                     let message = format!("{origin} ({path}): {error}");
