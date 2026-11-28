@@ -841,8 +841,8 @@ impl Architect {
         self.object_drag_axis = None;
         self.object_drag_start_pointer = None;
         self.object_drag_start_hit = None;
-        self.object_drag_start_axis_parameter = None;
-        self.object_drag_start_rotation_vector = None;
+            self.object_drag_start_axis_parameter = None;
+            self.object_drag_start_rotation_vector = None;
         self.object_drag_group.clear();
         self.object_drag_snapshot = None;
         self.marquee_start = None;
@@ -3670,10 +3670,14 @@ impl Architect {
                                 }
                             }
                             TransformMode::Scale if axis_scale_supported => {
-                                for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                                for (axis_index, axis) in
+                                    [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate()
+                                {
                                     if axis_end(axis).is_some_and(|end| {
                                         let segment = end - center;
-                                        let t = ((pointer - center).dot(segment) / segment.length_sq().max(0.001)).clamp(0.0, 1.0);
+                                        let t = ((pointer - center).dot(segment)
+                                            / segment.length_sq().max(0.001))
+                                        .clamp(0.0, 1.0);
                                         (center + segment * t).distance(pointer) <= 12.0
                                     }) {
                                         axis_pick = Some(axis_index);
@@ -3683,7 +3687,9 @@ impl Architect {
                             }
                             TransformMode::Scale => {}
                             TransformMode::Rotate => {
-                                for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                                for (axis_index, axis) in
+                            [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate()
+                        {
                                     let ring = Self::gizmo_ring_points(
                                         origin,
                                         axis,
@@ -4188,37 +4194,51 @@ impl Architect {
                     }
                 }
                 TransformMode::Scale => {
-                    if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer) {
+                    if let (Some(start), Some(current)) = (self.object_drag_start_pointer, pointer)
+                    {
                         let axis = self.object_drag_axis;
                         let factor = if let Some(axis_index) = axis {
                             let axis_vector = [Vec3::X, Vec3::Y, Vec3::Z][axis_index.min(2)];
                             let clip_origin = view_projection.project_point3(pivot);
                             let clip_end = view_projection.project_point3(
-                                pivot + axis_vector * (camera.distance(pivot) * 0.045).clamp(0.5, 10.)
+                                pivot
+                                    + axis_vector
+                                        * (camera.distance(pivot) * 0.045).clamp(0.5, 10.),
                             );
-                            let to_screen = |clip: Vec3| egui::pos2(
-                                screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
-                                screen.top() + (1. - clip.y) * 0.5 * screen.height(),
-                            );
-                            let direction = (to_screen(clip_end) - to_screen(clip_origin)).normalized();
-                            (((current - start).dot(direction)) * 0.015).exp().clamp(0.05, 20.0)
+                            let to_screen = |clip: Vec3| {
+                                egui::pos2(
+                                    screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
+                                    screen.top() + (1. - clip.y) * 0.5 * screen.height(),
+                                )
+                            };
+                            let direction =
+                                (to_screen(clip_end) - to_screen(clip_origin)).normalized();
+                            (((current - start).dot(direction)) * 0.015)
+                                .exp()
+                                .clamp(0.05, 20.0)
                         } else {
                             (-(current.y - start.y) * 0.01).exp().clamp(0.05, 20.0)
                         };
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
-                                if let Some(original) = self.object_drag_snapshot.as_ref().and_then(|items| items.get(index)) {
+                                if let Some(original) = self
+                                    .object_drag_snapshot
+                                    .as_ref()
+                                    .and_then(|items| items.get(index))
+                                {
                                     let relative = Vec3::from_array(original.position) - pivot;
                                     if let Some(axis_index) = axis {
                                         let axis_index = axis_index.min(2);
                                         object.scale = original.scale;
                                         object.scale_axes = original.scale_axes;
                                         object.scale_axes[axis_index] =
-                                            (original.scale_axes[axis_index] * factor).clamp(0.01, 100.0);
+                                            (original.scale_axes[axis_index] * factor)
+                                                .clamp(0.01, 100.0);
                                         if self.object_drag_group.len() > 1 {
                                             let mut scaled = relative.to_array();
                                             scaled[axis_index] *= factor;
-                                            object.position = (pivot + Vec3::from_array(scaled)).to_array();
+                                            object.position =
+                                                (pivot + Vec3::from_array(scaled)).to_array();
                                         } else {
                                             object.position = original.position;
                                         }
@@ -4393,10 +4413,19 @@ impl Architect {
                     TransformMode::Rotate => {
                         let radius = (camera.distance(origin) * 0.045).clamp(0.5, 10.);
                         for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
-                            let mut points = Self::gizmo_ring_points(origin, axis, radius, screen, view_projection);
+                            let mut points = Self::gizmo_ring_points(
+                                origin,
+                                axis,
+                                radius,
+                                screen,
+                                view_projection,
+                            );
                             if points.len() >= 3 {
                                 points.push(points[0]);
-                                painter.add(egui::Shape::line(points, egui::Stroke::new(3.0, axes[axis_index].1)));
+                                painter.add(egui::Shape::line(
+                                    points,
+                                    egui::Stroke::new(3.0, axes[axis_index].1),
+                                ));
                             }
                         }
                     }
@@ -4413,7 +4442,11 @@ impl Architect {
                         }
                     }
                     TransformMode::Scale => {
-                        painter.circle_stroke(center, 20.0, egui::Stroke::new(3.0, egui::Color32::WHITE));
+                        painter.circle_stroke(
+                            center,
+                            20.0,
+                            egui::Stroke::new(3.0, egui::Color32::WHITE),
+                        );
                     }
                 }
             }
@@ -5128,16 +5161,9 @@ mod tests {
 
     #[test]
     fn rotation_gizmo_renders_three_distinct_world_axis_rings() {
-        let viewport = egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(800.0, 600.0),
-        );
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let projection = glam::Mat4::perspective_rh(1.0, 800.0 / 600.0, 0.1, 1000.0);
-        let view = glam::Mat4::look_at_rh(
-            Vec3::new(8.0, 6.0, 10.0),
-            Vec3::ZERO,
-            Vec3::Y,
-        );
+        let view = glam::Mat4::look_at_rh(Vec3::new(8.0, 6.0, 10.0), Vec3::ZERO, Vec3::Y);
         let vp = projection * view;
         let x = Architect::gizmo_ring_points(Vec3::ZERO, Vec3::X, 2.0, viewport, vp);
         let y = Architect::gizmo_ring_points(Vec3::ZERO, Vec3::Y, 2.0, viewport, vp);
@@ -5150,23 +5176,17 @@ mod tests {
 
     #[test]
     fn rotation_gizmo_ray_intersects_the_selected_axis_plane() {
-        let viewport = egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(100.0, 100.0),
-        );
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
         let projection = glam::Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0);
-        let view = glam::Mat4::look_at_rh(
-            Vec3::new(0.0, 0.0, 10.0),
-            Vec3::ZERO,
-            Vec3::Y,
-        );
+        let view = glam::Mat4::look_at_rh(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO, Vec3::Y);
         let point = Architect::ray_plane_point(
             egui::pos2(60.0, 50.0),
             viewport,
             projection * view,
             Vec3::ZERO,
             Vec3::Z,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(point.z.abs() < 1e-4);
         assert!(point.x > 0.0);
     }
