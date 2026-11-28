@@ -2065,6 +2065,7 @@ impl Architect {
                 let bounds_score = self
                     .renderer_bounds_key(asset)
                     .and_then(|key| self.preview_bounds.get(&key).copied())
+                    .or_else(|| Some(Self::fallback_selection_bounds(asset)))
                     .and_then(|(min, max)| {
                         let mut rect = egui::Rect::NOTHING;
                         let mut projected_count = 0usize;
@@ -4043,12 +4044,6 @@ impl Architect {
                         }),
                     ) {
                         let axis = self.object_drag_axis.unwrap_or(1).min(2);
-                        let center = Vec3::from_array(self.object_drag_start_position);
-                        let clip = view_projection.project_point3(center);
-                        let center_screen = egui::pos2(
-                            screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
-                            screen.top() + (1. - clip.y) * 0.5 * screen.height(),
-                        );
                         let start_vector = Vec3::from_array(start_vector).normalize_or_zero();
                         let current_vector = Vec3::from_array(current).normalize_or_zero();
                         let axis_vector = [Vec3::X, Vec3::Y, Vec3::Z][axis];
@@ -4841,7 +4836,7 @@ mod tests {
                 position: [1., 2., 3.],
                 rotation: [0.1, 0.2, 0.3],
                 scale: 1.25,
-                scale_axes: [1.; 3],
+                scale_axes: [1.5, 0.75, 2.0],
             }],
             strokes: vec![TerrainStroke {
                 mode: BrushMode::Smooth,
