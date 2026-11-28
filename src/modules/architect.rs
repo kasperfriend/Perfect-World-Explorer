@@ -2295,6 +2295,17 @@ impl Architect {
 
     /// Closest point on a world-space axis to the pointer's camera ray.
     /// Returns signed distance along the axis from its origin.
+    fn wrapped_angle_delta(start: f32, current: f32) -> f32 {
+        let mut delta = current - start;
+        if delta > std::f32::consts::PI {
+            delta -= std::f32::consts::TAU;
+        }
+        if delta < -std::f32::consts::PI {
+            delta += std::f32::consts::TAU;
+        }
+        delta
+    }
+
     fn ray_axis_parameter(
         pointer: egui::Pos2,
         viewport: egui::Rect,
@@ -3889,13 +3900,7 @@ impl Architect {
                             (start.y - center_screen.y).atan2(start.x - center_screen.x);
                         let current_angle =
                             (current.y - center_screen.y).atan2(current.x - center_screen.x);
-                        let mut angle = current_angle - start_angle;
-                        if angle > std::f32::consts::PI {
-                            angle -= std::f32::consts::TAU;
-                        }
-                        if angle < -std::f32::consts::PI {
-                            angle += std::f32::consts::TAU;
-                        }
+                        let angle = Self::wrapped_angle_delta(start_angle, current_angle);
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
                                 let original = self
@@ -4799,6 +4804,16 @@ mod tests {
             editor.renderer_bmd_asset_path("/client/element/litmodels/a01/1/litmodel_42.bmd"),
             Some("litmodels/a01/1/litmodel_42.bmd".into())
         );
+    }
+
+    #[test]
+    fn rotation_gizmo_uses_shortest_wrapped_angle_across_pi() {
+        let delta = Architect::wrapped_angle_delta(3.10, -3.10);
+        assert!(delta > 0.0);
+        assert!(delta < 0.1);
+        let reverse = Architect::wrapped_angle_delta(-3.10, 3.10);
+        assert!(reverse < 0.0);
+        assert!(reverse > -0.1);
     }
 
     #[test]
