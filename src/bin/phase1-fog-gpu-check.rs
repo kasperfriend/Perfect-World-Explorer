@@ -13,6 +13,11 @@ fn main() {
     ))
     .unwrap();
     let mut uniform = [0f32; 392];
+    // Identity camera transform: the probe world position has forward depth 1.
+    uniform[0] = 1.;
+    uniform[5] = 1.;
+    uniform[10] = 1.;
+    uniform[15] = 1.;
     uniform[380..384].copy_from_slice(&[0., 2., 1., 0.]);
     uniform[384..388].copy_from_slice(&[0.1, 0.8, 0.2, 1.]);
     // `lod`: no bias, and 1.0 leaves the atlas gradient scale untouched.
@@ -56,8 +61,8 @@ fn main() {
 @vertex fn test_vs(@builtin(vertex_index) id:u32)->@builtin(position) vec4<f32> {
  let x=f32((id<<1u)&2u);let y=f32(id&2u);return vec4<f32>(x*2.-1.,1.-y*2.,0.5,1.);
 }
-@fragment fn test_fs(@builtin(position) p:vec4<f32>)->@location(0) vec4<f32> {
- return vec4<f32>(fogged(vec3<f32>(0.21404114,0.05087609,0.52252155),p.w),1.);
+@fragment fn test_fs()->@location(0) vec4<f32> {
+ return vec4<f32>(fogged(vec3<f32>(0.21404114,0.05087609,0.52252155),vec3<f32>(0.)),1.);
 }
 "#
         );
