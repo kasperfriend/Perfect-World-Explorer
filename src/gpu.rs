@@ -603,7 +603,7 @@ pub(crate) fn editor_bmd_vertex_transform(
     model: &crate::bmd::Model,
     ornament: &crate::scene::Ornament,
     vertex: &crate::bmd::Vertex,
-    instance_scale: f32,
+    instance_scale: [f32; 3],
 ) -> (Vec3, Vec3) {
     let model_z = basis(model.direction);
     let model_y = basis(model.up);
@@ -617,16 +617,17 @@ pub(crate) fn editor_bmd_vertex_transform(
         + model_y * (vertex.position[1] * model.scale[1])
         + model_z * (vertex.position[2] * model.scale[2]);
     let world_position = Vec3::from_array(ornament.position)
-        + instance_x * (local_position.x * instance_scale)
-        + instance_y * (local_position.y * instance_scale)
-        + instance_z * (local_position.z * instance_scale);
+        + instance_x * (local_position.x * instance_scale[0])
+        + instance_y * (local_position.y * instance_scale[1])
+        + instance_z * (local_position.z * instance_scale[2]);
 
     let local_normal =
         (model_x * vertex.normal[0] + model_y * vertex.normal[1] + model_z * vertex.normal[2])
             .normalize_or_zero();
-    let world_normal =
-        (instance_x * local_normal.x + instance_y * local_normal.y + instance_z * local_normal.z)
-            .normalize_or_zero();
+    let world_normal = (instance_x * (local_normal.x / instance_scale[0].max(1e-4))
+        + instance_y * (local_normal.y / instance_scale[1].max(1e-4))
+        + instance_z * (local_normal.z / instance_scale[2].max(1e-4)))
+        .normalize_or_zero();
     (world_position, world_normal)
 }
 
@@ -662,7 +663,7 @@ mod editor_bmd_transform_tests {
             day_diffuse: 0,
             night_diffuse: 0,
         };
-        let (position, normal) = editor_bmd_vertex_transform(&model, &ornament, &vertex, 2.0);
+        let (position, normal) = editor_bmd_vertex_transform(&model, &ornament, &vertex, [2.0; 3]);
         assert!((position.x - 10.0).abs() < 0.0001);
         assert!((position.y - 20.0).abs() < 0.0001);
         assert!((position.z - 28.0).abs() < 0.0001);
@@ -1477,7 +1478,7 @@ fn build(
         let z = basis(model.direction);
         let y = basis(model.up);
         let x = y.cross(z).normalize_or_zero();
-        let instance_scale = t.objects.placement_scale(id);
+        let instance_scale = t.objects.placement_scale_axes(id);
         for mesh in &model.meshes {
             let key = mesh.texture.to_lowercase();
             let Some((page_id, slot)) = texture_slots.get(&key).copied() else {
