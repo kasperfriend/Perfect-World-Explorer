@@ -328,9 +328,7 @@ fn fog_depth_probe(
         [x1, z1],
         [eye[0], eye[2]],
     ];
-    let depth_at = |xz: [f32; 2]| {
-        (matrix * Vec4::new(xz[0], plane_y, xz[1], 1.)).w.max(0.)
-    };
+    let depth_at = |xz: [f32; 2]| (matrix * Vec4::new(xz[0], plane_y, xz[1], 1.)).w.max(0.);
     let camera_xz_depth = depth_at([eye[0], eye[2]]);
     let window_center_depth = depth_at([xm, zm]);
     let mut min_depth = f32::INFINITY;
@@ -10298,12 +10296,7 @@ mod frame_snapshot_tests {
     fn fog_depth_probe_reports_camera_space_window_depth_and_fog_factor() {
         let eye = Vec3::new(0., 100., 0.);
         let matrix = Mat4::from_scale(Vec3::new(-1., 1., 1.))
-            * Mat4::perspective_rh(
-                CAMERA_FOV_Y_RADIANS,
-                16. / 9.,
-                16000.,
-                CAMERA_NEAR,
-            )
+            * Mat4::perspective_rh(CAMERA_FOV_Y_RADIANS, 16. / 9., 16000., CAMERA_NEAR)
             * Mat4::look_to_rh(eye, Vec3::NEG_Z, Vec3::Y);
         let probe = fog_depth_probe(
             matrix,
