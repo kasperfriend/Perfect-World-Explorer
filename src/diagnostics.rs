@@ -775,7 +775,7 @@ pub const PRESETS: [Preset; 6] = [
     },
     Preset {
         name: "Fog check",
-        help: "A focused one-click capture for outdoor fog. Records the selected region's authored fog, active camera fog, exact main-scene GPU uniforms, camera/projection state and visible terrain/pass counts once per second. Enable it, reproduce the edge-only fog, then turn it off and send fog-check.log plus session.log.",
+        help: "A focused one-click capture for outdoor fog. Records authored and uploaded fog ranges, camera/projection state, visible terrain/pass counts, and automatic camera-space depth/fog-factor samples across the resident window. No environment variables or visual debug mode required. Reproduce edge-only fog, then send fog-check.log plus session.log.",
         all: false,
         channels: FOG_CHECK,
     },
