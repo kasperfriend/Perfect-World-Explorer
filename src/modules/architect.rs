@@ -1179,7 +1179,7 @@ impl Architect {
                     {
                         self.open_archive(child.clone());
                     } else {
-                        self.selected_asset = Some(child.to_string_lossy().into_owned());
+                        self.select_asset_for_placement(child.to_string_lossy().into_owned());
                     }
                 }
                 response.context_menu(|ui| {
@@ -1346,14 +1346,33 @@ impl Architect {
             || self.renderer_tree_type(asset).is_some()
     }
 
+    /// Route every asset-browser and source-scene selection through the same
+    /// native placement gate. This avoids UI paths that merely highlight an
+    /// asset while leaving the viewport in Select mode.
+    fn select_asset_for_placement(&mut self, asset: String) {
+        self.selected_asset = Some(asset.clone());
+        if self.renderer_placeable_asset(&asset) {
+            self.cursor = CursorMode::Place;
+            self.snap = SnapMode::Terrain;
+            self.status = "Asset selected. Move over the world and click to place it.".into();
+        } else {
+            self.status = "Asset selected. This format is browse-only until a native placement adapter is available.".into();
+        }
+    }
+
     fn renderer_tree_type(&self, asset: &str) -> Option<usize> {
         let candidate = asset.split_once("::").map_or(asset, |(_, entry)| entry);
         let candidate = crate::ecmodel::normalize(candidate);
         self.tree_types.iter().position(|tree| {
-            let path = crate::ecmodel::normalize(&tree.tree);
-            candidate == path
-                || candidate.ends_with(&format!("/{path}"))
-                || path.ends_with(&format!("/{candidate}"))
+            [tree.tree.as_str(), tree.composite.as_str()]
+                .into_iter()
+                .filter(|path| !path.is_empty())
+                .map(crate::ecmodel::normalize)
+                .any(|path| {
+                    candidate == path
+                        || candidate.ends_with(&format!("/{path}"))
+                        || path.ends_with(&format!("/{candidate}"))
+                })
         })
     }
 
@@ -1369,7 +1388,8 @@ impl Architect {
         {
             return Vec::new();
         }
-        self.project
+        let mut placements = self
+            .project
             .objects
             .iter()
             .filter(|object| object.visible)
@@ -1389,7 +1409,57 @@ impl Architect {
                     scale: object.scale,
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+
+        // Use the existing SpeedTree GPU instancer for the placement ghost as
+        // well. The cursor preview and committed trees therefore share exactly
+        // the same tree type, LOD, material and wind path.
+        if self.cursor == CursorMode::Place {
+            if let (Some(tree_type), Some(mut position)) = (
+                self.selected_asset
+                    .as_deref()
+                    .and_then(|asset| self.renderer_tree_type(asset)),
+                self.brush_cursor_position,
+            ) {
+                match self.snap {
+                    SnapMode::Off => {}
+                    SnapMode::Terrain => {
+                        if let Some(map) = &self.map {
+                            position[1] = map.ground(position[0], position[2]) + 0.5;
+                        }
+                    }
+                    SnapMode::Objects => {
+                        if let Some(selected) = self.selected_scene_transform {
+                            position = selected;
+                        }
+                    }
+                    SnapMode::Smart => {
+                        if let Some(selected) = self.selected_scene_transform {
+                            position = selected;
+                        } else if let Some(map) = &self.map {
+                            position[1] = map.ground(position[0], position[2]) + 0.5;
+                        }
+                    }
+                }
+                let already_committed = placements.iter().any(|placement| {
+                    placement.tree_type == tree_type as u32
+                        && placement
+                            .position
+                            .iter()
+                            .zip(position)
+                            .all(|(left, right)| (*left - right).abs() < 0.01)
+                });
+                if !already_committed {
+                    placements.push(crate::scene::EditorTreePlacement {
+                        tree_type: tree_type as u32,
+                        position,
+                        yaw: 0.0,
+                        scale: 1.0,
+                    });
+                }
+            }
+        }
+        placements
     }
 
     /// BMD scenery placements for the native baked-scenery page builder.
@@ -1893,7 +1963,6 @@ impl Architect {
         let selected =
             self.selected_scene_object == Some(index) || self.multi_selection.contains(&index);
         if ui.selectable_label(selected, label).clicked() {
-            self.selected_asset = Some(asset.to_string());
             self.selected_scene_transform = Some(position);
             if self.cursor == CursorMode::MultiSelect {
                 self.selected_scene_object = None;
@@ -1911,11 +1980,7 @@ impl Architect {
                 // terrain-snapped viewport placement. Previously the click only
                 // changed selected_asset; viewport clicks stayed in Select mode,
                 // so users saw a name highlight but could not place the item.
-                if self.renderer_placeable_asset(asset) {
-                    self.cursor = CursorMode::Place;
-                    self.snap = SnapMode::Terrain;
-                    self.status = "Source item selected. Click the world to create an editable copy.".into();
-                }
+                self.select_asset_for_placement(asset.to_string());
             }
         }
     }
@@ -2420,15 +2485,7 @@ impl Architect {
                                 ));
                                 if response.hovered() { self.hovered_asset = Some(asset.clone()); }
                                 if response.clicked() {
-                                    self.selected_asset = Some(asset.clone());
-                                    // Selecting a supported archive model should
-                                    // be a direct placement workflow: preview it,
-                                    // then click the viewport to place it.
-                                    if self.renderer_placeable_asset(&asset) {
-                                        self.cursor = CursorMode::Place;
-                                        self.snap = SnapMode::Terrain;
-                                        self.status = "Asset selected. Click the world to place it.".into();
-                                    }
+                                    self.select_asset_for_placement(asset.clone());
                                 }
                                 response.context_menu(|ui| {
                                     if ui.button("Pin archive entry to quick bar").clicked() {
@@ -3095,7 +3152,7 @@ impl Architect {
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| item.clone());
                         if ui.small_button(label).on_hover_text(&item).clicked() {
-                            self.selected_asset = Some(item);
+                            self.select_asset_for_placement(item);
                         }
                     }
                 });
@@ -3141,7 +3198,8 @@ impl Architect {
             terrain_hit
         };
         self.brush_cursor_position = hit.map(|position| position.to_array());
-        if pressed && self.cursor == CursorMode::Place && !over_ui {
+        let placement_click = pressed && self.cursor == CursorMode::Place && !over_ui;
+        if placement_click {
             if let Some(position) = hit {
                 let mut placement = position.to_array();
                 match self.snap {
@@ -3172,6 +3230,7 @@ impl Architect {
         // Pick staged project objects directly in the viewport. Their editor
         // transform is independent from the immutable source-scene instances.
         if pressed
+            && !placement_click
             && matches!(
                 self.cursor,
                 CursorMode::Select | CursorMode::MultiSelect | CursorMode::Lasso
@@ -4560,6 +4619,7 @@ mod tests {
         assert!(editor.renderer_placeable_asset("models.pck::models/building.ecm"));
         assert!(editor.renderer_placeable_asset("litmodels.pck::litmodels/a01/1/litmodel_42.bmd"));
         assert!(editor.renderer_placeable_asset("trees.pck::trees/oak.spt"));
+        assert!(editor.renderer_placeable_asset("trees.pck::trees/oak.dds"));
         assert!(!editor.renderer_placeable_asset("gfx.pck::textures/oak.dds"));
     }
 
