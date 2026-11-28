@@ -102,6 +102,8 @@ pub struct Architect {
     archive_cache: HashMap<PathBuf, Vec<String>>,
     archive_detail_cache: HashMap<PathBuf, Vec<(String, u32, u32)>>,
     archive_details: Vec<(String, u32, u32)>,
+    archive_choices: Vec<PathBuf>,
+    archive_view_filter: usize,
     project_name: String,
     selected_project: Option<usize>,
     selected_map: String,
@@ -209,6 +211,8 @@ impl Architect {
             archive_cache: HashMap::new(),
             archive_detail_cache: HashMap::new(),
             archive_details: Vec::new(),
+            archive_choices: Vec::new(),
+            archive_view_filter: 0,
             project_name: "Untitled World".into(),
             selected_project: None,
             selected_map: "__empty__".into(),
@@ -1321,6 +1325,20 @@ impl Architect {
                 .insert(path.to_path_buf(), entries.clone());
             entries
         };
+        for entry in &entries {
+            if !entry.is_dir
+                && entry
+                    .path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("pck"))
+                && !self.archive_choices.contains(&entry.path)
+            {
+                self.archive_choices.push(entry.path.clone());
+            }
+        }
+        self.archive_choices
+            .sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
         for entry in entries {
             let child = entry.path;
             let label = entry.name;
@@ -2342,6 +2360,7 @@ impl Architect {
         self.archive_entries.clear();
         self.archive_details.clear();
         self.archive_error = None;
+        self.archive_view_filter = 0;
         if let Some(entries) = self.archive_cache.get(&path) {
             self.archive_entries = entries.clone();
             self.archive_details = self
@@ -2919,7 +2938,35 @@ impl Architect {
         self.hovered_asset = None;
         let asset_panel_response = asset_panel.show(ctx, |ui| {
                 ui.horizontal(|ui| { ui.heading("Client explorer"); Self::dock_picker(ui, &mut self.right_dock); });
-                ui.label(egui::RichText::new("Loose client files are browsed lazily. Select a PCK archive to index its internal asset paths on demand.").small().weak());
+                ui.label(egui::RichText::new("Browse loose client files or choose a game archive to open its indexed assets as a visual grid.").small().weak());
+                if !self.archive_choices.is_empty() {
+                    let archive_label = self
+                        .selected_archive
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Choose game archive…".into());
+                    egui::ComboBox::from_id_source("architect_archive_selector")
+                        .selected_text(archive_label)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for archive in self.archive_choices.clone() {
+                                let label = archive
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| archive.display().to_string());
+                                if ui
+                                    .selectable_label(
+                                        self.selected_archive.as_ref() == Some(&archive),
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    self.open_archive(archive);
+                                }
+                            }
+                        });
+                }
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut self.tree_filter);
                     if ui.small_button("Refresh files").clicked() {
@@ -2950,42 +2997,139 @@ impl Architect {
                             "{} files · {ecm_count} ECM · {smd_count} SMD · {bmd_count} BMD · {gfx_count} GFX",
                             archive_details.len()
                         ));
-                        let filter = self.tree_filter.to_lowercase();
-                        let filtered = archive_details.iter().filter(|(entry, _, _)| filter.is_empty() || entry.to_lowercase().contains(&filter)).collect::<Vec<_>>();
-                        let row_height = ui.text_style_height(&egui::TextStyle::Body);
-                        egui::ScrollArea::vertical().max_height(180.).show_rows(ui, row_height, filtered.len(), |ui, rows| {
-                            for row in rows {
-                                let (entry, size, compressed) = filtered[row];
-                                let asset = format!("{}::{}", archive.display(), entry);
-                                let label = Path::new(entry).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| entry.clone());
-                                let response = ui.selectable_label(self.selected_asset.as_deref() == Some(asset.as_str()), format!("📦 {label} · {size} B"));
-                                let response = response.on_hover_text(format!(
-                                    "{entry}\nType: {}\nUnpacked: {size} bytes\nStored: {compressed} bytes",
-                                    Path::new(entry).extension().and_then(|extension| extension.to_str()).unwrap_or("unknown").to_ascii_uppercase()
-                                ));
-                                if response.hovered() { self.hovered_asset = Some(asset.clone()); }
-                                if response.clicked() {
-                                    self.select_asset_for_placement(asset.clone());
-                                }
-                                response.context_menu(|ui| {
-                                    if ui.button("Pin archive entry to quick bar").clicked() {
-                                        self.pin(asset.clone());
-                                        ui.close_menu();
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            self.renderer_placeable_asset(&asset),
-                                            egui::Button::new("Place at camera"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.selected_asset = Some(asset.clone());
-                                        self.add_selected_asset_at_camera(camera);
-                                        ui.close_menu();
+                        ui.horizontal(|ui| {
+                            ui.label("Show:");
+                            egui::ComboBox::from_id_source("architect_archive_type_filter")
+                                .selected_text(match self.archive_view_filter {
+                                    1 => "ECM models",
+                                    2 => "SMD meshes",
+                                    3 => "BMD scenery",
+                                    4 => "GFX effects",
+                                    5 => "SpeedTree",
+                                    6 => "Other files",
+                                    _ => "All assets",
+                                })
+                                .show_ui(ui, |ui| {
+                                    for (value, label) in [
+                                        (0, "All assets"),
+                                        (1, "ECM models"),
+                                        (2, "SMD meshes"),
+                                        (3, "BMD scenery"),
+                                        (4, "GFX effects"),
+                                        (5, "SpeedTree"),
+                                        (6, "Other files"),
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.archive_view_filter,
+                                            value,
+                                            label,
+                                        );
                                     }
                                 });
-                            }
                         });
+                        let filter = self.tree_filter.to_lowercase();
+                        let filtered = archive_details
+                            .iter()
+                            .filter(|(entry, _, _)| {
+                                if !filter.is_empty()
+                                    && !entry.to_lowercase().contains(&filter)
+                                {
+                                    return false;
+                                }
+                                let asset = format!("{}::{}", archive.display(), entry);
+                                let extension = Path::new(entry)
+                                    .extension()
+                                    .and_then(|extension| extension.to_str())
+                                    .unwrap_or("")
+                                    .to_ascii_lowercase();
+                                match self.archive_view_filter {
+                                    1 => extension == "ecm",
+                                    2 => extension == "smd",
+                                    3 => extension == "bmd",
+                                    4 => extension == "gfx",
+                                    5 => self.renderer_tree_type(&asset).is_some(),
+                                    6 => {
+                                        !matches!(extension.as_str(), "ecm" | "smd" | "bmd" | "gfx")
+                                            && self.renderer_tree_type(&asset).is_none()
+                                    }
+                                    _ => true,
+                                }
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        ui.label(format!("{} assets shown", filtered.len()));
+                        egui::ScrollArea::vertical()
+                            .max_height(360.0)
+                            .show(ui, |ui| {
+                                let columns =
+                                    ((ui.available_width() / 112.0).floor() as usize).clamp(1, 6);
+                                egui::Grid::new((
+                                    "architect_archive_asset_grid",
+                                    archive.display().to_string(),
+                                ))
+                                .num_columns(columns)
+                                .spacing(egui::vec2(7.0, 7.0))
+                                .show(ui, |ui| {
+                                    for (index, (entry, size, compressed)) in
+                                        filtered.iter().enumerate()
+                                    {
+                                        let asset = format!("{}::{}", archive.display(), entry);
+                                        let extension = Path::new(entry)
+                                            .extension()
+                                            .and_then(|extension| extension.to_str())
+                                            .unwrap_or("file")
+                                            .to_ascii_uppercase();
+                                        let glyph = match extension.as_str() {
+                                            "ECM" => "🧍",
+                                            "SMD" => "🔷",
+                                            "BMD" => "🏛",
+                                            "GFX" => "✨",
+                                            _ => "📦",
+                                        };
+                                        let label = Path::new(entry)
+                                            .file_stem()
+                                            .map(|name| name.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| entry.clone());
+                                        let response = ui.add_sized(
+                                            egui::vec2(104.0, 68.0),
+                                            egui::SelectableLabel::new(
+                                                self.selected_asset.as_deref()
+                                                    == Some(asset.as_str()),
+                                                format!("{glyph}\n{label}\n{extension}"),
+                                            ),
+                                        );
+                                        let response = response.on_hover_text(format!(
+                                            "{entry}\nType: {extension}\nUnpacked: {size} bytes\nStored: {compressed} bytes"
+                                        ));
+                                        if response.hovered() {
+                                            self.hovered_asset = Some(asset.clone());
+                                        }
+                                        if response.clicked() {
+                                            self.select_asset_for_placement(asset.clone());
+                                        }
+                                        response.context_menu(|ui| {
+                                            if ui.button("Pin to quick bar").clicked() {
+                                                self.pin(asset.clone());
+                                                ui.close_menu();
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    self.renderer_placeable_asset(&asset),
+                                                    egui::Button::new("Place at camera"),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.select_asset_for_placement(asset.clone());
+                                                self.add_selected_asset_at_camera(camera);
+                                                ui.close_menu();
+                                            }
+                                        });
+                                        if (index + 1) % columns == 0 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+                            });
                     }
                 }
                 if let Some(asset) = self.selected_asset.clone() {
@@ -3033,6 +3177,33 @@ impl Architect {
                                     ui.available_width().min(280.),
                                 ),
                             );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut preview.turntable, "Turntable");
+                                ui.checkbox(&mut preview.playing, "Animate");
+                            });
+                            let actions = preview.action_names();
+                            if !actions.is_empty() {
+                                let mut selected_action = preview.action;
+                                egui::ComboBox::from_id_source("architect_preview_action")
+                                    .selected_text(
+                                        actions
+                                            .get(selected_action)
+                                            .cloned()
+                                            .unwrap_or_else(|| "Action".into()),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for (index, action) in actions.iter().enumerate() {
+                                            ui.selectable_value(
+                                                &mut selected_action,
+                                                index,
+                                                action,
+                                            );
+                                        }
+                                    });
+                                if selected_action != preview.action {
+                                    preview.select_action(selected_action);
+                                }
+                            }
                         }
                     } else {
                         ui.label(egui::RichText::new(&self.preview_message).small().weak());
