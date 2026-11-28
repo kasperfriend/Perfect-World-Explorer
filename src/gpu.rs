@@ -3106,16 +3106,24 @@ impl Renderer {
         // The bounds value is always the uploaded LOD window, independent of
         // the optional memory-saving terrain-cutoff setting. Tying fog fitting
         // to that setting made edge-only fog return when cutoff was disabled.
-        let (active_fog, _fog_window_cap) = if camera.underwater_depth <= 0. {
-            crate::fog_matrix::fit_to_terrain_window(
-                camera.active_fog(),
+        let mut active_fog = camera.active_fog();
+        let fog_window_cap = if camera.underwater_depth <= 0. {
+            crate::terrain_cutoff::fog_cap(
                 bounds,
                 camera.pos.to_array(),
                 w as f32 / h.max(1) as f32,
             )
         } else {
-            (camera.active_fog(), None)
+            None
         };
+        if active_fog.enabled {
+            if let Some(cap) = fog_window_cap {
+                let [start, end] =
+                    crate::terrain_cutoff::fit_fog(active_fog.start, active_fog.end, cap);
+                active_fog.start = start;
+                active_fog.end = end;
+            }
+        }
         let (mut fog_range, fog_color) = (active_fog.range(), active_fog.color4());
         // Uniform fog_range.w is the terrain day/night factor; the shader reads
         // it instead of overloading sun.w (the lightmap-availability flag).
