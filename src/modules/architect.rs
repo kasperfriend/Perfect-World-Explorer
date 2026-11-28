@@ -916,23 +916,45 @@ impl Architect {
         let scale = scale.max(0.01) * Vec3::from_array(scale_axes);
         let min = Vec3::from_array(min);
         let max = Vec3::from_array(max);
+        let mut world_corners = [Vec3::ZERO; 8];
         let mut rect = egui::Rect::NOTHING;
         let mut count = 0usize;
-        for bits in 0..8 {
+        let mut extend = |point: egui::Pos2| {
+            rect.extend_with(point);
+            count += 1;
+        };
+        for (bits, corner) in world_corners.iter_mut().enumerate() {
             let local = Vec3::new(
                 if bits & 1 == 0 { min.x } else { max.x },
                 if bits & 2 == 0 { min.y } else { max.y },
                 if bits & 4 == 0 { min.z } else { max.z },
             ) * scale;
-            let clip = view_projection.project_point3(center + rotation * local);
+            *corner = center + rotation * local;
+            let clip = view_projection.project_point3(*corner);
             if clip.is_finite() && (0.0..=1.0).contains(&clip.z) {
-                rect.extend_with(egui::pos2(
+                extend(egui::pos2(
                     screen.left() + (clip.x + 1.0) * 0.5 * screen.width(),
                     screen.top() + (1.0 - clip.y) * 0.5 * screen.height(),
                 ));
-                count += 1;
             }
         }
+        for bits in 0..8 {
+            for axis in [1usize, 2, 4] {
+                let other = bits ^ axis;
+                if bits < other {
+                    if let Some(edge) = Self::project_clipped_edge(
+                        world_corners[bits],
+                        world_corners[other],
+                        screen,
+                        view_projection,
+                    ) {
+                        extend(edge[0]);
+                        extend(edge[1]);
+                    }
+                }
+            }
+        }
+        drop(extend);
         if count == 0 {
             let clip = view_projection.project_point3(center);
             if !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
@@ -4208,7 +4230,7 @@ impl Architect {
                     for (index, object) in self.project.objects.iter().enumerate() {
                         let clip =
                             view_projection.project_point3(Vec3::from_array(object.position));
-                        if !object.visible || !clip.is_finite() || !(0.0..=1.0).contains(&clip.z) {
+                        if !object.visible || !clip.is_finite() {
                             continue;
                         }
                         let point = egui::pos2(
@@ -4218,44 +4240,15 @@ impl Architect {
                         // Prefer the projected mesh footprint over a small
                         // origin-only click radius. This makes tall/wide models
                         // selectable where their visible geometry actually is.
-                        let projected_bounds = {
-                            let (min, max) = self
-                                .renderer_bounds_key(&object.asset)
-                                .and_then(|path| self.preview_bounds.get(&path).copied())
-                                .unwrap_or_else(|| Self::fallback_selection_bounds(&object.asset));
-                            {
-                                let rotation = glam::Quat::from_euler(
-                                    glam::EulerRot::XYZ,
-                                    object.rotation[0],
-                                    object.rotation[1],
-                                    object.rotation[2],
-                                );
-                                let center = Vec3::from_array(object.position);
-                                let mut rect = egui::Rect::NOTHING;
-                                let mut count = 0usize;
-                                for bits in 0..8 {
-                                    let local = Vec3::new(
-                                        if bits & 1 == 0 { min[0] } else { max[0] },
-                                        if bits & 2 == 0 { min[1] } else { max[1] },
-                                        if bits & 4 == 0 { min[2] } else { max[2] },
-                                    ) * (object.scale.max(0.01)
-                                        * Vec3::from_array(object.scale_axes));
-                                    let world = center + rotation * local;
-                                    let projected = view_projection.project_point3(world);
-                                    if projected.is_finite() && (0.0..=1.0).contains(&projected.z) {
-                                        let screen_point = egui::pos2(
-                                            screen.left()
-                                                + (projected.x + 1.) * 0.5 * screen.width(),
-                                            screen.top()
-                                                + (1. - projected.y) * 0.5 * screen.height(),
-                                        );
-                                        rect.extend_with(screen_point);
-                                        count += 1;
-                                    }
-                                }
-                                (count > 0).then_some(rect.expand(8.0))
-                            }
-                        };
+                        let projected_bounds = self.projected_bounds_rect(
+                            &object.asset,
+                            object.position,
+                            object.rotation,
+                            object.scale,
+                            object.scale_axes,
+                            screen,
+                            view_projection,
+                        );
                         let score = if let Some(rect) = projected_bounds {
                             let dx = if pointer.x < rect.left() {
                                 rect.left() - pointer.x
