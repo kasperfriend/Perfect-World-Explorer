@@ -4529,19 +4529,13 @@ mod tests {
 
     #[test]
     fn placeable_asset_gate_accepts_every_native_adapter() {
-        let mut editor = Architect::new(
-            PathBuf::from("/client/element"),
-            None,
-            "a01".into(),
-        );
+        let mut editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
         editor.tree_types = vec![crate::scene::TreeType {
             tree: "trees/oak.spt".into(),
             composite: "trees/oak.dds".into(),
         }];
         assert!(editor.renderer_placeable_asset("models.pck::models/building.ecm"));
-        assert!(editor.renderer_placeable_asset(
-            "litmodels.pck::litmodels/a01/1/litmodel_42.bmd"
-        ));
+        assert!(editor.renderer_placeable_asset("litmodels.pck::litmodels/a01/1/litmodel_42.bmd"));
         assert!(editor.renderer_placeable_asset("trees.pck::trees/oak.spt"));
         assert!(!editor.renderer_placeable_asset("gfx.pck::textures/oak.dds"));
     }
