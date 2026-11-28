@@ -240,7 +240,7 @@ pub struct Objects {
     native_ornaments: Arc<[Ornament]>,
     /// Uniform scales for the transient Architect tail, keyed by combined
     /// ornament index. Native EC-BSD ornaments retain their authored scale.
-    editor_scales: HashMap<usize, f32>,
+    editor_scales: HashMap<usize, [f32; 3]>,
     editor_placements: Vec<crate::scene::EditorSceneryPlacement>,
     /// Canonical in-memory keys built once instead of formatting and lowercasing
     /// the same placement path on every streamed batch.
@@ -461,8 +461,14 @@ impl Objects {
                 path: placement.path.clone(),
                 map_id: placement.map_id.clone(),
             });
-            if placement.scale.is_finite() && placement.scale > 0.0 {
-                self.editor_scales.insert(base + offset, placement.scale);
+            if placement.scale.is_finite() && placement.scale > 0.0
+                && placement.scale_axes.iter().all(|v| v.is_finite() && *v > 0.0)
+            {
+                self.editor_scales.insert(base + offset, [
+                    placement.scale * placement.scale_axes[0],
+                    placement.scale * placement.scale_axes[1],
+                    placement.scale * placement.scale_axes[2],
+                ]);
             }
         }
         self.ornaments = combined.into();
@@ -482,7 +488,12 @@ impl Objects {
     /// Uniform instance scale for a BMD placement; native map scenery defaults
     /// to 1 because its transform is authored by EC-BSD direction/up vectors.
     pub fn placement_scale(&self, index: usize) -> f32 {
-        self.editor_scales.get(&index).copied().unwrap_or(1.0)
+        let axes = self.placement_scale_axes(index);
+        (axes[0] * axes[1] * axes[2]).cbrt()
+    }
+
+    pub fn placement_scale_axes(&self, index: usize) -> [f32; 3] {
+        self.editor_scales.get(&index).copied().unwrap_or([1.0; 3])
     }
 
     pub fn native_ornament_count(&self) -> usize {
