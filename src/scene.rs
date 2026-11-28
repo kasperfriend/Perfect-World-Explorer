@@ -421,6 +421,7 @@ pub struct EditorSceneryPlacement {
     pub direction: [f32; 3],
     pub up: [f32; 3],
     pub scale: f32,
+    pub scale_axes: [f32; 3],
     pub map_id: String,
 }
 
