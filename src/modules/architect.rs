@@ -396,7 +396,10 @@ impl Architect {
                     .all(|v| v.is_finite())
                 || !object.scale.is_finite()
                 || object.scale <= 0.
-                || !object.scale_axes.iter().all(|value| value.is_finite() && *value > 0. && *value <= 1000.)
+                || !object
+                    .scale_axes
+                    .iter()
+                    .all(|value| value.is_finite() && *value > 0. && *value <= 1000.)
             {
                 return Err("Project contains an invalid object asset or transform".into());
             }
@@ -567,8 +570,14 @@ impl Architect {
                         rotation: [n[3], n[4], n[5]],
                         scale: n[6].clamp(0.01, 1000.),
                         scale_axes: if version >= 3 {
-                            [n[7].clamp(0.01, 1000.), n[8].clamp(0.01, 1000.), n[9].clamp(0.01, 1000.)]
-                        } else { [1.; 3] },
+                            [
+                                n[7].clamp(0.01, 1000.),
+                                n[8].clamp(0.01, 1000.),
+                                n[9].clamp(0.01, 1000.),
+                            ]
+                        } else {
+                            [1.; 3]
+                        },
                     });
                 }
                 "stroke" if fields.len() == 7 => {
@@ -1068,7 +1077,9 @@ impl Architect {
             .as_deref()
             .or(self.selected_asset.as_deref());
         let Some(asset) = asset else {
-            self.preview_message = "Select a client asset to preview it or place it with its native world handler.".into();
+            self.preview_message =
+                "Select a client asset to preview it or place it with its native world handler."
+                    .into();
             return;
         };
         if self.renderer_effect_path(asset).is_some() {
@@ -1099,8 +1110,9 @@ impl Architect {
                     let mut min = Vec3::splat(f32::INFINITY);
                     let mut max = Vec3::splat(f32::NEG_INFINITY);
                     for vertex in model.meshes.iter().flat_map(|mesh| &mesh.vertices) {
-                        let (position, _) =
-                            crate::gpu::editor_bmd_vertex_transform(&model, &identity, vertex, [1.0; 3]);
+                        let (position, _) = crate::gpu::editor_bmd_vertex_transform(
+                            &model, &identity, vertex, [1.0; 3],
+                        );
                         if position.is_finite() {
                             min = min.min(position);
                             max = max.max(position);
@@ -1403,9 +1415,12 @@ impl Architect {
         let path = asset.to_ascii_lowercase();
         let (half_x, half_y, half_z) = if path.contains("tree") {
             (2.0, 10.0, 2.0)
-        } else if path.contains("litmodels/") || path.ends_with(".bmd")
-            || path.contains("building") || path.contains("house")
-            || path.contains("gate") || path.contains("wall")
+        } else if path.contains("litmodels/")
+            || path.ends_with(".bmd")
+            || path.contains("building")
+            || path.contains("house")
+            || path.contains("gate")
+            || path.contains("wall")
         {
             (6.0, 8.0, 6.0)
         } else if path.ends_with(".gfx") || path.contains("effect") {
@@ -1640,7 +1655,10 @@ impl Architect {
                     || !object.rotation.iter().all(|value| value.is_finite())
                     || !object.scale.is_finite()
                     || !(0.001..=1000.0).contains(&object.scale)
-                    || !object.scale_axes.iter().all(|v| v.is_finite() && (0.001..=1000.0).contains(v))
+                    || !object
+                        .scale_axes
+                        .iter()
+                        .all(|v| v.is_finite() && (0.001..=1000.0).contains(v))
                 {
                     return None;
                 }
@@ -2077,7 +2095,8 @@ impl Architect {
                                 if bits & 2 == 0 { min[1] } else { max[1] },
                                 if bits & 4 == 0 { min[2] } else { max[2] },
                             );
-                            let clip = view_projection.project_point3(Vec3::from_array(position) + local);
+                            let clip =
+                                view_projection.project_point3(Vec3::from_array(position) + local);
                             if clip.is_finite() && (0.0..=1.0).contains(&clip.z) {
                                 rect.extend_with(egui::pos2(
                                     screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
@@ -2089,8 +2108,12 @@ impl Architect {
                         (projected_count > 0).then_some(rect.expand(10.0))
                     });
                 let score = if let Some(rect) = bounds_score {
-                    let dx = (rect.left() - pointer.x).max(0.0).max(pointer.x - rect.right());
-                    let dy = (rect.top() - pointer.y).max(0.0).max(pointer.y - rect.bottom());
+                    let dx = (rect.left() - pointer.x)
+                        .max(0.0)
+                        .max(pointer.x - rect.right());
+                    let dy = (rect.top() - pointer.y)
+                        .max(0.0)
+                        .max(pointer.y - rect.bottom());
                     dx.hypot(dy) / 14.0
                 } else {
                     point.distance(pointer) / Self::source_pick_radius(asset)
@@ -2429,16 +2452,22 @@ impl Architect {
             1. - (pointer.y - viewport.top()) / viewport.height().max(1.) * 2.,
         );
         let inverse = view_projection.inverse();
-        if !inverse.is_finite() { return None; }
+        if !inverse.is_finite() {
+            return None;
+        }
         let near = inverse.project_point3(Vec3::new(uv.x, uv.y, 1.));
         let far = inverse.project_point3(Vec3::new(uv.x, uv.y, 0.));
         let direction = (far - near).normalize_or_zero();
         let normal = normal.normalize_or_zero();
         let denominator = direction.dot(normal);
-        if !near.is_finite() || !direction.is_finite()
+        if !near.is_finite()
+            || !direction.is_finite()
             || direction.length_squared() < 0.5
             || normal.length_squared() < 0.5
-            || denominator.abs() < 1e-5 { return None; }
+            || denominator.abs() < 1e-5
+        {
+            return None;
+        }
         let distance = (origin - near).dot(normal) / denominator;
         (distance >= 0.).then_some(near + direction * distance)
     }
@@ -2454,13 +2483,18 @@ impl Architect {
         if normal.length_squared() < 0.5 || !radius.is_finite() || radius <= 0. {
             return Vec::new();
         }
-        let reference = if normal.dot(Vec3::Y).abs() < 0.92 { Vec3::Y } else { Vec3::X };
+        let reference = if normal.dot(Vec3::Y).abs() < 0.92 {
+            Vec3::Y
+        } else {
+            Vec3::X
+        };
         let tangent = normal.cross(reference).normalize_or_zero();
         let bitangent = normal.cross(tangent).normalize_or_zero();
         let mut points = Vec::with_capacity(65);
         for step in 0..=64 {
             let angle = step as f32 * std::f32::consts::TAU / 64.;
-            let world = origin + tangent * (angle.cos() * radius) + bitangent * (angle.sin() * radius);
+            let world =
+                origin + tangent * (angle.cos() * radius) + bitangent * (angle.sin() * radius);
             let clip = view_projection.project_point3(world);
             if clip.is_finite() {
                 points.push(egui::pos2(
@@ -2473,11 +2507,15 @@ impl Architect {
     }
 
     fn distance_to_polyline(point: egui::Pos2, points: &[egui::Pos2]) -> f32 {
-        points.windows(2).map(|pair| {
-            let segment = pair[1] - pair[0];
-            let t = ((point - pair[0]).dot(segment) / segment.length_sq().max(0.001)).clamp(0., 1.);
-            (pair[0] + segment * t).distance(point)
-        }).fold(f32::INFINITY, f32::min)
+        points
+            .windows(2)
+            .map(|pair| {
+                let segment = pair[1] - pair[0];
+                let t =
+                    ((point - pair[0]).dot(segment) / segment.length_sq().max(0.001)).clamp(0., 1.);
+                (pair[0] + segment * t).distance(point)
+            })
+            .fold(f32::INFINITY, f32::min)
     }
 
     fn terrain_hit(
@@ -3331,21 +3369,31 @@ impl Architect {
                         );
                         let axis_scale_supported = {
                             let path = object.asset.to_ascii_lowercase();
-                            path.ends_with(".ecm") || path.ends_with(".smd") || path.ends_with(".bmd")
+                            path.ends_with(".ecm")
+                                || path.ends_with(".smd")
+                                || path.ends_with(".bmd")
                         };
                         ui.add_enabled_ui(axis_scale_supported, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Scale XYZ");
                                 for axis in 0..3 {
-                                    ui.add(egui::DragValue::new(&mut object.scale_axes[axis])
-                                        .speed(0.02)
-                                        .clamp_range(0.01..=100.0)
-                                        .prefix(["X ", "Y ", "Z "][axis]));
+                                    ui.add(
+                                        egui::DragValue::new(&mut object.scale_axes[axis])
+                                            .speed(0.02)
+                                            .clamp_range(0.01..=100.0)
+                                            .prefix(["X ", "Y ", "Z "][axis]),
+                                    );
                                 }
                             });
                         });
                         if !axis_scale_supported {
-                            ui.label(egui::RichText::new("This native handler currently supports uniform scale only.").small().weak());
+                            ui.label(
+                                egui::RichText::new(
+                                    "This native handler currently supports uniform scale only.",
+                                )
+                                .small()
+                                .weak(),
+                            );
                         }
                         if ui.button("Duplicate custom placement").clicked() {
                             duplicate_placement = Some(object.clone());
@@ -3596,16 +3644,24 @@ impl Architect {
                         let axis_end = |axis: Vec3| {
                             project_direction_point(origin + axis * gizmo_radius).map(|projected| {
                                 let direction = projected - center;
-                                let direction = if direction.length_sq() > 0.0001 { direction.normalized() } else { egui::Vec2::ZERO };
+                                let direction = if direction.length_sq() > 0.0001 {
+                                    direction.normalized()
+                                } else {
+                                    egui::Vec2::ZERO
+                                };
                                 center + direction * 76.0
                             })
                         };
                         match self.transform_mode {
                             TransformMode::Move => {
-                                for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                                for (axis_index, axis) in
+                                    [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate()
+                                {
                                     if axis_end(axis).is_some_and(|end| {
                                         let segment = end - center;
-                                        let t = ((pointer - center).dot(segment) / segment.length_sq().max(0.001)).clamp(0.0, 1.0);
+                                        let t = ((pointer - center).dot(segment)
+                                            / segment.length_sq().max(0.001))
+                                        .clamp(0.0, 1.0);
                                         (center + segment * t).distance(pointer) <= 12.0
                                     }) {
                                         axis_pick = Some(axis_index);
@@ -3628,7 +3684,13 @@ impl Architect {
                             TransformMode::Scale => {}
                             TransformMode::Rotate => {
                                 for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
-                                    let ring = Self::gizmo_ring_points(origin, axis, gizmo_radius, screen, view_projection);
+                                    let ring = Self::gizmo_ring_points(
+                                        origin,
+                                        axis,
+                                        gizmo_radius,
+                                        screen,
+                                        view_projection,
+                                    );
                                     if Self::distance_to_polyline(pointer, &ring) <= 9.0 {
                                         axis_pick = Some(axis_index);
                                         break;
@@ -3675,7 +3737,8 @@ impl Architect {
                                         if bits & 1 == 0 { min[0] } else { max[0] },
                                         if bits & 2 == 0 { min[1] } else { max[1] },
                                         if bits & 4 == 0 { min[2] } else { max[2] },
-                                    ) * (object.scale.max(0.01) * Vec3::from_array(object.scale_axes));
+                                    ) * (object.scale.max(0.01)
+                                        * Vec3::from_array(object.scale_axes));
                                     let world = center + rotation * local;
                                     let projected = view_projection.project_point3(world);
                                     if projected.is_finite() && (0.0..=1.0).contains(&projected.z) {
@@ -3854,10 +3917,15 @@ impl Architect {
                     Some(2) => Some(Vec3::Z),
                     _ => None,
                 }?;
-                let object = self.selected_placement
+                let object = self
+                    .selected_placement
                     .and_then(|index| self.project.objects.get(index))?;
                 Self::ray_axis_parameter(
-                    pointer, screen, view_projection, Vec3::from_array(object.position), axis,
+                    pointer,
+                    screen,
+                    view_projection,
+                    Vec3::from_array(object.position),
+                    axis,
                 )
             });
             let selected_is_unlocked = self
@@ -3895,9 +3963,11 @@ impl Architect {
                     self.object_drag_xz_offset = [position[0] - hit.x, position[2] - hit.z];
                 }
             }
-            self.object_drag_start_rotation_vector = if self.transform_mode == TransformMode::Rotate {
+            self.object_drag_start_rotation_vector = if self.transform_mode == TransformMode::Rotate
+            {
                 pointer.and_then(|pointer| {
-                    let axis = [Vec3::X, Vec3::Y, Vec3::Z][self.object_drag_axis.unwrap_or(1).min(2)];
+                    let axis =
+                        [Vec3::X, Vec3::Y, Vec3::Z][self.object_drag_axis.unwrap_or(1).min(2)];
                     let origin = Vec3::from_array(self.object_drag_start_position);
                     Self::ray_plane_point(pointer, screen, view_projection, origin, axis)
                         .map(|point| (point - origin).normalize_or_zero().to_array())
@@ -4019,9 +4089,15 @@ impl Architect {
                             Some(axis_index @ 0..=2) => {
                                 let axis = [Vec3::X, Vec3::Y, Vec3::Z][axis_index];
                                 self.object_drag_start_axis_parameter
-                                    .zip(pointer.and_then(|pointer| Self::ray_axis_parameter(
-                                        pointer, screen, view_projection, pivot, axis,
-                                    )))
+                                    .zip(pointer.and_then(|pointer| {
+                                        Self::ray_axis_parameter(
+                                            pointer,
+                                            screen,
+                                            view_projection,
+                                            pivot,
+                                            axis,
+                                        )
+                                    }))
                                     .map(|(start, current)| axis * (current - start))
                             }
                             _ => self
@@ -4044,13 +4120,20 @@ impl Architect {
                                     let axis = [Vec3::X, Vec3::Y, Vec3::Z][axis_index];
                                     if let (Some(start), Some(current)) = (
                                         self.object_drag_start_axis_parameter,
-                                        pointer.and_then(|pointer| Self::ray_axis_parameter(
-                                            pointer, screen, view_projection,
-                                            Vec3::from_array(self.object_drag_start_position), axis,
-                                        )),
+                                        pointer.and_then(|pointer| {
+                                            Self::ray_axis_parameter(
+                                                pointer,
+                                                screen,
+                                                view_projection,
+                                                Vec3::from_array(self.object_drag_start_position),
+                                                axis,
+                                            )
+                                        }),
                                     ) {
-                                        object.position = (Vec3::from_array(self.object_drag_start_position)
-                                            + axis * (current - start)).to_array();
+                                        object.position =
+                                            (Vec3::from_array(self.object_drag_start_position)
+                                                + axis * (current - start))
+                                                .to_array();
                                     }
                                 }
                                 _ => {
