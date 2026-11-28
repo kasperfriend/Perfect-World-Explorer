@@ -204,7 +204,7 @@ fn to_linear(c:vec3<f32>)->vec3<f32>{return select(c/12.92,pow((max(c,vec3<f32>(
 fn fog_view_depth(world:vec3<f32>)->f32 {
  // Re-evaluate clip-space W from the perspective-correct world position.
  // This is the camera-space forward depth, independent of fragment builtin W.
- return abs((camera.matrix*vec4<f32>(world,1.)).w);
+ return max((camera.matrix*vec4<f32>(world,1.)).w,0.);
 }
 fn fog_factor(view_z:f32)->f32 {
  if camera.fog_range.z<0.5 {return 0.;}
@@ -225,7 +225,7 @@ fn terrain_pass_fog(linear:vec3<f32>,world:vec3<f32>,transmittance:f32)->vec3<f3
 @fragment fn fs(i:Out)->@location(0) vec4<f32> {
  if camera.clip.y>0. && i.world.y<camera.clip.x {discard;}
  if i.distant>0.5 && i.world.x>=camera.bounds.x && i.world.x<camera.bounds.y && i.world.z>=camera.bounds.z && i.world.z<camera.bounds.w {discard;}
- if camera.lod.z>0.5 { let builtin_depth=1./max(i.pos.w,0.0000001); let matrix_depth=fog_view_depth(i.world); let builtin_factor=fog_factor(builtin_depth); let matrix_factor=fog_factor(matrix_depth); let disagreement=clamp(abs(builtin_depth-matrix_depth)/max(matrix_depth,1.),0.,1.); return vec4<f32>(builtin_factor,matrix_factor,disagreement,1.); }
+
  let gx=clamp(i.world.x/settings.params.z+settings.params.x*0.5,0.,settings.params.x-1.);
  let gy=clamp(settings.params.y*0.5-i.world.z/settings.params.z,0.,settings.params.y-1.);
  let coord=vec2<f32>(gx,gy)/settings.params.w;
@@ -1779,10 +1779,11 @@ mod fog_shader_contract_tests {
     #[test]
     fn terrain_fog_uses_camera_matrix_world_depth_and_exposes_comparison() {
         let src = include_str!("terrain_gpu.rs");
-        assert!(src.contains("return abs((camera.matrix*vec4<f32>(world,1.)).w);"));
+        assert!(src.contains("return max((camera.matrix*vec4<f32>(world,1.)).w,0.);"));
         assert!(src.contains("fog_view_depth(i.world)"));
-        assert!(src.contains("let builtin_depth=1./max(i.pos.w,0.0000001);"));
-        assert!(src.contains("camera.lod.z>0.5"));
-        assert!(src.contains("fn terrain_pass_fog(linear:vec3<f32>,world:vec3<f32>,transmittance:f32)"));
+        assert!(!src.contains("camera.lod.z>0.5"));
+        assert!(
+            src.contains("fn terrain_pass_fog(linear:vec3<f32>,world:vec3<f32>,transmittance:f32)")
+        );
     }
 }
