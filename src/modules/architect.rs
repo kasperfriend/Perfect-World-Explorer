@@ -854,6 +854,17 @@ impl Architect {
         }
     }
 
+    /// Source-scene selection identity is retained as an asset+transform
+    /// pair. The hierarchy/viewport row index is only a UI hint and can
+    /// disappear when the selected object is not in the visible hierarchy
+    /// page; it must not decide whether the outline or gizmo exists.
+    fn selected_source_target(&self) -> Option<(String, [f32; 3])> {
+        let asset = self.selected_asset.as_ref()?;
+        let position = self.selected_scene_transform?;
+        self.renderer_placeable_asset(asset)
+            .then(|| (asset.clone(), position))
+    }
+
     fn marquee_rect(start: egui::Pos2, current: egui::Pos2) -> egui::Rect {
         egui::Rect::from_two_pos(start, current)
     }
@@ -1378,6 +1389,7 @@ impl Architect {
                             renderer,
                             path.clone(),
                             &model,
+                            &mut self.preview_assets,
                         ) {
                             Ok(preview) => {
                                 self.preview_bounds
@@ -3388,8 +3400,19 @@ impl Architect {
                                 ),
                             );
                             ui.label(
+                                egui::RichText::new(preview.texture_status())
+                                    .small()
+                                    .weak(),
+                            );
+                            for warning in preview.texture_warnings().iter().take(4) {
+                                ui.colored_label(
+                                    egui::Color32::YELLOW,
+                                    egui::RichText::new(warning).small(),
+                                );
+                            }
+                            ui.label(
                                 egui::RichText::new(
-                                    "BMD geometry preview · native materials are used after placement",
+                                    "Preview uses decoded BMD diffuse textures and vertex lighting; world placement uses native scenery materials.",
                                 )
                                 .small()
                                 .weak(),
@@ -4237,12 +4260,8 @@ impl Architect {
                 .and_then(|index| self.project.objects.get(index))
                 .map(|object| (Vec3::from_array(object.position), object.asset.clone()))
                 .or_else(|| {
-                    self.selected_scene_object.and_then(|_| {
-                        self.selected_scene_transform
-                            .zip(self.selected_asset.clone())
-                            .filter(|(_, asset)| self.renderer_placeable_asset(asset))
-                            .map(|(position, asset)| (Vec3::from_array(position), asset))
-                    })
+                    self.selected_source_target()
+                        .map(|(asset, position)| (Vec3::from_array(position), asset))
                 });
             if let (Some((origin, asset)), Some(pointer)) = (gizmo_target, pointer) {
                 if self.cursor == CursorMode::Select {
@@ -4340,7 +4359,8 @@ impl Architect {
                     }
                 }
             }
-            let source_gizmo_position = axis_pick.and_then(|_| self.selected_scene_transform);
+            let source_gizmo_position = axis_pick
+                .and_then(|_| self.selected_source_target().map(|(_, position)| position));
             // Source-scene instances are immutable. The first transform-handle
             // drag promotes the selection into a project-owned copy.
             if axis_pick.is_some()
@@ -4731,7 +4751,7 @@ impl Architect {
             self.marquee_start = None;
             self.marquee_current = None;
         }
-        if self.object_dragging && down && self.cursor == CursorMode::Select && !over_ui {
+        if self.object_dragging && down && self.cursor == CursorMode::Select {
             let indices = if self.object_drag_group.is_empty() {
                 self.selected_placement.into_iter().collect::<Vec<_>>()
             } else {
@@ -5044,14 +5064,7 @@ impl Architect {
             .selected_placement
             .and_then(|index| self.project.objects.get(index))
             .map(|object| (object.asset.clone(), object.position))
-            .or_else(|| {
-                self.selected_scene_object.and_then(|_| {
-                    self.selected_scene_transform
-                        .zip(self.selected_asset.clone())
-                        .filter(|(_, asset)| self.renderer_placeable_asset(asset))
-                        .map(|(position, asset)| (asset, position))
-                })
-            });
+            .or_else(|| self.selected_source_target());
         if let Some((asset, position)) = gizmo_object {
             let origin = Vec3::from_array(position);
             let project_point = |point: Vec3| -> Option<egui::Pos2> {
@@ -5197,17 +5210,12 @@ impl Architect {
                 outline_items.push((asset.clone(), *position, 1.0, [1.; 3], [0.; 3]));
             }
         }
-        if let (Some(asset), Some(position)) = (
-            self.selected_asset
-                .as_ref()
-                .filter(|_| self.selected_scene_object.is_some()),
-            self.selected_scene_transform,
-        ) {
+        if let Some((asset, position)) = self.selected_source_target() {
             if !outline_items
                 .iter()
-                .any(|item| item.0 == *asset && item.1 == position)
+                .any(|item| item.0 == asset && item.1 == position)
             {
-                outline_items.push((asset.clone(), position, 1.0, [1.; 3], [0.; 3]));
+                outline_items.push((asset, position, 1.0, [1.; 3], [0.; 3]));
             }
         }
         let outline_painter = ctx.layer_painter(egui::LayerId::new(
@@ -5403,6 +5411,25 @@ mod tests {
             end,
             egui::pos2(101.0, 120.0)
         ));
+    }
+
+    #[test]
+    fn source_gizmo_target_survives_missing_hierarchy_row_index() {
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element"),
+            None,
+            "a01".into(),
+        );
+        editor.selected_scene_object = None;
+        editor.selected_asset = Some("models.pck::models/trees/test.ecm".into());
+        editor.selected_scene_transform = Some([10.0, 20.0, 30.0]);
+        assert_eq!(
+            editor.selected_source_target(),
+            Some((
+                "models.pck::models/trees/test.ecm".into(),
+                [10.0, 20.0, 30.0]
+            ))
+        );
     }
 
     #[test]
