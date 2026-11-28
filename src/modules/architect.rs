@@ -842,6 +842,7 @@ impl Architect {
             })
             .min_by_key(|(index, _, _)| *index);
         if let Some((index, asset, position)) = active {
+            self.selected_placement = None;
             self.selected_scene_object = Some(index);
             self.selected_scene_transform = Some(position);
             self.selected_asset = Some(asset);
@@ -5341,6 +5342,41 @@ mod tests {
             end,
             egui::pos2(101.0, 120.0)
         ));
+    }
+
+    #[test]
+    fn source_multiselect_keeps_active_gizmo_target_synchronized() {
+        let mut editor = Architect::new(
+            PathBuf::from("/client/element"),
+            None,
+            "a01".into(),
+        );
+        editor.multi_selection.extend([2, 4]);
+        editor
+            .multi_scene_items
+            .insert(2, ("models/first.ecm".into(), [1.0, 2.0, 3.0]));
+        editor
+            .multi_scene_items
+            .insert(4, ("models/second.ecm".into(), [4.0, 5.0, 6.0]));
+        editor.selected_placement = Some(7);
+        editor.sync_source_selection();
+        assert_eq!(editor.selected_scene_object, Some(2));
+        assert_eq!(editor.selected_scene_transform, Some([1.0, 2.0, 3.0]));
+        assert_eq!(editor.selected_asset.as_deref(), Some("models/first.ecm"));
+        assert_eq!(editor.selected_placement, None);
+
+        editor.multi_selection.remove(&2);
+        editor.multi_scene_items.remove(&2);
+        editor.sync_source_selection();
+        assert_eq!(editor.selected_scene_object, Some(4));
+        assert_eq!(editor.selected_scene_transform, Some([4.0, 5.0, 6.0]));
+        assert_eq!(editor.selected_asset.as_deref(), Some("models/second.ecm"));
+
+        editor.multi_selection.clear();
+        editor.multi_scene_items.clear();
+        editor.sync_source_selection();
+        assert_eq!(editor.selected_scene_object, None);
+        assert_eq!(editor.selected_scene_transform, None);
     }
 
     #[test]
