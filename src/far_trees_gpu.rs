@@ -608,9 +608,13 @@ fn rock_sample(corner:u32,time:f32)->vec3<f32>{
  // Bring the end of the measured interval smoothly back to its start.
  result=mix(result,rocking[p].xyz,clamp((phase-60.)/4.,0.,1.));return result;
 }
-fn fogged(linear:vec3<f32>, reciprocal_w:f32)->vec3<f32> {
+fn fog_view_depth(world:vec3<f32>)->f32 {
+ // Re-evaluate clip-space W from the perspective-correct world position.
+ return max((camera.matrix*vec4<f32>(world,1.)).w,0.);
+}
+fn fogged(linear:vec3<f32>,world:vec3<f32>)->vec3<f32> {
  if camera.fog_range.z<0.5 {return linear;}
- let view_z=1./max(reciprocal_w,0.0000001);
+ let view_z=fog_view_depth(world);
  let span=camera.fog_range.y-camera.fog_range.x;
  let f=select(clamp((view_z-camera.fog_range.x)/select(span,0.001,abs(span)<0.001),0.,1.),select(0.,1.,view_z>=camera.fog_range.y),abs(span)<0.001);
  let c=max(linear,vec3<f32>(0.));let encoded=select(c*12.92,1.055*pow(c,vec3<f32>(1./2.4))-0.055,c>vec3<f32>(0.0031308));
@@ -638,9 +642,9 @@ struct Out {@builtin(position) pos:vec4<f32>,@location(0) normal:vec3<f32>,@loca
   let rgb=clamp(camera.region_ambient.rgb+camera.region_diffuse.rgb*lambert,vec3<f32>(0.),vec3<f32>(1.));
   let luminance=dot(rgb,vec3<f32>(0.2126,0.7152,0.0722));
   let light=mix(vec3<f32>(luminance),rgb,0.25);
-  return vec4<f32>(fogged(tex.rgb*light,i.pos.w),1.);
+  return vec4<f32>(fogged(tex.rgb*light,i.world),1.);
  }
- let ndl_raw=dot(normalize(i.normal),normalize(camera.sun.xyz));let ndl=select(max(ndl_raw,0.),abs(ndl_raw)*0.85+0.15,camera.sun.w<0. && i.kind>3.5);let light=camera.light.x+camera.light.y*ndl;return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.pos.w),1.);}
+ let ndl_raw=dot(normalize(i.normal),normalize(camera.sun.xyz));let ndl=select(max(ndl_raw,0.),abs(ndl_raw)*0.85+0.15,camera.sun.w<0. && i.kind>3.5);let light=camera.light.x+camera.light.y*ndl;return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.world),1.);}
 "#;
 impl FarTrees {
     pub fn new(
