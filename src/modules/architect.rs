@@ -5033,6 +5033,22 @@ impl Architect {
                 )
             })
             .collect::<Vec<_>>();
+        // Keep the active item outlined even if a tool transition temporarily
+        // leaves the multi-selection set empty.
+        if let Some(index) = self
+            .selected_placement
+            .filter(|index| !self.selected_placements.contains(index))
+        {
+            if let Some(object) = self.project.objects.get(index).filter(|object| object.visible) {
+                outline_items.push((
+                    object.asset.clone(),
+                    object.position,
+                    object.scale,
+                    object.scale_axes,
+                    object.rotation,
+                ));
+            }
+        }
         if outline_items.is_empty() {
             for (asset, position) in self.multi_scene_items.values() {
                 outline_items.push((asset.clone(), *position, 1.0, [1.; 3], [0.; 3]));
