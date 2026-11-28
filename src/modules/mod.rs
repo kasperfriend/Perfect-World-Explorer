@@ -37,10 +37,8 @@ pub struct Modules {
     packages: Registry,
     selected: usize,
     /// The world's effect catalogue, handed over by the host when the GFX
-    /// archive attaches. Modules read it to find an effect by group, name or
-    /// search; playing one in the world goes through the host's
-    /// `World::spawn_catalog_effect`, which this handle deliberately does not
-    /// reach yet — access first, wiring later.
+    /// archive attaches. Architect resolves project-owned .gfx placements
+    /// against this index; WorldModels remains the owner of playback and lights.
     effect_catalog: Option<crate::gfx_catalog::Catalog>,
 }
 
