@@ -840,6 +840,52 @@ impl Architect {
         inside
     }
 
+    /// Clip a projected world-space box edge to the renderer's reverse-Z
+    /// depth interval. Drawing only edges whose endpoints are both in [0, 1]
+    /// makes a selected boundary disappear as soon as a corner crosses a
+    /// near/far plane. Interpolating the crossing keeps the outline stable.
+    fn project_clipped_edge(
+        start: Vec3,
+        end: Vec3,
+        screen: egui::Rect,
+        view_projection: glam::Mat4,
+    ) -> Option<[egui::Pos2; 2]> {
+        let mut a = view_projection.project_point3(start);
+        let mut b = view_projection.project_point3(end);
+        if !a.is_finite() || !b.is_finite() {
+            return None;
+        }
+        if (a.z < 0.0 && b.z < 0.0) || (a.z > 1.0 && b.z > 1.0) {
+            return None;
+        }
+        if a.z < 0.0 || a.z > 1.0 {
+            let boundary = if a.z < 0.0 { 0.0 } else { 1.0 };
+            let denominator = b.z - a.z;
+            if denominator.abs() < 1.0e-7 {
+                return None;
+            }
+            a = a.lerp(b, ((boundary - a.z) / denominator).clamp(0.0, 1.0));
+        }
+        if b.z < 0.0 || b.z > 1.0 {
+            let boundary = if b.z < 0.0 { 0.0 } else { 1.0 };
+            let denominator = a.z - b.z;
+            if denominator.abs() < 1.0e-7 {
+                return None;
+            }
+            b = b.lerp(a, ((boundary - b.z) / denominator).clamp(0.0, 1.0));
+        }
+        let to_screen = |point: Vec3| {
+            egui::pos2(
+                screen.left() + (point.x + 1.0) * 0.5 * screen.width(),
+                screen.top() + (1.0 - point.y) * 0.5 * screen.height(),
+            )
+        };
+        let a = to_screen(a);
+        let b = to_screen(b);
+        (a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite())
+            .then_some([a, b])
+    }
+
     /// Project transformed object bounds for viewport selection. Marquee and
     /// lasso operate on visible geometry rather than just the object origin.
     fn projected_bounds_rect(
@@ -4871,15 +4917,6 @@ impl Architect {
         // Draw a clear white 3D wire boundary for every selected project
         // placement. The current scene API exposes placement origins rather
         // than per-instance mesh bounds, so use conservative class-aware extents.
-        let project_outline_point = |point: Vec3| -> Option<egui::Pos2> {
-            let clip = view_projection.project_point3(point);
-            (clip.is_finite() && (0.0..=1.0).contains(&clip.z)).then(|| {
-                egui::pos2(
-                    screen.left() + (clip.x + 1.) * 0.5 * screen.width(),
-                    screen.top() + (1. - clip.y) * 0.5 * screen.height(),
-                )
-            })
-        };
         let mut outline_items = self
             .selected_placements
             .iter()
@@ -4926,9 +4963,8 @@ impl Architect {
             let center = Vec3::from_array(position);
             let rotation =
                 glam::Quat::from_euler(glam::EulerRot::XYZ, euler[0], euler[1], euler[2]);
-            let mut corners = [egui::Pos2::ZERO; 8];
-            let mut valid = [false; 8];
-            for bits in 0..8 {
+            let mut world_corners = [Vec3::ZERO; 8];
+            for (bits, corner) in world_corners.iter_mut().enumerate() {
                 let local = Vec3::new(
                     if bits & 1 == 0 {
                         local_min.x
@@ -4946,20 +4982,23 @@ impl Architect {
                         local_max.z
                     },
                 ) * (scale.max(0.01) * Vec3::from_array(scale_axes));
-                let point = center + rotation * local;
-                if let Some(projected) = project_outline_point(point) {
-                    corners[bits] = projected;
-                    valid[bits] = true;
-                }
+                *corner = center + rotation * local;
             }
             for bits in 0..8 {
                 for axis in [1usize, 2, 4] {
                     let other = bits ^ axis;
-                    if bits < other && valid[bits] && valid[other] {
-                        outline_painter.line_segment(
-                            [corners[bits], corners[other]],
-                            egui::Stroke::new(1.8, egui::Color32::WHITE),
-                        );
+                    if bits < other {
+                        if let Some(edge) = Self::project_clipped_edge(
+                            world_corners[bits],
+                            world_corners[other],
+                            screen,
+                            view_projection,
+                        ) {
+                            outline_painter.line_segment(
+                                edge,
+                                egui::Stroke::new(1.8, egui::Color32::WHITE),
+                            );
+                        }
                     }
                 }
             }
@@ -5103,6 +5142,40 @@ mod tests {
             end,
             egui::pos2(101.0, 120.0)
         ));
+    }
+
+    #[test]
+    fn selected_bounds_clip_edges_instead_of_dropping_them_at_depth_planes() {
+        let viewport = egui::Rect::from_min_size(
+            egui::pos2(10.0, 20.0),
+            egui::vec2(200.0, 100.0),
+        );
+        let edge = Architect::project_clipped_edge(
+            Vec3::new(-0.5, 0.0, -1.0),
+            Vec3::new(0.5, 0.0, 2.0),
+            viewport,
+            glam::Mat4::IDENTITY,
+        )
+        .expect("edge crosses the visible depth range");
+        assert!((edge[0].x - 60.0).abs() < 1.0e-4);
+        assert!((edge[1].x - 160.0).abs() < 1.0e-4);
+        assert!((edge[0].y - 70.0).abs() < 1.0e-4);
+        assert!((edge[1].y - 70.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn selected_bounds_skip_edges_entirely_outside_depth_range() {
+        let viewport = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(100.0, 100.0),
+        );
+        assert!(Architect::project_clipped_edge(
+            Vec3::new(-0.5, 0.0, -3.0),
+            Vec3::new(0.5, 0.0, -1.0),
+            viewport,
+            glam::Mat4::IDENTITY,
+        )
+        .is_none());
     }
 
     #[test]
