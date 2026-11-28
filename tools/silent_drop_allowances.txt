@@ -73,8 +73,8 @@ src/weather_gpu.rs:70 unreachable an absent size_variation is the documented def
 src/weather_gpu.rs:74 unreachable an absent count is the documented default of a uniform effect
 src/weather_gpu.rs:76 unreachable an absent count is the documented default of a uniform effect
 src/weather_gpu.rs:313 unreachable an absent field is the documented default of a uniform
-src/terrain_store.rs:386 unreachable a clock that predates 1970 gives zero nanoseconds; the nonce also carries a counter
-src/terrain_store.rs:581 unreachable a counter default for a fresh store; nothing is read
+src/terrain_store.rs:412 unreachable a clock that predates 1970 gives zero nanoseconds; the nonce also carries a counter
+src/terrain_store.rs:631 unreachable a counter default for a fresh store; nothing is read
 src/world_page_cache.rs:130 unreachable a clock that predates 1970 gives zero; the temp name also carries a counter
 src/dlss/imp.rs:912 unreachable an absent SDK frame-generation option is the documented default value
 src/fsr/fg.rs:568 unreachable an absent SDK option is the documented default value
@@ -82,11 +82,11 @@ src/fsr/fg.rs:578 unreachable an absent SDK option is the documented default val
 src/model_asset.rs:362 unreachable an absent optional field is the documented default of the record
 src/world_audio.rs:108 unreachable an absent optional field is the documented default of the setting
 src/load_status.rs:160 unreachable `reasons` returns Vec; unfit lock gives no reasons, which is the honest empty answer
-src/terrain_store.rs:453 unreachable a directory removal whose failure the next create reports
-src/terrain_store.rs:626 unreachable a cleanup unlink of a temp file
-src/terrain_store.rs:639 unreachable a cleanup unlink of a temp file
-src/terrain_store.rs:806 unreachable a cleanup unlink of a temp file
-src/terrain_store.rs:808 unreachable a cleanup unlink of a temp file
+src/terrain_store.rs:483 unreachable a directory removal whose failure the next create reports
+src/terrain_store.rs:676 unreachable a cleanup unlink of a temp file
+src/terrain_store.rs:689 unreachable fmt::Write into String is infallible because String implements fmt::Write without I/O
+src/terrain_store.rs:859 unreachable a cleanup unlink of a temp file
+src/terrain_store.rs:861 unreachable a cleanup unlink of a temp file
 src/world_page_cache.rs:243 unreachable a cache eviction unlink; a failure is retried on the next write
 src/world_page_cache.rs:302 unreachable a cache eviction unlink; a failure is retried on the next write
 src/world_catalog.rs:90 unreachable an absent record set is the documented default: this instance simply has no list entry
@@ -128,4 +128,4 @@ src/gpu.rs unreachable the harvest poll installs the completed scene in its cach
 src/gpu.rs unreachable refusing an identical initial day/night pairing leaves the seeded sky transition state valid; code: let _ = sky_transition.author(
 src/dlss/loader.rs unreachable OnceLock::set can fail only when another initialisation already won; CORE.get below uses the live core singleton; code: let _ = CORE.set(core);
 src/fsr/imp.rs unreachable this implementation keeps the same queue parameter as the shared FSR constructor but builds the native queue from the DX12 device; code: let _ = queue;
-src/model_draw_gpu.rs:724 unreachable the let-else guard returns when no alpha receiver or indexed mesh is available; there is no drawable alpha mesh in that case
+src/model_draw_gpu.rs:721 unreachable the let-else guard returns when no alpha receiver or indexed mesh is available; there is no drawable alpha mesh in that case
