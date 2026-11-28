@@ -5082,9 +5082,9 @@ mod tests {
             viewport,
             projection * view,
             Vec3::ZERO,
-            Vec3::Y,
+            Vec3::Z,
         ).unwrap();
-        assert!(point.y.abs() < 1e-4);
+        assert!(point.z.abs() < 1e-4);
         assert!(point.x > 0.0);
     }
 
