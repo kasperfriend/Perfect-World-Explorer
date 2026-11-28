@@ -1300,11 +1300,13 @@ impl Architect {
                     .into();
             self.preview = None;
             self.bmd_preview = None;
+            self.bmd_preview_path = None;
             return;
         };
         if self.renderer_effect_path(asset).is_some() {
             self.preview = None;
             self.bmd_preview = None;
+            self.bmd_preview_path = None;
             self.preview_message =
                 "GFX effect uses the native world effect handler and appears after placement."
                     .into();
@@ -1354,6 +1356,7 @@ impl Architect {
             return;
         }
         self.bmd_preview = None;
+        self.bmd_preview_path = None;
         if self.renderer_tree_type(asset).is_some() {
             self.preview = None;
             self.preview_message = "SpeedTree uses the native vegetation renderer. Select Place to see its live LOD/material/wind preview in the world.".into();
