@@ -147,7 +147,10 @@ fn editor_scene_transform(
         || !placement.rotation.iter().all(|value| value.is_finite())
         || !placement.scale.is_finite()
         || !(0.001..=1000.).contains(&placement.scale)
-        || !placement.scale_axes.iter().all(|v| v.is_finite() && (0.001..=1000.).contains(v))
+        || !placement
+            .scale_axes
+            .iter()
+            .all(|v| v.is_finite() && (0.001..=1000.).contains(v))
     {
         return Err("non-finite or out-of-range editor transform".into());
     }
@@ -168,7 +171,9 @@ fn editor_scene_transform(
         action: String::new(),
     };
     let transform = crate::world_models::transform(&scene_placement)?
-        * glam::Mat4::from_scale(glam::Vec3::splat(placement.scale) * glam::Vec3::from_array(placement.scale_axes));
+        * glam::Mat4::from_scale(
+            glam::Vec3::splat(placement.scale) * glam::Vec3::from_array(placement.scale_axes),
+        );
     Ok((scene_placement, transform))
 }
 
