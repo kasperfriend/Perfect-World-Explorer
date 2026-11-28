@@ -80,22 +80,22 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/gfx_light.rs` | 366 | `let-underscore` | **unreachable** | `let _ = version;` |
 | `src/gfx_player.rs` | 1748 | `let-underscore` | **unreachable** | `let _ = root_path;` |
 | `src/gfx_player.rs` | 3349 | `else-continue` | **unreachable** | `else {` |
-| `src/gpu.rs` | 603 | `let-underscore` | **unreachable** | `let _ = write!(` |
-| `src/gpu.rs` | 2750 | `let-underscore` | **unreachable** | `let _ = sky_transition.author(` |
-| `src/gpu.rs` | 4004 | `let-underscore` | **unreachable** | `let _ = tx.send(result);` |
-| `src/gpu.rs` | 4181 | `let-underscore` | **unreachable** | `let _ = self.raywatcher_harvest.poll_background_build();` |
-| `src/gpu.rs` | 4197 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
-| `src/gpu.rs` | 4263 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
-| `src/gpu.rs` | 4277 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
-| `src/gpu.rs` | 4282 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
-| `src/gpu.rs` | 4480 | `let-underscore` | **unreachable** | `let _ = tx.send(result);` |
-| `src/gpu.rs` | 5480 | `let-underscore` | **unreachable** | `let _ = e.begin_render_pass(&wgpu::RenderPassDescriptor {` |
-| `src/gpu.rs` | 7697 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
-| `src/gpu.rs` | 8539 | `unwrap_or_default` | **named** | `elapsed.unwrap_or_default(),` |
-| `src/gpu.rs` | 9452 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
-| `src/gpu.rs` | 9607 | `let-underscore` | **unreachable** | `let _ = &mut pass;` |
-| `src/gpu.rs` | 9898 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
-| `src/gpu.rs` | 10235 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
+| `src/gpu.rs` | 604 | `let-underscore` | **unreachable** | `let _ = write!(` |
+| `src/gpu.rs` | 2751 | `let-underscore` | **unreachable** | `let _ = sky_transition.author(` |
+| `src/gpu.rs` | 4005 | `let-underscore` | **unreachable** | `let _ = tx.send(result);` |
+| `src/gpu.rs` | 4182 | `let-underscore` | **unreachable** | `let _ = self.raywatcher_harvest.poll_background_build();` |
+| `src/gpu.rs` | 4198 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
+| `src/gpu.rs` | 4264 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
+| `src/gpu.rs` | 4278 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
+| `src/gpu.rs` | 4283 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
+| `src/gpu.rs` | 4483 | `let-underscore` | **unreachable** | `let _ = tx.send(result);` |
+| `src/gpu.rs` | 5483 | `let-underscore` | **unreachable** | `let _ = e.begin_render_pass(&wgpu::RenderPassDescriptor {` |
+| `src/gpu.rs` | 7700 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
+| `src/gpu.rs` | 8542 | `unwrap_or_default` | **named** | `elapsed.unwrap_or_default(),` |
+| `src/gpu.rs` | 9455 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
+| `src/gpu.rs` | 9610 | `let-underscore` | **unreachable** | `let _ = &mut pass;` |
+| `src/gpu.rs` | 9901 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
+| `src/gpu.rs` | 10238 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
 | `src/grass_random.rs` | 144 | `else-continue` | **unreachable** | `else {` |
 | `src/latency.rs` | 309 | `let-underscore` | **unreachable** | `let _ = end(1);` |
 | `src/launcher_ui.rs` | 222 | `ok-question` | **probe** | `decode(&fs::read(settings_file()?).ok()?)` |
