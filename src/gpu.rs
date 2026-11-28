@@ -3116,8 +3116,7 @@ impl Renderer {
                     w as f32 / h.max(1) as f32,
                 )
             }) {
-                let range =
-                    crate::terrain_cutoff::fit_fog(active_fog.start, active_fog.end, cap);
+                let range = crate::terrain_cutoff::fit_fog(active_fog.start, active_fog.end, cap);
                 active_fog.start = range[0];
                 active_fog.end = range[1];
             }
