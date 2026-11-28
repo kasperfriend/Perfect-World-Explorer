@@ -841,8 +841,8 @@ impl Architect {
         self.object_drag_axis = None;
         self.object_drag_start_pointer = None;
         self.object_drag_start_hit = None;
-            self.object_drag_start_axis_parameter = None;
-            self.object_drag_start_rotation_vector = None;
+        self.object_drag_start_axis_parameter = None;
+        self.object_drag_start_rotation_vector = None;
         self.object_drag_group.clear();
         self.object_drag_snapshot = None;
         self.marquee_start = None;
@@ -3688,8 +3688,8 @@ impl Architect {
                             TransformMode::Scale => {}
                             TransformMode::Rotate => {
                                 for (axis_index, axis) in
-                            [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate()
-                        {
+                                    [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate()
+                                {
                                     let ring = Self::gizmo_ring_points(
                                         origin,
                                         axis,
@@ -4274,8 +4274,8 @@ impl Architect {
             }
             self.object_drag_group.clear();
             self.object_drag_start_hit = None;
-        self.object_drag_start_axis_parameter = None;
-        self.object_drag_start_rotation_vector = None;
+            self.object_drag_start_axis_parameter = None;
+            self.object_drag_start_rotation_vector = None;
             self.object_dragging = false;
             self.object_drag_axis = None;
             self.object_drag_start_pointer = None;
@@ -4424,7 +4424,9 @@ impl Architect {
                     }
                     TransformMode::Rotate => {
                         let radius = (camera.distance(origin) * 0.045).clamp(0.5, 10.);
-                        for (axis_index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                        for (axis_index, axis) in
+                            [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate()
+                        {
                             let mut points = Self::gizmo_ring_points(
                                 origin,
                                 axis,
@@ -5215,16 +5217,9 @@ mod tests {
 
     #[test]
     fn ray_axis_parameter_is_finite_for_a_center_ray_and_horizontal_axis() {
-        let viewport = egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(100.0, 100.0),
-        );
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
         let projection = glam::Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0);
-        let view = glam::Mat4::look_at_rh(
-            Vec3::new(0.0, 0.0, 10.0),
-            Vec3::ZERO,
-            Vec3::Y,
-        );
+        let view = glam::Mat4::look_at_rh(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO, Vec3::Y);
         let value = Architect::ray_axis_parameter(
             egui::pos2(50.0, 50.0),
             viewport,
