@@ -3103,14 +3103,8 @@ impl Renderer {
             } else {
                 1.
             });
-        // Outdoor fog is a camera-space horizon, never a function of map edges
-        // or the optional terrain-residency window. Keep regional colour and
-        // nearer authored ranges, but prevent long regional ranges from moving
-        // the fog boundary all the way to the edge of a fully rendered world.
-        let mut active_fog = camera.active_fog();
-        if camera.underwater_depth <= 0. {
-            active_fog = crate::fog_matrix::camera_relative_outdoor_fog(active_fog);
-        }
+        // All passes read the same camera-relative fog via active_fog().
+        let active_fog = camera.active_fog();
         let (mut fog_range, fog_color) = (active_fog.range(), active_fog.color4());
         // Uniform fog_range.w is the terrain day/night factor; the shader reads
         // it instead of overloading sun.w (the lightmap-availability flag).
@@ -5395,11 +5389,7 @@ impl Renderer {
                     frame.elapsed,
                     camera.far,
                     camera.underwater_depth,
-                    if camera.underwater_depth > 0. {
-                        camera.underwater_fog
-                    } else {
-                        camera.air_fog
-                    },
+                    camera.active_fog(),
                     false, // no screen-space fog; scene geometry uses material fog
                     false,
                     camera.bloom,
@@ -5482,11 +5472,7 @@ impl Renderer {
                     frame.elapsed,
                     camera.far,
                     camera.underwater_depth,
-                    if camera.underwater_depth > 0. {
-                        camera.underwater_fog
-                    } else {
-                        camera.air_fog
-                    },
+                    camera.active_fog(),
                     false, // no screen-space fog; scene geometry uses material fog
                     false,
                     camera.bloom,
@@ -5644,12 +5630,8 @@ impl Renderer {
                 above.clip = [plane, 1., 1., normal.clip[3]];
                 // 0x7cca50: the below-surface scene is drawn with air fog even
                 // while the camera is underwater.
-                let above_fog = crate::fog_matrix::below_surface_fog(crate::fog_matrix::Fog {
-                    start: camera.air_fog.start,
-                    end: camera.air_fog.end,
-                    color: camera.air_fog.color,
-                    enabled: true,
-                });
+                let above_fog =
+                    crate::fog_matrix::below_surface_fog(camera.outdoor_fog());
                 above.fog_range = above_fog.range();
                 above.fog_color = above_fog.color4();
                 self.queue
@@ -5920,11 +5902,7 @@ impl Renderer {
                 frame.elapsed,
                 camera.far,
                 camera.underwater_depth,
-                if camera.underwater_depth > 0. {
-                    camera.underwater_fog
-                } else {
-                    camera.air_fog
-                },
+                camera.active_fog(),
                 false, // no screen-space fog; scene geometry uses material fog
                 false,
                 camera.bloom,
@@ -6075,25 +6053,46 @@ impl Camera {
             logic_delta_ms: 0,
         }
     }
+    fn authored_air_fog(&self) -> crate::fog_matrix::Fog {
+        crate::fog_matrix::Fog {
+            start: self.air_fog.start,
+            end: self.air_fog.end,
+            color: self.air_fog.color,
+            enabled: true,
+        }
+    }
+    /// Outdoor fog used by the camera and the below-surface scene pass.
+    fn outdoor_fog(&self) -> crate::fog_matrix::Fog {
+        crate::fog_matrix::camera_relative_outdoor_fog(self.authored_air_fog())
+    }
     fn active_fog(&self) -> crate::fog_matrix::Fog {
-        // Main/reflection table fog uses the camera's active regional set; the
-        // selection (and its enable rule) lives in the audited fog matrix.
-        crate::fog_matrix::camera_fog(
-            self.underwater_depth > 0.,
-            self.atmospheric_fog,
-            crate::fog_matrix::Fog {
-                start: self.air_fog.start,
-                end: self.air_fog.end,
-                color: self.air_fog.color,
-                enabled: true,
-            },
-            crate::fog_matrix::Fog {
-                start: self.underwater_fog.start,
-                end: self.underwater_fog.end,
-                color: self.underwater_fog.color,
-                enabled: true,
-            },
-        )
+        // Every pass obtains the same camera-relative air horizon here. Water
+        // retains its separate authored underwater range.
+        if self.underwater_depth > 0. {
+            crate::fog_matrix::camera_fog(
+                true,
+                self.atmospheric_fog,
+                self.authored_air_fog(),
+                crate::fog_matrix::Fog {
+                    start: self.underwater_fog.start,
+                    end: self.underwater_fog.end,
+                    color: self.underwater_fog.color,
+                    enabled: true,
+                },
+            )
+        } else {
+            crate::fog_matrix::camera_fog(
+                false,
+                self.atmospheric_fog,
+                self.outdoor_fog(),
+                crate::fog_matrix::Fog {
+                    start: self.underwater_fog.start,
+                    end: self.underwater_fog.end,
+                    color: self.underwater_fog.color,
+                    enabled: true,
+                },
+            )
+        }
     }
     fn fog_uniform(&self) -> ([f32; 4], [f32; 4]) {
         let f = self.active_fog();
