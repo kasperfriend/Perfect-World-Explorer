@@ -5629,8 +5629,7 @@ impl Renderer {
                 above.clip = [plane, 1., 1., normal.clip[3]];
                 // 0x7cca50: the below-surface scene is drawn with air fog even
                 // while the camera is underwater.
-                let above_fog =
-                    crate::fog_matrix::below_surface_fog(camera.outdoor_fog());
+                let above_fog = crate::fog_matrix::below_surface_fog(camera.outdoor_fog());
                 above.fog_range = above_fog.range();
                 above.fog_color = above_fog.color4();
                 self.queue

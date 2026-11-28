@@ -94,11 +94,7 @@ pub fn camera_relative_outdoor_fog(mut fog: Fog) -> Fog {
     if !fog.enabled {
         return fog;
     }
-    if !fog.start.is_finite()
-        || !fog.end.is_finite()
-        || fog.start < 0.
-        || fog.end <= fog.start
-    {
+    if !fog.start.is_finite() || !fog.end.is_finite() || fog.start < 0. || fog.end <= fog.start {
         fog.start = CAMERA_OUTDOOR_FOG_START;
         fog.end = CAMERA_OUTDOOR_FOG_END;
         return fog;
