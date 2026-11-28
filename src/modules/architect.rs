@@ -1075,7 +1075,8 @@ impl Architect {
                             "BMD bounds loaded from the client mesh. Its native materials are shown in the world viewport.".into();
                     } else {
                         self.preview_message =
-                            "This BMD contains no finite mesh geometry for selection bounds.".into();
+                            "This BMD contains no finite mesh geometry for selection bounds."
+                                .into();
                     }
                 }
                 Err(error) => {
