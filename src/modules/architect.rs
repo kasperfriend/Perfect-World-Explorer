@@ -110,6 +110,10 @@ pub struct Architect {
     cursor: CursorMode,
     transform_mode: TransformMode,
     snap: SnapMode,
+    transform_snap: bool,
+    translation_snap: f32,
+    rotation_snap_degrees: f32,
+    scale_snap_percent: f32,
     brush: BrushMode,
     brush_radius: f32,
     brush_strength: f32,
@@ -221,6 +225,10 @@ impl Architect {
             cursor: CursorMode::Select,
             transform_mode: TransformMode::Move,
             snap: SnapMode::Smart,
+            transform_snap: false,
+            translation_snap: 1.0,
+            rotation_snap_degrees: 15.0,
+            scale_snap_percent: 5.0,
             brush: BrushMode::Raise,
             brush_radius: 24.,
             brush_strength: 2.,
@@ -3484,6 +3492,24 @@ impl Architect {
                 }
                 ui.separator();
                 ui.heading("Custom placements");
+                ui.collapsing("Transform snapping", |ui| {
+                    ui.checkbox(&mut self.transform_snap, "Snap during gizmo drags");
+                    ui.add(
+                        egui::DragValue::new(&mut self.translation_snap)
+                            .speed(0.1)
+                            .prefix("Move step "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.rotation_snap_degrees)
+                            .speed(1.0)
+                            .prefix("Rotate step ° "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.scale_snap_percent)
+                            .speed(0.5)
+                            .prefix("Scale step % "),
+                    );
+                });
                 ui.horizontal(|ui| {
                     if ui.button("Copy (Ctrl+C)").clicked() {
                         self.copy_selected_objects();
@@ -4699,6 +4725,16 @@ impl Architect {
                             }
                         }
                     }
+                    if self.transform_snap {
+                        let step = self.translation_snap.abs().max(0.001);
+                        for index in &indices {
+                            if let Some(object) = self.project.objects.get_mut(*index) {
+                                for component in &mut object.position {
+                                    *component = (*component / step).round() * step;
+                                }
+                            }
+                        }
+                    }
                 }
                 TransformMode::Rotate => {
                     if let (Some(start_vector), Some(current)) = (
@@ -4724,10 +4760,14 @@ impl Architect {
                         let start_vector = Vec3::from_array(start_vector).normalize_or_zero();
                         let current_vector = Vec3::from_array(current).normalize_or_zero();
                         let axis_vector = [Vec3::X, Vec3::Y, Vec3::Z][axis];
-                        let angle = start_vector
+                        let mut angle = start_vector
                             .cross(current_vector)
                             .dot(axis_vector)
                             .atan2(start_vector.dot(current_vector));
+                        if self.transform_snap {
+                            let step = self.rotation_snap_degrees.abs().max(0.1).to_radians();
+                            angle = (angle / step).round() * step;
+                        }
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
                                 let original = self
@@ -4775,6 +4815,12 @@ impl Architect {
                                 .clamp(0.05, 20.0)
                         } else {
                             (-(current.y - start.y) * 0.01).exp().clamp(0.05, 20.0)
+                        };
+                        let factor = if self.transform_snap {
+                            let step = self.scale_snap_percent.abs().max(0.1) * 0.01;
+                            (1.0 + ((factor - 1.0) / step).round() * step).clamp(0.05, 20.0)
+                        } else {
+                            factor
                         };
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
@@ -5684,12 +5730,18 @@ mod tests {
             archive_cache: HashMap::new(),
             archive_detail_cache: HashMap::new(),
             archive_details: Vec::new(),
+            archive_choices: Vec::new(),
+            archive_view_filter: 0,
             project_name: project.name.clone(),
             selected_project: None,
             selected_map: project.source_map.clone(),
             cursor: CursorMode::Select,
             transform_mode: TransformMode::Move,
             snap: SnapMode::Smart,
+            transform_snap: false,
+            translation_snap: 1.0,
+            rotation_snap_degrees: 15.0,
+            scale_snap_percent: 5.0,
             brush: BrushMode::Raise,
             brush_radius: 24.,
             brush_strength: 2.,
@@ -5701,6 +5753,8 @@ mod tests {
             )),
             effect_catalog: None,
             preview: None,
+            bmd_preview: None,
+            bmd_preview_path: None,
             preview_bounds: HashMap::new(),
             tree_types: Vec::new(),
             preview_message: String::new(),
