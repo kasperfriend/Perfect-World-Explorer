@@ -4159,17 +4159,29 @@ impl Architect {
                     if let (Some(start_vector), Some(current)) = (
                         self.object_drag_start_rotation_vector,
                         pointer.and_then(|pointer| {
-                            let axis = [Vec3::X, Vec3::Y, Vec3::Z][self.object_drag_axis.unwrap_or(1).min(2)];
-                            Self::ray_plane_point(pointer, screen, view_projection,
-                                Vec3::from_array(self.object_drag_start_position), axis)
-                                .map(|point| (point - Vec3::from_array(self.object_drag_start_position)).normalize_or_zero().to_array())
+                            let axis = [Vec3::X, Vec3::Y, Vec3::Z]
+                                [self.object_drag_axis.unwrap_or(1).min(2)];
+                            Self::ray_plane_point(
+                                pointer,
+                                screen,
+                                view_projection,
+                                Vec3::from_array(self.object_drag_start_position),
+                                axis,
+                            )
+                            .map(|point| {
+                                (point - Vec3::from_array(self.object_drag_start_position))
+                                    .normalize_or_zero()
+                                    .to_array()
+                            })
                         }),
                     ) {
                         let axis = self.object_drag_axis.unwrap_or(1).min(2);
                         let start_vector = Vec3::from_array(start_vector).normalize_or_zero();
                         let current_vector = Vec3::from_array(current).normalize_or_zero();
                         let axis_vector = [Vec3::X, Vec3::Y, Vec3::Z][axis];
-                        let angle = start_vector.cross(current_vector).dot(axis_vector)
+                        let angle = start_vector
+                            .cross(current_vector)
+                            .dot(axis_vector)
                             .atan2(start_vector.dot(current_vector));
                         for index in indices {
                             if let Some(object) = self.project.objects.get_mut(index) {
