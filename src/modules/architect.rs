@@ -4361,8 +4361,8 @@ impl Architect {
                     }
                 }
             }
-            let source_gizmo_position = axis_pick
-                .and_then(|_| self.selected_source_target().map(|(_, position)| position));
+            let source_gizmo_position =
+                axis_pick.and_then(|_| self.selected_source_target().map(|(_, position)| position));
             // Source-scene instances are immutable. The first transform-handle
             // drag promotes the selection into a project-owned copy.
             if axis_pick.is_some()
@@ -5417,11 +5417,7 @@ mod tests {
 
     #[test]
     fn place_at_camera_uses_the_requested_asset_and_camera_position() {
-        let mut editor = Architect::new(
-            PathBuf::from("/client/element"),
-            None,
-            "a01".into(),
-        );
+        let mut editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
         editor.place_asset_at_camera(
             "models.pck::models/test.ecm".into(),
             Vec3::new(12.0, 34.0, 56.0),
@@ -5438,11 +5434,7 @@ mod tests {
 
     #[test]
     fn source_gizmo_target_survives_missing_hierarchy_row_index() {
-        let mut editor = Architect::new(
-            PathBuf::from("/client/element"),
-            None,
-            "a01".into(),
-        );
+        let mut editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
         editor.selected_scene_object = None;
         editor.selected_asset = Some("models.pck::models/trees/test.ecm".into());
         editor.selected_scene_transform = Some([10.0, 20.0, 30.0]);

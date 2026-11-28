@@ -504,7 +504,8 @@ impl BmdPreview {
                     Ok(image) => {
                         let (width, height) = image.dimensions();
                         if width == 0 || height == 0 {
-                            texture_warnings.push(format!("{texture_key}: image has zero dimensions"));
+                            texture_warnings
+                                .push(format!("{texture_key}: image has zero dimensions"));
                             None
                         } else {
                             let index = textures.len();
@@ -635,9 +636,16 @@ impl BmdPreview {
     }
 
     pub fn texture_status(&self) -> String {
-        let textured_triangles = self.triangles.iter().filter(|triangle| triangle.texture.is_some()).count();
+        let textured_triangles = self
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.texture.is_some())
+            .count();
         if self.texture_warnings.is_empty() {
-            format!("Diffuse textures loaded: {} · textured triangles: {textured_triangles}", self.textures.len())
+            format!(
+                "Diffuse textures loaded: {} · textured triangles: {textured_triangles}",
+                self.textures.len()
+            )
         } else {
             format!(
                 "Diffuse textures loaded: {} · {} missing/unsupported",
@@ -734,8 +742,8 @@ impl BmdPreview {
                     if !reciprocal_depth.is_finite() || reciprocal_depth <= 0.0 {
                         continue;
                     }
-                    let uv = (a.4 * (wa / a.1) + b.4 * (wb / b.1) + c.4 * (wc / c.1))
-                        / reciprocal_depth;
+                    let uv =
+                        (a.4 * (wa / a.1) + b.4 * (wb / b.1) + c.4 * (wc / c.1)) / reciprocal_depth;
                     let texel = triangle
                         .texture
                         .and_then(|index| self.textures.get(index))
@@ -1278,8 +1286,7 @@ mod tests {
             width: 2,
             height: 2,
             rgba: vec![
-                255, 0, 0, 255, 0, 255, 0, 255,
-                0, 0, 255, 255, 255, 255, 255, 255,
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
             ],
         };
         assert_eq!(texture.sample(0.25, 0.25), [1.0, 0.0, 0.0, 1.0]);

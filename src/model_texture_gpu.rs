@@ -130,8 +130,12 @@ pub(crate) fn decode_preview_rgba(bytes: &[u8]) -> Result<image::RgbaImage, Stri
         if mip.width == 0 || mip.height == 0 || pixel_count > 64 * 1024 * 1024 {
             return Err("DDS preview dimensions exceed the safety limit".into());
         }
-        let capacity = usize::try_from(pixel_count.checked_mul(4).ok_or("DDS preview byte size overflow")?)
-            .map_err(|_| "DDS preview byte size overflow")?;
+        let capacity = usize::try_from(
+            pixel_count
+                .checked_mul(4)
+                .ok_or("DDS preview byte size overflow")?,
+        )
+        .map_err(|_| "DDS preview byte size overflow")?;
         let mut rgba = Vec::with_capacity(capacity);
         append_mip(bytes, dds.format, mip, &mut rgba)?;
         return image::RgbaImage::from_raw(mip.width, mip.height, rgba)
@@ -324,10 +328,7 @@ mod tests {
         bytes.extend_from_slice(&[0, 0, 255, 255, 0, 255, 0, 128]);
         let image = decode_preview_rgba(&bytes).unwrap();
         assert_eq!(image.dimensions(), (2, 1));
-        assert_eq!(
-            image.into_raw(),
-            [255, 0, 0, 255, 0, 255, 0, 128]
-        );
+        assert_eq!(image.into_raw(), [255, 0, 0, 255, 0, 255, 0, 128]);
     }
 
     #[test]
