@@ -17,13 +17,7 @@ src/latency.rs:309 unreachable an end-of-frame latency marker's return code is a
 src/objects.rs:273 unreachable OnceLock::set: a second logger would be a programming error, and the first is the one used
 src/gfx_file.rs:1395 unreachable `accurate_aabb` is intentionally unread: the flag describes a bound this build derives instead
 src/gfx_player.rs:1748 unreachable `root_path` is intentionally unread at this call site; the path is carried by the element
-src/gpu.rs:7823 unreachable `&mut pass` reborrow to end a borrow; no value is produced
-src/gpu.rs:2542 unreachable `author()` writes into the recorder it is given; the return value carries nothing
-src/gpu.rs:3843 unreachable begin_render_pass returns the encoder-owned pass, which is then used through the handle
-src/gpu.rs:5957 unreachable cursor grab can legitimately fail in windowed mode and is retried; not content
-src/gpu.rs:7668 unreachable cursor grab can legitimately fail in windowed mode and is retried; not content
 src/gfx_player.rs:3349 unreachable let-else on a control that is not a Fractal: this loop asks for the Fractal, so another kind is not a loss
-src/model_draw_gpu.rs:693 unreachable let-else on a mesh that is absent by construction: draw_alpha_mesh is only called for indices alpha_meshes lists
 src/xess/imp.rs:323 unreachable `queue` is kept alive past the call; no result
 src/xess/fg.rs:506 unreachable `queue` is kept alive past the call; no result
 src/windows_setup.rs:450 unreachable mpsc send to the UI: a closed receiver means the window is gone, and the work is moot
@@ -51,18 +45,12 @@ src/world_objects.rs:702 unreachable mpsc invalidate to the UI: a closed receive
 src/world_objects.rs:718 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
 src/world_objects.rs:712 unreachable mpsc done to the UI: a closed receiver means the window is gone
 src/world_objects.rs:966 unreachable mpsc done to the UI: a closed receiver means the window is gone
-src/gpu.rs:8114 unreachable mpsc send of a worker result whose receiver is the caller that already returned
-src/gpu.rs:8449 unreachable mpsc send of a worker result whose receiver is the caller that already returned
 src/dlss/fg.rs:200 unreachable an SDK destroy call's status: the context is being torn down
 src/dlss/fg.rs:305 unreachable an SDK destroy call's status: the context is being torn down
 src/dlss/imp.rs:415 unreachable an SDK destroy call's status: the context is being torn down
 src/dlss/imp.rs:539 unreachable an SDK destroy call's status: the context is being torn down
-src/dlss/loader.rs:296 unreachable an SDK destroy call's status: the context is being torn down
 src/fsr/fg.rs:333 unreachable an SDK destroy call's status: the context is being torn down
 src/fsr/imp.rs:1179 unreachable an SDK destroy call's status: the context is being torn down
-src/fsr/imp.rs:1218 unreachable an SDK destroy call's status: the context is being torn down
-src/fsr/imp.rs:1227 unreachable an SDK destroy call's status: the context is being torn down
-src/fsr/imp.rs:1279 unreachable an SDK destroy call's status: the context is being torn down
 src/xess/fg.rs:416 unreachable an SDK destroy call's status: the context is being torn down
 src/xess/fg.rs:477 unreachable an SDK destroy call's status: the context is being torn down
 src/xess/fg.rs:567 unreachable an SDK marker call's status: a marker is not content
@@ -89,19 +77,10 @@ src/terrain_store.rs:386 unreachable a clock that predates 1970 gives zero nanos
 src/terrain_store.rs:581 unreachable a counter default for a fresh store; nothing is read
 src/world_page_cache.rs:130 unreachable a clock that predates 1970 gives zero; the temp name also carries a counter
 src/dlss/imp.rs:912 unreachable an absent SDK frame-generation option is the documented default value
-src/dlss/loader.rs:480 unreachable an absent SDK option block is the documented default value
-src/dlss/loader.rs:1018 unreachable an absent SDK option block is the documented default value
-src/dlss/loader.rs:1145 unreachable an absent SDK option block is the documented default value
-src/dlss/loader.rs:842 unreachable the loader probe: None means 'this SDK does not export it', which the caller names
-src/dlss/loader.rs:1567 unreachable a cleanup status on teardown; the context is being destroyed
 src/fsr/fg.rs:568 unreachable an absent SDK option is the documented default value
 src/fsr/fg.rs:578 unreachable an absent SDK option is the documented default value
-src/fsr/imp.rs:1404 unreachable an absent SDK option is the documented default value
-src/gpu.rs:473 unreachable a write! into a String cannot fail; the result is the byte count
-src/gpu.rs:479 unreachable a write! into a String cannot fail; the result is the byte count
 src/model_asset.rs:362 unreachable an absent optional field is the documented default of the record
 src/world_audio.rs:108 unreachable an absent optional field is the documented default of the setting
-src/gfx_effect_gpu.rs:555 unreachable the scratch pool is empty-handed a fresh Vec, which is what the pool is for
 src/load_status.rs:160 unreachable `reasons` returns Vec; unfit lock gives no reasons, which is the honest empty answer
 src/terrain_store.rs:453 unreachable a directory removal whose failure the next create reports
 src/terrain_store.rs:626 unreachable a cleanup unlink of a temp file
@@ -112,8 +91,6 @@ src/world_page_cache.rs:243 unreachable a cache eviction unlink; a failure is re
 src/world_page_cache.rs:302 unreachable a cache eviction unlink; a failure is retried on the next write
 src/world_catalog.rs:90 unreachable an absent record set is the documented default: this instance simply has no list entry
 src/grass_random.rs:144 unreachable else-continue over a hash seed selection; every branch produces a seed
-src/gfx_effect_gpu.rs:744 unreachable else-continue over an element kind this pass does not draw; the owner names it
-src/gfx_effect_gpu.rs:821 unreachable else-continue over an element kind this pass does not draw; the owner names it
 # `continuation_path` returns None when there is no such continuation, and that
 # is the caller's answer, not a loss: the name is only built after the range
 # check above has already proven `n` is in range. A stem-less path cannot occur
@@ -122,8 +99,6 @@ src/pck.rs unreachable caller already range-checked n; the stem exists because P
 
 src/windows_setup.rs:1330 unreachable mpsc ready signal: a closed receiver means the caller stopped waiting
 src/world_handoff.rs:205 unreachable mpsc window-shown signal to the UI: a closed receiver means the window is gone
-src/gpu.rs:8380 unreachable an absent frame option is the documented default value
-src/gpu.rs:8383 unreachable an absent frame option is the documented default value
 src/loading_screen.rs:714 unreachable pre-epoch system clock falls back to zero duration for random seed
 src/windows_setup.rs:445 unreachable mpsc progress send to the UI: a closed receiver means the window is gone
 src/world_handoff.rs:117 unreachable an absent optional field is the documented default of the handoff request
@@ -137,3 +112,20 @@ src/world_handoff.rs:276 unreachable an unlink of a stale marker
 src/world_handoff.rs:284 unreachable an unlink of a stale marker
 src/world_handoff.rs:292 unreachable an unlink of a stale marker
 src/world_handoff.rs:308 unreachable an unlink of a stale marker
+src/dlss/loader.rs unreachable NGX parameter names passed here are static SDK identifiers without NUL bytes; CString construction cannot fail; code: let name = std::ffi::CString::new(name).ok()?;
+src/fsr/imp.rs unreachable no provider override was selected, so an empty prefix is the intended diagnostic text; code: .unwrap_or_default()
+src/far_trees_gpu.rs unreachable fmt::Write into String is infallible because String implements fmt::Write without I/O; code: let _ = writeln!(
+src/far_trees_gpu.rs unreachable a species without an LOD0 diagnostic record has zero measured LOD0 foliage; the report's NO_FOLIAGE warning handles that absence; code: let d0 = sp.lod_diags.first().copied().unwrap_or_default();
+src/gfx_effect_gpu.rs unreachable an empty scratch pool is a cache miss; allocating an empty Vec is the pool's defined fallback; code: let mut verts = self.scratch_pool.pop().unwrap_or_default();
+src/gpu.rs unreachable fmt::Write into String is infallible because String implements fmt::Write without I/O; code: let _ = write!(
+src/gpu.rs unreachable fmt::Write into String is infallible because String implements fmt::Write without I/O; code: let _ = writeln!(
+src/gpu.rs unreachable a result sent to a viewer-owned worker receiver is intentionally discarded only when the receiving window has already gone away; code: let _ = tx.send(result);
+src/gpu.rs unreachable a result sent to a viewer-owned worker receiver is intentionally discarded only when the receiving window has already gone away; code: let _ = tx.send(r);
+src/gpu.rs unreachable this pass guard is intentionally dropped immediately to record the clear command; code: let _ = e.begin_render_pass(&wgpu::RenderPassDescriptor {
+src/gpu.rs unreachable cursor release is best-effort during focus loss/window teardown; code: let _ = window.set_cursor_grab(CursorGrabMode::None);
+src/gpu.rs unreachable this reborrow exists only to end the mutable borrow before queue submission; code: let _ = &mut pass;
+src/gpu.rs unreachable the harvest poll installs the completed scene in its cache; this temporary Arc clone is not content; code: let _ = self.raywatcher_harvest.poll_background_build();
+src/gpu.rs unreachable refusing an identical initial day/night pairing leaves the seeded sky transition state valid; code: let _ = sky_transition.author(
+src/dlss/loader.rs unreachable OnceLock::set can fail only when another initialisation already won; CORE.get below uses the live core singleton; code: let _ = CORE.set(core);
+src/fsr/imp.rs unreachable this implementation keeps the same queue parameter as the shared FSR constructor but builds the native queue from the DX12 device; code: let _ = queue;
+src/model_draw_gpu.rs:724 unreachable the let-else guard returns when no alpha receiver or indexed mesh is available; there is no drawable alpha mesh in that case

@@ -817,6 +817,9 @@ impl Draw {
             let (Some(bucket), Some(pipeline)) =
                 (self.buckets.get(key), self.pipelines.get(&key.pipeline))
             else {
+                eprintln!(
+                    "[GFX effects] missing cached draw bucket or pipeline; skipping stale draw entry"
+                );
                 continue;
             };
             if last_pipeline != Some(key.pipeline) {
@@ -894,6 +897,9 @@ impl Draw {
             let (Some(bucket), Some(pipeline)) =
                 (self.buckets.get(key), self.pipelines.get(&motion))
             else {
+                eprintln!(
+                    "[GFX effects] missing cached motion bucket or pipeline; skipping stale motion entry"
+                );
                 continue;
             };
             if last != Some(key.pipeline) {

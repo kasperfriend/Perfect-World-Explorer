@@ -594,7 +594,8 @@ impl FrameBudget {
             use std::fmt::Write;
             let mut stages = String::new();
             for (name, ms) in STAGE_NAMES.iter().zip(self.stage_ms) {
-                let _ = write!(stages, "; {name} {:.2} ms", ms / self.frames as f64);
+                write!(stages, "; {name} {:.2} ms", ms / self.frames as f64)
+                .expect("writing diagnostic text to String is infallible");
             }
             // Only mentioned when it happened, so the line stays the same shape
             // for a view with no water in it.
@@ -4285,15 +4286,27 @@ impl Renderer {
                     suspect_pages.len()
                 );
                 for (_, line) in suspect_pages {
-                    let _ = writeln!(report, "{line}");
+                    writeln!(report, "{line}")
+                        .expect("writing diagnostic text to String is infallible");
                 }
             }
-            let _ = writeln!(report, "\n[SpeedTree / FarTrees]");
+            writeln!(report, "\n[SpeedTree / FarTrees]")
+                .expect("writing diagnostic text to String is infallible");
             report.push_str(&self.far_trees.diagnostics_report(camera.pos, detail_radius));
             let log_dir =
                 crate::diagnostics::dir().unwrap_or_else(crate::diagnostics::default_log_dir);
-            let _ = std::fs::create_dir_all(&log_dir);
-            let _ = std::fs::write(log_dir.join("raywatcher-diag.log"), report);
+            let log_path = log_dir.join("raywatcher-diag.log");
+            if let Err(error) = std::fs::create_dir_all(&log_dir) {
+                eprintln!(
+                    "[Raywatcher] cannot create diagnostics directory {}: {error}",
+                    log_dir.display()
+                );
+            } else if let Err(error) = std::fs::write(&log_path, report) {
+                eprintln!(
+                    "[Raywatcher] cannot write diagnostics report {}: {error}",
+                    log_path.display()
+                );
+            }
         }
         if self.raywatcher_harvest.needs_frustum_rebuild(
             config,
@@ -4303,8 +4316,7 @@ impl Renderer {
             content_hash,
         ) && !self.raywatcher_harvest.is_building_in_background()
         {
-            use crate::modules::raywatcher::harvest::{Frustum, MeshTriangle, WaterSurface};
-            let _ = Frustum::from_view_projection(matrix);
+            use crate::modules::raywatcher::harvest::{MeshTriangle, WaterSurface};
             // Keep a focused nearest-first real-mesh bubble around the camera
             // (covering both on-screen and off-screen reflected buildings) with a
             // bounded triangle budget so BLAS/BVH rebuilds stay hitch-free while
@@ -10152,10 +10164,12 @@ pub fn preview(
                 )
             })
             .unwrap_or_else(|| "no world".into());
-        let on = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();
+        let on = read_target_pixels(&renderer, &target, width, height)
+            .map_err(|error| format!("effect A/B enabled readback failed: {error}"))?;
         cam.world_effects = false;
         draw(&mut renderer, &cam);
-        let off = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();
+        let off = read_target_pixels(&renderer, &target, width, height)
+            .map_err(|error| format!("effect A/B disabled readback failed: {error}"))?;
         cam.world_effects = true;
         let differing = on
             .chunks_exact(4)

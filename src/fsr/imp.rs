@@ -1246,7 +1246,9 @@ impl NativeCommandRing {
         queue.execute_command_lists(std::slice::from_ref(&slot.list.as_list()));
         self.fence_value += 1;
         slot.retired = self.fence_value;
-        let _ = queue.signal(&self.fence, self.fence_value);
+        if let Err(error) = queue.signal(&self.fence, self.fence_value) {
+            eprintln!("[FSR] D3D12 fence signal failed: {error:?}");
+        }
         Ok(())
     }
 
@@ -1255,9 +1257,12 @@ impl NativeCommandRing {
         if self.fence.get_value() >= self.fence_value {
             return;
         }
-        let _ = self
+        if let Err(error) = self
             .fence
-            .set_event_on_completion(self.fence_event, self.fence_value);
+            .set_event_on_completion(self.fence_event, self.fence_value)
+        {
+            eprintln!("[FSR] D3D12 fence wait registration failed: {error:?}");
+        }
         self.fence_event.wait(5_000);
     }
 }
