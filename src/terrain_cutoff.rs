@@ -78,7 +78,7 @@ mod residency_tests {
         assert!(!contains(b, [0., 1., 80.]));
         assert!(contains(None, [10000., 1., 0.]));
     }
-}
+
     #[test]
     fn fog_cap_covers_wide_screen_corners_and_fit_moves_start_inside_window() {
         for aspect in [1., 16. / 9., 32. / 9.] {
@@ -107,8 +107,8 @@ pub fn fog_cap(bounds: [f32; 4], eye: [f32; 3], aspect: f32) -> Option<f32> {
         .min(bounds[1] - eye[0])
         .min(eye[2] - bounds[2])
         .min(bounds[3] - eye[2]);
-    let half_fov_tangent = 35f32.to_radians().tan();
-    let diagonal = (1. + half_fov_tangent.powi(2) * (1. + aspect.max(0.01).powi(2))).sqrt();
+    let tangent = 35f32.to_radians().tan();
+    let diagonal = (1. + tangent * tangent * (1. + aspect.max(0.01).powi(2))).sqrt();
     Some((distance_to_edge / diagonal * 0.95).max(0.01))
 }
 
