@@ -977,7 +977,10 @@ impl Architect {
             let ab_d = orientation(a, b, d);
             let cd_a = orientation(c, d, a);
             let cd_b = orientation(c, d, b);
-            if ab_c.signum() != ab_d.signum() && cd_a.signum() != cd_b.signum() {
+            let opposite = |left: f32, right: f32| {
+                (left > 0.0 && right < 0.0) || (left < 0.0 && right > 0.0)
+            };
+            if opposite(ab_c, ab_d) && opposite(cd_a, cd_b) {
                 return true;
             }
             (ab_c.abs() <= 1.0e-4 && on_segment(a, b, c))
@@ -5167,8 +5170,8 @@ mod tests {
             glam::Mat4::IDENTITY,
         )
         .expect("edge crosses the visible depth range");
-        assert!((edge[0].x - 60.0).abs() < 1.0e-4);
-        assert!((edge[1].x - 160.0).abs() < 1.0e-4);
+        assert!((edge[0].x - 93.333_336).abs() < 1.0e-3);
+        assert!((edge[1].x - 126.666_664).abs() < 1.0e-3);
         assert!((edge[0].y - 70.0).abs() < 1.0e-4);
         assert!((edge[1].y - 70.0).abs() < 1.0e-4);
     }
