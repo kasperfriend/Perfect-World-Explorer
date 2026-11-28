@@ -119,13 +119,12 @@ impl Request {
 pub fn multiply(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
     let mut out = [0.0f32; 16];
     for column in 0..4 {
-        let c = column * 4;
-        let b0 = b[c];
-        let b1 = b[c + 1];
-        let b2 = b[c + 2];
-        let b3 = b[c + 3];
         for row in 0..4 {
-            out[c + row] = a[row] * b0 + a[4 + row] * b1 + a[8 + row] * b2 + a[12 + row] * b3;
+            let mut sum = 0.0f32;
+            for k in 0..4 {
+                sum += a[k * 4 + row] * b[column * 4 + k];
+            }
+            out[column * 4 + row] = sum;
         }
     }
     out
@@ -288,9 +287,6 @@ struct Owner {
     /// stays *loaded* through the fade — `Release()` runs only in the
     /// time-of-day branch — so this is an alpha ramp, not activation.
     attenuation: f32,
-    /// Cached terrain height/normal for static world effects so we don't
-    /// perform 5 terrain height lookups per active effect on every frame.
-    cached_ground: Option<([f32; 2], Option<crate::gfx_player::GroundHit>)>,
 }
 
 /// Publication identity: owner serial in the high half, element index in the
@@ -344,73 +340,8 @@ pub struct Status {
     pub player_failures: usize,
 }
 
-#[derive(Clone, Copy)]
-struct EffectStepJob {
-    owner_index: usize,
-    transform: Mat4,
-    authored_scale: f32,
-    alpha: f32,
-    ground: Option<crate::gfx_player::GroundHit>,
-}
-
-// Scoped OS threads are expensive to create and join on every rendered frame.
-// Parallelize only unusually dense effect clusters; normal city/area loads stay
-// on the caller thread and avoid scheduler churn.
-const MIN_PARALLEL_EFFECT_ROOTS: usize = 256;
-const EFFECT_ROOTS_PER_WORKER: usize = 128;
-const MAX_EFFECT_WORKERS: usize = 4;
-
-fn effect_worker_count(active_roots: usize, available_workers: usize) -> usize {
-    if active_roots < MIN_PARALLEL_EFFECT_ROOTS {
-        return 1;
-    }
-    available_workers
-        .max(1)
-        .min(MAX_EFFECT_WORKERS)
-        .min(active_roots / EFFECT_ROOTS_PER_WORKER)
-        .max(1)
-}
-
-/// Keep a Vec of owner indices sorted, making activation changes logarithmic
-/// to locate and allowing the frame loop to visit only active owners.
-fn set_sorted_owner_index(indices: &mut Vec<usize>, index: usize, present: bool) {
-    match indices.binary_search(&index) {
-        Ok(position) if !present => {
-            indices.remove(position);
-        }
-        Err(position) if present => indices.insert(position, index),
-        _ => {}
-    }
-}
-
-/// Update a sorted owner-index list after Vec::swap_remove moved the last owner.
-fn swap_remove_sorted_owner_index(indices: &mut Vec<usize>, removed: usize, last: usize) {
-    set_sorted_owner_index(indices, removed, false);
-    if removed != last {
-        if let Ok(position) = indices.binary_search(&last) {
-            indices[position] = removed;
-            indices.sort_unstable();
-        }
-    }
-}
-
 pub struct Manager {
     owners: Vec<Owner>,
-    /// All live owners, including inactive ones whose clocks/lights still tick.
-    /// Avoids scanning pending and failed entries on every frame.
-    live_owner_indices: Vec<usize>,
-    /// Live, active owner indices; geometry stepping never scans the full owner list.
-    active_owner_indices: Vec<usize>,
-    /// Eligible active roots whose animated Player has not been built yet.
-    /// Drained in O(1) so a fully warmed world does not rescan every owner each frame.
-    player_build_indices: Vec<usize>,
-    /// Pending indices, plus the active subset preferred by the one-root loader.
-    pending_owner_indices: Vec<usize>,
-    active_pending_indices: Vec<usize>,
-    /// Reused sparse job list: only owners with an active player occupy a slot.
-    effect_jobs: Vec<EffectStepJob>,
-    /// Cached once at construction; the frame loop never queries the OS.
-    effect_worker_limit: usize,
     /// Manager light-priority limit (native `[[0x9b3eec]+0x28]+0x134`). An
     /// element whose authored `Priority` exceeds this value is skipped by the
     /// publication gate at `0x70ba3c..0x70ba44` while still advancing. The
@@ -609,21 +540,6 @@ impl Manager {
     pub fn new() -> Self {
         Self {
             owners: Vec::new(),
-            // Every live owner must advance its clock, but pending and failed
-            // owners have no work in the per-frame tick. Keep the live subset
-            // indexed so a map with a large pending queue is not rescanned in
-            // full on every frame while roots are being admitted.
-            live_owner_indices: Vec::new(),
-            active_owner_indices: Vec::new(),
-            player_build_indices: Vec::new(),
-            pending_owner_indices: Vec::new(),
-            active_pending_indices: Vec::new(),
-            effect_jobs: Vec::new(),
-            effect_worker_limit: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(MAX_EFFECT_WORKERS)
-                .max(1),
             priority_limit: i32::MAX,
             failures: Vec::new(),
             unsupported: Vec::new(),
@@ -723,7 +639,6 @@ impl Manager {
         self.next_serial = self.next_serial.wrapping_add(1);
         let identity = request.identity;
         let index = self.owners.len();
-        let active = request.active;
         self.owners.push(Owner {
             serial,
             request,
@@ -732,13 +647,8 @@ impl Manager {
             player: None,
             player_failed: false,
             attenuation: 1.,
-            cached_ground: None,
         });
         self.index.insert(identity, index);
-        self.pending_owner_indices.push(index);
-        if active {
-            self.active_pending_indices.push(index);
-        }
         Ok(())
     }
 
@@ -751,34 +661,8 @@ impl Manager {
     fn reindex(&mut self) {
         self.index.clear();
         self.index.reserve(self.owners.len());
-        self.live_owner_indices.clear();
-        self.active_owner_indices.clear();
-        self.player_build_indices.clear();
-        self.pending_owner_indices.clear();
-        self.active_pending_indices.clear();
         for (index, owner) in self.owners.iter().enumerate() {
             self.index.insert(owner.request.identity, index);
-            match owner.state {
-                State::Pending => {
-                    self.pending_owner_indices.push(index);
-                    if owner.request.active {
-                        self.active_pending_indices.push(index);
-                    }
-                }
-                State::Live { .. } if owner.request.active => {
-                    self.live_owner_indices.push(index);
-                    self.active_owner_indices.push(index);
-                    if self.effects
-                        && owner.player.is_none()
-                        && !owner.player_failed
-                        && owner.elapsed >= owner.request.start_ms
-                    {
-                        self.player_build_indices.push(index);
-                    }
-                }
-                State::Live { .. } => self.live_owner_indices.push(index),
-                State::Failed => {}
-            }
         }
     }
 
@@ -812,32 +696,7 @@ impl Manager {
         let Some(index) = self.position_of(identity) else {
             return false;
         };
-        if self.owners[index].request.active == active {
-            return true;
-        }
-        let pending = matches!(self.owners[index].state, State::Pending);
-        let live = matches!(self.owners[index].state, State::Live { .. });
         self.owners[index].request.active = active;
-        if pending {
-            set_sorted_owner_index(&mut self.active_pending_indices, index, active);
-        } else if live {
-            set_sorted_owner_index(&mut self.active_owner_indices, index, active);
-            if active {
-                let owner = &self.owners[index];
-                if self.effects
-                    && owner.player.is_none()
-                    && !owner.player_failed
-                    && owner.elapsed >= owner.request.start_ms
-                {
-                    set_sorted_owner_index(&mut self.player_build_indices, index, true);
-                }
-            } else {
-                set_sorted_owner_index(&mut self.player_build_indices, index, false);
-                // The previous full-owner pass released an inactive root on the
-                // same frame. Preserve that residency rule with indexed updates.
-                self.owners[index].player = None;
-            }
-        }
         true
     }
 
@@ -869,9 +728,7 @@ impl Manager {
         let Some(index) = self.position_of(identity) else {
             return false;
         };
-        if self.owners[index].request.attachment != parent {
-            self.owners[index].request.attachment = parent;
-        }
+        self.owners[index].request.attachment = parent;
         true
     }
 
@@ -894,18 +751,10 @@ impl Manager {
             return false;
         };
         self.unregister(&self.owners[index], publications);
-        let last_index = self.owners.len() - 1;
-        let removed_id = self.owners.swap_remove(index).request.identity;
-        swap_remove_sorted_owner_index(&mut self.live_owner_indices, index, last_index);
-        swap_remove_sorted_owner_index(&mut self.active_owner_indices, index, last_index);
-        swap_remove_sorted_owner_index(&mut self.player_build_indices, index, last_index);
-        swap_remove_sorted_owner_index(&mut self.pending_owner_indices, index, last_index);
-        swap_remove_sorted_owner_index(&mut self.active_pending_indices, index, last_index);
-        self.index.remove(&removed_id);
-        if let Some(moved) = self.owners.get(index) {
-            self.index.insert(moved.request.identity, index);
-        }
+        self.owners.remove(index);
         self.removed += 1;
+        // Every index past the removed one moved down by one.
+        self.reindex();
         true
     }
 
@@ -916,12 +765,6 @@ impl Manager {
         }
         self.removed += self.owners.len();
         self.owners.clear();
-        self.live_owner_indices.clear();
-        self.active_owner_indices.clear();
-        self.player_build_indices.clear();
-        self.pending_owner_indices.clear();
-        self.active_pending_indices.clear();
-        self.effect_jobs.clear();
         self.index.clear();
     }
 
@@ -944,45 +787,23 @@ impl Manager {
         let limit = self.priority_limit;
         let mut finished = Vec::new();
         let mut failed = Vec::new();
-        let mut newly_buildable = Vec::new();
-        for &owner_index in &self.live_owner_indices {
-            let owner = &mut self.owners[owner_index];
-            let was_buildable = owner.request.active
-                && owner.player.is_none()
-                && !owner.player_failed
-                && owner.elapsed >= owner.request.start_ms;
+        for owner in &mut self.owners {
+            if !matches!(owner.state, State::Live { .. }) {
+                continue;
+            }
             match tick_owner(owner, delta_ms, publications, limit) {
-                Ok(true) => {
-                    let is_buildable = owner.request.active
-                        && owner.player.is_none()
-                        && !owner.player_failed
-                        && owner.elapsed >= owner.request.start_ms;
-                    if !was_buildable && is_buildable {
-                        newly_buildable.push(owner_index);
-                    }
-                }
+                Ok(true) => {}
                 Ok(false) => finished.push(owner.request.identity),
                 Err(e) => failed.push((owner.request.identity, e)),
             }
         }
-        for index in newly_buildable {
-            set_sorted_owner_index(&mut self.player_build_indices, index, true);
-        }
         for identity in finished {
             if let Some(index) = self.position_of(identity) {
                 self.unregister(&self.owners[index], publications);
-                let last_index = self.owners.len() - 1;
-                let removed_id = self.owners.swap_remove(index).request.identity;
-                swap_remove_sorted_owner_index(&mut self.live_owner_indices, index, last_index);
-                swap_remove_sorted_owner_index(&mut self.active_owner_indices, index, last_index);
-                swap_remove_sorted_owner_index(&mut self.player_build_indices, index, last_index);
-                swap_remove_sorted_owner_index(&mut self.pending_owner_indices, index, last_index);
-                swap_remove_sorted_owner_index(&mut self.active_pending_indices, index, last_index);
-                self.index.remove(&removed_id);
-                if let Some(moved) = self.owners.get(index) {
-                    self.index.insert(moved.request.identity, index);
-                }
+                self.owners.remove(index);
                 self.removed += 1;
+                // An authored lifetime ended: the indices past it moved down.
+                self.reindex();
             }
         }
         for (identity, error) in failed {
@@ -990,26 +811,14 @@ impl Manager {
                 self.unregister(&self.owners[index], publications);
                 let origin = self.owners[index].request.origin.clone();
                 self.owners[index].state = State::Failed;
-                set_sorted_owner_index(&mut self.live_owner_indices, index, false);
-                set_sorted_owner_index(&mut self.active_owner_indices, index, false);
-                set_sorted_owner_index(&mut self.player_build_indices, index, false);
-                set_sorted_owner_index(&mut self.pending_owner_indices, index, false);
-                set_sorted_owner_index(&mut self.active_pending_indices, index, false);
                 self.failures.push(format!("{origin}: {error}"));
             }
         }
-        // Native 0x5b1a00 admits one pending root per frame; once live,
-        // warm up to 4 active visible players per frame so torches, fire,
-        // and waterfalls appear promptly when entering an area.
         self.load_one();
-        const ACTIVE_PLAYER_BUDGET: usize = 4;
-        for _ in 0..ACTIVE_PLAYER_BUDGET {
-            // The builder performs its own candidate search. A separate .any()
-            // here walked the full owner array once more before every build.
-            if !self.build_one_player() {
-                break;
-            }
-        }
+        // One animated root per frame, the same budget the loader has. Only
+        // owners that are visible right now are admitted, so a world with
+        // thousands of installed effects builds the handful inside the radius.
+        self.build_one_player();
     }
 
     /// Gate the animated effect graph: the sprites, particles, ribbons, trails
@@ -1026,20 +835,7 @@ impl Manager {
             return;
         }
         self.effects = enabled;
-        self.player_build_indices.clear();
         if enabled {
-            // Rebuild the queue once on an explicit effects-on transition.
-            // Steady-state frames never have to search for missing Players.
-            for (index, owner) in self.owners.iter().enumerate() {
-                if matches!(owner.state, State::Live { .. })
-                    && owner.request.active
-                    && owner.player.is_none()
-                    && !owner.player_failed
-                    && owner.elapsed >= owner.request.start_ms
-                {
-                    self.player_build_indices.push(index);
-                }
-            }
             return;
         }
         for owner in &mut self.owners {
@@ -1108,23 +904,9 @@ impl Manager {
         view: &View,
         terrain: Option<crate::gfx_player::GroundHeightQuery<'_>>,
     ) -> Vec<EffectQuad> {
-        let mut out = Vec::with_capacity(self.owners.len().min(64) * 8);
-        self.effect_quads_with_ground_into(delta_ms, view, terrain, &mut out);
-        out
-    }
-
-    /// Reusable-buffer variant of [`Self::effect_quads_with_ground`] that
-    /// avoids reallocating the outer `Vec<EffectQuad>` every frame.
-    pub fn effect_quads_with_ground_into(
-        &mut self,
-        delta_ms: u32,
-        view: &View,
-        terrain: Option<crate::gfx_player::GroundHeightQuery<'_>>,
-        out: &mut Vec<EffectQuad>,
-    ) {
-        out.clear();
+        let mut out = Vec::new();
         if !self.effects {
-            return;
+            return out;
         }
         // Report only when one is due; the rows themselves allocate, so nothing
         // is collected on the frames between reports.
@@ -1136,14 +918,8 @@ impl Manager {
             _ => None,
         };
         let mut failures = Vec::new();
-        // Retain capacity from the previous frame, but store only active players.
-        let mut jobs = std::mem::take(&mut self.effect_jobs);
-        jobs.clear();
-        for &owner_index in &self.active_owner_indices {
-            let Some(owner) = self.owners.get_mut(owner_index) else {
-                continue;
-            };
-            if !matches!(owner.state, State::Live { .. }) || !owner.request.active {
+        for owner in &mut self.owners {
+            if !matches!(owner.state, State::Live { .. }) {
                 continue;
             }
             if !owner.request.active || owner.elapsed < owner.request.start_ms {
@@ -1157,6 +933,10 @@ impl Manager {
                         owner.request.start_ms
                     );
                 }
+                // Culling is the channel that filled a report with one repeated
+                // line per root per frame. Keyed by root, so every root says
+                // once why it is not drawn, and says it again only every ten
+                // seconds while that stays true.
                 crate::diag_keyed!(
                     EffectCulling,
                     format!("{} skipped", owner.request.path),
@@ -1169,20 +949,30 @@ impl Manager {
                 );
                 continue;
             }
-            if owner.player.is_none() {
-                continue;
-            }
+            // The record's alpha is the *target* of the client's distance fade,
+            // not a second factor beside it: `FadeGFX` ramps the root to
+            // `max_alpha * fAlpha` and then holds it there, so the drawn alpha is
+            // `fAlpha * fade`. An owner with no `outer` colour draws at the
+            // fade alone (full alpha when nothing attenuates it).
             let alpha = owner.request.outer.map_or(1., |outer| outer[3]) * owner.attenuation;
             let world = match owner.request.world_transform() {
                 Ok(columns) => columns,
                 Err(error) => {
                     failures.push((owner.request.origin.clone(), error));
                     owner.player = None;
-                    owner.player_failed = true;
                     continue;
                 }
             };
             let transform = Mat4::from_cols_array(&world);
+            // `0x5b3700` bakes the record's scale into the placement, but
+            // `Player::advance` normalizes that basis before it fans anything
+            // out — the client does the same in `A3DGFXEx::SetParentTM`
+            // (A3DGFXEx.cpp:1589-1595) and carries the scale separately, as
+            // `SetScale(record scale)` right after the placement
+            // (EC_ManOrnament.cpp:950-952). So the scale has to be handed over
+            // on its own or it is lost. Measured against the 9 November census:
+            // the roof bagua is authored 0.304 and came out 44.8 units wide
+            // instead of 13.6, and `水门_瀑布` is authored 2.736.
             let authored_scale = placement_scale(&world);
             crate::diag_keyed!(
                 EffectCulling,
@@ -1209,134 +999,42 @@ impl Manager {
                 world[9],
                 world[10]
             );
-            let ground = if let Some(height_at) = terrain {
-                let ox = world[12];
-                let oz = world[14];
-                match owner.cached_ground {
-                    Some((pos, hit)) if pos[0] == ox && pos[1] == oz => hit,
-                    _ => {
-                        let hit = height_at(ox, oz).map(|h| {
-                            const STEP: f32 = 0.5;
-                            let hx_p = height_at(ox + STEP, oz).unwrap_or(h);
-                            let hx_m = height_at(ox - STEP, oz).unwrap_or(h);
-                            let hz_p = height_at(ox, oz + STEP).unwrap_or(h);
-                            let hz_m = height_at(ox, oz - STEP).unwrap_or(h);
-                            let dx = (hx_p - hx_m) / (2. * STEP);
-                            let dz = (hz_p - hz_m) / (2. * STEP);
-                            let normal = glam::Vec3::new(-dx, 1., -dz).normalize_or_zero();
-                            crate::gfx_player::GroundHit {
-                                height: h,
-                                normal: if normal == glam::Vec3::ZERO {
-                                    glam::Vec3::Y
-                                } else {
-                                    normal
-                                },
-                            }
-                        });
-                        owner.cached_ground = Some(([ox, oz], hit));
-                        hit
-                    }
-                }
-            } else {
-                None
-            };
-            jobs.push(EffectStepJob {
-                owner_index,
-                transform,
-                authored_scale,
-                alpha,
-                ground,
-            });
-        }
-
-        // Step active effect players in parallel across CPU cores when many
-        // effects are live simultaneously (cities, torch clusters, waterfalls).
-        let workers = effect_worker_count(jobs.len(), self.effect_worker_limit);
-        let mut step_errors: Vec<(usize, String)> = Vec::new();
-        if workers > 1 {
-            let chunk_len = self.owners.len().div_ceil(workers);
-            let dt = delta_ms as f32;
-            std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(workers);
-                for (chunk_idx, owner_chunk) in self.owners.chunks_mut(chunk_len).enumerate() {
-                    let base = chunk_idx * chunk_len;
-                    let limit = base + owner_chunk.len();
-                    let start = jobs.partition_point(|job| job.owner_index < base);
-                    let end = jobs.partition_point(|job| job.owner_index < limit);
-                    let job_chunk = &jobs[start..end];
-                    if job_chunk.is_empty() {
-                        continue;
-                    }
-                    handles.push(s.spawn(move || {
-                        let mut errs = Vec::new();
-                        for job in job_chunk {
-                            let owner = &mut owner_chunk[job.owner_index - base];
-                            let Some(player) = owner.player.as_mut() else {
-                                continue;
-                            };
-                            if let Err(error) = player.advance_with_terrain(
-                                dt,
-                                view,
-                                job.transform,
-                                job.authored_scale,
-                                job.alpha,
-                                job.ground,
-                                terrain,
-                            ) {
-                                owner.player = None;
-                                owner.player_failed = true;
-                                errs.push((job.owner_index, error));
-                            }
-                        }
-                        errs
-                    }));
-                }
-                for h in handles {
-                    step_errors.extend(h.join().unwrap());
-                }
-            });
-        } else {
-            let dt = delta_ms as f32;
-            for job in &jobs {
-                let owner = &mut self.owners[job.owner_index];
+            let stepped = {
                 let Some(player) = owner.player.as_mut() else {
                     continue;
                 };
-                if let Err(error) = player.advance_with_terrain(
-                    dt,
-                    view,
-                    job.transform,
-                    job.authored_scale,
-                    job.alpha,
-                    job.ground,
-                    terrain,
-                ) {
+                // The player carries the placement's speed itself
+                // (`A3DGFXEx::SetPlaySpeed` is handed the record's `fSpeed`), so
+                // it is advanced by the *frame* delta. `scaled` above is for the
+                // owner clock, the lifetime window and the light emitters, all of
+                // which are in the record's own time base.
+                player
+                    .advance_with_terrain(
+                        delta_ms as f32,
+                        view,
+                        transform,
+                        authored_scale,
+                        alpha,
+                        None,
+                        terrain,
+                    )
+                    .map(|()| (player.quads().to_vec(), player.clock_ms()))
+            };
+            match stepped {
+                Ok((quads, clock)) => {
+                    if let Some(rows) = rows.as_mut() {
+                        rows.push(census_row(&owner.request.path, &quads, clock));
+                    }
+                    out.extend(quads);
+                }
+                Err(error) => {
+                    failures.push((owner.request.origin.clone(), error));
                     owner.player = None;
-                    owner.player_failed = true;
-                    step_errors.push((job.owner_index, error));
                 }
             }
         }
-        for (idx, error) in step_errors {
-            failures.push((self.owners[idx].request.origin.clone(), error));
-        }
-        for job in &jobs {
-            let owner = &self.owners[job.owner_index];
-            let Some(player) = owner.player.as_ref() else {
-                continue;
-            };
-            let quads = player.quads();
-            if let Some(rows) = rows.as_mut() {
-                rows.push(census_row(&owner.request.path, quads, player.clock_ms()));
-            }
-            if job.alpha > 0.0 {
-                out.extend(quads.iter().cloned());
-            }
-        }
         for (origin, error) in failures {
-            if self.effect_failures.len() < 512 {
-                self.effect_failures.push(format!("{origin}: {error}"));
-            }
+            self.effect_failures.push(format!("{origin}: {error}"));
         }
         if let Some(mut rows) = rows {
             // A file, not stderr: the shipped Windows build has no console, so a
@@ -1350,33 +1048,23 @@ impl Manager {
                     .push(format!("effect census not written: {error}"));
             }
         }
-        self.effect_jobs = jobs;
+        out
     }
 
     /// Build the animated root for one visible owner, at most one per call, and
     /// record the failure once if it will not build.
-    fn build_one_player(&mut self) -> bool {
+    fn build_one_player(&mut self) {
         if !self.effects {
-            return false;
+            return;
         }
-        // Every eligible owner is queued when it becomes live, crosses its
-        // StartTime, or is reactivated. Popping avoids an O(active owners) search
-        // on every frame after the world has finished warming up.
-        let index = loop {
-            let Some(index) = self.player_build_indices.pop() else {
-                return false;
-            };
-            let Some(owner) = self.owners.get(index) else {
-                continue;
-            };
-            if matches!(owner.state, State::Live { .. })
+        let Some(index) = self.owners.iter().position(|owner| {
+            matches!(owner.state, State::Live { .. })
                 && owner.player.is_none()
                 && !owner.player_failed
                 && owner.request.active
                 && owner.elapsed >= owner.request.start_ms
-            {
-                break index;
-            }
+        }) else {
+            return;
         };
         let path = self.owners[index].request.path.clone();
         let origin = self.owners[index].request.origin.clone();
@@ -1448,12 +1136,9 @@ impl Manager {
                 crate::diag!(EffectProblems, "{path} would not build: {error}");
                 crate::diag!(ModelQueue, "{path} rejected while loading effects: {error}");
                 self.owners[index].player_failed = true;
-                if self.effect_failures.len() < 512 {
-                    self.effect_failures.push(format!("{origin}: {error}"));
-                }
+                self.effect_failures.push(format!("{origin}: {error}"));
             }
         }
-        true
     }
 
     /// Parse a root and build its player, resolving nested `GfxPath` children
@@ -1520,16 +1205,15 @@ impl Manager {
         // while the handful around the player waited their turn in install
         // order. Sorting by "would this draw now" first drains the visible set
         // in a few frames, which is what the status line's playing count means.
-        let Some(index) = self
-            .active_pending_indices
-            .first()
-            .copied()
-            .or_else(|| self.pending_owner_indices.first().copied())
-        else {
+        let pending = |o: &Owner| matches!(o.state, State::Pending);
+        let index = self
+            .owners
+            .iter()
+            .position(|o| pending(o) && o.request.active)
+            .or_else(|| self.owners.iter().position(pending));
+        let Some(index) = index else {
             return;
         };
-        set_sorted_owner_index(&mut self.pending_owner_indices, index, false);
-        set_sorted_owner_index(&mut self.active_pending_indices, index, false);
         let path = self.owners[index].request.path.clone();
         let origin = self.owners[index].request.origin.clone();
         let result = match &mut self.read {
@@ -1591,18 +1275,6 @@ impl Manager {
             lights,
             light_error,
         };
-        set_sorted_owner_index(&mut self.live_owner_indices, index, true);
-        if self.owners[index].request.active {
-            set_sorted_owner_index(&mut self.active_owner_indices, index, true);
-            let owner = &self.owners[index];
-            if self.effects
-                && owner.player.is_none()
-                && !owner.player_failed
-                && owner.elapsed >= owner.request.start_ms
-            {
-                set_sorted_owner_index(&mut self.player_build_indices, index, true);
-            }
-        }
     }
 
     fn decode(text: &str) -> Result<Vec<Emitter>, String> {
@@ -1680,26 +1352,13 @@ fn tick_owner(
             return Ok(false);
         }
     }
+    let visible = owner.request.active && owner.elapsed >= start;
+    let transform = owner.request.world_transform()?;
+    let outer = owner.request.outer;
+    let serial = owner.serial;
     let State::Live { lights, .. } = &mut owner.state else {
         return Ok(true);
     };
-    // Geometry-only roots can be numerous. Their clocks/lifetimes still advance,
-    // but computing a world matrix and validating it every frame serves no
-    // light producer and used to add avoidable work for the majority of roots.
-    if lights.is_empty() {
-        return Ok(true);
-    }
-    let visible = owner.request.active && owner.elapsed >= start;
-    // Hidden roots and roots before StartTime still advance each emitter's
-    // clocks, but Emitter::tick returns before reading the parent transform
-    // when !visible. Do not compose/validate the world matrix for those owners.
-    let transform = if visible {
-        owner.request.world_transform()?
-    } else {
-        glam::Mat4::IDENTITY.to_cols_array()
-    };
-    let outer = owner.request.outer;
-    let serial = owner.serial;
     let emitters = lights;
     for (index, emitter) in emitters.iter_mut().enumerate() {
         let light: Option<DynamicLight> =
@@ -1716,40 +1375,6 @@ mod tests {
     use super::*;
     use crate::scene_lights::StaticGrid;
     use glam::Vec3;
-
-    #[test]
-    fn sorted_owner_indices_track_activation_and_swap_remove() {
-        let mut active = Vec::new();
-        set_sorted_owner_index(&mut active, 4, true);
-        set_sorted_owner_index(&mut active, 1, true);
-        set_sorted_owner_index(&mut active, 7, true);
-        assert_eq!(active, [1, 4, 7]);
-
-        set_sorted_owner_index(&mut active, 4, false);
-        assert_eq!(active, [1, 7]);
-        set_sorted_owner_index(&mut active, 2, true);
-        assert_eq!(active, [1, 2, 7]);
-
-        // Removing owner 1 swaps owner 7 into slot 1; it remains active.
-        swap_remove_sorted_owner_index(&mut active, 1, 7);
-        assert_eq!(active, [1, 2]);
-        // Removing an inactive last slot leaves the active set untouched.
-        swap_remove_sorted_owner_index(&mut active, 6, 6);
-        assert_eq!(active, [1, 2]);
-    }
-
-    #[test]
-    fn pending_loader_indices_prefer_active_then_fall_back_without_a_world_scan() {
-        let mut pending = vec![0, 1, 2, 3, 4];
-        let mut active_pending = vec![2, 4];
-        assert_eq!(active_pending.first(), Some(&2));
-        swap_remove_sorted_owner_index(&mut pending, 2, 4);
-        swap_remove_sorted_owner_index(&mut active_pending, 2, 4);
-        assert_eq!(pending, [0, 1, 2, 3]);
-        assert_eq!(active_pending, [2]);
-        swap_remove_sorted_owner_index(&mut pending, 2, 3);
-        assert_eq!(pending, [0, 1, 2]);
-    }
 
     fn root(path: &str, text: &str) -> impl FnMut(&str) -> Result<String, String> + 'static {
         let path = path.to_string();
@@ -1780,17 +1405,6 @@ mod tests {
             active,
             origin: format!("test owner {identity}"),
         }
-    }
-
-    #[test]
-    fn sparse_effect_sets_do_not_spawn_transient_worker_threads() {
-        assert_eq!(effect_worker_count(0, 8), 1);
-        assert_eq!(effect_worker_count(12, 8), 1);
-        assert_eq!(effect_worker_count(255, 8), 1);
-        assert_eq!(effect_worker_count(256, 8), 2);
-        assert_eq!(effect_worker_count(512, 8), 4);
-        assert_eq!(effect_worker_count(1024, 16), 4);
-        assert_eq!(effect_worker_count(256, 0), 1);
     }
 
     fn grid() -> StaticGrid {
@@ -1844,7 +1458,6 @@ mod tests {
         manager.update(50, &mut publications);
         assert_eq!(manager.status().live, 1);
         assert_eq!(manager.status().loads, 1);
-        assert_eq!(manager.live_owner_indices, [0]);
         publications.consume_into(&mut grid);
         assert!(grid.query([1., 2., 3.], 1.).is_none());
         // Before StartTime the clock advances but nothing is published.
@@ -1860,7 +1473,6 @@ mod tests {
         publications.consume_into(&mut grid);
         assert_eq!(manager.status().live, 0);
         assert_eq!(manager.status().removed, 1);
-        assert!(manager.live_owner_indices.is_empty());
         assert!(grid.query([1., 2., 3.], 1.).is_none());
         manager.update(500, &mut publications);
         assert!(publications.len() == 0);

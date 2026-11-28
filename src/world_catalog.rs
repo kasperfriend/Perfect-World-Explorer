@@ -247,19 +247,17 @@ fn parse_instance_text(text: &str) -> Vec<InstanceRecord> {
         let Some(open) = (i + 1..lines.len().min(i + 4)).find(|&j| lines[j] == "{") else {
             continue;
         };
-        let mut fields = [""; 3];
-        let mut field_count = 0usize;
+        let mut fields = Vec::new();
         for candidate in lines.iter().skip(open + 1).take(8) {
             if *candidate == "}" {
                 break;
             }
-            fields[field_count] = *candidate;
-            field_count += 1;
-            if field_count == 3 {
+            fields.push(*candidate);
+            if fields.len() == 3 {
                 break;
             }
         }
-        if field_count < 3 {
+        if fields.len() < 3 {
             crate::load_status::dropped(
                 crate::load_status::Category::Instances,
                 format!(
@@ -648,7 +646,7 @@ pub fn discover(element: &Path) -> Catalog {
             }
         }
     }
-    maps.sort_by_cached_key(sort_key);
+    maps.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
     Catalog { maps, warning }
 }
 

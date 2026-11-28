@@ -161,7 +161,7 @@ impl<'a> Dds<'a> {
         if count > max_count {
             return Err("model DDS mip count exceeds dimensions".into());
         }
-        let mut mips = Vec::with_capacity(count as usize);
+        let mut mips = Vec::new();
         let mut offset = 128usize;
         for i in 0..count {
             let w = (width >> i).max(1);

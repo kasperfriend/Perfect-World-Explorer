@@ -258,20 +258,16 @@ impl Database {
     }
     pub fn suites_for(&self, id: u32) -> Vec<(u32, String, Vec<u32>)> {
         let mut result = Vec::new();
-        if id == 0 {
-            return result;
-        }
         for (suite_id, record) in &self.suites {
-            if !(0..12).any(|index| number(record, 72 + index * 4) == id) {
-                continue;
-            }
             let members: Vec<u32> = (0..12)
                 .map(|index| number(record, 72 + index * 4))
                 .filter(|member| *member != 0)
                 .collect();
-            result.push((*suite_id, wide(record, 4), members));
+            if members.contains(&id) {
+                result.push((*suite_id, wide(record, 4), members));
+            }
         }
-        result.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+        result.sort_by(|a, b| a.1.cmp(&b.1));
         result
     }
 }

@@ -593,7 +593,7 @@ impl State {
                     })
                 })
                 .collect();
-            majors.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            majors.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
             majors.dedup_by_key(|entry| entry.0);
             if !majors.is_empty() {
                 egui::ComboBox::from_label("Type")
@@ -642,7 +642,7 @@ impl State {
                     })
                 })
                 .collect();
-            subtypes.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            subtypes.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
             subtypes.dedup_by_key(|entry| entry.0);
             if !subtypes.is_empty() {
                 egui::ComboBox::from_label("Subtype")

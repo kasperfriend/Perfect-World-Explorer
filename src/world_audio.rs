@@ -10,70 +10,6 @@ use std::{
 
 const MAX_VOICES: usize = 16;
 
-// Short-range emitters are indexed in 256-unit X/Z cells. The 512-unit
-// radius covers every emitter kept in the grid; longer-range sounds stay in
-// a small global list so no authored sound can be missed by the broad phase.
-const AUDIO_CELL: f32 = 256.0;
-const AUDIO_LOCAL_RADIUS: f32 = 512.0;
-const AUDIO_CELL_RADIUS: i32 = 2;
-
-#[derive(Default)]
-struct SpatialIndex {
-    cells: HashMap<(i32, i32), Vec<usize>>,
-    global: Vec<usize>,
-}
-
-impl SpatialIndex {
-    fn cell(x: f32, z: f32) -> Option<(i32, i32)> {
-        let x = (x / AUDIO_CELL).floor();
-        let z = (z / AUDIO_CELL).floor();
-        if !x.is_finite()
-            || !z.is_finite()
-            || x < i32::MIN as f32
-            || x > i32::MAX as f32
-            || z < i32::MIN as f32
-            || z > i32::MAX as f32
-        {
-            return None;
-        }
-        Some((x as i32, z as i32))
-    }
-
-    fn new(emitters: &[Emitter]) -> Self {
-        let mut index = Self::default();
-        for (id, emitter) in emitters.iter().enumerate() {
-            let sound = &emitter.sound;
-            if sound.max_distance > AUDIO_LOCAL_RADIUS {
-                index.global.push(id);
-            } else if let Some(cell) = Self::cell(sound.position[0], sound.position[2]) {
-                index.cells.entry(cell).or_default().push(id);
-            } else {
-                // Preserve correctness for unusual but finite coordinates.
-                index.global.push(id);
-            }
-        }
-        index
-    }
-
-    fn candidates(&self, pos: [f32; 3], emitter_count: usize) -> Vec<usize> {
-        let Some((cx, cz)) = Self::cell(pos[0], pos[2]) else {
-            return (0..emitter_count).collect();
-        };
-        let mut result = Vec::with_capacity(self.global.len() + 32);
-        result.extend_from_slice(&self.global);
-        for z in -AUDIO_CELL_RADIUS..=AUDIO_CELL_RADIUS {
-            for x in -AUDIO_CELL_RADIUS..=AUDIO_CELL_RADIUS {
-                if let (Some(x), Some(z)) = (cx.checked_add(x), cz.checked_add(z)) {
-                    if let Some(ids) = self.cells.get(&(x, z)) {
-                        result.extend_from_slice(ids);
-                    }
-                }
-            }
-        }
-        result
-    }
-}
-
 #[derive(Clone, Debug)]
 enum Asset {
     Packed(pck::Entry),
@@ -86,43 +22,6 @@ struct Emitter {
     asset: Option<Asset>,
 }
 
-fn asset_key(path: &str) -> Option<String> {
-    let mut normalized = if path.is_ascii() {
-        let mut s = String::with_capacity(path.len());
-        for b in path.bytes() {
-            s.push(if b == b'\\' {
-                '/'
-            } else {
-                (b as char).to_ascii_lowercase()
-            });
-        }
-        s
-    } else {
-        let mut s = path.to_lowercase();
-        if s.as_bytes().contains(&b'\\') {
-            unsafe {
-                for b in s.as_bytes_mut() {
-                    if *b == b'\\' {
-                        *b = b'/';
-                    }
-                }
-            }
-        }
-        s
-    };
-    if normalized.starts_with('/')
-        || normalized
-            .split('/')
-            .any(|p| p.is_empty() || p == "." || p == ".." || p.contains(':'))
-    {
-        return None;
-    }
-    if !normalized.starts_with("sfx/") {
-        normalized.insert_str(0, "sfx/");
-    }
-    Some(normalized)
-}
-
 #[derive(Clone, Debug)]
 struct Voice {
     index: usize,
@@ -132,25 +31,16 @@ struct Voice {
 
 /// The client gates modes 0/1/2 at the strict 0.5 day/night boundary.
 /// Gain and the voice cap are deliberately not claimed as native behavior.
-fn select(
-    emitters: &[Emitter],
-    spatial: &SpatialIndex,
-    pos: [f32; 3],
-    yaw: f32,
-    night_factor: f32,
-) -> Vec<Voice> {
+fn select(emitters: &[Emitter], pos: [f32; 3], yaw: f32, night_factor: f32) -> Vec<Voice> {
     if !pos.iter().all(|v| v.is_finite()) || !yaw.is_finite() {
         return Vec::new();
     }
     let (sin, cos) = yaw.sin_cos();
-    let mut result = Vec::with_capacity(MAX_VOICES.min(emitters.len()));
-    for index in spatial.candidates(pos, emitters.len()) {
-        let e = &emitters[index];
+    let mut result = Vec::new();
+    for (index, e) in emitters.iter().enumerate() {
         let s = &e.sound;
         if e.asset.is_none()
             || !scene::effect_visible(s.mode, night_factor)
-            || !s.min_distance.is_finite()
-            || !s.max_distance.is_finite()
             || s.min_distance < 0.
             || s.max_distance <= 0.
             || s.max_distance < s.min_distance
@@ -160,19 +50,17 @@ fn select(
         let dx = s.position[0] - pos[0];
         let dy = s.position[1] - pos[1];
         let dz = s.position[2] - pos[2];
-        let horiz_sq = dx * dx + dz * dz;
-        let dist_sq = horiz_sq + dy * dy;
-        if !dist_sq.is_finite() || dist_sq >= s.max_distance * s.max_distance {
+        let distance = dx.hypot(dy).hypot(dz);
+        if !distance.is_finite() || distance >= s.max_distance {
             continue;
         }
-        let distance = dist_sq.sqrt();
         let gain = if distance <= s.min_distance {
             1.
         } else {
             (s.max_distance - distance) / (s.max_distance - s.min_distance)
         };
         // Match the viewer's mirrored camera and D-key strafe direction.
-        let horizontal = horiz_sq.sqrt();
+        let horizontal = dx.hypot(dz);
         let pan = if horizontal > 0.0001 {
             ((-cos * dx - sin * dz) / horizontal).clamp(-1., 1.)
         } else {
@@ -180,7 +68,7 @@ fn select(
         };
         result.push(Voice { index, gain, pan });
     }
-    result.sort_unstable_by(|a, b| {
+    result.sort_by(|a, b| {
         b.gain
             .total_cmp(&a.gain)
             .then_with(|| a.index.cmp(&b.index))
@@ -197,7 +85,6 @@ struct Request {
 
 pub struct WorldAudio {
     emitters: Vec<Emitter>,
-    spatial: SpatialIndex,
     missing: usize,
     catalog_error: Option<String>,
     worker_error: Option<String>,
@@ -248,7 +135,6 @@ impl WorldAudio {
                 }
             })
             .collect::<Vec<_>>();
-        let spatial = SpatialIndex::new(&emitters);
         let status = format!(
             "{} world sound placements; {missing} unresolved",
             emitters.len()
@@ -267,7 +153,6 @@ impl WorldAudio {
         };
         Self {
             emitters,
-            spatial,
             missing,
             catalog_error,
             worker_error: None,
@@ -309,7 +194,7 @@ impl WorldAudio {
         self.last_enabled = enabled;
         self.last_volume = volume;
         let voices = if enabled {
-            select(&self.emitters, &self.spatial, pos, yaw, night_factor)
+            select(&self.emitters, pos, yaw, night_factor)
         } else {
             Vec::new()
         };
@@ -535,86 +420,26 @@ mod tests {
             emitter([10., 0., 0.], 1),
             emitter([0., 0., 15.], 2),
         ];
-        let spatial = SpatialIndex::new(&emitters);
-        let day = select(&emitters, &spatial, [0., 0., 0.], 0., 0.);
+        let day = select(&emitters, [0., 0., 0.], 0., 0.);
         assert_eq!(day.len(), 1);
         assert_eq!(day[0].index, 0);
         assert_eq!(day[0].gain, 1.);
         assert_eq!(day[0].pan, 1.);
-        let night = select(&emitters, &spatial, [0., 0., 0.], 0., 1.);
+        let night = select(&emitters, [0., 0., 0.], 0., 1.);
         assert_eq!(night.len(), 1);
         assert_eq!(night[0].index, 1);
         assert_eq!(night[0].gain, 0.5);
         assert_eq!(night[0].pan, -1.);
-        assert!(select(&emitters, &spatial, [0., 0., 0.], 0., 0.5).is_empty());
-        assert!(select(&emitters, &spatial, [f32::NAN, 0., 0.], 0., 0.).is_empty());
+        assert!(select(&emitters, [0., 0., 0.], 0., 0.5).is_empty());
+        assert!(select(&emitters, [f32::NAN, 0., 0.], 0., 0.).is_empty());
     }
-    #[test]
-    fn spatial_selection_matches_full_scan_for_short_and_long_ranges() {
-        let mut emitters = Vec::new();
-        for z in -12i32..=12 {
-            for x in -12i32..=12 {
-                let mut e = emitter(
-                    [x as f32 * 173.0, (x - z) as f32 * 3.0, z as f32 * 191.0],
-                    2,
-                );
-                e.sound.max_distance = match (x + z).rem_euclid(4) {
-                    0 => 64.0,
-                    1 => 256.0,
-                    2 => 512.0,
-                    _ => 900.0,
-                };
-                e.sound.min_distance = 5.0;
-                emitters.push(e);
-            }
-        }
-        let indexed = SpatialIndex::new(&emitters);
-        let full_scan = SpatialIndex {
-            cells: HashMap::new(),
-            global: (0..emitters.len()).collect(),
-        };
-        for pos in [
-            [0.0, 0.0, 0.0],
-            [512.0, 8.0, -512.0],
-            [-1100.0, 30.0, 900.0],
-            [2200.0, -10.0, 1700.0],
-        ] {
-            let a = select(&emitters, &indexed, pos, 0.73, 0.0);
-            let b = select(&emitters, &full_scan, pos, 0.73, 0.0);
-            assert_eq!(a.len(), b.len());
-            for (a, b) in a.iter().zip(&b) {
-                assert_eq!(a.index, b.index);
-                assert_eq!(a.gain.to_bits(), b.gain.to_bits());
-                assert_eq!(a.pan.to_bits(), b.pan.to_bits());
-            }
-        }
-    }
-
-    #[test]
-    fn spatial_index_keeps_nearby_short_range_and_all_long_range_emitters() {
-        let emitters = vec![
-            emitter([510., 0., 0.], 2),
-            emitter([770., 0., 0.], 2),
-            emitter([0., 0., 900.], 2),
-        ];
-        let mut long = emitters[2].clone();
-        long.sound.max_distance = 900.;
-        let emitters = vec![emitters[0].clone(), emitters[1].clone(), long];
-        let index = SpatialIndex::new(&emitters);
-        let candidates = index.candidates([0., 0., 0.], emitters.len());
-        assert!(candidates.contains(&0));
-        assert!(!candidates.contains(&1));
-        assert!(candidates.contains(&2));
-    }
-
     #[test]
     fn caps_prioritizes_and_filters_unresolved_voices() {
         let mut emitters = (0..30)
             .map(|i| emitter([i as f32 / 2., 0., 0.], 2))
             .collect::<Vec<_>>();
         emitters[0].asset = None;
-        let spatial = SpatialIndex::new(&emitters);
-        let voices = select(&emitters, &spatial, [0., 0., 0.], 0., 0.);
+        let voices = select(&emitters, [0., 0., 0.], 0., 0.);
         assert_eq!(voices.len(), MAX_VOICES);
         assert_eq!(voices[0].index, 1);
         assert!(voices.iter().all(|v| v.index != 0));

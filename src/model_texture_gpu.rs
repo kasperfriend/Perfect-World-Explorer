@@ -23,7 +23,6 @@ fn append_mip(
     // Round-tripping it through the block decoder's synthetic header is what
     // used to fail, and a failure here becomes the draw's white placeholder.
     if let Format::Uncompressed(layout) = format {
-        rgba.reserve(mip.width as usize * mip.height as usize * 4);
         if layout.luminance {
             // One channel widened into R, G and B: a grey mask, which is what
             // `textures/water/caustic/` is. Inventing colour here would be
@@ -88,8 +87,6 @@ fn append_mip(
     // Restore that authored BC1 mode even when the decoded image is RGB-only.
     if format == Format::Dxt1 {
         let blocks_x = width / 4;
-        let stride = width as usize;
-        let raw = image.as_mut();
         for (block, data) in mip.bytes.chunks_exact(8).enumerate() {
             let c0 = u16::from_le_bytes([data[0], data[1]]);
             let c1 = u16::from_le_bytes([data[2], data[3]]);
@@ -97,12 +94,11 @@ fn append_mip(
                 continue;
             }
             let selectors = u32::from_le_bytes(data[4..8].try_into().unwrap());
-            let x = ((block as u32 % blocks_x) * 4) as usize;
-            let y = ((block as u32 / blocks_x) * 4) as usize;
-            for p in 0..16usize {
+            let x = (block as u32 % blocks_x) * 4;
+            let y = (block as u32 / blocks_x) * 4;
+            for p in 0..16 {
                 if (selectors >> (p * 2)) & 3 == 3 {
-                    let idx = ((y + (p >> 2)) * stride + (x + (p & 3))) * 4 + 3;
-                    raw[idx] = 0;
+                    image.get_pixel_mut(x + p % 4, y + p / 4).0[3] = 0;
                 }
             }
         }

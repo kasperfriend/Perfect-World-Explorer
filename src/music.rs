@@ -268,7 +268,7 @@ impl Zones {
             let list = stop + labels + 1;
             let ambience_day = quoted(lines[stop + labels])?;
             let ambience_night = quoted(lines[list + tracks])?;
-            let mut playlist = Vec::with_capacity(tracks);
+            let mut playlist = Vec::new();
             for line in &lines[list..list + tracks] {
                 let path = quoted(line)?;
                 if !path.is_empty() {
@@ -359,17 +359,12 @@ impl Zones {
     #[cfg(test)]
     #[allow(dead_code)]
     fn parse_instance_zones(lines: &[&str]) -> Result<Self, String> {
-        fn header(line: &str) -> Option<[usize; 10]> {
-            let mut out = [0usize; 10];
-            let mut count = 0usize;
-            for tok in line.split_whitespace() {
-                let v = tok.parse::<usize>().ok()?;
-                if count < 10 {
-                    out[count] = v;
-                }
-                count += 1;
-            }
-            (count >= 10).then_some(out)
+        fn header(line: &str) -> Option<Vec<usize>> {
+            line.split_whitespace()
+                .map(str::parse::<usize>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+                .filter(|nums| nums.len() >= 10)
         }
         let mut zones = Vec::new();
         let mut i = 0usize;
@@ -550,11 +545,7 @@ impl Track {
     }
 }
 fn packed_key(raw: &str) -> Option<String> {
-    let path = if raw.contains('\\') {
-        std::borrow::Cow::Owned(raw.replace('\\', "/"))
-    } else {
-        std::borrow::Cow::Borrowed(raw)
-    };
+    let path = raw.replace('\\', "/");
     let (prefix, name) = path.split_once('/')?;
     if !prefix.eq_ignore_ascii_case("music")
         || name

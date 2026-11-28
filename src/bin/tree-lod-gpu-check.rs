@@ -268,22 +268,9 @@ pub fn run(authored_mips: bool) {
             uni[382] = 0.;
             queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&uni));
         }
-        renderer.update_resident_lods(
-            &device,
-            &queue,
-            [dist, 0., 0.],
-            1.,
-            bounds,
-            [
-                [1., 0., 0., 1.0e9],
-                [-1., 0., 0., 1.0e9],
-                [0., 1., 0., 1.0e9],
-                [0., -1., 0., 1.0e9],
-                [0., 0., 1., 1.0e9],
-                [0., 0., -1., 1.0e9],
-            ],
-            None,
-        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.update_resident_lods(&queue, &mut encoder, [dist, 0., 0.], 1., bounds);
+        queue.submit(Some(encoder.finish()));
         let (count, bytes) = renderer.residency_stats();
         // The instance buffer keeps every (group, level) slice: two `vec4`s per
         // record, three levels per group.
@@ -573,22 +560,9 @@ fn multi_group(device: &wgpu::Device, queue: &wgpu::Queue) {
     let heights = renderer.group_heights();
     assert_eq!(heights.len(), 3, "three tree types, three groups");
     for dist in [20f32, 40., 120., 300., 1000., 3000., 12000.] {
-        renderer.update_resident_lods(
-            device,
-            queue,
-            [dist, 0., 0.],
-            1.,
-            None,
-            [
-                [1., 0., 0., 1.0e9],
-                [-1., 0., 0., 1.0e9],
-                [0., 1., 0., 1.0e9],
-                [0., -1., 0., 1.0e9],
-                [0., 0., 1., 1.0e9],
-                [0., 0., -1., 1.0e9],
-            ],
-            None,
-        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.update_resident_lods(queue, &mut encoder, [dist, 0., 0.], 1., None);
+        queue.submit(Some(encoder.finish()));
         let counts = renderer.lod_instance_counts(device, queue);
         assert_eq!(
             counts.len(),

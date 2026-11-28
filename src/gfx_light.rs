@@ -367,7 +367,7 @@ pub fn parse(text: &str) -> Result<Vec<Definition>, String> {
     let mut expected = None;
     let mut elements = 0;
     let mut current = None;
-    let mut fields = Vec::with_capacity(32);
+    let mut fields = Vec::new();
     let mut definitions = Vec::new();
     for line in lines {
         let Some((key, value)) = line.split_once(':') else {
@@ -383,7 +383,6 @@ pub fn parse(text: &str) -> Result<Vec<Definition>, String> {
             if n > 100000 {
                 return Err("excessive GFX element count".into());
             }
-            definitions.reserve(n.min(64));
             expected = Some(n);
         } else if key == "GFXELEMENTID" {
             elements += 1;
@@ -444,6 +443,11 @@ impl Emitter {
         parent: [f32; 16],
         outer: Option<[f32; 4]>,
     ) -> Result<Option<DynamicLight>, String> {
+        if parent.iter().any(|v| !v.is_finite())
+            || outer.is_some_and(|v| v.iter().any(|v| !v.is_finite() || *v < 0.))
+        {
+            return Err("invalid GFX light parent/outer color".into());
+        }
         if self.finished {
             return Ok(None);
         }
@@ -469,15 +473,6 @@ impl Emitter {
         // `gfx_catalog::priority_exempts` for the dumped direction.
         if !visible || self.definition.priority > manager_priority {
             return Ok(None);
-        }
-        // Hidden or low-priority emitters still advance their keypoint clocks,
-        // but their parent transform and outer tint are not consumed until a
-        // light can actually be published. Avoid validating the same unused
-        // matrix once per hidden light on every frame.
-        if parent.iter().any(|v| !v.is_finite())
-            || outer.is_some_and(|v| v.iter().any(|v| !v.is_finite() || *v < 0.))
-        {
-            return Err("invalid GFX light parent/outer color".into());
         }
         let mut color = [16, 8, 0, 24].map(|shift| ((self.color >> shift) & 255) as f32 / 255.);
         if let Some(outer) = outer {
@@ -609,23 +604,6 @@ mod tests {
             light.color,
             [128. / 255.; 4],
             "an unconverted window leaves the ramp shut for its whole life"
-        );
-    }
-
-    #[test]
-    fn hidden_lights_defer_parent_validation_until_publication() {
-        let mut hidden = Emitter::new(parse(&file()).unwrap().pop().unwrap());
-        let mut invalid = IDENTITY;
-        invalid[12] = f32::NAN;
-        assert!(
-            hidden.tick(100, false, 4, invalid, None).unwrap().is_none(),
-            "a hidden light advances without using or validating its parent"
-        );
-
-        let mut visible = Emitter::new(parse(&file()).unwrap().pop().unwrap());
-        assert!(
-            visible.tick(100, true, 4, invalid, None).is_err(),
-            "the same invalid parent is rejected as soon as the light is publishable"
         );
     }
 

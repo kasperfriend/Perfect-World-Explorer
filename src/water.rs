@@ -86,16 +86,7 @@ pub(crate) fn path_string(b: &[u8], p: &mut usize) -> Result<String, String> {
     if bad {
         return Err("bad BSData name".into());
     }
-    let mut path = s.into_owned();
-    if path.as_bytes().contains(&b'\\') {
-        unsafe {
-            for b in path.as_bytes_mut() {
-                if *b == b'\\' {
-                    *b = b'/';
-                }
-            }
-        }
-    }
+    let path = s.replace('\\', "/");
     if path.contains("..") || path.starts_with('/') || path.contains(':') {
         return Err("unsafe BSData path".into());
     }
@@ -764,10 +755,9 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
     }
     let mut loaded_index = None;
     let mut loaded = Vec::new();
-    let est: usize = scene.blocks.iter().map(|bl| bl.water.len()).sum();
-    let mut records = Vec::with_capacity(est);
-    let mut seen = HashMap::<u32, u32>::with_capacity(est);
-    let mut areas = Vec::with_capacity(est);
+    let mut records = Vec::new();
+    let mut seen = HashMap::<u32, u32>::new();
+    let mut areas = Vec::new();
     for block in &scene.blocks {
         for r in &block.water {
             if let Some(previous) = seen.insert(r.export_id, r.offset) {
@@ -779,7 +769,7 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
             records.push((u(&b, r.offset as usize)? as usize, records.len(), r));
         }
     }
-    records.sort_unstable_by_key(|r| r.0);
+    records.sort_by_key(|r| r.0);
     for (index, order, r) in records {
         let off = r.offset as usize;
         let (Ok(record), Some(path)) = (u(&b, off + 4), files.get(index)) else {
@@ -1759,65 +1749,19 @@ mod tests {
 
 /// Load the retail client's animated water-normal sequence from its texture package.
 pub fn load_normals(element: &Path) -> Result<Vec<Vec<image::RgbaImage>>, String> {
-    use std::collections::HashMap;
     use std::fs::File;
-    use std::sync::{Mutex, OnceLock};
-
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Vec<Vec<image::RgbaImage>>>>> = OnceLock::new();
-    let cache_key = element.to_path_buf();
-    if let Ok(guard) = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
-        if let Some(cached) = guard.get(&cache_key) {
-            return Ok(cached.clone());
-        }
-    }
-
     let mut file = File::open(element.join("textures.pck")).map_err(|e| e.to_string())?;
     let entries = crate::pck::directory(&mut file)?;
-    let mut targets: Vec<(usize, String)> = (0..29)
-        .map(|i| {
-            (
-                i,
-                format!("textures/water/waternormal/water_normal{i:02}.dds"),
-            )
-        })
-        .collect();
-    let mut matched: Vec<Option<crate::pck::Entry>> = vec![None; targets.len()];
-    let mut remaining = targets.len();
-    for e in &entries {
-        if e.name.len() < 40 {
-            continue;
-        }
-        for (slot, (_, name)) in targets.iter().enumerate() {
-            if matched[slot].is_none() && e.name.eq_ignore_ascii_case(name) {
-                matched[slot] = Some(e.clone());
-                remaining -= 1;
-                break;
-            }
-        }
-        if remaining == 0 {
-            break;
-        }
-    }
-    let resolved: Vec<(String, crate::pck::Entry)> = targets
-        .drain(..)
-        .zip(matched)
-        .map(|((_, name), entry)| {
-            let entry = entry.ok_or_else(|| format!("missing {name}"))?;
-            Ok((name, entry))
-        })
-        .collect::<Result<_, String>>()?;
-
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(resolved.len())
-        .min(32);
-    let decode_one = |name: &str,
-                      entry: &crate::pck::Entry|
-     -> Result<Vec<image::RgbaImage>, String> {
-        let raw = crate::pck::read_entry_at(&file, entry).map_err(|e| e.to_string())?;
-        match decode_water_dds_mips(&raw) {
-            Ok(levels) => Ok(levels),
+    let mut frames = Vec::new();
+    for i in 0..29 {
+        let name = format!("textures/water/waternormal/water_normal{i:02}.dds");
+        let e = entries
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(&name))
+            .ok_or_else(|| format!("missing {name}"))?;
+        let raw = crate::pck::read_entry(&mut file, e)?;
+        let img = match decode_water_dds_mips(&raw) {
+            Ok(levels) => levels,
             Err(err) => {
                 // A malformed or unsupported lower mip must not prevent a
                 // client that previously loaded its base level from starting.
@@ -1828,55 +1772,22 @@ pub fn load_normals(element: &Path) -> Result<Vec<Vec<image::RgbaImage>>, String
                 }
                 let levels = decode_water_dds_mips(&base).map_err(|e| format!("{name}: {e}"))?;
                 eprintln!("{name}: {err}; using base level");
-                Ok(levels)
+                levels
+            }
+        };
+        if let Some(first) = frames.first() {
+            let first: &Vec<image::RgbaImage> = first;
+            if img[0].dimensions() != first[0].dimensions() {
+                return Err("water normal sequence dimensions differ".into());
             }
         }
-    };
-    let mut frames: Vec<Vec<image::RgbaImage>> = if workers > 1 {
-        let chunk = resolved.len().div_ceil(workers);
-        std::thread::scope(|s| -> Result<Vec<Vec<image::RgbaImage>>, String> {
-            let handles: Vec<_> = resolved
-                .chunks(chunk)
-                .map(|slice| {
-                    let decode = &decode_one;
-                    s.spawn(move || {
-                        slice
-                            .iter()
-                            .map(|(name, entry)| decode(name, entry))
-                            .collect::<Result<Vec<_>, String>>()
-                    })
-                })
-                .collect();
-            let mut out = Vec::with_capacity(resolved.len());
-            for h in handles {
-                out.extend(h.join().unwrap()?);
-            }
-            Ok(out)
-        })?
-    } else {
-        resolved
-            .iter()
-            .map(|(name, entry)| decode_one(name, entry))
-            .collect::<Result<Vec<_>, String>>()?
-    };
-
-    if let Some(first_dims) = frames.first().map(|f| f[0].dimensions()) {
-        if frames
-            .iter()
-            .skip(1)
-            .any(|f| f[0].dimensions() != first_dims)
-        {
-            return Err("water normal sequence dimensions differ".into());
-        }
+        frames.push(img);
     }
     // A texture array needs a common chain length; keep every authored level
     // shared by all frames rather than failing on an unusual archive.
     let levels = frames.iter().map(Vec::len).min().unwrap_or(1);
     for frame in &mut frames {
         frame.truncate(levels);
-    }
-    if let Ok(mut guard) = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
-        guard.insert(cache_key, frames.clone());
     }
     Ok(frames)
 }
@@ -1926,80 +1837,18 @@ pub(crate) fn decode_water_dds_mips(b: &[u8]) -> Result<Vec<image::RgbaImage>, S
             .ok_or("water DDS overflow")?;
         let end = offset.checked_add(n).ok_or("water DDS overflow")?;
         let src = b.get(offset..end).ok_or("truncated water DDS mip")?;
-        let mut out = vec![0u8; n];
-        let shifts = [
-            if masks[0] != 0 {
-                masks[0].trailing_zeros()
-            } else {
-                0
-            },
-            if masks[1] != 0 {
-                masks[1].trailing_zeros()
-            } else {
-                0
-            },
-            if masks[2] != 0 {
-                masks[2].trailing_zeros()
-            } else {
-                0
-            },
-            if masks[3] != 0 {
-                masks[3].trailing_zeros()
-            } else {
-                0
-            },
-        ];
-        let maxes = [
-            if masks[0] != 0 {
-                masks[0] >> shifts[0]
-            } else {
-                0
-            },
-            if masks[1] != 0 {
-                masks[1] >> shifts[1]
-            } else {
-                0
-            },
-            if masks[2] != 0 {
-                masks[2] >> shifts[2]
-            } else {
-                0
-            },
-            if masks[3] != 0 {
-                masks[3] >> shifts[3]
-            } else {
-                0
-            },
-        ];
-        if maxes[0] == 255
-            && maxes[1] == 255
-            && maxes[2] == 255
-            && (maxes[3] == 255 || maxes[3] == 0)
-        {
-            let s0 = shifts[0];
-            let s1 = shifts[1];
-            let s2 = shifts[2];
-            let s3 = shifts[3];
-            let has_a = maxes[3] == 255;
-            for (pix, dst) in src.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
-                let v = u32::from_le_bytes([pix[0], pix[1], pix[2], pix[3]]);
-                dst[0] = (v >> s0) as u8;
-                dst[1] = (v >> s1) as u8;
-                dst[2] = (v >> s2) as u8;
-                dst[3] = if has_a { (v >> s3) as u8 } else { 255 };
-            }
-        } else {
-            for (pix, dst) in src.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
-                let v = u32::from_le_bytes([pix[0], pix[1], pix[2], pix[3]]);
-                for i in 0..4 {
-                    let m = masks[i];
-                    if m == 0 {
-                        dst[i] = if i == 3 { 255 } else { 0 };
-                    } else {
-                        let val = (v & m) >> shifts[i];
-                        dst[i] = ((val as u64 * 255) / (maxes[i] as u64)) as u8;
-                    }
+        let mut out = Vec::with_capacity(n);
+        for pix in src.chunks_exact(4) {
+            let v = u32::from_le_bytes(pix.try_into().unwrap());
+            for (i, m) in masks.iter().enumerate() {
+                if *m == 0 {
+                    out.push(if i == 3 { 255 } else { 0 });
+                    continue;
                 }
+                let shift = m.trailing_zeros();
+                let max = m >> shift;
+                let val = (v & m) >> shift;
+                out.push(((val as u64 * 255) / (max as u64)) as u8);
             }
         }
         levels.push(image::RgbaImage::from_raw(w, h, out).ok_or("invalid water DDS pixels")?);
@@ -2084,100 +1933,29 @@ pub(crate) fn decode_texture_mips(raw: &[u8]) -> Result<Vec<image::RgbaImage>, S
 
 /// Load the client's 30-frame alternate-water texture sequence.
 pub fn load_simple_frames(element: &Path) -> Result<Vec<Vec<image::RgbaImage>>, String> {
-    use std::collections::HashMap;
     use std::fs::File;
-    use std::sync::{Mutex, OnceLock};
-
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Vec<Vec<image::RgbaImage>>>>> = OnceLock::new();
-    let cache_key = element.to_path_buf();
-    if let Ok(guard) = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
-        if let Some(cached) = guard.get(&cache_key) {
-            return Ok(cached.clone());
-        }
-    }
-
     let mut file = File::open(element.join("textures.pck")).map_err(|e| e.to_string())?;
     let entries = crate::pck::directory(&mut file)?;
-    let targets: Vec<String> = (0..30)
-        .map(|i| format!("textures/water/l/l{i}.dds"))
-        .collect();
-    let mut matched: Vec<Option<crate::pck::Entry>> = vec![None; targets.len()];
-    let mut remaining = targets.len();
-    for e in &entries {
-        if e.name.len() < 22 || e.name.len() > 26 {
-            continue;
-        }
-        for (slot, name) in targets.iter().enumerate() {
-            if matched[slot].is_none() && e.name.eq_ignore_ascii_case(name) {
-                matched[slot] = Some(e.clone());
-                remaining -= 1;
-                break;
-            }
-        }
-        if remaining == 0 {
-            break;
-        }
-    }
-    let resolved: Vec<(String, crate::pck::Entry)> = targets
-        .into_iter()
-        .zip(matched)
-        .map(|(name, entry)| {
-            let entry = entry.ok_or_else(|| format!("missing {name}"))?;
-            Ok((name, entry))
-        })
-        .collect::<Result<_, String>>()?;
-
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(resolved.len())
-        .min(32);
-    let decode_one =
-        |name: &str, entry: &crate::pck::Entry| -> Result<Vec<image::RgbaImage>, String> {
-            let data = crate::pck::read_entry_at(&file, entry).map_err(|e| e.to_string())?;
-            decode_texture_mips(&data).map_err(|e| format!("{name}: {e}"))
-        };
-    let mut frames: Vec<Vec<image::RgbaImage>> = if workers > 1 {
-        let chunk = resolved.len().div_ceil(workers);
-        std::thread::scope(|s| -> Result<Vec<Vec<image::RgbaImage>>, String> {
-            let handles: Vec<_> = resolved
-                .chunks(chunk)
-                .map(|slice| {
-                    let decode = &decode_one;
-                    s.spawn(move || {
-                        slice
-                            .iter()
-                            .map(|(name, entry)| decode(name, entry))
-                            .collect::<Result<Vec<_>, String>>()
-                    })
-                })
-                .collect();
-            let mut out = Vec::with_capacity(resolved.len());
-            for h in handles {
-                out.extend(h.join().unwrap()?);
-            }
-            Ok(out)
-        })?
-    } else {
-        resolved
+    let mut frames = Vec::with_capacity(30);
+    for i in 0..30 {
+        let name = format!("textures/water/l/l{i}.dds");
+        let entry = entries
             .iter()
-            .map(|(name, entry)| decode_one(name, entry))
-            .collect::<Result<Vec<_>, String>>()?
-    };
-
-    if let Some(first_dims) = frames.first().map(|f| f[0].dimensions()) {
-        for (i, frame) in frames.iter().enumerate().skip(1) {
-            if frame[0].dimensions() != first_dims {
-                return Err(format!("textures/water/l/l{i}.dds: dimensions differ"));
+            .find(|e| e.name.eq_ignore_ascii_case(&name))
+            .ok_or_else(|| format!("missing {name}"))?;
+        let data = crate::pck::read_entry(&mut file, entry)?;
+        let levels = decode_texture_mips(&data).map_err(|e| format!("{name}: {e}"))?;
+        if let Some(first) = frames.first() {
+            let first: &Vec<image::RgbaImage> = first;
+            if first[0].dimensions() != levels[0].dimensions() {
+                return Err(format!("{name}: dimensions differ"));
             }
         }
+        frames.push(levels);
     }
     let count = frames.iter().map(Vec::len).min().unwrap_or(1);
     for frame in &mut frames {
         frame.truncate(count);
-    }
-    if let Ok(mut guard) = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
-        guard.insert(cache_key, frames.clone());
     }
     Ok(frames)
 }

@@ -132,7 +132,7 @@ struct PipelineKey {
     motion: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct BucketKey {
     layer: i32,
     /// `Priority` orders elements *inside* a layer. It is a sort key only, so it
@@ -143,9 +143,7 @@ struct BucketKey {
     /// so a tile group binds the WRAP sampler and every other group CLAMPs.
     tile: bool,
     pipeline: PipelineKey,
-    /// Interned texture identifier (index into `Draw::texture_names`) so
-    /// per-quad bucketing and sorting allocate zero `String`s per frame.
-    texture: u32,
+    texture: String,
 }
 
 struct TextureEntry {
@@ -158,25 +156,20 @@ struct TextureEntry {
 }
 
 struct Bucket {
-    #[allow(dead_code)]
     pipeline: PipelineKey,
     binding: wgpu::BindGroup,
+    buffer: wgpu::Buffer,
+    /// Vertices the buffer holds; the CPU side is refilled every frame.
+    capacity: usize,
     /// Whether `binding` points at the placeholder rather than the real
-    /// texture. A bucket built before a texture is successfully uploaded must
-    /// rebind if a real entry later becomes available under the same key.
+    /// texture. A bucket built while the texture was missing must rebind
+    /// once it loads — the cache key matches, so nothing else would.
     bound_fallback: bool,
 }
 
 /// How many distinct (layer, state, texture) groups are cached before the pass
 /// drops them all. Retail roots reuse a few hundred at most.
 const BUCKET_CACHE_LIMIT: usize = 1024;
-/// Retain scratch buffers for all normal effect buckets, under a total vertex
-/// capacity budget so a burst cannot pin unbounded CPU memory.
-const MAX_SCRATCH_POOL_VERTICES: usize = 262_144;
-/// Missing/corrupt effect textures are probed again every five seconds at 60 FPS,
-/// not every rendered frame. This preserves recovery if an archive becomes available
-/// later while keeping the steady-state render path free of repeated disk I/O.
-const TEXTURE_RETRY_INTERVAL_FRAMES: u64 = 300;
 
 pub struct Draw {
     device_format: wgpu::TextureFormat,
@@ -185,21 +178,8 @@ pub struct Draw {
     pipeline_layout: wgpu::PipelineLayout,
     shader: wgpu::ShaderModule,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
-    textures: HashMap<u32, TextureEntry>,
-    /// Next frame each failed texture may be retried. A cooldown lets late
-    /// archive availability recover without hammering missing files every frame.
-    failed_textures: HashMap<u32, u64>,
-    frame_index: u64,
-    texture_ids: HashMap<String, u32>,
-    texture_names: Vec<String>,
+    textures: HashMap<String, TextureEntry>,
     buckets: HashMap<BucketKey, Bucket>,
-    /// Single consolidated dynamic vertex buffer holding all effect vertices
-    /// for the current frame, uploaded via one `queue.write_buffer` and bound
-    /// once per pass instead of once per bucket.
-    shared_vertex_buffer: wgpu::Buffer,
-    shared_vertex_capacity: usize,
-    low_usage_frames: u32,
-    staging_vertices: Vec<Vertex>,
     uniform: wgpu::Buffer,
     sampler_repeat: wgpu::Sampler,
     sampler_clamp: wgpu::Sampler,
@@ -216,20 +196,13 @@ pub struct Draw {
     /// own matrices without re-deriving them from the mirror or refraction view
     /// that has overwritten the uniform in between.
     last_params: Option<Params>,
-    /// Last bytes physically sent to the uniform, distinct from the main motion snapshot.
-    uniform_params: Option<Params>,
     /// The view-projection the previous sheet-motion pass used.
     prev_motion_vp: Option<[[f32; 4]; 4]>,
-    /// This frame's groups in draw order: `(key, first_vertex, vertex_count)`.
-    order: Vec<(BucketKey, u32, u32)>,
-    /// Reused outer bucket vector; allocating this once per frame caused
-    /// persistent allocator churn in the animated-effects render path.
-    group_scratch: Vec<(BucketKey, Vec<Vertex>)>,
+    /// This frame's groups in draw order, with their vertex counts.
+    order: Vec<(BucketKey, u32)>,
     scratch_index: HashMap<BucketKey, usize>,
     scratch_pool: Vec<Vec<Vertex>>,
-    scratch_pool_vertices: usize,
     failed: Vec<String>,
-    failed_set: std::collections::HashSet<String>,
 }
 
 fn blend_factor(code: u32) -> Result<wgpu::BlendFactor, String> {
@@ -462,13 +435,6 @@ impl Draw {
                 emissive_color: [1.0, 1.0, 1.0],
             }
         };
-        const INITIAL_SHARED_VERTICES: usize = 1024;
-        let shared_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GFX effect shared vertex buffer"),
-            size: (INITIAL_SHARED_VERTICES * std::mem::size_of::<Vertex>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         Ok(Self {
             device_format: format,
             depth,
@@ -477,29 +443,17 @@ impl Draw {
             shader,
             pipelines: HashMap::new(),
             textures: HashMap::new(),
-            failed_textures: HashMap::new(),
-            frame_index: 0,
-            texture_ids: HashMap::new(),
-            texture_names: Vec::new(),
             buckets: HashMap::new(),
-            shared_vertex_buffer,
-            shared_vertex_capacity: INITIAL_SHARED_VERTICES,
-            low_usage_frames: 0,
-            staging_vertices: Vec::with_capacity(INITIAL_SHARED_VERTICES),
             uniform,
             last_params: None,
-            uniform_params: None,
             prev_motion_vp: None,
             sampler_repeat,
             sampler_clamp,
             fallback,
             order: Vec::new(),
-            group_scratch: Vec::new(),
             scratch_index: HashMap::new(),
             scratch_pool: Vec::new(),
-            scratch_pool_vertices: 0,
             failed: Vec::new(),
-            failed_set: std::collections::HashSet::new(),
         })
     }
 
@@ -518,37 +472,14 @@ impl Draw {
 
     /// Cached dominant linear emissive RGB colour of a loaded effect texture.
     pub fn texture_emissive_color(&self, texture: &str) -> [f32; 3] {
-        self.texture_ids
+        self.textures
             .get(texture)
-            .and_then(|id| self.textures.get(id))
-            .map(|entry| entry.emissive_color)
+            .map(|e| e.emissive_color)
             .unwrap_or([1.0, 1.0, 1.0])
     }
 
     pub fn vertex_count(&self) -> usize {
-        self.order.iter().map(|(_, _, count)| *count as usize).sum()
-    }
-
-    fn intern_texture(&mut self, name: &str) -> u32 {
-        if let Some(&id) = self.texture_ids.get(name) {
-            return id;
-        }
-        let id = self.texture_names.len() as u32;
-        self.texture_names.push(name.to_owned());
-        self.texture_ids.insert(name.to_owned(), id);
-        id
-    }
-
-    /// Restore effect frame constants for a secondary view without changing the main motion snapshot.
-    pub fn update_params(
-        &mut self,
-        queue: &wgpu::Queue,
-        matrix: [[f32; 4]; 4],
-        clip_plane: [f32; 4],
-        camera: [f32; 4],
-        light: Option<EffectLight>,
-    ) -> Result<(), String> {
-        self.write_frame(queue, matrix, clip_plane, camera, light, false)
+        self.order.iter().map(|(_, count)| *count as usize).sum()
     }
 
     /// Update only view-dependent constants. Secondary views call this instead
@@ -627,19 +558,15 @@ impl Draw {
             prev_matrix: matrix,
             mv_size: [0.; 4],
         };
-        let changed = self.uniform_params.map_or(true, |previous| {
-            bytemuck::bytes_of(&previous) != bytemuck::bytes_of(&params)
-        });
-        if changed {
-            queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
-            self.uniform_params = Some(params);
-        }
+        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
         if remember_motion {
             self.last_params = Some(params);
         }
         Ok(())
     }
 
+    /// Refill every group from this frame's quads. `read` resolves an archive
+    /// path to bytes and is only called for textures the pass has not seen.
     pub fn update(
         &mut self,
         device: &wgpu::Device,
@@ -651,8 +578,8 @@ impl Draw {
         light: Option<EffectLight>,
         read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
     ) -> Result<(), String> {
-        self.frame_index = self.frame_index.wrapping_add(1);
         self.update_frame(queue, matrix, clip_plane, camera, light)?;
+
         // No sheets this frame — switched off, none admitted yet, nothing
         // visible — means the previous vector has no successor. Dropping it makes
         // the first frame back publish a still sheet's zero motion instead of
@@ -662,11 +589,8 @@ impl Draw {
         }
         // Group and order: `RenderLayer` first, then depth-tested quads, then
         // the blend pair and the texture so a group reuses one pipeline.
-        let mut groups = std::mem::take(&mut self.group_scratch);
-        groups.clear();
-        groups.reserve(self.order.len().max(8));
+        let mut groups: Vec<(BucketKey, Vec<Vertex>)> = Vec::new();
         self.scratch_index.clear();
-        let mut last_tex: Option<(&str, u32)> = None;
         for quad in quads {
             let pipeline = PipelineKey {
                 source: quad.source_blend,
@@ -675,38 +599,32 @@ impl Draw {
                 write_depth: quad.mesh.as_ref().is_some_and(|mesh| mesh.write_depth),
                 motion: false,
             };
-            let tex_id = match last_tex {
-                Some((prev_name, prev_id)) if prev_name == quad.texture.as_str() => prev_id,
-                _ => {
-                    let id = self.intern_texture(&quad.texture);
-                    last_tex = Some((quad.texture.as_str(), id));
-                    id
-                }
-            };
-            let key = BucketKey {
-                layer: quad.layer,
-                pipeline,
-                priority: quad.priority,
-                tile: quad.tile,
-                texture: tex_id,
-            };
-            let position = if groups.last().is_some_and(|(last_key, _)| *last_key == key) {
+            let position = if groups.last_mut().is_some_and(|(last_key, _)| {
+                last_key.layer == quad.layer
+                    && last_key.pipeline == pipeline
+                    && last_key.priority == quad.priority
+                    && last_key.tile == quad.tile
+                    && last_key.texture == quad.texture.as_str()
+            }) {
                 groups.len() - 1
-            } else if let Some(&pos) = self.scratch_index.get(&key) {
-                pos
             } else {
-                let mut verts = if let Some(verts) = self.scratch_pool.pop() {
-                    self.scratch_pool_vertices =
-                        self.scratch_pool_vertices.saturating_sub(verts.capacity());
-                    verts
-                } else {
-                    Vec::new()
+                let key = BucketKey {
+                    layer: quad.layer,
+                    pipeline,
+                    priority: quad.priority,
+                    tile: quad.tile,
+                    texture: quad.texture.clone(),
                 };
-                verts.clear();
-                let pos = groups.len();
-                self.scratch_index.insert(key, pos);
-                groups.push((key, verts));
-                pos
+                match self.scratch_index.get(&key) {
+                    Some(position) => *position,
+                    None => {
+                        let mut verts = self.scratch_pool.pop().unwrap_or_default();
+                        verts.clear();
+                        self.scratch_index.insert(key.clone(), groups.len());
+                        groups.push((key, verts));
+                        groups.len() - 1
+                    }
+                }
             };
             let vertices = &mut groups[position].1;
             if let Some(mesh) = &quad.mesh {
@@ -750,38 +668,38 @@ impl Draw {
                 });
             }
         }
-        if groups.len() > 1 {
-            let names = &self.texture_names;
-            groups.sort_unstable_by(|(a, _), (b, _)| {
-                a.layer
-                    .cmp(&b.layer)
-                    .then_with(|| b.pipeline.write_depth.cmp(&a.pipeline.write_depth))
-                    .then_with(|| a.priority.cmp(&b.priority))
-                    .then_with(|| a.pipeline.depth_test.cmp(&b.pipeline.depth_test).reverse())
-                    .then_with(|| a.pipeline.source.cmp(&b.pipeline.source))
-                    .then_with(|| a.pipeline.destination.cmp(&b.pipeline.destination))
-                    .then_with(|| names[a.texture as usize].cmp(&names[b.texture as usize]))
-                    .then_with(|| a.tile.cmp(&b.tile))
-            });
-        }
+        groups.sort_by(|(a, _), (b, _)| {
+            a.layer
+                .cmp(&b.layer)
+                // Depth writers establish the buffer the blended sheets are
+                // tested against, so within a layer they go first whatever the
+                // authored `Priority` says: a model drawn after the sheet it
+                // stands in front of would otherwise be painted over.
+                .then_with(|| b.pipeline.write_depth.cmp(&a.pipeline.write_depth))
+                // `Priority` orders the elements inside one `RenderLayer`: the
+                // client authors it 1..5 on every element (7,820 are a 4 and
+                // 5,586 a 2) and nothing read it, so a background dust sheet
+                // and the flash over it landed in whatever order the texture
+                // bucket happened to produce.
+                .then_with(|| a.priority.cmp(&b.priority))
+                .then_with(|| a.pipeline.depth_test.cmp(&b.pipeline.depth_test).reverse())
+                .then_with(|| a.pipeline.source.cmp(&b.pipeline.source))
+                .then_with(|| a.pipeline.destination.cmp(&b.pipeline.destination))
+                .then_with(|| a.texture.cmp(&b.texture))
+                .then_with(|| a.tile.cmp(&b.tile))
+        });
 
         if self.buckets.len() + groups.len() > BUCKET_CACHE_LIMIT {
             self.buckets.clear();
         }
         self.order.clear();
         self.order.reserve(groups.len());
-        self.staging_vertices.clear();
         for (key, vertices) in &groups {
             if vertices.is_empty() {
                 continue;
             }
-            let retry_due = self
-                .failed_textures
-                .get(&key.texture)
-                .map_or(true, |next_frame| self.frame_index >= *next_frame);
-            if !self.textures.contains_key(&key.texture) && retry_due {
-                let tex_name = self.texture_names[key.texture as usize].clone();
-                match read(&tex_name) {
+            if !self.textures.contains_key(&key.texture) {
+                match read(&key.texture) {
                     Ok(bytes) => {
                         match model_texture_gpu::upload(
                             device,
@@ -793,41 +711,28 @@ impl Draw {
                                 let view = texture.create_view(&Default::default());
                                 let emissive_color = model_texture_gpu::sample_emissive_rgb(&bytes);
                                 self.textures.insert(
-                                    key.texture,
+                                    key.texture.clone(),
                                     TextureEntry {
                                         texture,
                                         view,
                                         emissive_color,
                                     },
                                 );
-                                self.failed_textures.remove(&key.texture);
                             }
-                            Err(error) => {
-                                self.failed_textures.insert(
-                                    key.texture,
-                                    self.frame_index
-                                        .saturating_add(TEXTURE_RETRY_INTERVAL_FRAMES),
-                                );
-                                self.note_failure(&tex_name, &error);
-                            }
+                            Err(error) => self.note_failure(&key.texture, &error),
                         }
                     }
                     // The element still draws, with the white stand-in: the
                     // quads and their authored colour survive (the NOTEX
-                    // vertex-colour law), only the map is lost. Back off the
-                    // retry: the archive may become available later, but a
-                    // missing member must not trigger a read on every frame.
-                    Err(error) => {
-                        self.failed_textures.insert(
-                            key.texture,
-                            self.frame_index
-                                .saturating_add(TEXTURE_RETRY_INTERVAL_FRAMES),
-                        );
-                        self.note_failure(&tex_name, &error);
-                    }
+                    // vertex-colour law), only the map is lost. Returning here
+                    // instead would delete the bucket and the element with it.
+                    Err(error) => self.note_failure(&key.texture, &error),
                 }
             }
-            let entry = self.textures.get(&key.texture).unwrap_or(&self.fallback);
+            let (entry, loaded) = match self.textures.get(&key.texture) {
+                Some(e) => (e, true),
+                None => (&self.fallback, false),
+            };
             if !self.pipelines.contains_key(&key.pipeline) {
                 let pipeline = self.pipeline(device, key.pipeline)?;
                 self.pipelines.insert(key.pipeline, pipeline);
@@ -844,15 +749,23 @@ impl Draw {
                     self.pipelines.insert(motion, pipeline);
                 }
             }
-            let loaded = self.textures.contains_key(&key.texture);
             let was_fallback = self.buckets.get(key).is_some_and(|b| b.bound_fallback);
             if !self.buckets.contains_key(key) {
                 let binding = self.binding_for(device, entry, key.tile);
+                let capacity = vertices.len().next_power_of_two();
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("GFX effect quad batch"),
+                    size: (capacity * std::mem::size_of::<Vertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
                 self.buckets.insert(
-                    *key,
+                    key.clone(),
                     Bucket {
                         pipeline: key.pipeline,
                         binding,
+                        buffer,
+                        capacity,
                         bound_fallback: !loaded,
                     },
                 );
@@ -868,88 +781,39 @@ impl Draw {
                     bucket.bound_fallback = false;
                 }
             }
-            let first_vertex = self.staging_vertices.len() as u32;
-            self.staging_vertices.extend_from_slice(vertices);
-            self.order.push((*key, first_vertex, vertices.len() as u32));
-        }
-        let vert_len = self.staging_vertices.len();
-        if vert_len > self.shared_vertex_capacity {
-            self.shared_vertex_capacity = vert_len.next_power_of_two();
-            self.shared_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("GFX effect shared vertex buffer"),
-                size: (self.shared_vertex_capacity * std::mem::size_of::<Vertex>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.low_usage_frames = 0;
-        } else if self.shared_vertex_capacity > 65_536 && vert_len < self.shared_vertex_capacity / 8
-        {
-            self.low_usage_frames = self.low_usage_frames.saturating_add(1);
-            if self.low_usage_frames >= 120 {
-                self.shared_vertex_capacity = vert_len.max(32_768).next_power_of_two();
-                self.shared_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("GFX effect shared vertex buffer"),
-                    size: (self.shared_vertex_capacity * std::mem::size_of::<Vertex>()) as u64,
+            let bucket = match self.buckets.get_mut(key) {
+                Some(bucket) => bucket,
+                None => continue,
+            };
+            if vertices.len() > bucket.capacity {
+                bucket.capacity = vertices.len().next_power_of_two();
+                bucket.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("GFX effect quad batch"),
+                    size: (bucket.capacity * std::mem::size_of::<Vertex>()) as u64,
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                self.low_usage_frames = 0;
             }
-        } else {
-            self.low_usage_frames = 0;
+            queue.write_buffer(&bucket.buffer, 0, bytemuck::cast_slice(vertices));
+            self.order.push((key.clone(), vertices.len() as u32));
         }
-        if vert_len > 0 {
-            queue.write_buffer(
-                &self.shared_vertex_buffer,
-                0,
-                bytemuck::cast_slice(&self.staging_vertices),
-            );
-        }
-        // Release burst high-water marks so effect spikes do not permanently
-        // pin megabytes of unused staging/scratch RAM.
-        const STAGING_TRIM_THRESHOLD: usize = 32_768;
-        if self.staging_vertices.capacity() > STAGING_TRIM_THRESHOLD
-            && self.staging_vertices.len() < self.staging_vertices.capacity() / 8
-        {
-            self.staging_vertices.shrink_to(STAGING_TRIM_THRESHOLD);
-        }
-        const MAX_SCRATCH_VERTS: usize = 8_192;
-        for (_, mut verts) in groups.drain(..) {
+        for (_, mut verts) in groups {
             verts.clear();
-            if verts.capacity() > MAX_SCRATCH_VERTS {
-                verts.shrink_to(MAX_SCRATCH_VERTS);
-            }
-            let capacity = verts.capacity();
-            if self.scratch_pool.len() < BUCKET_CACHE_LIMIT
-                && self.scratch_pool_vertices.saturating_add(capacity) <= MAX_SCRATCH_POOL_VERTICES
-            {
-                self.scratch_pool_vertices += capacity;
-                self.scratch_pool.push(verts);
-            }
+            self.scratch_pool.push(verts);
         }
-        self.group_scratch = groups;
         Ok(())
     }
 
     fn note_failure(&mut self, texture: &str, error: &str) {
-        const MAX_FAILED_DIAGNOSTICS: usize = 512;
-        if self.failed.len() >= MAX_FAILED_DIAGNOSTICS {
-            return;
-        }
         let message = format!("{texture}: {error}");
-        if self.failed_set.insert(message.clone()) {
+        if !self.failed.contains(&message) {
             self.failed.push(message);
         }
     }
 
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        if self.order.is_empty() {
-            return;
-        }
-        pass.set_vertex_buffer(0, self.shared_vertex_buffer.slice(..));
         let mut last_pipeline = None;
-        let mut last_binding: Option<(u32, bool)> = None;
-        for (key, first, count) in &self.order {
+        for (key, count) in &self.order {
             let (Some(bucket), Some(pipeline)) =
                 (self.buckets.get(key), self.pipelines.get(&key.pipeline))
             else {
@@ -962,12 +826,9 @@ impl Draw {
                 pass.set_pipeline(pipeline);
                 last_pipeline = Some(key.pipeline);
             }
-            let bind_key = (key.texture, key.tile);
-            if last_binding != Some(bind_key) {
-                pass.set_bind_group(0, &bucket.binding, &[]);
-                last_binding = Some(bind_key);
-            }
-            pass.draw(*first..(*first + *count), 0..1);
+            pass.set_bind_group(0, &bucket.binding, &[]);
+            pass.set_vertex_buffer(0, bucket.buffer.slice(..));
+            pass.draw(0..*count, 0..1);
         }
     }
 
@@ -1006,9 +867,6 @@ impl Draw {
     ) {
         // The frame block written by the main view's `update`, which is the last
         // one written before this pass runs.
-        if self.order.is_empty() {
-            return;
-        }
         let Some(params) = self.last_params else {
             return;
         };
@@ -1027,12 +885,8 @@ impl Draw {
                 ..params
             }),
         );
-        self.uniform_params = None; // motion constants replaced the cached frame block.
-
-        pass.set_vertex_buffer(0, self.shared_vertex_buffer.slice(..));
         let mut last = None;
-        let mut last_binding: Option<(u32, bool)> = None;
-        for (key, first, count) in &self.order {
+        for (key, count) in &self.order {
             if key.pipeline.write_depth {
                 continue;
             }
@@ -1052,12 +906,9 @@ impl Draw {
                 pass.set_pipeline(pipeline);
                 last = Some(key.pipeline);
             }
-            let bind_key = (key.texture, key.tile);
-            if last_binding != Some(bind_key) {
-                pass.set_bind_group(0, &bucket.binding, &[]);
-                last_binding = Some(bind_key);
-            }
-            pass.draw(*first..(*first + *count), 0..1);
+            pass.set_bind_group(0, &bucket.binding, &[]);
+            pass.set_vertex_buffer(0, bucket.buffer.slice(..));
+            pass.draw(0..*count, 0..1);
         }
     }
 
@@ -1871,15 +1722,14 @@ mod tests {
         assert_eq!(draw.order[0].0.layer, 0);
         assert!(draw.order[0].0.pipeline.depth_test, "depth-tested first");
         assert_eq!(draw.order[2].0.layer, 1);
-        assert_eq!(draw.order[2].2, 12);
-        // The second frame reused the consolidated shared vertex buffer and
-        // kept every bucket binding cached.
-        assert!(draw.shared_vertex_capacity >= draw.vertex_count());
-        assert!(draw
-            .order
-            .iter()
-            .all(|(key, first, count)| draw.buckets.contains_key(key)
-                && (*first as usize + *count as usize) <= draw.shared_vertex_capacity));
+        assert_eq!(draw.order[2].1, 12);
+        // The second frame reused the cached buffers: every group's buffer can
+        // still hold its own draw (a 6-vertex group only needs 8), and the pair
+        // that grew to twelve vertices kept a buffer at least that large.
+        assert!(draw.order.iter().all(|(key, count)| draw
+            .buckets
+            .get(key)
+            .is_some_and(|bucket| bucket.capacity >= *count as usize)));
     }
 
     /// Element 160 draws through `A3DSkinModel`, so its vertex colour is the
@@ -2327,11 +2177,8 @@ mod tests {
             draw.buckets.values().next().unwrap().bound_fallback,
             "the first frame must bind the placeholder"
         );
-        // A texture that becomes available on the next frame must not trigger a
-        // second archive read immediately; the failed path is on cooldown.
-        let present_attempts = std::cell::Cell::new(0);
+        // The archive answers on the next frame: a 1x1 uncompressed TGA.
         let mut present = |_: &str| -> Result<Vec<u8>, String> {
-            present_attempts.set(present_attempts.get() + 1);
             let mut bytes = vec![0; 18];
             bytes[2] = 2;
             bytes[12..14].copy_from_slice(&1u16.to_le_bytes());
@@ -2352,31 +2199,6 @@ mod tests {
             &mut present,
         )
         .unwrap();
-        assert_eq!(
-            present_attempts.get(),
-            0,
-            "failed paths are not retried each frame"
-        );
-        assert!(draw.buckets.values().next().unwrap().bound_fallback);
-
-        // When the retry window arrives, the archive answers and replaces the
-        // fallback binding as before.
-        let texture_id = draw.texture_ids["late.png"];
-        let retry_frame = draw.failed_textures[&texture_id];
-        assert!(retry_frame > draw.frame_index);
-        draw.frame_index = retry_frame - 1;
-        draw.update(
-            &harness.device,
-            &harness.queue,
-            &frame,
-            matrix,
-            [0., 0., 0., 1.],
-            [0., 0., 0., 100.],
-            None,
-            &mut present,
-        )
-        .unwrap();
-        assert_eq!(present_attempts.get(), 1);
         assert!(
             !draw.buckets.values().next().unwrap().bound_fallback,
             "a texture that loads after failing must replace the placeholder binding"
@@ -2410,7 +2232,7 @@ mod tests {
             &mut read,
         )
         .unwrap();
-        let small = draw.shared_vertex_capacity;
+        let small = draw.buckets.values().next().unwrap().capacity;
         let burst: Vec<EffectQuad> = (0..200)
             .map(|_| quad("a.png", 5, 2, 0, false, [1.; 4]))
             .collect();
@@ -2425,7 +2247,7 @@ mod tests {
             &mut read,
         )
         .unwrap();
-        let large = draw.shared_vertex_capacity;
+        let large = draw.buckets.values().next().unwrap().capacity;
         assert!(large >= 200 * 6, "{small} -> {large}");
         assert_eq!(draw.vertex_count(), 200 * 6);
         // Emptying the frame keeps the group but draws nothing.
@@ -2459,21 +2281,21 @@ mod tests {
                 layer: 1,
                 priority: 0,
                 pipeline: pipeline(5, 2, false),
-                texture: 1,
+                texture: "b".into(),
                 tile: false,
             },
             BucketKey {
                 layer: 0,
                 priority: 0,
                 pipeline: pipeline(5, 6, true),
-                texture: 0,
+                texture: "a".into(),
                 tile: false,
             },
             BucketKey {
                 layer: 0,
                 priority: 0,
                 pipeline: pipeline(5, 2, false),
-                texture: 0,
+                texture: "a".into(),
                 tile: false,
             },
         ];
@@ -2522,21 +2344,21 @@ mod tests {
                 layer: 0,
                 priority: 4,
                 pipeline: pipeline(5, 2, true),
-                texture: 0,
+                texture: "flash".into(),
                 tile: false,
             },
             BucketKey {
                 layer: 0,
                 priority: 1,
                 pipeline: pipeline(5, 2, true),
-                texture: 1,
+                texture: "dust".into(),
                 tile: false,
             },
             BucketKey {
                 layer: 1,
                 priority: 1,
                 pipeline: pipeline(5, 2, true),
-                texture: 2,
+                texture: "later-layer".into(),
                 tile: false,
             },
         ];
@@ -2556,12 +2378,12 @@ mod tests {
                 .then_with(|| a.tile.cmp(&b.tile))
         });
         assert_eq!(
-            sorted[0].texture, 1,
+            sorted[0].texture, "dust",
             "priority 1 inside layer 0 draws before priority 4"
         );
-        assert_eq!(sorted[1].texture, 0);
+        assert_eq!(sorted[1].texture, "flash");
         // Layer still dominates: a priority-1 element in layer 1 comes last.
-        assert_eq!(sorted[2].texture, 2);
+        assert_eq!(sorted[2].texture, "later-layer");
     }
 
     /// A model slot is a skin draw, not a quad slot, so element 160's `WriteZ`
@@ -2591,21 +2413,21 @@ mod tests {
                 layer: 0,
                 priority: 1,
                 pipeline: sheet,
-                texture: 0,
+                texture: "sheet".into(),
                 tile: false,
             },
             BucketKey {
                 layer: 0,
                 priority: 4,
                 pipeline: model,
-                texture: 1,
+                texture: "model".into(),
                 tile: false,
             },
             BucketKey {
                 layer: 1,
                 priority: 1,
                 pipeline: model,
-                texture: 2,
+                texture: "later-layer-model".into(),
                 tile: false,
             },
         ];
@@ -2621,11 +2443,11 @@ mod tests {
                 .then_with(|| a.tile.cmp(&b.tile))
         });
         assert_eq!(
-            sorted[0].texture, 1,
+            sorted[0].texture, "model",
             "the depth writer goes first even at priority 4"
         );
-        assert_eq!(sorted[1].texture, 0);
-        assert_eq!(sorted[2].texture, 2);
+        assert_eq!(sorted[1].texture, "sheet");
+        assert_eq!(sorted[2].texture, "later-layer-model");
         // A writer and a non-writer must not share a pipeline: the state differs.
         assert_ne!(sorted[0].pipeline, sorted[1].pipeline);
     }

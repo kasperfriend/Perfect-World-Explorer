@@ -350,11 +350,9 @@ impl CollisionWorld {
                 tree_ids.extend(0..self.trees.len());
             }
         }
-        if building_ids.len() > 1 {
-            building_ids.sort_unstable();
-            building_ids.dedup();
-        }
-        if include_trees && tree_ids.len() > 1 {
+        building_ids.sort_unstable();
+        building_ids.dedup();
+        if include_trees {
             tree_ids.sort_unstable();
             tree_ids.dedup();
         }
@@ -700,7 +698,7 @@ fn tree_brushes(world: &mut CollisionWorld, element: &PathBuf, scene: &scene::Sc
         }
     };
     for (index, tree) in scene.tree_types.iter().enumerate() {
-        let key = crate::texture_resolution::normalize(&tree.tree);
+        let key = tree.tree.to_lowercase().replace('\\', "/");
         let Some(stem) = key.strip_suffix(".spt") else {
             report.failed += 1;
             report
@@ -777,8 +775,7 @@ fn model_decks(model: &crate::bmd::Model) -> Vec<PropDeck> {
     }
     // Collect the up-facing triangles and their own XZ bounds first, so the tile
     // grid covers only the surface that can carry an actor.
-    let total_tris: usize = model.meshes.iter().map(|m| m.indices.len() / 3).sum();
-    let mut faces = Vec::with_capacity(total_tris / 4);
+    let mut faces = Vec::new();
     let mut area_min = Vec2::splat(f32::MAX);
     let mut area_max = Vec2::splat(f32::MIN);
     for mesh in &model.meshes {
@@ -796,8 +793,7 @@ fn model_decks(model: &crate::bmd::Model) -> Vec<PropDeck> {
             let b = Vec3::from_array(b.position);
             let c = Vec3::from_array(c.position);
             let normal = (b - a).cross(c - a);
-            let n2 = normal.length_squared();
-            if n2 < 1e-8 || normal.y <= 0.0 || normal.y * normal.y <= 0.25 * n2 {
+            if normal.length_squared() < 1e-8 || normal.normalize().y <= 0.5 {
                 continue;
             }
             for point in [a, b, c] {
@@ -825,7 +821,7 @@ fn model_decks(model: &crate::bmd::Model) -> Vec<PropDeck> {
         let slot = &mut tops[row * columns + column];
         *slot = slot.max(top);
     }
-    let mut decks = Vec::with_capacity((columns * rows).min(64));
+    let mut decks = Vec::new();
     for row in 0..rows {
         for column in 0..columns {
             let top = tops[row * columns + column];
