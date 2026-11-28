@@ -3412,6 +3412,16 @@ impl Renderer {
             if let Some(models) = &mut self.models {
                 models.sync_editor_placements(&editor_placements);
             }
+
+            // Effects use their native owner/player pipeline. Keep the last
+            // committed transform while a gizmo drag is in progress; on release
+            // the changed placement is reconciled once, not reloaded every frame.
+            if !self.modules.architect_object_dragging() {
+                let editor_effects = self.modules.architect_effect_placements();
+                if let Some(models) = &mut self.models {
+                    models.sync_editor_effects(&editor_effects);
+                }
+            }
         }
         // WaterEffect 0 (shipped default) hides EC models and home ornaments
         // in reflection/refraction (0x5b2015, 0x5b2336). RenderContext carries
