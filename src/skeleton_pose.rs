@@ -105,7 +105,7 @@ pub fn evaluate(
     let mut absolute = vec![Mat4::IDENTITY; count];
     let mut skin = vec![Mat4::IDENTITY; count];
     let mut children = vec![Vec::new(); count];
-    let mut queue = VecDeque::new();
+    let mut queue = VecDeque::with_capacity(count);
     for (index, bone) in s.bones.iter().enumerate() {
         if bone.parent == -1 {
             queue.push_back(index);
@@ -169,17 +169,23 @@ pub fn palette(skin: &Skin, skeleton: &Skeleton, pose: &Pose) -> Result<Vec<Mat4
     }
     let mut matrices = if skin.version >= 9 {
         let mut out = Vec::with_capacity(skin.bones.len() + 1);
-        for name in &skin.bones {
-            let index = skeleton
-                .bones
-                .iter()
-                .position(|b| b.name == *name)
-                .ok_or_else(|| format!("skin bone not found in skeleton: {name}"))?;
+        for (slot, name) in skin.bones.iter().enumerate() {
+            let index = if skeleton.bones.get(slot).is_some_and(|b| b.name == *name) {
+                slot
+            } else {
+                skeleton
+                    .bones
+                    .iter()
+                    .position(|b| b.name == *name)
+                    .ok_or_else(|| format!("skin bone not found in skeleton: {name}"))?
+            };
             out.push(pose.skin[index]);
         }
         out
     } else {
-        pose.skin.clone()
+        let mut out = Vec::with_capacity(pose.skin.len() + 1);
+        out.extend_from_slice(&pose.skin);
+        out
     };
     matrices.push(pose.model);
     Ok(matrices)

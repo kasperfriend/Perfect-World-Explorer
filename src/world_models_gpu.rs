@@ -34,6 +34,10 @@ struct Producer {
     attenuation: bool,
     /// Current distance fade, 0..1, ramped toward the target at 1/3000 per ms.
     fade: f32,
+    /// Last activation decision applied to the owner. Camera motion changes
+    /// distance calculations every frame, but most producers remain on the
+    /// same side of the activation boundary; skip their hash/index updates.
+    active: Option<bool>,
 }
 
 /// `FadeGFX`'s transition length: `SetAlphaTransition(max_alpha * fAlpha, 3000)`
@@ -46,6 +50,111 @@ const FADE_MS: f32 = 3000.;
 fn attenuation_step(fade: f32, target: f32, delta_ms: u32) -> f32 {
     let step = (delta_ms as f32 / FADE_MS).clamp(0., 1.);
     (fade + (target - fade).clamp(-step, step)).clamp(0., 1.)
+}
+
+const MODEL_SPATIAL_CELL_SIZE: f32 = 256.0;
+const MODEL_SPATIAL_RADIUS: f32 = 128.0;
+
+struct ModelSpatialCell {
+    min: [f32; 3],
+    max: [f32; 3],
+    slots: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActivationKey {
+    view_x: u32,
+    view_z: u32,
+    radius: u32,
+    night: u32,
+    resident_bounds: Option<[u32; 4]>,
+    producer_count: usize,
+}
+
+fn build_model_spatial_cells(
+    positions: impl IntoIterator<Item = (usize, [f32; 3])>,
+) -> Vec<ModelSpatialCell> {
+    let mut cells = std::collections::BTreeMap::<(i32, i32), ModelSpatialCell>::new();
+    for (slot, position) in positions {
+        let valid = position.iter().all(|value| value.is_finite());
+        let key = if valid {
+            (
+                (position[0] / MODEL_SPATIAL_CELL_SIZE).floor() as i32,
+                (position[2] / MODEL_SPATIAL_CELL_SIZE).floor() as i32,
+            )
+        } else {
+            (i32::MIN, i32::MIN)
+        };
+        let (min, max) = if valid {
+            (
+                [
+                    position[0] - MODEL_SPATIAL_RADIUS,
+                    position[1] - MODEL_SPATIAL_RADIUS,
+                    position[2] - MODEL_SPATIAL_RADIUS,
+                ],
+                [
+                    position[0] + MODEL_SPATIAL_RADIUS,
+                    position[1] + MODEL_SPATIAL_RADIUS,
+                    position[2] + MODEL_SPATIAL_RADIUS,
+                ],
+            )
+        } else {
+            ([-f32::MAX; 3], [f32::MAX; 3])
+        };
+        let cell = cells.entry(key).or_insert_with(|| ModelSpatialCell {
+            min: [f32::INFINITY; 3],
+            max: [f32::NEG_INFINITY; 3],
+            slots: Vec::new(),
+        });
+        for axis in 0..3 {
+            cell.min[axis] = cell.min[axis].min(min[axis]);
+            cell.max[axis] = cell.max[axis].max(max[axis]);
+        }
+        cell.slots.push(slot);
+    }
+    cells.into_values().collect()
+}
+
+/// Conservative broad phase for the existing per-model 128-unit sphere test.
+/// Every kept slot still runs that exact sphere test before it is drawn.
+fn model_cell_intersects_frustum(planes: &[[f32; 4]; 6], min: [f32; 3], max: [f32; 3]) -> bool {
+    if min.iter().chain(max.iter()).any(|value| !value.is_finite())
+        || (0..3).any(|axis| min[axis] > max[axis])
+    {
+        return true;
+    }
+    for plane in planes {
+        let positive = [
+            if plane[0] >= 0.0 { max[0] } else { min[0] },
+            if plane[1] >= 0.0 { max[1] } else { min[1] },
+            if plane[2] >= 0.0 { max[2] } else { min[2] },
+        ];
+        if plane[0] * positive[0] + plane[1] * positive[1] + plane[2] * positive[2] + plane[3] < 0.0
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn append_visible_model_slots(
+    cells: &[ModelSpatialCell],
+    frustum: Option<&[[f32; 4]; 6]>,
+    bounds: Option<[f32; 4]>,
+    out: &mut Vec<usize>,
+) {
+    for cell in cells {
+        if let Some([x0, x1, z0, z1]) = bounds {
+            if cell.max[0] < x0 || cell.min[0] >= x1 || cell.max[2] < z0 || cell.min[2] >= z1 {
+                continue;
+            }
+        }
+        if frustum.is_some_and(|planes| !model_cell_intersects_frustum(planes, cell.min, cell.max))
+        {
+            continue;
+        }
+        out.extend_from_slice(&cell.slots);
+    }
 }
 
 /// The fade a root asks for: full alpha when the fade is switched off, else
@@ -72,6 +181,10 @@ struct HookBinding {
     record: model_attachment::Attachment,
     /// Authored hook-local matrix, resolved once at install time.
     local: glam::Mat4,
+    /// A parent without an active action never changes pose. Cache the first
+    /// resolved hook matrix so world effects attached to static scenery do not
+    /// traverse its skeleton on every camera turn/frame.
+    static_parent: Option<[f32; 16]>,
 }
 
 /// This frame's pose and deformed meshes for one slot. Secondary views reuse
@@ -88,6 +201,8 @@ struct Slot {
     transform: Result<glam::Mat4, String>,
     /// Last evaluated pose, reused by every pass of the same frame.
     posed: Option<Result<SlotPose, String>>,
+    /// Static bind poses are queued only until first evaluated or evicted.
+    static_pose_pending: bool,
     geometry_dirty: bool,
     /// Playback may advance while an off-frustum model defers skinning. The
     /// next visible frame must rebuild its pose even if its sampled time repeats.
@@ -117,6 +232,19 @@ pub struct World {
     assets: Assets,
     keep_unbounded: bool,
     slots: Vec<Slot>,
+    model_spatial_cells: Vec<ModelSpatialCell>,
+    /// Static models needing one bind-pose evaluation (not a per-frame scan).
+    pending_static_pose_slots: Vec<usize>,
+    /// Models with actual animation playback; these alone are ticked each frame.
+    animated_pose_slots: Vec<usize>,
+    /// Indices of slots visible in the most recently prepared view.
+    visible_slots: Vec<usize>,
+    /// Last main-view alpha order key. Rotation changes the frustum but not
+    /// transparent-mesh sort distance; reuse while the eye and visible set match.
+    alpha_order_eye: Option<[f32; 3]>,
+    alpha_order_slots: Vec<usize>,
+    /// Reused candidate storage for the spatial-cell query.
+    scratch_model_candidates: Vec<usize>,
     read: Box<dyn FnMut(&str) -> Result<Vec<u8>, String>>,
     textures: HashMap<String, (std::sync::Arc<wgpu::Texture>, bool)>,
     receivers: crate::model_draw_gpu::ReceiverCache,
@@ -134,8 +262,12 @@ pub struct World {
     /// this module is also compiled into binaries whose crate root has no
     /// `navigation` (the shipped survey tools), and the query is all the effect
     /// pass needs anyway.
-    terrain: Option<Box<dyn Fn(f32, f32) -> Option<f32>>>,
+    terrain: Option<Box<dyn Fn(f32, f32) -> Option<f32> + Send + Sync>>,
     producers: Vec<Producer>,
+    /// Reused scratch for resolving model-hook effect parents; retaining these
+    /// allocations prevents per-frame Vec churn when many effects are attached.
+    attachment_results: Vec<(u64, Result<Option<[f32; 16]>, String>)>,
+    detached_producers: Vec<u64>,
     /// The animated half of the world's effects. Created on the first update that
     /// needs it, because `with_reader` has no queue to build a draw object with.
     effects: Option<gfx_effect_gpu::Draw>,
@@ -153,6 +285,13 @@ pub struct World {
     /// Retail `SCNRES_EFFECT` distance in world units; 0 disables the fade and
     /// leaves every root at its authored alpha (the explorer default).
     effect_distance: f32,
+    /// Last inputs used for the CPU activation scan. Rotation alone does not
+    /// change activation; position, radius, night, residency or root membership does.
+    activation_key: Option<ActivationKey>,
+    /// Last eye/distance key and per-root target used by the attenuation ramp.
+    attenuation_key: Option<(u32, u32, u32, usize)>,
+    attenuation_targets: Vec<f32>,
+    attenuation_settled: bool,
     /// Why the last activation pass left producers out, so a zone that draws
     /// nothing can say which gate closed on it: beyond the activation radius,
     /// outside the resident terrain window, or outside its day/night window.
@@ -162,6 +301,10 @@ pub struct World {
     alpha: Vec<model_queue::AlphaCandidate>,
     reported: Vec<String>,
     frustum: Option<[[f32; 4]; 6]>,
+    /// Plane normal lengths are invariant for a frame's frustum. Cache them
+    /// when the camera matrix changes instead of taking six square roots for
+    /// every world-model instance on every frame.
+    frustum_plane_lengths: Option<[f32; 6]>,
     scratch_candidates: Vec<model_queue::AlphaCandidate>,
     scratch_failures: Vec<(usize, String)>,
     /// Pose culling is safe only when the main view is the only model view this
@@ -214,18 +357,38 @@ impl World {
                 clock.tick(initial)?;
             }
         }
+        let model_spatial_cells = build_model_spatial_cells(
+            assets
+                .instances
+                .iter()
+                .enumerate()
+                .map(|(index, instance)| (index, instance.placement.position)),
+        );
+        let mut pending_static_pose_slots = Vec::new();
+        let mut animated_pose_slots = Vec::new();
         let slots = assets
             .instances
             .iter()
-            .map(|i| Slot {
-                draw: None,
-                failed: false,
-                transform: crate::world_models::transform(&i.placement),
-                posed: None,
-                geometry_dirty: true,
-                pose_stale: false,
-                vertex_fog: None,
-                visible: true,
+            .enumerate()
+            .map(|(index, instance)| {
+                let static_pose_pending = instance.action.is_none();
+                if static_pose_pending {
+                    pending_static_pose_slots.push(index);
+                } else {
+                    animated_pose_slots.push(index);
+                }
+                Slot {
+                    draw: None,
+                    failed: false,
+                    transform: crate::world_models::transform(&instance.placement),
+                    posed: None,
+                    static_pose_pending,
+                    geometry_dirty: true,
+                    pose_stale: false,
+                    vertex_fog: None,
+                    // Only the current view's spatial query may mark a slot visible.
+                    visible: false,
+                }
             })
             .collect();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -241,6 +404,13 @@ impl World {
             assets,
             keep_unbounded: false,
             slots,
+            model_spatial_cells,
+            pending_static_pose_slots,
+            animated_pose_slots,
+            visible_slots: Vec::new(),
+            alpha_order_eye: None,
+            alpha_order_slots: Vec::new(),
+            scratch_model_candidates: Vec::new(),
             read: Box::new(read),
             textures: HashMap::new(),
             receivers: Default::default(),
@@ -251,6 +421,8 @@ impl World {
             owners: gfx_owner::Manager::new(),
             terrain: None,
             producers: Vec::new(),
+            attachment_results: Vec::new(),
+            detached_producers: Vec::new(),
             effects: None,
             effect_trace_printed: false,
             effect_quads: Vec::new(),
@@ -258,11 +430,16 @@ impl World {
             catalog_spawns: 0,
             view: None,
             effect_distance: 0.,
+            activation_key: None,
+            attenuation_key: None,
+            attenuation_targets: Vec::new(),
+            attenuation_settled: false,
             census: [0; 3],
             resident_bounds: None,
             alpha: Vec::new(),
             reported: Vec::new(),
             frustum: None,
+            frustum_plane_lengths: None,
             scratch_candidates: Vec::new(),
             scratch_failures: Vec::new(),
             pose_culling: false,
@@ -287,9 +464,9 @@ impl World {
     }
 
     pub fn set_frustum(&mut self, frustum: Option<[[f32; 4]; 6]>) {
-        // Normalize once per view rather than taking six square roots for
-        // every retained model slot on every main/reflection/refraction pass.
-        self.frustum = frustum.map(normalize_frustum_planes);
+        let normalized = frustum.map(normalize_frustum_planes);
+        self.frustum_plane_lengths = normalized.map(frustum_plane_lengths);
+        self.frustum = normalized;
     }
 
     /// Enable expensive-pose deferral only when no secondary model view will
@@ -338,17 +515,21 @@ impl World {
             &mut self.read,
             Box::new(move |path: &str| Err(format!("unset reader: {path}"))),
         );
-        self.read = Box::new(move |path: &str| match gfx_entries.get(path) {
-            Some(entry) => crate::pck::read_entry(&mut gfx_pack, entry),
-            None => previous(path),
+        self.read = Box::new(move |path: &str| {
+            let key = crate::ecmodel::normalize(path);
+            match gfx_entries.get(&key) {
+                Some(entry) => crate::pck::read_entry(&mut gfx_pack, entry),
+                None => previous(path),
+            }
         });
         // Root text is a separate handle so a root load and a texture load can
         // never interleave their file positions.
         let root_entries = entries.clone();
         let mut pack = File::open(element.join("gfx.pck")).map_err(|e| format!("gfx.pck: {e}"))?;
         self.owners.set_reader(move |path: &str| {
+            let key = crate::ecmodel::normalize(path);
             let entry = root_entries
-                .get(path)
+                .get(&key)
                 .ok_or_else(|| format!("missing gfx.pck entry: {path}"))?;
             let bytes = crate::pck::read_entry(&mut pack, entry)?;
             if !bytes.starts_with(b"MOXT") {
@@ -477,6 +658,7 @@ impl World {
                     hook: None,
                     attenuation: effect.attenuation,
                     fade: if effect.attenuation { 0. } else { 1. },
+                    active: None,
                 });
                 installed += 1;
             }
@@ -542,6 +724,24 @@ impl World {
                         continue;
                     }
                 };
+                let event_scale = event
+                    .fields
+                    .iter()
+                    .find(|(k, _)| k == "GfxScale")
+                    .and_then(|(_, v)| v.trim().parse::<f32>().ok())
+                    .filter(|v| v.is_finite() && *v > 0.)
+                    .unwrap_or(1.);
+                let event_alpha = event
+                    .fields
+                    .iter()
+                    .find(|(k, _)| k == "GfxAlpha")
+                    .and_then(|(_, v)| v.trim().parse::<f32>().ok())
+                    .and_then(gfx_owner::scene_alpha);
+                let scale_mat = if event_scale != 1. {
+                    glam::Mat4::from_scale(glam::Vec3::splat(event_scale))
+                } else {
+                    glam::Mat4::IDENTITY
+                };
                 let identity = MODEL_EVENT_IDENTITY + self.producers.len() as u64;
                 let request = gfx_owner::Request {
                     identity,
@@ -550,13 +750,13 @@ impl World {
                     // parent is installed per frame; a hook-free root is placed
                     // by the model transform the native event inherits.
                     transform: match &record {
-                        Some(_) => local.to_cols_array(),
-                        None => transform.to_cols_array(),
+                        Some(_) => (local * scale_mat).to_cols_array(),
+                        None => (transform * scale_mat).to_cols_array(),
                     },
                     speed: asset.descriptor.render_settings().default_speed,
                     start_ms: start_ms as u32,
                     span_ms,
-                    outer: None,
+                    outer: event_alpha,
                     attachment: None,
                     active: false,
                     origin: described.clone(),
@@ -575,7 +775,9 @@ impl World {
                         instance: index,
                         record,
                         local,
+                        static_parent: None,
                     }),
+                    active: None,
                 });
                 installed += 1;
             }
@@ -589,11 +791,24 @@ impl World {
             return;
         }
         self.resident_bounds = bounds;
-        for (instance, slot) in self.assets.instances.iter().zip(&mut self.slots) {
+        for (index, (instance, slot)) in self
+            .assets
+            .instances
+            .iter()
+            .zip(&mut self.slots)
+            .enumerate()
+        {
             if !cutoff_residency::contains(bounds, instance.placement.position) {
                 slot.draw = None;
                 slot.posed = None;
                 slot.geometry_dirty = true;
+                // No static pose work is needed while this object is evicted.
+                // It is queued again only if a later resident window includes it.
+                slot.static_pose_pending = false;
+            } else if instance.action.is_none() && slot.posed.is_none() && !slot.static_pose_pending
+            {
+                slot.static_pose_pending = true;
+                self.pending_static_pose_slots.push(index);
             }
         }
         if bounds.is_some() {
@@ -692,15 +907,26 @@ impl World {
             return;
         }
         let (x, z, radius) = self.view.unwrap_or((0., 0., -1.));
-        let mut census = [0usize; 3];
-        let updates: Vec<(u64, bool)> = self
-            .producers
-            .iter()
-            .map(|producer| {
+        let key = ActivationKey {
+            view_x: x.to_bits(),
+            view_z: z.to_bits(),
+            radius: radius.to_bits(),
+            night: night.to_bits(),
+            resident_bounds: self.resident_bounds.map(|bounds| bounds.map(f32::to_bits)),
+            producer_count: self.producers.len(),
+        };
+        if self.activation_key != Some(key) {
+            let radius_sq = radius * radius;
+            let resident_bounds = self.resident_bounds;
+            let mut census = [0usize; 3];
+            let Self {
+                producers, owners, ..
+            } = self;
+            for producer in producers.iter_mut() {
                 let dx = producer.position[0] - x;
                 let dz = producer.position[2] - z;
-                let near = dx * dx + dz * dz <= radius * radius;
-                let resident = cutoff_residency::contains(self.resident_bounds, producer.position);
+                let near = dx * dx + dz * dz <= radius_sq;
+                let resident = cutoff_residency::contains(resident_bounds, producer.position);
                 let visible = match producer.valid_time {
                     Some(mode) => crate::scene::effect_visible(mode, night),
                     None => true,
@@ -714,12 +940,14 @@ impl World {
                 if !visible {
                     census[2] += 1;
                 }
-                (producer.identity, near && resident && visible)
-            })
-            .collect();
-        self.census = census;
-        for (identity, active) in updates {
-            self.owners.set_active(identity, active);
+                let active = near && resident && visible;
+                if producer.active != Some(active) {
+                    owners.set_active(producer.identity, active);
+                    producer.active = Some(active);
+                }
+            }
+            self.census = census;
+            self.activation_key = Some(key);
         }
         self.apply_attenuation(delta_ms, eye);
     }
@@ -746,23 +974,54 @@ impl World {
     /// stored, and nothing else in the frame writes it back, so returning early
     /// here would hold that root invisible for the rest of the session.
     fn apply_attenuation(&mut self, delta_ms: u32, eye: [f32; 3]) {
-        let off = self.effect_distance <= 0.;
-        let mut updates: Vec<(u64, f32)> = Vec::new();
-        for producer in self.producers.iter_mut().filter(|p| p.attenuation) {
-            if off {
-                if producer.fade != 1. {
-                    producer.fade = 1.;
-                    updates.push((producer.identity, 1.));
-                }
+        let effect_distance = self.effect_distance;
+        let off = effect_distance <= 0.;
+        let key = (
+            effect_distance.to_bits(),
+            eye[0].to_bits(),
+            eye[2].to_bits(),
+            self.producers.len(),
+        );
+        if self.attenuation_key != Some(key)
+            || self.attenuation_targets.len() != self.producers.len()
+        {
+            self.attenuation_targets.clear();
+            self.attenuation_targets
+                .extend(self.producers.iter().map(|producer| {
+                    if producer.attenuation && !off {
+                        attenuation_target(effect_distance, producer.position, eye)
+                    } else {
+                        1.
+                    }
+                }));
+            self.attenuation_key = Some(key);
+            self.attenuation_settled = false;
+        }
+        // Once every fade reaches its current target, a stationary camera and
+        // unchanged distance setting need no producer walk or owner writes.
+        if self.attenuation_settled {
+            return;
+        }
+        let mut moving = false;
+        let targets = &self.attenuation_targets;
+        let (producers, owners) = (&mut self.producers, &mut self.owners);
+        for (producer, &target) in producers.iter_mut().zip(targets) {
+            if !producer.attenuation || producer.fade == target {
                 continue;
             }
-            let target = attenuation_target(self.effect_distance, producer.position, eye);
-            producer.fade = attenuation_step(producer.fade, target, delta_ms);
-            updates.push((producer.identity, producer.fade));
+            let old = producer.fade;
+            let next = if off {
+                1.
+            } else {
+                attenuation_step(old, target, delta_ms)
+            };
+            if next != old {
+                producer.fade = next;
+                owners.set_attenuation(producer.identity, next);
+            }
+            moving |= next != target;
         }
-        for (identity, fade) in updates {
-            self.owners.set_attenuation(identity, fade);
-        }
+        self.attenuation_settled = !moving;
     }
     pub fn update(
         &mut self,
@@ -832,18 +1091,18 @@ impl World {
     /// the first frame.
     pub fn set_terrain<F>(&mut self, height: F)
     where
-        F: Fn(f32, f32) -> Option<f32> + 'static,
+        F: Fn(f32, f32) -> Option<f32> + Send + Sync + 'static,
     {
-        let broken = std::cell::Cell::new(false);
+        let broken = std::sync::atomic::AtomicBool::new(false);
         self.terrain = Some(Box::new(move |x: f32, z: f32| {
-            if broken.get() {
+            if broken.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
             let read = || height(x, z);
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)) {
                 Ok(value) => value,
                 Err(_) => {
-                    broken.set(true);
+                    broken.store(true, std::sync::atomic::Ordering::Relaxed);
                     None
                 }
             }
@@ -880,7 +1139,7 @@ impl World {
         ) {
             Ok(view) => view,
             Err(error) => {
-                if !self.reported.contains(&error) {
+                if self.reported.len() < 256 && !self.reported.contains(&error) {
                     self.reported.push(error);
                 }
                 self.effect_quads.clear();
@@ -888,11 +1147,26 @@ impl World {
             }
         };
         // The field and the owner manager are separate places, so the sampler
-        // borrows one and the pass advances the other.
-        let sampler: Option<crate::gfx_player::GroundHeightQuery<'_>> = self.terrain.as_deref();
-        let quads = self
-            .owners
-            .effect_quads_with_ground(delta_ms, &view, sampler);
+        // borrows one and the pass advances the other. Reuse `self.effect_quads`
+        // directly to avoid reallocating and copying every frame.
+        {
+            let Self {
+                owners,
+                terrain,
+                effect_quads,
+                ..
+            } = self;
+            let sampler: Option<crate::gfx_player::GroundHeightQuery<'_>> = terrain
+                .as_deref()
+                .map(|f| f as crate::gfx_player::GroundHeightQuery<'_>);
+            owners.effect_quads_with_ground_into(delta_ms, &view, sampler, effect_quads);
+            const EFFECT_QUAD_TRIM_THRESHOLD: usize = 4096;
+            if effect_quads.capacity() > EFFECT_QUAD_TRIM_THRESHOLD
+                && effect_quads.len() < effect_quads.capacity() / 8
+            {
+                effect_quads.shrink_to(effect_quads.len().max(EFFECT_QUAD_TRIM_THRESHOLD));
+            }
+        }
         // Say once, on stderr, what the invisible pipeline is doing. Nothing in
         // the world told a user *which* stage was empty when no effect appeared:
         // the roots could be unloaded, out of radius, failed to parse, or drawing
@@ -909,7 +1183,7 @@ impl World {
                 status.pending,
                 status.players,
                 status.frames,
-                quads.len(),
+                self.effect_quads.len(),
                 view.position.x,
                 view.position.y,
                 view.position.z,
@@ -933,7 +1207,7 @@ impl World {
             reported,
             ..
         } = self;
-        *effect_quads = quads;
+
         if effects.is_none() {
             // The same reverse-Z depth buffer the world's models use, so an
             // effect in front of a wall is occluded by nothing and one behind it
@@ -961,7 +1235,9 @@ impl World {
             ) {
                 Ok(draw) => *effects = Some(draw),
                 Err(error) => {
-                    reported.push(format!("world effects: {error}"));
+                    if reported.len() < 256 {
+                        reported.push(format!("world effects: {error}"));
+                    }
                     return;
                 }
             }
@@ -995,7 +1271,9 @@ impl World {
             Some(light),
             &mut **read,
         ) {
-            reported.push(format!("world effects: {error}"));
+            if reported.len() < 256 {
+                reported.push(format!("world effects: {error}"));
+            }
         }
     }
 
@@ -1038,7 +1316,9 @@ impl World {
     pub fn set_effects_enabled(&mut self, enabled: bool) {
         self.owners.set_effects_enabled(enabled);
         if !enabled {
+            self.effects = None;
             self.effect_quads.clear();
+            self.effect_quads.shrink_to_fit();
         }
     }
 
@@ -1107,120 +1387,84 @@ impl World {
     fn advance_poses(&mut self, delta_ms: u32) {
         let bounds = self.resident_bounds;
         let frustum = self.frustum;
-        // Hook-attached effects need their parent bone matrices even when the
-        // parent is outside the camera view. In worlds without such attachments,
-        // defer expensive skinning/mesh generation for off-frustum models while
-        // still advancing their playback clocks.
+        let plane_lengths = self.frustum_plane_lengths.unwrap_or([0.; 6]);
+        // Hook parents need their off-screen pose. Otherwise skinning can be
+        // deferred outside the current view while their playback clocks advance.
         let defer_offscreen_poses = self.pose_culling
             && !self
                 .producers
                 .iter()
                 .any(|producer| producer.hook.is_some());
-        let len = self.slots.len();
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(16);
-        if len >= 64 && threads > 1 {
-            let assets = &self.assets.assets;
-            let chunk_size = (len + threads - 1) / threads;
-            std::thread::scope(|s| {
-                for (inst_chunk, slot_chunk) in self
-                    .assets
-                    .instances
-                    .chunks_mut(chunk_size)
-                    .zip(self.slots.chunks_mut(chunk_size))
-                {
-                    s.spawn(move || {
-                        for (instance, slot) in inst_chunk.iter_mut().zip(slot_chunk.iter_mut()) {
-                            if !cutoff_residency::contains(bounds, instance.placement.position) {
-                                continue;
-                            }
-                            if slot.failed {
-                                continue;
-                            }
-                            let asset = &assets[instance.asset];
-                            let sample = match instance.playback.as_mut() {
-                                Ok(clock) => {
-                                    if delta_ms != 0 {
-                                        if let Err(e) = clock.tick(delta_ms) {
-                                            slot.posed = Some(Err(e));
-                                            continue;
-                                        }
-                                    }
-                                    clock.sample()
-                                }
-                                Err(e) => {
-                                    slot.posed = Some(Err(e.clone()));
-                                    continue;
-                                }
-                            };
-                            if defer_offscreen_poses
-                                && frustum.is_some_and(|planes| {
-                                    !sphere_in_frustum(&planes, instance.placement.position, 128.0)
-                                })
-                            {
-                                slot.pose_stale = true;
-                                continue;
-                            }
-                            if !slot.pose_stale {
-                                if let Some(Ok(previous)) = &slot.posed {
-                                    if previous.sample == sample {
-                                        continue;
-                                    }
-                                }
-                            }
-                            let result = (|| -> Result<SlotPose, String> {
-                                let transform = *slot.transform.as_ref().map_err(Clone::clone)?;
-                                let pose = match sample {
-                                    Some((action, time)) => {
-                                        asset.action_pose(action, time, transform)?
-                                    }
-                                    None => asset.bind_pose(transform)?,
-                                };
-                                let meshes = asset.meshes_from_pose(&pose)?;
-                                Ok(SlotPose {
-                                    sample,
-                                    pose,
-                                    meshes,
-                                })
-                            })();
-                            slot.geometry_dirty = true;
-                            slot.pose_stale = false;
-                            slot.posed = Some(result);
-                        }
-                    });
-                }
-            });
-            return;
+        let Self {
+            assets,
+            slots,
+            pending_static_pose_slots,
+            animated_pose_slots,
+            ..
+        } = self;
+
+        // Static props are evaluated once when they first become resident.
+        for index in pending_static_pose_slots.drain(..) {
+            let Some(instance) = assets.instances.get(index) else {
+                continue;
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                continue;
+            };
+            if !slot.static_pose_pending {
+                continue;
+            }
+            if !cutoff_residency::contains(bounds, instance.placement.position) || slot.failed {
+                slot.static_pose_pending = false;
+                continue;
+            }
+            let asset = &assets.assets[instance.asset];
+            let result = (|| -> Result<SlotPose, String> {
+                let transform = *slot.transform.as_ref().map_err(Clone::clone)?;
+                let pose = asset.bind_pose(transform)?;
+                let meshes = asset.meshes_from_pose(&pose)?;
+                Ok(SlotPose {
+                    sample: None,
+                    pose,
+                    meshes,
+                })
+            })();
+            slot.geometry_dirty = true;
+            slot.pose_stale = false;
+            slot.posed = Some(result);
+            slot.static_pose_pending = false;
         }
 
-        for (instance, slot) in self.assets.instances.iter_mut().zip(&mut self.slots) {
-            if !cutoff_residency::contains(bounds, instance.placement.position) {
+        // Only placements with an action clock are visited every frame.
+        for &index in animated_pose_slots.iter() {
+            let Some(instance) = assets.instances.get_mut(index) else {
+                continue;
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                continue;
+            };
+            if !cutoff_residency::contains(bounds, instance.placement.position) || slot.failed {
                 continue;
             }
-            if slot.failed {
-                continue;
-            }
-            let asset = &self.assets.assets[instance.asset];
+            let asset = &assets.assets[instance.asset];
             let sample = match instance.playback.as_mut() {
                 Ok(clock) => {
                     if delta_ms != 0 {
-                        if let Err(e) = clock.tick(delta_ms) {
-                            slot.posed = Some(Err(e));
+                        if let Err(error) = clock.tick(delta_ms) {
+                            slot.posed = Some(Err(error));
                             continue;
                         }
                     }
                     clock.sample()
                 }
-                Err(e) => {
-                    slot.posed = Some(Err(e.clone()));
+                Err(error) => {
+                    slot.posed = Some(Err(error.clone()));
                     continue;
                 }
             };
             if defer_offscreen_poses
                 && frustum.is_some_and(|planes| {
-                    !sphere_in_frustum(&planes, instance.placement.position, 128.0)
+                    !sphere_in_frustum(&planes, &plane_lengths, instance.placement.position, 128.0)
                 })
             {
                 slot.pose_stale = true;
@@ -1254,40 +1498,70 @@ impl World {
     /// a destroyed parent all surface as recorded failures instead of leaving a
     /// light attached to a stale or invented transform.
     fn resolve_attachments(&mut self) {
-        let mut resolved: Vec<(u64, Result<Option<[f32; 16]>, String>)> = Vec::new();
-        for producer in &self.producers {
-            let Some(binding) = &producer.hook else {
+        let mut resolved = std::mem::take(&mut self.attachment_results);
+        resolved.clear();
+        for producer in &mut self.producers {
+            let Some(binding) = producer.hook.as_mut() else {
                 continue;
             };
-            let origin = format!("producer {}", producer.identity);
+            let id = producer.identity;
             let outcome = (|| -> Result<Option<[f32; 16]>, String> {
                 let slot = self
                     .slots
                     .get(binding.instance)
-                    .ok_or_else(|| format!("{origin}: parent slot is gone"))?;
+                    .ok_or_else(|| format!("producer {id}: parent slot is gone"))?;
                 let parent = self
                     .assets
                     .instances
                     .get(binding.instance)
-                    .ok_or_else(|| format!("{origin}: parent instance is gone"))?;
+                    .ok_or_else(|| format!("producer {id}: parent instance is gone"))?;
+                if !cutoff_residency::contains(self.resident_bounds, parent.placement.position) {
+                    return Ok(None);
+                }
+
+                // Static placements use the bind pose forever. Once one of
+                // their hook matrices has been validated, reuse it after future
+                // camera/window changes instead of walking the skeleton each
+                // frame. Still check residency above so an evicted parent
+                // detaches just as before.
+                let static_parent = parent.action.is_none();
+                if static_parent {
+                    if let Some(matrix) = binding.static_parent {
+                        // Both the hook matrix and its local composition were
+                        // validated when cached; neither changes for a static
+                        // parent. Residency was checked above, so no math or
+                        // matrix reconstruction is needed in the steady state.
+                        return Ok(Some(matrix));
+                    }
+                }
+
                 let posed = match &slot.posed {
                     Some(Ok(posed)) => posed,
-                    Some(Err(e)) => return Err(format!("{origin}: parent pose failed: {e}")),
-                    None => return Err(format!("{origin}: parent has no pose")),
+                    Some(Err(e)) => return Err(format!("producer {id}: parent pose failed: {e}")),
+                    None => return Ok(None),
                 };
                 let asset = self
                     .assets
                     .assets
                     .get(parent.asset)
-                    .ok_or_else(|| format!("{origin}: parent asset is gone"))?;
+                    .ok_or_else(|| format!("producer {id}: parent asset is gone"))?;
                 let hook = asset.hook_matrix(&posed.pose, &binding.record.hook)?;
-                let composed = model_attachment::world(hook, binding.local)?;
-                Ok(Some(composed.to_cols_array()))
+                // Validate hook * local composition without baking `local` into
+                // the attachment parent: `Request::transform` already holds
+                // `local`, and `Request::world_transform` computes
+                // `parent * self.transform`.
+                let _ = model_attachment::world(hook, binding.local)?;
+                let matrix = hook.to_cols_array();
+                if static_parent {
+                    binding.static_parent = Some(matrix);
+                }
+                Ok(Some(matrix))
             })();
             resolved.push((producer.identity, outcome));
         }
-        let mut detached = Vec::new();
-        for (identity, outcome) in resolved {
+        let mut detached = std::mem::take(&mut self.detached_producers);
+        detached.clear();
+        for (identity, outcome) in resolved.drain(..) {
             match outcome {
                 Ok(parent) => {
                     if !self.owners.set_attachment(identity, parent) {
@@ -1303,7 +1577,11 @@ impl World {
         }
         // A producer whose owner is gone or whose hook cannot be resolved is
         // dropped instead of retrying against a stale parent every frame.
-        self.producers.retain(|p| !detached.contains(&p.identity));
+        if !detached.is_empty() {
+            self.producers.retain(|p| !detached.contains(&p.identity));
+        }
+        self.attachment_results = resolved;
+        self.detached_producers = detached;
     }
     /// Upload this frame's already-evaluated poses. Runs for every pass without
     /// touching playback, producer clocks or publications.
@@ -1314,12 +1592,29 @@ impl World {
         frame: Frame,
         night: f32,
     ) {
+        if self.slots.is_empty() {
+            return;
+        }
+        // Clear the previous view's visible flags, then visit only spatial
+        // cells that can intersect this view. This replaces a full instance
+        // scan for main + reflection + refraction on every camera turn.
+        for &index in &self.visible_slots {
+            if let Some(slot) = self.slots.get_mut(index) {
+                slot.visible = false;
+            }
+        }
+        self.visible_slots.clear();
+
         let bounds = self.resident_bounds;
         let frustum = self.frustum;
+        let frustum_plane_lengths = self.frustum_plane_lengths.unwrap_or([0.; 6]);
         let keep_unbounded = self.keep_unbounded;
         let Self {
             assets,
             slots,
+            model_spatial_cells,
+            visible_slots,
+            scratch_model_candidates,
             read,
             textures,
             receivers,
@@ -1329,7 +1624,27 @@ impl World {
             reported,
             ..
         } = self;
-        for (instance, slot) in assets.instances.iter().zip(slots.iter_mut()) {
+
+        scratch_model_candidates.clear();
+        if frustum.is_none() && bounds.is_none() {
+            scratch_model_candidates.extend(0..assets.instances.len());
+        } else {
+            append_visible_model_slots(
+                model_spatial_cells,
+                frustum.as_ref(),
+                bounds,
+                scratch_model_candidates,
+            );
+            scratch_model_candidates.sort_unstable();
+        }
+
+        for &index in scratch_model_candidates.iter() {
+            let Some(instance) = assets.instances.get(index) else {
+                continue;
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                continue;
+            };
             if !cutoff_residency::contains(bounds, instance.placement.position) {
                 slot.visible = false;
                 if !keep_unbounded {
@@ -1343,12 +1658,18 @@ impl World {
                 continue;
             }
             if let Some(planes) = frustum {
-                if !sphere_in_frustum(&planes, instance.placement.position, 128.0) {
+                if !sphere_in_frustum(
+                    &planes,
+                    &frustum_plane_lengths,
+                    instance.placement.position,
+                    MODEL_SPATIAL_RADIUS,
+                ) {
                     slot.visible = false;
                     continue;
                 }
             }
             slot.visible = true;
+            visible_slots.push(index);
             let asset = &assets.assets[instance.asset];
             let outcome = draw_one(
                 device,
@@ -1371,6 +1692,8 @@ impl World {
                     instance.placement.export_id, instance.placement.path
                 ));
                 slot.failed = true;
+                slot.visible = false;
+                visible_slots.pop();
                 slot.draw = None;
             }
         }
@@ -1380,9 +1703,20 @@ impl World {
     /// priority weights of the original insertion routine were not recovered, so
     /// they stay zero and the comparison falls through to distance.
     fn rebuild_alpha_order(&mut self, eye: [f32; 3]) {
+        // Alpha distance is measured from the eye position and the visible
+        // model set, not from camera yaw/pitch. A rotation-only frame with an
+        // unchanged set therefore has exactly the same ordered candidates.
+        if self.alpha_order_eye == Some(eye)
+            && self.alpha_order_slots.as_slice() == self.visible_slots.as_slice()
+        {
+            return;
+        }
         self.scratch_candidates.clear();
         self.scratch_failures.clear();
-        for (slot, entry) in self.slots.iter().enumerate() {
+        for &slot in &self.visible_slots {
+            let Some(entry) = self.slots.get(slot) else {
+                continue;
+            };
             if !entry.visible {
                 continue;
             }
@@ -1420,11 +1754,15 @@ impl World {
                 }
             }
         }
-        match model_queue::alpha_order(&self.scratch_candidates) {
-            Ok(order) => self.alpha = order,
-            Err(e) => {
-                self.alpha.clear();
-                self.reported.push(format!("alpha queue: {e}"));
+        if self.scratch_candidates.is_empty() {
+            self.alpha.clear();
+        } else {
+            match model_queue::alpha_order(&self.scratch_candidates) {
+                Ok(order) => self.alpha = order,
+                Err(e) => {
+                    self.alpha.clear();
+                    self.reported.push(format!("alpha queue: {e}"));
+                }
             }
         }
         for (slot, error) in &self.scratch_failures {
@@ -1436,6 +1774,8 @@ impl World {
             }
             self.alpha.retain(|candidate| candidate.slot != *slot);
         }
+        self.alpha_order_eye = Some(eye);
+        self.alpha_order_slots.clone_from(&self.visible_slots);
     }
     /// Include dependency failures in the UI; never count a skipped asset ready.
     /// Entries owned by the world cache, excluding live draw references.
@@ -1455,7 +1795,18 @@ impl World {
     /// main view alone: the mirror and refraction depth feeds the water, and the
     /// motion vectors never read it.
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        for slot in &self.slots {
+        self.draw_models_only(pass);
+        self.draw_effects(pass);
+    }
+
+    /// Draws opaque and alpha-blended world models without world effects.
+    /// Used by the main pass before water so water surfaces cannot overwrite
+    /// blended effect quads that do not write depth.
+    pub fn draw_models_only<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        for &index in &self.visible_slots {
+            let Some(slot) = self.slots.get(index) else {
+                continue;
+            };
             if !slot.visible {
                 continue;
             }
@@ -1464,14 +1815,80 @@ impl World {
             }
         }
         for candidate in &self.alpha {
-            if let Some(Some(draw)) = self.slots.get(candidate.slot).map(|s| &s.draw) {
+            let Some(slot) = self.slots.get(candidate.slot) else {
+                continue;
+            };
+            // Alpha order is built by the main view and reused by reflection /
+            // refraction. Respect the visibility produced by each secondary view
+            // instead of resubmitting every main-view alpha mesh into the water.
+            if !slot.visible {
+                continue;
+            }
+            if let Some(draw) = &slot.draw {
                 draw.draw_alpha_mesh(pass, candidate.mesh);
             }
         }
-        // Blended effect quads last, after the opaque models and the alpha meshes,
-        // with their own render-layer sort inside the draw object.
+    }
+
+    /// Draws blended world effect quads. In the main view this runs after
+    /// water surfaces and shoreline waves so effects in front of water are
+    /// composited over the water surface and depth-tested against it.
+    pub fn draw_effects<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         if let Some(effects) = &self.effects {
             effects.draw(pass);
+        }
+    }
+
+    pub fn has_effect_quads(&self) -> bool {
+        self.effects.is_some() && !self.effect_quads.is_empty()
+    }
+
+    /// Re-binds the main-pass camera matrix, clip plane and lighting onto the
+    /// effect renderer after water reflection/refraction passes may have
+    /// overwritten its uniform buffer, without advancing effect clocks.
+    pub fn refresh_effects_view(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Frame,
+    ) {
+        if !self.owners.effects_enabled() || self.effect_quads.is_empty() {
+            return;
+        }
+        let Ok(view) = crate::gfx_player::View::try_from_inverse_view_projection(
+            glam::Mat4::from_cols_array_2d(&frame.matrix).inverse(),
+        ) else {
+            return;
+        };
+        let _ = device;
+        let Self {
+            effects, reported, ..
+        } = self;
+        let Some(draw) = effects.as_mut() else {
+            return;
+        };
+        let light = gfx_effect_gpu::EffectLight {
+            lighting: frame.lighting,
+            direction: frame.direction,
+            fog_range: frame.fog_range,
+            fog_color: frame.fog_color,
+            water_fog: frame.water_fog,
+            directional_specular: frame.directional_specular,
+            eye_direction: frame.eye_direction,
+        };
+        // Only the frame uniform constants changed after reflection/refraction;
+        // reuse the already-uploaded vertex buffer and bucket order instead of
+        // re-bucketing and re-uploading every effect quad a second time.
+        if let Err(error) = draw.update_params(
+            queue,
+            frame.matrix,
+            frame.clip_plane,
+            [view.position.x, view.position.y, view.position.z, 0.],
+            Some(light),
+        ) {
+            if reported.len() < 256 {
+                reported.push(format!("world effects: {error}"));
+            }
         }
     }
 
@@ -1547,18 +1964,25 @@ fn normalize_frustum_planes(mut planes: [[f32; 4]; 6]) -> [[f32; 4]; 6] {
                 d * inverse_len,
             ];
         } else {
-            // A degenerate/non-finite plane must not reject scene geometry.
             *plane = [0.0; 4];
         }
     }
     planes
 }
 
-fn sphere_in_frustum(planes: &[[f32; 4]; 6], center: [f32; 3], radius: f32) -> bool {
-    for &[a, b, c, d] in planes {
-        // Planes are normalized by set_frustum; the hot loop is just a dot
-        // product and radius comparison.
-        if a * center[0] + b * center[1] + c * center[2] + d < -radius {
+#[inline]
+fn frustum_plane_lengths(planes: [[f32; 4]; 6]) -> [f32; 6] {
+    planes.map(|[a, b, c, _]| (a * a + b * b + c * c).sqrt())
+}
+
+fn sphere_in_frustum(
+    planes: &[[f32; 4]; 6],
+    plane_lengths: &[f32; 6],
+    center: [f32; 3],
+    radius: f32,
+) -> bool {
+    for (&[a, b, c, d], &len) in planes.iter().zip(plane_lengths) {
+        if len > 0.0 && a * center[0] + b * center[1] + c * center[2] + d < -radius * len {
             return false;
         }
     }
@@ -1670,27 +2094,56 @@ fn event_milliseconds(event: &crate::ecmodel::EcmEvent, key: &str) -> Result<f32
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_spatial_cells_preserve_original_indices_and_keep_sphere_overlaps() {
+        let cells = super::build_model_spatial_cells([
+            (0, [100.0, 0.0, 0.0]),
+            (1, [200.0, 0.0, 0.0]),
+            (2, [1024.0, 0.0, 0.0]),
+        ]);
+        let frustum = [
+            [1.0, 0.0, 0.0, 100.0],
+            [-1.0, 0.0, 0.0, 100.0],
+            [0.0, 1.0, 0.0, 100.0],
+            [0.0, -1.0, 0.0, 100.0],
+            [0.0, 0.0, 1.0, 100.0],
+            [0.0, 0.0, -1.0, 100.0],
+        ];
+        let mut visible = Vec::new();
+        super::append_visible_model_slots(&cells, Some(&frustum), None, &mut visible);
+        visible.sort_unstable();
+        assert_eq!(visible, vec![0, 1]);
+    }
+
     use super::*;
 
     #[test]
-    fn normalized_frustum_planes_preserve_sphere_visibility() {
+    fn world_model_frustum_plane_lengths_are_cached_without_changing_sphere_tests() {
         let planes = [
-            [2.0, 0.0, 0.0, 10.0],
-            [-3.0, 0.0, 0.0, 30.0],
-            [0.0, 4.0, 0.0, 20.0],
-            [0.0, -5.0, 0.0, 50.0],
-            [0.0, 0.0, 6.0, 60.0],
-            [0.0, 0.0, -7.0, 70.0],
+            [2., 0., 0., 20.],
+            [-3., 0., 0., 30.],
+            [0., 4., 0., 40.],
+            [0., -5., 0., 50.],
+            [0., 0., 6., 60.],
+            [0., 0., 0., 1.],
         ];
-        let normalized = normalize_frustum_planes(planes);
-        assert!(sphere_in_frustum(&normalized, [0.0; 3], 9.9));
-        assert!(!sphere_in_frustum(&normalized, [-20.0, 0.0, 0.0], 1.0));
-        assert_eq!(normalize_frustum_planes([[0.0; 4]; 6]), [[0.0; 4]; 6]);
-        assert!(sphere_in_frustum(
-            &normalize_frustum_planes([[0.0; 4]; 6]),
-            [1.0e9; 3],
-            0.0
-        ));
+        let lengths = frustum_plane_lengths(planes);
+        assert_eq!(lengths, [2., 3., 4., 5., 6., 0.]);
+        assert!(sphere_in_frustum(&planes, &lengths, [0., 0., 0.], 128.));
+        assert!(!sphere_in_frustum(&planes, &lengths, [-100., 0., 0.], 1.));
+        // A zero-normal plane retains the old rule: it never rejects a sphere.
+        let mut zero_only = [[0.; 4]; 6];
+        zero_only[0][3] = -1000.;
+        let zero_lengths = frustum_plane_lengths(zero_only);
+        assert!(sphere_in_frustum(&zero_only, &zero_lengths, [0.; 3], 0.));
+    }
+
+    #[test]
+    fn normalized_planes_also_preserve_zero_plane_visibility() {
+        let planes = normalize_frustum_planes([[0.0; 4]; 6]);
+        let lengths = frustum_plane_lengths(planes);
+        assert_eq!(planes, [[0.0; 4]; 6]);
+        assert!(sphere_in_frustum(&planes, &lengths, [1.0e9; 3], 0.0));
     }
 
     /// `FadeGFX` is `SetAlphaTransition(alpha, 3000)`: a full ramp takes three

@@ -8,7 +8,7 @@ pub fn sky_object_direction(hour: f32, authored_direction: [f32; 3]) -> Option<[
     }
     let x = authored_direction[0];
     let z = authored_direction[2];
-    if x.hypot(z) < 1e-6 {
+    if x * x + z * z < 1e-12 {
         return None;
     }
     let azimuth = (-z).atan2(-x);

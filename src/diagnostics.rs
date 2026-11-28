@@ -1342,7 +1342,7 @@ fn shorten(line: &str, limit: usize) -> String {
 
 /// Every channel file in the folder, in channel order, with its size.
 fn channel_files(dir: &Path) -> Vec<(Channel, PathBuf, u64)> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(16);
     for channel in Channel::ALL {
         if !channel.wired() {
             continue;

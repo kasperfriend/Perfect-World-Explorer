@@ -365,7 +365,7 @@ impl Library {
     /// sheets beside their rigs), but retain a duplicate from `textures.pck` as
     /// a decode fallback if the model-pack payload is damaged or unsupported.
     fn texture_candidates(&mut self, path: &str) -> Result<Vec<Vec<u8>>, String> {
-        let mut candidates = Vec::new();
+        let mut candidates = Vec::with_capacity(2);
         let mut failures = Vec::new();
         match self.models.read(path) {
             Ok(bytes) => candidates.push(bytes),
@@ -564,7 +564,7 @@ fn gait_candidate_rank(name: &str) -> u8 {
         "奔跑",
         "跑",
     ];
-    u8::from(!PLAIN.contains(&name.to_lowercase().as_str()))
+    u8::from(!PLAIN.iter().any(|p| p.eq_ignore_ascii_case(name)))
 }
 
 /// Rotation-only absolute rest orientations of a skeleton's bones, indexed by
@@ -1013,8 +1013,9 @@ fn initial_yaw(_spawn: &Spawn) -> f32 {
 /// Model-to-world matrix with the actor's local `+Z` as forward, matching
 /// `walker::character::character_transform`.
 pub(crate) fn transform(position: Vec3, yaw: f32) -> Mat4 {
-    let direction = Vec3::new(yaw.sin(), 0., -yaw.cos());
-    let right = Vec3::Y.cross(direction).normalize_or_zero();
+    let (s, c) = yaw.sin_cos();
+    let direction = Vec3::new(s, 0., -c);
+    let right = Vec3::new(-c, 0., -s);
     Mat4::from_cols(
         right.extend(0.),
         Vec3::Y.extend(0.),
@@ -1142,8 +1143,9 @@ fn resolve_placement(
     for ring in WALL_RINGS {
         for step in 0..WALL_DIRECTIONS {
             let angle = step as f32 / WALL_DIRECTIONS as f32 * std::f32::consts::TAU;
-            let x = anchor[0] + angle.cos() * ring;
-            let z = anchor[1] + angle.sin() * ring;
+            let (s, c) = angle.sin_cos();
+            let x = anchor[0] + c * ring;
+            let z = anchor[1] + s * ring;
             let terrain = map.ground(x, z);
             let height = spot_height(
                 spawn.height,
@@ -1709,8 +1711,9 @@ fn build_live_world_route(
             let radius = 4.0
                 + (random >> 32) as u32 as f32 / u32::MAX as f32
                     * (LIVE_WORLD_MAX_ROUTE_RADIUS - 4.0);
-            let px = start.x + bearing.cos() * radius;
-            let pz = start.z + bearing.sin() * radius;
+            let (sb, cb) = bearing.sin_cos();
+            let px = start.x + cb * radius;
+            let pz = start.z + sb * radius;
             let Some(point) = live_world_ground_point(px, pz, map, floors) else {
                 valid = false;
                 break;
@@ -1848,8 +1851,9 @@ fn build_live_world_spawn(
         random ^= random << 17;
         let angle = random as u32 as f32 / u32::MAX as f32 * std::f32::consts::TAU;
         let radial = 8.0 + (random >> 32) as u32 as f32 / u32::MAX as f32 * max_spawn_radius;
-        let x = zone.center[0] + angle.cos() * radial;
-        let z = zone.center[1] + angle.sin() * radial;
+        let (sa, ca) = angle.sin_cos();
+        let x = zone.center[0] + ca * radial;
+        let z = zone.center[1] + sa * radial;
         let Some(start) = live_world_ground_point(x, z, map, floors) else {
             continue;
         };
@@ -2748,6 +2752,15 @@ impl Populator {
         let Some(cache) = self.stream_cache.as_ref() else {
             return;
         };
+        if self.live.len() == cache.nearest.len()
+            && self
+                .live
+                .iter()
+                .zip(cache.nearest.iter())
+                .all(|(live, &(index, _))| live.spawn == index)
+        {
+            return;
+        }
         // The cache is borrowed from `self` while `self.live` is reconciled, so
         // copy the indices out first: the search result is at most `limit` long.
         let nearest: Vec<(usize, f32)> = cache.nearest.clone();
@@ -3114,7 +3127,8 @@ impl Populator {
         let time_advanced = self.time_advanced;
         // Evaluate every pose before touching GPU state, so one broken rig
         // cannot stop the rest of the population from appearing.
-        let mut posed: Vec<Option<Vec<PosedMesh>>> = (0..self.live.len()).map(|_| None).collect();
+        let mut posed: Vec<Option<Vec<PosedMesh>>> = Vec::new();
+        let mut any_visible = false;
         for index in 0..self.live.len() {
             let live = &mut self.live[index];
             if live.failure.is_some() || live.wedged {
@@ -3131,8 +3145,7 @@ impl Populator {
                 live.rt_verts.clear();
             }
             if !live.visible {
-                // Keep nearby off-screen actors (e.g. behind the camera) posed at a
-                // relaxed stride so their RT shadows and water reflections stay alive.
+                // Retain nearby off-screen geometry for Raywatcher shadows/reflections.
                 if dist_sq <= POPULATOR_RT_OFFSCREEN_RADIUS * POPULATOR_RT_OFFSCREEN_RADIUS
                     && (live.rt_verts.is_empty()
                         || (time_advanced && pose_due(frame_index, live.spawn, 4)))
@@ -3148,6 +3161,7 @@ impl Populator {
                 }
                 continue;
             }
+            any_visible = true;
             if live.pose_index == Some(frame_index) {
                 continue;
             }
@@ -3175,24 +3189,31 @@ impl Populator {
                             POPULATOR_RT_TRIS_PER_ACTOR,
                         );
                     }
+                    if posed.is_empty() {
+                        posed.resize_with(self.live.len(), || None);
+                    }
                     posed[index] = Some(meshes);
                 }
                 Err(error) => live.failure = Some(error),
             }
+        }
+        if !any_visible {
+            return;
         }
         for index in 0..self.live.len() {
             let live = &mut self.live[index];
             if live.failure.is_some() || !live.visible {
                 continue;
             }
-            let asset = live.asset.clone();
+            let asset = live.asset.as_ref();
             // A pose identical to the one already on the GPU (scenery rigs, a
             // held pose, another pass of this frame) needs only the constants.
             let unchanged = live.uploaded_stamp.is_some() && live.uploaded_stamp == live.pose_stamp;
-            match (live.draw.take(), posed[index].take()) {
-                (Some(draw), Some(meshes)) if unchanged => {
+            let new_pose = posed.get_mut(index).and_then(Option::take);
+            match (live.draw.take(), new_pose) {
+                (Some(mut draw), Some(meshes)) if unchanged => {
                     drop(meshes);
-                    match draw.update_constants(queue, asset.as_ref(), frame) {
+                    match draw.update_constants(queue, asset, frame) {
                         Ok(()) => live.draw = Some(draw),
                         Err(error) => live.failure = Some(error),
                     }
@@ -3201,7 +3222,7 @@ impl Populator {
                     // Topology is fixed for a retained rig, so this skips
                     // `model_draw::prepare`'s per-frame re-validation and
                     // converts the pose straight into the vertex buffer.
-                    match draw.update_posed(queue, asset.as_ref(), &meshes, frame) {
+                    match draw.update_posed(queue, asset, &meshes, frame) {
                         Ok(()) => {
                             live.uploaded_stamp = live.pose_stamp;
                             live.draw = Some(draw);
@@ -3209,24 +3230,18 @@ impl Populator {
                         Err(error) => live.failure = Some(error),
                     }
                 }
-                (Some(draw), None) => {
+                (Some(mut draw), None) => {
                     // Posed by an earlier pass of this frame: only this pass's
                     // view matrix and light are new.
-                    match draw.update_constants(queue, asset.as_ref(), frame) {
+                    match draw.update_constants(queue, asset, frame) {
                         Ok(()) => live.draw = Some(draw),
                         Err(error) => live.failure = Some(error),
                     }
                 }
                 (None, Some(meshes)) => {
-                    match renderer.build(
-                        device,
-                        queue,
-                        format,
-                        asset.as_ref(),
-                        &meshes,
-                        frame,
-                        |path| library.texture_candidates(path),
-                    ) {
+                    match renderer.build(device, queue, format, asset, &meshes, frame, |path| {
+                        library.texture_candidates(path)
+                    }) {
                         Ok(draw) => {
                             live.uploaded_stamp = live.pose_stamp;
                             live.draw = Some(draw);

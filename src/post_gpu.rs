@@ -178,15 +178,26 @@ fn texture(
 pub struct PostGpu {
     modulation: [f32; 4],
     sharpen: bool,
-    composite_target: wgpu::Texture,
+    /// Lazily allocated only when sharpen is enabled; dropped when disabled
+    /// (saves 8.3 MiB at 1080p / 33 MiB at 4K VRAM).
+    composite_target: std::sync::Mutex<Option<wgpu::Texture>>,
     encoded_finish: wgpu::RenderPipeline,
     sharpen_finish: wgpu::RenderPipeline,
     format: wgpu::TextureFormat,
-    scene: wgpu::Texture,
-    fogged: wgpu::Texture,
-    warped: wgpu::Texture,
-    downsample: wgpu::Texture,
-    blur: wgpu::Texture,
+    /// Lazily retained only while `use_post` is active; initialized `Some(...)`
+    /// in `PostGpu::new` so standalone checks (`post-gpu-check`, `bloom-gpu-check`)
+    /// continue to work without calling `set_scene_active`.
+    scene: std::sync::Mutex<Option<wgpu::Texture>>,
+    /// Diagnostic-only depth-fog target; allocated only when `plan.fog`.
+    fogged: std::sync::Mutex<Option<wgpu::Texture>>,
+    /// Lazily allocated only when camera goes underwater (saves 8.3 MiB at
+    /// 1080p / 33 MiB at 4K VRAM during normal above-water exploration).
+    warped: std::sync::Mutex<Option<wgpu::Texture>>,
+    /// Quarter-res glow targets; allocated only when `plan.glow`.
+    downsample: std::sync::Mutex<Option<wgpu::Texture>>,
+    blur: std::sync::Mutex<Option<wgpu::Texture>>,
+    /// 1x1 stand-in bound at `@binding(1)` when `!plan.glow`.
+    blur_dummy: wgpu::Texture,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniform: wgpu::Buffer,
@@ -198,29 +209,12 @@ pub struct PostGpu {
 }
 impl PostGpu {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> Self {
-        let scene = texture(device, format, w, h, "post scene");
-        let fogged = texture(device, format.remove_srgb_suffix(), w, h, "fogged scene");
-        let warped = texture(
-            device,
-            format.remove_srgb_suffix(),
-            w,
-            h,
-            "underwater warped scene",
-        );
-        let downsample = texture(
-            device,
-            format.remove_srgb_suffix(),
-            (w / 4).max(1),
-            (h / 4).max(1),
-            "glow quarter-size copy",
-        );
-        let blur = texture(
-            device,
-            format.remove_srgb_suffix(),
-            (w / 4).max(1),
-            (h / 4).max(1),
-            "glow blur",
-        );
+        let scene = std::sync::Mutex::new(Some(texture(device, format, w, h, "post scene")));
+        let fogged = std::sync::Mutex::new(None);
+        let warped = std::sync::Mutex::new(None);
+        let downsample = std::sync::Mutex::new(None);
+        let blur = std::sync::Mutex::new(None);
+        let blur_dummy = texture(device, format.remove_srgb_suffix(), 1, 1, "glow blur dummy");
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("post parameters"),
             contents: bytemuck::bytes_of(&Params {
@@ -319,13 +313,7 @@ impl PostGpu {
         Self {
             modulation: [1.; 4],
             sharpen: false,
-            composite_target: texture(
-                device,
-                format.remove_srgb_suffix(),
-                w,
-                h,
-                "encoded glow before sharpen",
-            ),
+            composite_target: std::sync::Mutex::new(None),
             encoded_finish: make("finish_encoded", format.remove_srgb_suffix()),
             sharpen_finish: make("sharpen_finish", format),
             format,
@@ -334,6 +322,7 @@ impl PostGpu {
             warped,
             downsample,
             blur,
+            blur_dummy,
             layout,
             sampler,
             uniform,
@@ -351,54 +340,112 @@ impl PostGpu {
     /// Native renderer flag +6, 0x40fd69 -> 0x410970. Independent of bloom.
     pub fn set_sharpen(&mut self, enabled: bool) {
         self.sharpen = enabled;
+        if !enabled {
+            if let Ok(mut guard) = self.composite_target.lock() {
+                *guard = None;
+            }
+        }
+    }
+    fn ensure_target(
+        slot: &std::sync::Mutex<Option<wgpu::Texture>>,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        w: u32,
+        h: u32,
+        label: &str,
+    ) -> wgpu::TextureView {
+        let mut guard = slot.lock().unwrap();
+        let tw = w.max(1);
+        let th = h.max(1);
+        let need_alloc = match guard.as_ref() {
+            Some(tex) => {
+                let sz = tex.size();
+                sz.width != tw || sz.height != th
+            }
+            None => true,
+        };
+        if need_alloc {
+            *guard = Some(texture(device, format, tw, th, label));
+        }
+        guard.as_ref().unwrap().create_view(&Default::default())
+    }
+    /// Allocate or release the post-processing `scene` target (and any
+    /// transient post intermediates when inactive) based on `use_post`.
+    pub fn set_scene_active(&self, device: &wgpu::Device, w: u32, h: u32, active: bool) {
+        let mut guard = self.scene.lock().unwrap();
+        if active {
+            let tw = w.max(1);
+            let th = h.max(1);
+            let need_alloc = match guard.as_ref() {
+                Some(tex) => {
+                    let sz = tex.size();
+                    sz.width != tw || sz.height != th
+                }
+                None => true,
+            };
+            if need_alloc {
+                *guard = Some(texture(device, self.format, tw, th, "post scene"));
+            }
+        } else {
+            *guard = None;
+            if let Ok(mut g) = self.fogged.lock() {
+                *g = None;
+            }
+            if let Ok(mut g) = self.warped.lock() {
+                *g = None;
+            }
+            if let Ok(mut g) = self.downsample.lock() {
+                *g = None;
+            }
+            if let Ok(mut g) = self.blur.lock() {
+                *g = None;
+            }
+            if let Ok(mut g) = self.composite_target.lock() {
+                *g = None;
+            }
+        }
     }
     pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) {
-        self.scene = texture(device, self.format, w, h, "post scene");
-        self.composite_target = texture(
-            device,
-            self.format.remove_srgb_suffix(),
-            w,
-            h,
-            "encoded glow before sharpen",
-        );
-        self.fogged = texture(
-            device,
-            self.format.remove_srgb_suffix(),
-            w,
-            h,
-            "fogged scene",
-        );
-        self.warped = texture(
-            device,
-            self.format.remove_srgb_suffix(),
-            w,
-            h,
-            "underwater warped scene",
-        );
-        self.downsample = texture(
-            device,
-            self.format.remove_srgb_suffix(),
-            (w / 4).max(1),
-            (h / 4).max(1),
-            "glow quarter-size copy",
-        );
-        self.blur = texture(
-            device,
-            self.format.remove_srgb_suffix(),
-            (w / 4).max(1),
-            (h / 4).max(1),
-            "glow blur",
-        );
+        if let Ok(mut guard) = self.scene.lock() {
+            if guard.is_some() {
+                *guard = Some(texture(device, self.format, w, h, "post scene"));
+            }
+        }
+        if let Ok(mut guard) = self.composite_target.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.fogged.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.warped.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.downsample.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.blur.lock() {
+            *guard = None;
+        }
     }
     pub fn scene_view(&self) -> wgpu::TextureView {
-        self.scene.create_view(&Default::default())
+        self.scene
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("post scene texture must be active")
+            .create_view(&Default::default())
     }
     /// Raw view permits legacy encoded-space alpha blending for shoreline waves.
     pub fn scene_raw_view(&self) -> wgpu::TextureView {
-        self.scene.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(self.format.remove_srgb_suffix()),
-            ..Default::default()
-        })
+        self.scene
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("post scene texture must be active")
+            .create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.format.remove_srgb_suffix()),
+                ..Default::default()
+            })
     }
     pub fn render(
         &self,
@@ -431,7 +478,22 @@ impl PostGpu {
             srgb_target: self.format.is_srgb(),
         });
         if !plan.active() {
-            // Nothing writes the frame: do not copy or quantize it.
+            // Nothing writes the frame: release any inactive intermediates.
+            if let Ok(mut g) = self.fogged.lock() {
+                *g = None;
+            }
+            if let Ok(mut g) = self.warped.lock() {
+                *g = None;
+            }
+            if let Ok(mut g) = self.downsample.lock() {
+                *g = None;
+            }
+            if let Ok(mut g) = self.blur.lock() {
+                *g = None;
+            }
+            if let Ok(mut g) = self.composite_target.lock() {
+                *g = None;
+            }
             return;
         }
         queue.write_buffer(
@@ -468,14 +530,60 @@ impl PostGpu {
                 ramp: gamma_curve::table(gamma_setting),
             }),
         );
-        let scene = self.scene.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(self.format.remove_srgb_suffix()),
-            ..Default::default()
-        });
-        let fogged = self.fogged.create_view(&Default::default());
-        let warped = self.warped.create_view(&Default::default());
-        let downsample = self.downsample.create_view(&Default::default());
-        let blur = self.blur.create_view(&Default::default());
+        let raw_format = self.format.remove_srgb_suffix();
+        let scene = self.scene_raw_view();
+        let fogged = if plan.fog {
+            Some(Self::ensure_target(
+                &self.fogged,
+                device,
+                raw_format,
+                w,
+                h,
+                "fogged scene",
+            ))
+        } else {
+            if let Ok(mut g) = self.fogged.lock() {
+                *g = None;
+            }
+            None
+        };
+        let warped = if plan.warp {
+            Some(Self::ensure_target(
+                &self.warped,
+                device,
+                raw_format,
+                w,
+                h,
+                "underwater warped scene",
+            ))
+        } else {
+            if let Ok(mut g) = self.warped.lock() {
+                *g = None;
+            }
+            None
+        };
+        let (downsample, blur) = if plan.glow {
+            let qw = (w / 4).max(1);
+            let qh = (h / 4).max(1);
+            let ds = Self::ensure_target(
+                &self.downsample,
+                device,
+                raw_format,
+                qw,
+                qh,
+                "glow quarter-size copy",
+            );
+            let bl = Self::ensure_target(&self.blur, device, raw_format, qw, qh, "glow blur");
+            (Some(ds), bl)
+        } else {
+            if let Ok(mut g) = self.downsample.lock() {
+                *g = None;
+            }
+            if let Ok(mut g) = self.blur.lock() {
+                *g = None;
+            }
+            (None, self.blur_dummy.create_view(&Default::default()))
+        };
         // Separate horizontal and composite bind groups avoid binding the blur texture
         // as both render target and shader resource in the same pass.
         let bind = |input: &wgpu::TextureView, other: &wgpu::TextureView| {
@@ -509,13 +617,12 @@ impl PostGpu {
         let mut encoder = device.create_command_encoder(&Default::default());
         // Diagnostic depth fog only. Production shading is fogged per material,
         // so this stage is never part of the shipped chain (`post_plan`).
-        let apply_fog = plan.fog;
-        if apply_fog {
+        if let Some(ref fogged_view) = fogged {
             let group = bind(&scene, &scene);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene fog before glow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &fogged,
+                    view: fogged_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -530,14 +637,14 @@ impl PostGpu {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let before_warp = if apply_fog { &fogged } else { &scene };
+        let before_warp = fogged.as_ref().unwrap_or(&scene);
         // 0x40fd33: spacewarp consumes the quantized capture, before glow.
-        if plan.warp {
+        if let Some(ref warped_view) = warped {
             let group = bind(before_warp, before_warp);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("underwater distortion before glow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &warped,
+                    view: warped_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -552,16 +659,16 @@ impl PostGpu {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let input = if plan.warp { &warped } else { before_warp };
+        let input = warped.as_ref().unwrap_or(before_warp);
         // 0x40fdb0/0x40f053: quarter-size copy, horizontal blur, then the
         // vertical blur + composite in the finish pass.
-        if plan.glow {
+        if let Some(ref downsample_view) = downsample {
             {
                 let group = bind(input, input);
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("glow quarter-size stretch copy"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &downsample,
+                        view: downsample_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -576,7 +683,7 @@ impl PostGpu {
                 pass.set_bind_group(0, &group, &[]);
                 pass.draw(0..3, 0..1);
             }
-            let group = bind(input, &downsample);
+            let group = bind(input, downsample_view);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("glow horizontal"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -595,17 +702,27 @@ impl PostGpu {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let composite_target = self.composite_target.create_view(&Default::default());
+        let composite_target = if plan.sharpen {
+            Some(Self::ensure_target(
+                &self.composite_target,
+                device,
+                raw_format,
+                w,
+                h,
+                "encoded glow before sharpen",
+            ))
+        } else {
+            if let Ok(mut g) = self.composite_target.lock() {
+                *g = None;
+            }
+            None
+        };
         {
             let group = bind(input, &blur);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("underwater and glow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: if plan.sharpen {
-                        &composite_target
-                    } else {
-                        target
-                    },
+                    view: composite_target.as_ref().unwrap_or(target),
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -625,8 +742,8 @@ impl PostGpu {
             pass.draw(0..3, 0..1);
         }
         // 0x40fd64..0x40fd9c: authored fullsharpen_14 after the encoded glow.
-        if plan.sharpen {
-            let group = bind(&composite_target, &blur);
+        if let Some(ref composite_view) = composite_target {
+            let group = bind(composite_view, &blur);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("client fullscreen sharpen after encoded glow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {

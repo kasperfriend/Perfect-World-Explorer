@@ -212,8 +212,8 @@ fn service_tables() -> Vec<usize> {
 impl Database {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         let mut db = Self::default();
-        let mut npc_types: HashMap<u32, String> = HashMap::new();
-        let mut monster_types: HashMap<u32, String> = HashMap::new();
+        let mut npc_types: HashMap<u32, String> = HashMap::with_capacity(64);
+        let mut monster_types: HashMap<u32, String> = HashMap::with_capacity(64);
         let wanted = service_tables();
         visit_v27_records(bytes, |section, record| {
             let id = number(record, 0);

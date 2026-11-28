@@ -113,17 +113,18 @@ impl Follow {
             return Motion::Finished;
         }
         let target = Vec3::from(self.waypoints[self.target].position);
-        let mut to_target = target - *position;
-        to_target.y = 0.;
-        let distance = to_target.length();
+        let dx = target.x - position.x;
+        let dz = target.z - position.z;
+        let dist_sq = dx * dx + dz * dz;
         let travel = self.speed * delta;
-        if distance <= travel || distance < 1e-4 {
+        if dist_sq <= travel * travel || dist_sq < 1e-8 {
             position.x = target.x;
             position.z = target.z;
             self.arrive();
             return Motion::Walking;
         }
-        let step = to_target / distance * travel;
+        let scale = travel / dist_sq.sqrt();
+        let step = Vec3::new(dx * scale, 0., dz * scale);
         position.x += step.x;
         position.z += step.z;
         Motion::Walking

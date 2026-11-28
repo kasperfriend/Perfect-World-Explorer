@@ -45,7 +45,7 @@ pub fn prepare<'a>(
     if poses.len() != expected {
         return Err("model pose does not cover every retained mesh".into());
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::with_capacity(expected);
     let mut result = Vec::with_capacity(expected);
     for pose in poses {
         if !seen.insert((pose.skin, pose.mesh)) {
@@ -84,14 +84,11 @@ pub fn prepare<'a>(
             .ok()
             .and_then(|i| skin.data.materials.get(i))
             .ok_or("model mesh material index out of range")?;
-        if material
-            .ambient
-            .iter()
-            .chain(material.diffuse.iter())
-            .chain(material.emissive.iter())
-            .chain(material.specular.iter())
-            .chain(std::iter::once(&material.power))
-            .any(|v| !v.is_finite())
+        if !(material.power.is_finite()
+            && material.ambient.iter().all(|v| v.is_finite())
+            && material.diffuse.iter().all(|v| v.is_finite())
+            && material.emissive.iter().all(|v| v.is_finite())
+            && material.specular.iter().all(|v| v.is_finite()))
         {
             return Err("nonfinite model material".into());
         }
@@ -111,12 +108,17 @@ pub fn prepare<'a>(
         }
         let mut vertices = Vec::with_capacity(pose.vertices.len());
         for (source, posed) in mesh.vertices.iter().zip(&pose.vertices) {
-            if posed
-                .position
-                .iter()
-                .chain(posed.normal.iter())
-                .chain(source.uv.iter())
-                .any(|v| !v.is_finite())
+            let p = posed.position;
+            let n = posed.normal;
+            let uv = source.uv;
+            if !(p[0].is_finite()
+                && p[1].is_finite()
+                && p[2].is_finite()
+                && n[0].is_finite()
+                && n[1].is_finite()
+                && n[2].is_finite()
+                && uv[0].is_finite()
+                && uv[1].is_finite())
             {
                 return Err("nonfinite posed model geometry/UV".into());
             }

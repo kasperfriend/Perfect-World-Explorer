@@ -252,17 +252,34 @@ impl Browser {
             })
             .inner;
         if first || changed {
-            let q = self.query.to_lowercase();
-            self.matches = catalog
-                .entries()
-                .iter()
-                .enumerate()
-                .filter(|(i, e)| {
-                    self.labels[*i].text.to_lowercase().contains(&q)
-                        || e.path.to_lowercase().contains(&q)
-                })
-                .map(|(i, _)| i)
-                .collect();
+            let q = if self.query.is_ascii() {
+                self.query.to_ascii_lowercase()
+            } else {
+                self.query.to_lowercase()
+            };
+            if q.is_empty() {
+                self.matches = (0..catalog.len()).collect();
+            } else {
+                let q_ascii = q.is_ascii();
+                let qb = q.as_bytes();
+                let contains_ci = |haystack: &str| -> bool {
+                    if q_ascii && haystack.is_ascii() {
+                        haystack
+                            .as_bytes()
+                            .windows(qb.len())
+                            .any(|w| w.eq_ignore_ascii_case(qb))
+                    } else {
+                        haystack.to_lowercase().contains(&q)
+                    }
+                };
+                self.matches = catalog
+                    .entries()
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, e)| contains_ci(&self.labels[*i].text) || contains_ci(&e.path))
+                    .map(|(i, _)| i)
+                    .collect();
+            }
         }
         ui.label(format!(
             "{} of {} effects",

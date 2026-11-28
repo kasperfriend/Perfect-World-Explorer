@@ -44,11 +44,12 @@ struct Quad {
     key: PipelineKey,
     texture: String,
     vertices: wgpu::Buffer,
-    binding: wgpu::BindGroup,
+    binding_index: usize,
 }
 
 pub struct Draw {
     quads: Vec<Quad>,
+    bindings: Vec<wgpu::BindGroup>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     uniform: wgpu::Buffer,
     // Bind groups retain references to these resources internally.
@@ -151,6 +152,8 @@ impl Draw {
         });
         let mut pipelines = HashMap::new();
         let mut textures = HashMap::new();
+        let mut binding_indices: HashMap<String, usize> = HashMap::new();
+        let mut bindings = Vec::new();
         let mut gpu_quads = Vec::with_capacity(quads.len());
         for quad in quads {
             let key = PipelineKey {
@@ -162,7 +165,9 @@ impl Draw {
                 let pipeline = pipeline(device, &pipeline_layout, &shader, format, depth, key)?;
                 pipelines.insert(key, pipeline);
             }
-            if !textures.contains_key(&quad.texture) {
+            let binding_index = if let Some(&idx) = binding_indices.get(&quad.texture) {
+                idx
+            } else {
                 let bytes =
                     read(&quad.texture).map_err(|error| format!("{}: {error}", quad.texture))?;
                 let texture = model_texture_gpu::upload(
@@ -172,29 +177,32 @@ impl Draw {
                     model_texture_gpu::UploadMode::Auto,
                 )
                 .map_err(|error| format!("{}: {error}", quad.texture))?;
+                let view = texture.create_view(&Default::default());
+                let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("static GFX decal texture/frame binding"),
+                    layout: &binding_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                    ],
+                });
+                let idx = bindings.len();
+                bindings.push(binding);
                 textures.insert(quad.texture.clone(), texture);
-            }
-            let texture = &textures[&quad.texture];
-            let view = texture.create_view(&Default::default());
-            let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("static GFX decal texture/frame binding"),
-                layout: &binding_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniform.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                ],
-            });
-            let vertices = quad.vertices.iter().map(Vertex::from).collect::<Vec<_>>();
+                binding_indices.insert(quad.texture.clone(), idx);
+                idx
+            };
+            let vertices: [Vertex; 4] = std::array::from_fn(|i| Vertex::from(&quad.vertices[i]));
             let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("native static GFX decal quad"),
                 contents: bytemuck::cast_slice(&vertices),
@@ -204,11 +212,12 @@ impl Draw {
                 key,
                 texture: quad.texture.clone(),
                 vertices,
-                binding,
+                binding_index,
             });
         }
         Ok(Self {
             quads: gpu_quads,
+            bindings,
             pipelines,
             uniform,
             _textures: textures,
@@ -234,6 +243,9 @@ impl Draw {
         }
         if quads.len() != self.quads.len() {
             return Err("GFX decal topology changed without rebuilding GPU resources".into());
+        }
+        if self.quads.is_empty() {
+            return Ok(());
         }
         queue.write_buffer(
             &self.uniform,
@@ -269,12 +281,16 @@ impl Draw {
         }
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint16);
         let mut last_key = None;
+        let mut last_binding = None;
         for quad in &self.quads {
             if last_key != Some(quad.key) {
                 pass.set_pipeline(&self.pipelines[&quad.key]);
                 last_key = Some(quad.key);
             }
-            pass.set_bind_group(0, &quad.binding, &[]);
+            if last_binding != Some(quad.binding_index) {
+                pass.set_bind_group(0, &self.bindings[quad.binding_index], &[]);
+                last_binding = Some(quad.binding_index);
+            }
             pass.set_vertex_buffer(0, quad.vertices.slice(..));
             pass.draw_indexed(0..6, 0, 0..1);
         }

@@ -1001,6 +1001,8 @@ struct Sampled {
 struct ElementRuntime {
     /// Index into `Root::elements`.
     index: usize,
+    /// Direct slot in this Player's model array, computed once at load time.
+    model_slot: Option<usize>,
     /// The keypoint the controller state was seeded from; -1 reseeds.
     seeded: isize,
     /// Which play of the element's clock `state` belongs to. A controller
@@ -1020,6 +1022,9 @@ struct ElementRuntime {
     /// with no diagnostic. `None` therefore covers both "unbound" and "bound to
     /// a name this root does not contain", which is what the client does too.
     bind_target: Option<usize>,
+    /// The sibling named by `DummyEle` (399 corpus roots), used as a basis
+    /// anchor when `BindEle` is absent.
+    dummy_target: Option<usize>,
     /// This element's world placement at its most recent update. A dependent
     /// reads it the way `0x710121` reads the target's matrix at +0x58: one
     /// level, never recursively, so the mutual binds the corpus really contains
@@ -1079,6 +1084,8 @@ struct ElementContext<'a> {
     rotation: f32,
     /// Milliseconds on the element clock, for flipbooks and UV scroll.
     clock: f32,
+    /// Whether the root set `2DRender: 1`, which forces Z-test off.
+    render_2d: bool,
     /// The archive path of the root this element belongs to, so a log line says
     /// which asset it came from. Empty when the host never named the player,
     /// which is only true of tests.
@@ -1202,7 +1209,7 @@ const GROUND_NEAR_DISTANCE: f32 = 0.2;
 /// (`AfxGetGrndNorm` with a NULL normal, `A3DDecalEx.cpp:517`), which is why a
 /// ground decal can follow a crater floor instead of hovering over it. The
 /// viewer is handed the query rather than owning terrain it does not have.
-pub type GroundHeightQuery<'a> = &'a dyn Fn(f32, f32) -> Option<f32>;
+pub type GroundHeightQuery<'a> = &'a (dyn Fn(f32, f32) -> Option<f32> + Sync);
 
 /// The owner's terrain, threaded down to the sprite path so a `MatchGrnd` decal
 /// can be draped over the surface the way `A3DDecalEx::Fill_Verts_3D` drapes it.
@@ -1584,7 +1591,15 @@ impl Player {
         let mut warnings: Vec<String> = Vec::new();
         let mut elements = Vec::with_capacity(root.elements.len());
         let mut textures = Vec::new();
+        let mut next_model_slot = 0usize;
         for (index, element) in root.elements.iter().enumerate() {
+            let model_slot = if matches!(&element.spec, Spec::Model(_)) {
+                let slot = next_model_slot;
+                next_model_slot += 1;
+                Some(slot)
+            } else {
+                None
+            };
             if !element.common.texture.is_empty() {
                 let path = texture_path(&element.common.texture)?;
                 if !textures.contains(&path) {
@@ -1665,28 +1680,36 @@ impl Player {
             }
             elements.push(ElementRuntime {
                 index,
+                model_slot,
                 seeded: -1,
                 play: 0.,
                 state,
                 runtime,
                 bind_target: None,
+                dummy_target: None,
                 placement: None,
                 ended: false,
             });
         }
-        // Resolve `BindEle` after every element exists, since a name may point
-        // forward. Element names are unique within a root in all 5,459 corpus
-        // files, so the first match is the only match and a linear scan
-        // reproduces the client's bucket-chain lookup without a hash map.
+        // Resolve `BindEle` and `DummyEle` after every element exists, since a
+        // name may point forward. Element names are unique within a root in all
+        // 5,459 corpus files, so the first match is the only match and a linear
+        // scan reproduces the client's bucket-chain lookup without a hash map.
         for slot in 0..elements.len() {
             let name = &root.elements[slot].common.bind_element;
-            if name.is_empty() {
-                continue;
+            if !name.is_empty() {
+                elements[slot].bind_target = root
+                    .elements
+                    .iter()
+                    .position(|candidate| &candidate.common.name == name);
             }
-            elements[slot].bind_target = root
-                .elements
-                .iter()
-                .position(|candidate| &candidate.common.name == name);
+            let dummy = &root.elements[slot].common.dummy_element;
+            if !dummy.is_empty() {
+                elements[slot].dummy_target = root
+                    .elements
+                    .iter()
+                    .position(|candidate| &candidate.common.name == dummy);
+            }
         }
         Ok(Self {
             root,
@@ -1964,7 +1987,8 @@ impl Player {
         let mut rng = self.rng;
         rng.next_u32();
         let mut stats = Stats::default();
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.quads);
+        out.clear();
 
         // The parent basis is normalized exactly like the verified static decal
         // path, so a non-uniform placement cannot shear the billboards. A
@@ -1995,7 +2019,12 @@ impl Player {
         // The owner's ground pass runs once per frame, before any element asks
         // for a frame (`0x6e53f0` is the owner's tick, `0x6fa7c0` is called from
         // the corner builder later in the same frame).
-        let frames = ground.and_then(|hit| self.ground_frames(hit, transform, base));
+        let pre_norm = if !self.root.face_to_viewer && !self.root.no_change_dir {
+            Some(orientation)
+        } else {
+            None
+        };
+        let frames = ground.and_then(|hit| self.ground_frames(hit, transform, base, pre_norm));
         // `A3DDecalEx::Fill_Verts_3D` takes its ground branch only for an owner
         // that was placed with ground data and sits within
         // `GROUND_NEAR_DISTANCE` of the surface (`m_pGfx->IsCloseToGrnd() &&
@@ -2048,7 +2077,10 @@ impl Player {
                     self.elements[target].placement.unwrap_or(own),
                     self.elements[target].ended,
                 ),
-                None => (own, false),
+                None => match self.elements[slot].dummy_target {
+                    Some(target) => (self.elements[target].placement.unwrap_or(own), false),
+                    None => (own, false),
+                },
             };
             if target_ended {
                 // `0x6fa69a`: the tick returns without updating. The target's
@@ -2058,18 +2090,12 @@ impl Player {
                 continue;
             }
             let element = &self.root.elements[index];
-            // Models are stored in element order, skipping the elements that are
-            // not models, so find this element's turn by counting earlier models.
-            let model_slot = self.root.elements[..index]
-                .iter()
-                .filter(|element| matches!(element.spec, Spec::Model(_)))
-                .count();
             // The instance owns this element's action clock, so the frame is
-            // posed per tick instead of once at load.
-            let model_instance = match self.root.elements[index].spec {
-                Spec::Model(_) => self.models.get_mut(model_slot),
-                _ => None,
-            };
+            // posed per tick instead of once at load. Only scan earlier elements
+            // for the model slot when this element actually is a Spec::Model.
+            let model_instance = self.elements[slot]
+                .model_slot
+                .and_then(|model_slot| self.models.get_mut(model_slot));
             let runtime = &mut self.elements[slot];
             let done = advance_element(
                 element,
@@ -2086,6 +2112,7 @@ impl Player {
                 &mut out,
                 model_instance,
                 drape,
+                self.root.render_2d,
                 root_name,
             )?;
             runtime.ended = done;
@@ -2095,7 +2122,7 @@ impl Player {
         // millisecond tick rather than any element's, which is why it sits after
         // the element loop: `0x6e4b7d` is called once per root update and reads
         // root+0x1cc directly.
-        let distance = (view.position - base.transform_point3(Vec3::ZERO)).length();
+        let distance = (view.position - origin).length();
         self.shake_offset = camera_shake_frame(
             &self.root,
             &mut self.shake,
@@ -2158,7 +2185,13 @@ impl Player {
     /// the near-ground byte at owner+0x284 and the two frames `0x6fa7c0` chooses
     /// between. The frames carry the same scale `base` does, so matching the
     /// ground can move and tilt an effect but never resize it.
-    fn ground_frames(&self, hit: GroundHit, transform: Mat4, base: Mat4) -> Option<GroundFrames> {
+    fn ground_frames(
+        &self,
+        hit: GroundHit,
+        transform: Mat4,
+        base: Mat4,
+        pre_norm: Option<Mat4>,
+    ) -> Option<GroundFrames> {
         if !hit.height.is_finite() || !hit.normal.is_finite() {
             return None;
         }
@@ -2167,7 +2200,8 @@ impl Player {
         // m_fGroundHeight) < _match_grnd_max_delta`, the 0.2 at :254. Absolute,
         // so an owner far below the surface is not close to it either.
         let near_ground = (origin.y - hit.height).abs() < GROUND_NEAR_DISTANCE;
-        let own = Quat::from_mat4(&normalize_basis(transform));
+        let norm_mat = pre_norm.unwrap_or_else(|| normalize_basis(transform));
+        let own = Quat::from_mat4(&norm_mat);
         let scale = Mat4::from_scale(Vec3::splat(base.x_axis.length()));
         // 0x6e5540..0x6e556e: the ground frame's translation is (pos.x, the
         // raycast height, pos.z).
@@ -2257,6 +2291,7 @@ fn advance_element(
     // The owner's surface, for the ground-draped sprite path. Copy, so every
     // element of the root can take its own.
     drape: Option<GroundSampler<'_>>,
+    render_2d: bool,
     // The root's archive path, carried into every log line this element writes.
     root: &str,
 ) -> Result<bool, String> {
@@ -2382,6 +2417,7 @@ fn advance_element(
         // class that takes `GetTranMatrix` picks it up.
         rotation,
         clock: phase,
+        render_2d,
         root,
     };
     // The Logging tab's frame channel: what the element resolved to this tick.
@@ -2455,6 +2491,7 @@ fn advance_element(
                 element.generation_sequence.as_deref(),
                 &context,
                 dt_s,
+                drape,
                 stats,
                 out,
             );
@@ -2475,10 +2512,29 @@ fn advance_element(
                 color_scale
             };
             let child_dt = dt_s * 1000. * child.play_speed;
+            if child.loop_flag && child.player.finished() {
+                child.player.reset();
+            }
             if child.loop_flag || !child.player.finished() {
-                child
-                    .player
-                    .advance(child_dt, view, placement, context.scale, child_alpha)?;
+                // `A3DGFXContainer.cpp:300` hands the child `GetTranMatrix(kp) * GetParentTM()`,
+                // which includes `Rad_2D` spin, and preserves the parent's accumulated scale
+                // (since `advance_with_terrain` normalizes `transform`'s basis columns).
+                let child_transform = context.element_matrix(Vec3::Z);
+                let parent_scale = placement.x_axis.truncate().length();
+                let child_scale = if parent_scale.is_finite() && parent_scale > 1e-6 {
+                    parent_scale * context.scale
+                } else {
+                    context.scale
+                };
+                child.player.advance_with_terrain(
+                    child_dt,
+                    view,
+                    child_transform,
+                    child_scale,
+                    child_alpha,
+                    None,
+                    drape.map(|s| s.height),
+                )?;
                 out.extend(child.player.quads.iter().cloned());
                 stats.merge(&child.player.stats);
             }
@@ -2799,7 +2855,12 @@ fn apply_controls(state: &mut CtrlState, key: &KeyPoint, sampled: &Sampled, dt: 
                 }
             }
             ControlData::ScaleChange { rate, min, max } => {
-                let total = (sampled.scale + state.scale_extra + rate * dt).clamp(*min, *max);
+                let (lo, hi) = if min <= max {
+                    (*min, *max)
+                } else {
+                    (*max, *min)
+                };
+                let total = (sampled.scale + state.scale_extra + rate * dt).clamp(lo, hi);
                 state.scale_extra = total - sampled.scale;
             }
             ControlData::Fractal {
@@ -2913,16 +2974,20 @@ fn apply_controls(state: &mut CtrlState, key: &KeyPoint, sampled: &Sampled, dt: 
                 // long it is, the ratio clamps at 1 (the last point is held,
                 // no wrap), and `GenPath` builds cubic Bezier segments whose
                 // end tangents are `(P[i+1] - P[i-1]) / 6`.
-                let span = if key.time_span > 0. {
-                    key.time_span
+                // `sampled.offset` and `key.time_span` are both in milliseconds;
+                // dividing `age` (seconds) by `key.time_span` (ms) ran 1,000x too slow.
+                let (elapsed_ms, span_ms) = if key.time_span > 0. {
+                    (sampled.offset, key.time_span)
+                } else if control.end > control.start {
+                    (sampled.offset - control.start, control.end - control.start)
                 } else {
-                    1.
+                    (sampled.offset, 1000.)
                 };
-                let ratio = (age / span).clamp(0., 1.);
+                let ratio = (elapsed_ms / span_ms).clamp(0., 1.);
                 let (position, tangent) = sample_curve_ratio(points, ratio);
                 state.path_override = Some(position);
                 if state.path_direction {
-                    state.rotation = tangent.angle_between(Vec3::X);
+                    state.rotation = tangent.y.atan2(tangent.x);
                 }
             }
         }
@@ -3438,7 +3503,10 @@ pub fn texture_path(texture: &str) -> Result<String, String> {
     if path.is_empty() || !is_safe(&path) {
         return Err(format!("unsafe GFX texture path: {texture}"));
     }
-    Ok(format!("gfx/textures/{path}"))
+    let mut out = String::with_capacity(13 + path.len());
+    out.push_str("gfx/textures/");
+    out.push_str(&path);
+    Ok(out)
 }
 
 /// Archive path of a child root (`GfxPath`), relative to the `gfx` root.
@@ -3450,7 +3518,10 @@ pub fn child_path(path: &str) -> Result<String, String> {
     Ok(if normalized.starts_with("gfx/") {
         normalized
     } else {
-        format!("gfx/{normalized}")
+        let mut out = String::with_capacity(4 + normalized.len());
+        out.push_str("gfx/");
+        out.push_str(&normalized);
+        out
     })
 }
 
@@ -3744,7 +3815,7 @@ fn push_quad(
         texture: texture.to_string(),
         source_blend: context.common.source_blend,
         destination_blend: context.common.destination_blend,
-        depth_test: depth_test(context.common, context.version),
+        depth_test: !context.render_2d && depth_test(context.common, context.version),
         layer: context.common.render_layer,
         priority: context.common.priority,
         tile: context.common.tile_mode != 0,
@@ -4685,22 +4756,23 @@ fn quad_corners(
             // same angle *down*, which is exactly the "sun rays point in random
             // directions" the field report describes.
             let client = context.placement.z_axis.truncate().normalize_or_zero();
-            // `parent` is the placement with the keypoint taken back out, i.e.
-            // the owner's own `GetParentDir`.
-            let parent = context.placement * Mat4::from_quat(keypoint.inverse());
             let dir = match context.shaft {
                 EffectShaft::Client => client,
                 // The root's own direction, whatever the .gfx keypoint adds on
                 // top of it: what the ecwld record asked for on its own.
-                EffectShaft::RootDir => parent.z_axis.truncate().normalize_or_zero(),
+                EffectShaft::RootDir => {
+                    let parent = context.placement * Mat4::from_quat(keypoint.inverse());
+                    parent.z_axis.truncate().normalize_or_zero()
+                }
                 EffectShaft::WorldUp => Vec3::Y,
                 // The client axis with its rise removed, so a shaft that should
                 // sweep across the ground stays in the ground plane.
                 EffectShaft::Horizontal => {
                     let flat = Vec3::new(client.x, 0., client.z);
-                    if flat.length() > 1e-4 {
+                    if flat.length_squared() > 1e-8 {
                         flat.normalize()
                     } else {
+                        let parent = context.placement * Mat4::from_quat(keypoint.inverse());
                         let root = parent.z_axis.truncate();
                         Vec3::new(root.x, 0., root.z).normalize_or_zero()
                     }
@@ -4875,7 +4947,7 @@ fn emit_model(
             texture: mesh.texture.clone(),
             source_blend: context.common.source_blend,
             destination_blend: context.common.destination_blend,
-            depth_test: depth_test(context.common, context.version),
+            depth_test: !context.render_2d && depth_test(context.common, context.version),
             layer: context.common.render_layer,
             priority: context.common.priority,
             // A model slot is not a `m_bTileMode` card slot; its texture stages
@@ -5175,22 +5247,22 @@ fn emit_cylinder(cylinder: &Cylinder, context: &ElementContext, out: &mut Vec<Ef
     let matrix = context.element_matrix(Vec3::Y);
     let uv = flipbook_uv(context.common, context.clock);
     let mut positions = [[0f32; 3]; 4];
+    let inv_sections = 1.0 / sections as f32;
+    let angle_step = std::f32::consts::TAU * inv_sections;
+    let u_start = uv[0][0];
+    let u_span = uv[1][0] - uv[0][0];
+    let (v_low, v_high) = (uv[2][1], uv[0][1]);
+    let top_y = base_y + height;
+    let (mut s0, mut c0) = (0.0f32, 1.0f32);
     for index in 0..sections {
-        let a0 = index as f32 / sections as f32 * std::f32::consts::TAU;
-        let a1 = (index + 1) as f32 / sections as f32 * std::f32::consts::TAU;
+        let (s1, c1) = ((index + 1) as f32 * angle_step).sin_cos();
+        // Z-order [low0, low1, high0, high1] to match `gfx_effect_gpu`'s
+        // `[0, 1, 3, 0, 3, 2]` quad triangulation (diagonal 0 <-> 3).
         let corners = [
-            Vec3::new(a0.cos() * lower_radius, base_y, a0.sin() * lower_radius),
-            Vec3::new(a1.cos() * lower_radius, base_y, a1.sin() * lower_radius),
-            Vec3::new(
-                a1.cos() * upper_radius,
-                base_y + height,
-                a1.sin() * upper_radius,
-            ),
-            Vec3::new(
-                a0.cos() * upper_radius,
-                base_y + height,
-                a0.sin() * upper_radius,
-            ),
+            Vec3::new(c0 * lower_radius, base_y, s0 * lower_radius),
+            Vec3::new(c1 * lower_radius, base_y, s1 * lower_radius),
+            Vec3::new(c0 * upper_radius, top_y, s0 * upper_radius),
+            Vec3::new(c1 * upper_radius, top_y, s1 * upper_radius),
         ];
         for (slot, corner) in corners.into_iter().enumerate() {
             positions[slot] = matrix.transform_point3(corner).to_array();
@@ -5198,13 +5270,12 @@ fn emit_cylinder(cylinder: &Cylinder, context: &ElementContext, out: &mut Vec<Ef
         // `tu = i * m_fTexWid / nSects + m_fTexU`, and the lower row of the
         // strip carries `tv = m_fTexV + m_fTexHei` while the upper carries
         // `m_fTexV`.
-        let u_start = uv[0][0];
-        let u_span = uv[1][0] - uv[0][0];
-        let u0 = u_start + u_span * index as f32 / sections as f32;
-        let u1 = u_start + u_span * (index + 1) as f32 / sections as f32;
-        let (v_low, v_high) = (uv[2][1], uv[0][1]);
-        let strip = [[u0, v_low], [u1, v_low], [u1, v_high], [u0, v_high]];
+        let u0 = u_start + u_span * (index as f32 * inv_sections);
+        let u1 = u_start + u_span * ((index + 1) as f32 * inv_sections);
+        let strip = [[u0, v_low], [u1, v_low], [u0, v_high], [u1, v_high]];
         push_quad(out, context, &texture, positions, strip, color);
+        s0 = s1;
+        c0 = c1;
     }
 }
 
@@ -5296,14 +5367,20 @@ fn emit_paraboloid(curve: &Curve, context: &ElementContext, out: &mut Vec<Effect
     // `_unit_z` — the bowl's own axis, since its surface of revolution runs
     // along local Z.
     let matrix = context.element_matrix(Vec3::Z);
+    let angle_step = std::f32::consts::TAU / PARABOLOID_SEGMENTS as f32;
+    let sincos: [(f32, f32); PARABOLOID_SEGMENTS + 1] =
+        std::array::from_fn(|seg| (angle_step * seg as f32).sin_cos());
+    let u_center = u_base + u_span * 0.5;
+    let v_center = v_base + v_span * 0.5;
     let vertex = |ring: usize, seg: usize| -> (Vec3, [f32; 2]) {
-        let angle = std::f32::consts::TAU / PARABOLOID_SEGMENTS as f32 * seg as f32;
-        let radius = (coefficient * ring as f32 * grid).max(0.).sqrt();
-        let height = grid * ring as f32;
-        let point = Vec3::new(radius * angle.cos(), radius * angle.sin(), height) * local_scale;
+        let (s, c) = sincos[seg];
+        let ring_f = ring as f32;
+        let radius = (coefficient * ring_f * grid).max(0.).sqrt();
+        let height = grid * ring_f;
+        let point = Vec3::new(radius * c, radius * s, height) * local_scale;
         let uv = [
-            u_base + u_span * 0.5 + tex_x_step * ring as f32 * angle.cos(),
-            v_base + v_span * 0.5 - tex_y_step * ring as f32 * angle.sin(),
+            u_center + tex_x_step * ring_f * c,
+            v_center - tex_y_step * ring_f * s,
         ];
         (point, uv)
     };
@@ -5456,6 +5533,7 @@ fn emit_particles(
     generation: Option<&KeyPoint>,
     context: &ElementContext,
     dt: f32,
+    drape: Option<GroundSampler<'_>>,
     stats: &mut Stats,
     out: &mut Vec<EffectQuad>,
 ) {
@@ -5491,11 +5569,34 @@ fn emit_particles(
                 _ => None,
             })
         });
+        let inv_placement = if particle.start_on_ground && drape.is_some() {
+            Some(context.placement.inverse())
+        } else {
+            None
+        };
         for _ in 0..count {
-            particles.push(spawn(particle, path, rng, average, context));
+            let mut p = spawn(particle, path, rng, average, context);
+            if let (Some(sampler), Some(inv)) = (drape, inv_placement) {
+                let mut world = context.placement.transform_point3(p.position);
+                if let Some(h) = (sampler.height)(world.x, world.z) {
+                    world.y = h;
+                    let snapped = inv.transform_point3(world);
+                    if snapped.is_finite() {
+                        p.position = snapped;
+                        p.previous = snapped;
+                        p.origin = snapped;
+                    }
+                }
+            }
+            particles.push(p);
         }
     }
     if dt > 0. {
+        let acc_dir_norm = if particle.acc != 0. && particle.acc_dir.length_squared() > 1e-9 {
+            particle.acc_dir.normalize()
+        } else {
+            Vec3::ZERO
+        };
         // `age >= ttl` unlinks the node (0x71a247).
         particles.retain_mut(|state| {
             state.age += dt;
@@ -5503,7 +5604,7 @@ fn emit_particles(
             if particle.ttl > 0. && state.age >= particle.ttl {
                 return false;
             }
-            integrate(state, particle, affectors, ramps, dt);
+            integrate(state, particle, acc_dir_norm, affectors, ramps, dt);
             true
         });
     }
@@ -5608,23 +5709,41 @@ fn emit_particles(
             continue;
         }
         let scale = if state.scale.is_finite() && state.scale > 0. {
-            state.scale + state.scale_noise
+            (state.scale + state.scale_noise).max(0.)
         } else {
             1.
         };
-        let (right, up) = if billboard {
-            (context.view.right, context.view.up)
+        if scale <= 0. {
+            continue;
+        }
+        let (right, up, forward) = if billboard {
+            (context.view.right, context.view.up, context.view.forward)
         } else {
-            oriented_basis(context, state.direction)
+            let (r, u) = oriented_basis(context, state.direction);
+            let n = r.cross(u);
+            let f = if n.length_squared() > 1e-9 {
+                n.normalize()
+            } else {
+                context.view.forward
+            };
+            (r, u, f)
+        };
+        // `ScaleNoOff`: keep particle offset unscaled by the parent placement
+        // scale while still scaling the particle's own quad extents.
+        let center = if particle.scale_no_offset {
+            let basis_scale = sized.placement.x_axis.truncate().length();
+            if basis_scale > 1e-6 {
+                state.position / basis_scale
+            } else {
+                state.position
+            }
+        } else {
+            state.position
         };
         let positions = quad_corners(
             &sized,
-            QuadBasis::Billboard {
-                right,
-                up,
-                forward: context.view.forward,
-            },
-            state.position,
+            QuadBasis::Billboard { right, up, forward },
+            center,
             particle.width,
             particle.height,
             particle.origin,
@@ -6332,8 +6451,8 @@ fn random_unit_ball(rng: &mut Rng) -> Vec3 {
 fn random_unit(rng: &mut Rng) -> Vec3 {
     let z = rng.signed();
     let radius = (1. - z * z).max(0.).sqrt();
-    let theta = rng.unit() * std::f32::consts::TAU;
-    Vec3::new(radius * theta.cos(), radius * theta.sin(), z)
+    let (s, c) = (rng.unit() * std::f32::consts::TAU).sin_cos();
+    Vec3::new(radius * c, radius * s, z)
 }
 
 /// Spawn colour, drawn the way the client's colour slot `0x7237f0` draws it.
@@ -6509,6 +6628,7 @@ fn hsva_to_packed(hsva: [f32; 4]) -> u32 {
 fn integrate(
     state: &mut ParticleState,
     particle: &Particle,
+    acc_dir_norm: Vec3,
     affectors: &[Control],
     ramps: &[Option<ColorTrack>],
     dt: f32,
@@ -6597,7 +6717,12 @@ fn integrate(
                 state.color = packed;
             }
             ControlData::ScaleChange { rate, min, max } => {
-                state.scale = (state.scale + rate * dt).clamp(*min, *max);
+                let (lo, hi) = if min <= max {
+                    (*min, *max)
+                } else {
+                    (*max, *min)
+                };
+                state.scale = (state.scale + rate * dt).clamp(lo, hi);
             }
             ControlData::Fractal {
                 kind,
@@ -6676,16 +6801,28 @@ fn integrate(
             ControlData::ScaleRamp { first, stops } => {
                 state.scale = sample_ramp(*first, stops, state.age);
             }
-            ControlData::Path { points, .. } => {
+            ControlData::Path { points, calc_dir } => {
                 if points.len() > 1 {
                     let total = path_length(points);
                     if total > 0. {
-                        let distance = if state.ttl > 0. {
-                            (state.age / state.ttl).clamp(0., 1.) * total
+                        let span_ms = if control.end > control.start {
+                            control.end - control.start
                         } else {
-                            total
+                            state.ttl * 1000.
                         };
-                        state.position = sample_path(points, distance).0;
+                        let fraction = if span_ms > 0. {
+                            ((age_ms - control.start) / span_ms).clamp(0., 1.)
+                        } else {
+                            1.
+                        };
+                        let (pos, tangent) = sample_path(points, fraction * total);
+                        state.position = pos;
+                        if *calc_dir {
+                            let dir = tangent.normalize_or_zero();
+                            if dir.length_squared() > 1e-6 {
+                                state.direction = dir;
+                            }
+                        }
                     }
                 }
             }
@@ -6711,11 +6848,7 @@ fn integrate(
         let before = state.acc_speed;
         state.acc_speed += particle.acc * dt;
         let step = (before + state.acc_speed) * half;
-        let direction = if particle.acc_dir.length_squared() > 1e-9 {
-            particle.acc_dir.normalize()
-        } else {
-            Vec3::ZERO
-        };
+        let direction = acc_dir_norm;
         state.position += direction * step;
         state.displacement += direction * step;
     }
@@ -6825,15 +6958,24 @@ fn emit_ribbon(
         if alpha < ALPHA_CUTOFF {
             continue;
         }
-        for (slot, point) in [a0.position, a1.position, b1.position, b0.position]
+        // Z-order [a0, a1, b0, b1] matches `gfx_effect_gpu`'s `[0, 1, 3, 0, 3, 2]`
+        // triangulation and the Z-order `strip` UVs below.
+        for (slot, point) in [a0.position, a1.position, b0.position, b1.position]
             .into_iter()
             .enumerate()
         {
             positions[slot] = point.to_array();
         }
-        let u = (a0.age / life).clamp(0., 1.);
-        let v = (b0.age / life).clamp(0., 1.);
-        let strip = [[uv[0][0], u], [uv[1][0], u], [uv[2][0], v], [uv[3][0], v]];
+        let v_start = uv[0][1];
+        let v_span = uv[2][1] - uv[0][1];
+        let v_a = v_start + v_span * (a0.age / life).clamp(0., 1.);
+        let v_b = v_start + v_span * (b0.age / life).clamp(0., 1.);
+        let strip = [
+            [uv[0][0], v_a],
+            [uv[1][0], v_a],
+            [uv[2][0], v_b],
+            [uv[3][0], v_b],
+        ];
         push_quad(
             out,
             context,
@@ -6934,11 +7076,12 @@ fn emit_ltn_trail(
         if alpha < ALPHA_CUTOFF {
             continue;
         }
-        for (slot, point) in [a.rail1, a.rail2, b.rail2, b.rail1].into_iter().enumerate() {
+        // Z-order [a.rail1, a.rail2, b.rail1, b.rail2] to match `[0, 1, 3, 0, 3, 2]`.
+        for (slot, point) in [a.rail1, a.rail2, b.rail1, b.rail2].into_iter().enumerate() {
             positions[slot] = point.to_array();
         }
         // `tu` is the cross-section's own `U` on both rails; `tv` spans them.
-        let strip = [[a.u, 0.], [a.u, 1.], [b.u, 1.], [b.u, 0.]];
+        let strip = [[a.u, 0.], [a.u, 1.], [b.u, 0.], [b.u, 1.]];
         push_quad(
             out,
             context,
@@ -7388,11 +7531,13 @@ fn emit_fractal(
         if alpha < ALPHA_CUTOFF {
             continue;
         }
+        // Z-order [a-, a+, b-, b+] to match `gfx_effect_gpu`'s `[0, 1, 3, 0, 3, 2]`
+        // quad triangulation (diagonal 0 <-> 3).
         let corners = [
             a - normal * width0,
             a + normal * width0,
-            b + normal * width1,
             b - normal * width1,
+            b + normal * width1,
         ];
         for (slot, corner) in corners.into_iter().enumerate() {
             positions[slot] = corner.to_array();
@@ -7408,12 +7553,12 @@ fn emit_fractal(
         } else {
             win_v
         };
-        // Corner 0/3 are the `-vViewUp` vertices, 1/2 the `+vViewUp` ones.
+        // Corner 0/2 are the `-vViewUp` vertices, 1/3 the `+vViewUp` ones.
         let mut strip = [
             [u_at(t0), v_minus],
             [u_at(t0), v_plus],
-            [u_at(t1), v_plus],
             [u_at(t1), v_minus],
+            [u_at(t1), v_plus],
         ];
         if context.common.exchange_uv {
             for point in strip.iter_mut() {
@@ -7491,7 +7636,8 @@ fn emit_bolts(
         let a1 = *start + right * half;
         let b0 = *end - right * half;
         let b1 = *end + right * half;
-        for (slot, point) in [a0, a1, b1, b0].into_iter().enumerate() {
+        // Z-order [a0, a1, b0, b1] to match `[0, 1, 3, 0, 3, 2]` and `flipbook_uv`.
+        for (slot, point) in [a0, a1, b0, b1].into_iter().enumerate() {
             positions[slot] = point.to_array();
         }
         push_quad(
@@ -7536,7 +7682,14 @@ fn grow_bolt(
         };
         let pitch = Quat::from_axis_angle(pitch_axis, bolts.rng.signed() * bolt.deviation);
         direction = (pitch * (yaw * direction)).normalize_or_zero();
-        let next = position + direction * length;
+        let stroke = if bolt.stroke_amplitude != 0. {
+            let side = direction.cross(pitch_axis).normalize_or_zero();
+            pitch_axis * (bolts.rng.signed() * bolt.stroke_amplitude)
+                + side * (bolts.rng.signed() * bolt.stroke_amplitude)
+        } else {
+            Vec3::ZERO
+        };
+        let next = position + direction * length + stroke;
         let width = bolt.width_start + (bolt.width_end - bolt.width_start) * blend;
         let alpha = bolt.alpha_start + (bolt.alpha_end - bolt.alpha_start) * blend;
         bolts
@@ -9524,6 +9677,7 @@ mod tests {
             emission_scale: 1.,
             rotation: 0.,
             clock: 0.,
+            render_2d: false,
             root: "test.gfx",
         }
     }
@@ -10333,7 +10487,7 @@ mod tests {
         // A minimal player, only for its ground helpers.
         let player = build(&(header37(1) + &SPRITE));
         let frames = player
-            .ground_frames(hit, place, base)
+            .ground_frames(hit, place, base, None)
             .expect("a finite hit must build the frames");
         let parsed = gfx_file::parse(&(header37(1) + &SPRITE)).unwrap();
         let mut element = parsed.elements[0].clone();
@@ -14385,12 +14539,12 @@ mod tests {
             // the two coordinates per vertex, so either orientation is the law.
             let plain = uv[0][0] == uv[1][0]
                 && uv[2][0] == uv[3][0]
-                && uv[0][1] == uv[3][1]
-                && uv[1][1] == uv[2][1];
+                && uv[0][1] == uv[2][1]
+                && uv[1][1] == uv[3][1];
             let exchanged = uv[0][1] == uv[1][1]
                 && uv[2][1] == uv[3][1]
-                && uv[0][0] == uv[3][0]
-                && uv[1][0] == uv[2][0];
+                && uv[0][0] == uv[2][0]
+                && uv[1][0] == uv[3][0];
             assert!(
                 plain || exchanged,
                 "the strip UV runs u along the length and v across the width: {uv:?}"

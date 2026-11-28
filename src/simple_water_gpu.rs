@@ -62,50 +62,78 @@ impl SimpleWaterGpu {
         format: wgpu::TextureFormat,
         frames: &[Vec<image::RgbaImage>],
     ) -> Self {
-        assert_eq!(frames.len(), 30);
-        let (w, h) = frames[0][0].dimensions();
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("client alternate-water frames"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 30,
-            },
-            mip_level_count: frames[0].len() as u32,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        for (layer, levels) in frames.iter().enumerate() {
-            for (level, img) in levels.iter().enumerate() {
-                let (w, h) = img.dimensions();
-                queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: &texture,
-                        mip_level: level as u32,
-                        origin: wgpu::Origin3d {
-                            x: 0,
-                            y: 0,
-                            z: layer as u32,
+        Self::new_for_map(device, queue, format, frames, true)
+    }
+
+    pub fn new_for_map(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        frames: &[Vec<image::RgbaImage>],
+        has_water: bool,
+    ) -> Self {
+        let texture = if has_water {
+            assert_eq!(frames.len(), 30);
+            let (w, h) = frames[0][0].dimensions();
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("client alternate-water frames"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 30,
+                },
+                mip_level_count: frames[0].len() as u32,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            for (layer, levels) in frames.iter().enumerate() {
+                for (level, img) in levels.iter().enumerate() {
+                    let (w, h) = img.dimensions();
+                    queue.write_texture(
+                        wgpu::ImageCopyTexture {
+                            texture: &texture,
+                            mip_level: level as u32,
+                            origin: wgpu::Origin3d {
+                                x: 0,
+                                y: 0,
+                                z: layer as u32,
+                            },
+                            aspect: wgpu::TextureAspect::All,
                         },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    img.as_raw(),
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(w * 4),
-                        rows_per_image: Some(h),
-                    },
-                    wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                        img.as_raw(),
+                        wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(w * 4),
+                            rows_per_image: Some(h),
+                        },
+                        wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
-        }
+            texture
+        } else {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("client alternate-water frames (dry map dummy)"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()

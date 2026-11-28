@@ -503,7 +503,33 @@ enum FaceId {
 }
 
 fn item_matches(id: u32, name: &str, lowercase_query: &str) -> bool {
-    id.to_string().contains(lowercase_query) || name.to_lowercase().contains(lowercase_query)
+    if lowercase_query.is_empty() {
+        return true;
+    }
+    if lowercase_query.bytes().all(|b| b.is_ascii_digit()) {
+        let mut buf = [0u8; 10];
+        let mut n = id;
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if let Ok(id_str) = std::str::from_utf8(&buf[i..]) {
+            if id_str.contains(lowercase_query) {
+                return true;
+            }
+        }
+    }
+    if name.is_ascii() && lowercase_query.is_ascii() {
+        let nb = name.as_bytes();
+        let qb = lowercase_query.as_bytes();
+        return nb.windows(qb.len()).any(|w| w.eq_ignore_ascii_case(qb));
+    }
+    name.to_lowercase().contains(lowercase_query)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -267,7 +267,8 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 fn normalize(v: [f32; 3]) -> Option<[f32; 3]> {
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     if len.is_finite() && len > 1e-6 {
-        Some([v[0] / len, v[1] / len, v[2] / len])
+        let inv = 1.0 / len;
+        Some([v[0] * inv, v[1] * inv, v[2] * inv])
     } else {
         None
     }

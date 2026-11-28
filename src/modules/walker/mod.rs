@@ -947,8 +947,8 @@ impl Walker {
                 self.camera_position = Some(eye);
                 return Some(eye);
             }
-            let cp = pitch.cos();
-            let look = Vec3::new(s * cp, pitch.sin(), -c * cp);
+            let (sp, cp) = pitch.sin_cos();
+            let look = Vec3::new(s * cp, sp, -c * cp);
             let mut camera = eye - look * self.settings.camera_distance;
             let clearance = physics::ground(map, camera.x, camera.z).height + 0.25;
             camera.y = camera.y.max(clearance);
@@ -1182,6 +1182,7 @@ impl Walker {
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         frame: model_draw_gpu::Frame,
+        include_effects: bool,
     ) {
         if !self.is_active() || self.gpu_failed {
             return;
@@ -1461,8 +1462,20 @@ impl Walker {
                     PartVisibility::All => draw.draw(&mut pass),
                 }
             }
-            gpu.gfx.draw_quads(&mut pass);
-            gpu.effects.draw(&mut pass);
+            if include_effects {
+                gpu.gfx.draw_quads(&mut pass);
+                gpu.effects.draw(&mut pass);
+            }
+        }
+    }
+
+    pub fn render_effects<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        if !self.is_active() || self.gpu_failed {
+            return;
+        }
+        if let Some(gpu) = &self.gpu {
+            gpu.gfx.draw_quads(pass);
+            gpu.effects.draw(pass);
         }
     }
 }

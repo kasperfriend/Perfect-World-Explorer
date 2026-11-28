@@ -594,9 +594,22 @@ impl Modules {
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         frame: model_draw_gpu::Frame,
+        include_effects: bool,
     ) {
-        self.walker
-            .render(device, queue, format, encoder, target, depth, frame);
+        self.walker.render(
+            device,
+            queue,
+            format,
+            encoder,
+            target,
+            depth,
+            frame,
+            include_effects,
+        );
+    }
+
+    pub fn render_walker_effects<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        self.walker.render_effects(pass);
     }
 
     #[allow(clippy::too_many_arguments)]

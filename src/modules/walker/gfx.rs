@@ -178,7 +178,10 @@ impl CharacterGfx {
     /// Resolve against the exact pose used by the character meshes. Hidden
     /// travel models contribute no effects, just as they contribute no meshes.
     pub fn quads(&self, assembly: &Character, pose: &CharacterPose) -> Result<Vec<Quad>, String> {
-        let mut quads = Vec::new();
+        if self.effects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut quads = Vec::with_capacity(self.effects.len());
         for effect in &self.effects {
             let Kind::Static(root) = &effect.kind else {
                 continue;
@@ -205,7 +208,10 @@ impl CharacterGfx {
         dt_ms: f32,
         map: Option<&MapSpace>,
     ) -> Result<Vec<gfx_player::EffectQuad>, String> {
-        let mut out = Vec::new();
+        if self.effects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(self.effects.len() * 4);
         for effect in &mut self.effects {
             // Resolved first: `parent_of` reads the whole effect, which cannot
             // overlap the mutable borrow of its runtime below.

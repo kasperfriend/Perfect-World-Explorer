@@ -205,48 +205,98 @@ impl Materials {
         let element = archive_root(dir)?;
         let mut file =
             File::open(element.join("textures.pck")).map_err(|e| format!("textures.pck: {e}"))?;
-        let entries = if colors {
-            pck::directory(&mut file)?
+        let (entries, entry_index) = if colors {
+            pck::normalized_index_arc(&mut file)?
         } else {
-            Vec::new()
+            (
+                std::sync::Arc::from(Vec::new()),
+                std::sync::Arc::new(HashMap::new()),
+            )
         };
-        let entry_index: HashMap<String, usize> = entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (e.name.to_ascii_lowercase(), i))
-            .collect();
-        let mut textures = Vec::with_capacity(paths.len());
-        for path in paths.iter().filter(|_| colors) {
-            let entry = entry_index
-                .get(&path.to_ascii_lowercase())
-                .map(|&i| &entries[i])
-                .ok_or_else(|| format!("missing texture {path}"))?;
-            let raw = pck::read_entry(&mut file, entry)?;
-            // Terrain sources must be one of the compressed formats the client
-            // can create; anything else is an explicit error naming the file
-            // instead of an `image` crate fallback that silently decodes a
-            // format the native device would have rejected.
-            let info = crate::terrain_sampling::parse_terrain_dds(&raw)
-                .map_err(|e| format!("texture {path}: {e}"))?;
-            let (w, h) = (info.width as usize, info.height as usize);
-            textures.push(Texture {
-                w,
-                h,
-                source: raw,
-                levels: Default::default(),
-            });
+        let mut textures = Vec::with_capacity(if colors { paths.len() } else { 0 });
+        if colors && !paths.is_empty() {
+            let mut tex_entries = Vec::with_capacity(paths.len());
+            for path in &paths {
+                let entry = entry_index
+                    .get(&path.to_ascii_lowercase())
+                    .map(|&i| &entries[i])
+                    .ok_or_else(|| format!("missing texture {path}"))?;
+                tex_entries.push(entry);
+            }
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(32)
+                .min(tex_entries.len());
+            if workers > 1 && tex_entries.len() >= 8 {
+                let chunk_size = (tex_entries.len() + workers - 1) / workers;
+                let file_ref = &file;
+                let chunks: Result<Vec<Vec<Texture>>, String> = std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(workers);
+                    for (entry_chunk, path_chunk) in
+                        tex_entries.chunks(chunk_size).zip(paths.chunks(chunk_size))
+                    {
+                        handles.push(s.spawn(move || -> Result<Vec<Texture>, String> {
+                            let raws = pck::read_entries_at(file_ref, entry_chunk)
+                                .map_err(|e| e.to_string())?;
+                            let mut out = Vec::with_capacity(raws.len());
+                            for (raw, path) in raws.into_iter().zip(path_chunk.iter()) {
+                                let info = crate::terrain_sampling::parse_terrain_dds(&raw)
+                                    .map_err(|e| format!("texture {path}: {e}"))?;
+                                out.push(Texture {
+                                    w: info.width as usize,
+                                    h: info.height as usize,
+                                    source: raw,
+                                    levels: Default::default(),
+                                });
+                            }
+                            Ok(out)
+                        }));
+                    }
+                    let mut all = Vec::with_capacity(handles.len());
+                    for h in handles {
+                        all.push(h.join().unwrap()?);
+                    }
+                    Ok(all)
+                });
+                for chunk in chunks? {
+                    textures.extend(chunk);
+                }
+            } else {
+                let raws = pck::read_entries_at(&file, &tex_entries).map_err(|e| e.to_string())?;
+                for (raw, path) in raws.into_iter().zip(paths.iter()) {
+                    let info = crate::terrain_sampling::parse_terrain_dds(&raw)
+                        .map_err(|e| format!("texture {path}: {e}"))?;
+                    textures.push(Texture {
+                        w: info.width as usize,
+                        h: info.height as usize,
+                        source: raw,
+                        levels: Default::default(),
+                    });
+                }
+            }
         }
         let mut areas: Vec<Area> = (0..areas_x * areas_y)
             .map(|_| Area { layers: Vec::new() })
             .collect();
         let small_mask_atlas = small_mask_atlas();
-        for (si, name) in names.iter().enumerate() {
-            if let Some([x0, y0, x1, y1]) = window {
-                let (sx, sy) = ((si % subs_x) * sub_areas, (si / subs_x) * sub_areas);
-                if sx >= x1 || sy >= y1 || sx + sub_areas <= x0 || sy + sub_areas <= y0 {
-                    continue;
+        let active_tiles: Vec<(usize, &str)> = names
+            .iter()
+            .enumerate()
+            .filter_map(|(si, name)| {
+                if let Some([x0, y0, x1, y1]) = window {
+                    let (sx, sy) = ((si % subs_x) * sub_areas, (si / subs_x) * sub_areas);
+                    if sx >= x1 || sy >= y1 || sx + sub_areas <= x0 || sy + sub_areas <= y0 {
+                        return None;
+                    }
                 }
-            }
+                Some((si, name.as_str()))
+            })
+            .collect();
+        let parse_tile = |si: usize,
+                          name: &str,
+                          scratch: &mut Vec<u8>|
+         -> Result<Vec<(usize, Vec<Layer>)>, String> {
             let data = fs::read(dir.join(format!("{name}.t2mk"))).map_err(|e| e.to_string())?;
             if u32at(&data, 0)? != 0x544d4b42 || u32at(&data, 4)? != 2 {
                 return Err(format!("{name}: unsupported T2MK"));
@@ -256,7 +306,9 @@ impl Materials {
             if area_count != sub_areas * sub_areas || layer_count > 4096 {
                 return Err(format!("{name}: invalid layer count"));
             }
+            let compressed_flag = u32at(&data, 16)? != 0;
             let layerstart = 20 + area_count * 4;
+            let mut tile_areas = Vec::with_capacity(area_count);
             for ai in 0..area_count {
                 let p = u32at(&data, 20 + ai * 4)? as usize;
                 let n = u32at(&data, p)? as usize;
@@ -269,7 +321,10 @@ impl Materials {
                 if !in_window(dst, areas_x, window) {
                     continue;
                 }
-                let area = areas.get_mut(dst).ok_or("mask area outside world")?;
+                if dst >= areas_x * areas_y {
+                    return Err("mask area outside world".into());
+                }
+                let mut layers = Vec::with_capacity(n);
                 for li in 0..n {
                     let r = p + 4 + li * 12;
                     let idx = u32at(&data, r)? as usize;
@@ -289,63 +344,129 @@ impl Materials {
                     if size > 8192 || (li > 0 && size == 0) {
                         return Err("invalid mask size".into());
                     }
-                    let mut mask = Vec::with_capacity(size * size);
-                    let mut packed = None;
-                    if li > 0 {
+                    let mask_obj = if li == 0 {
+                        Mask::raw(Vec::new())
+                    } else {
                         let off = u32at(&data, r + 4)? as usize;
                         let len = u32at(&data, r + 8)? as usize;
                         let bytes = data
                             .get(off..off.checked_add(len).ok_or("mask overflow")?)
                             .ok_or("truncated mask")?;
-                        if u32at(&data, 16)? != 0 {
-                            if !(size == 256 && small_mask_atlas) {
-                                packed = Some(bytes.to_vec());
+                        let expected_len = size * size;
+                        if compressed_flag {
+                            // Validate compressed payload into a reused per-thread
+                            // scratch buffer so we avoid allocating ~900 MiB of
+                            // temporary buffers across the world's mask layers.
+                            scratch.clear();
+                            if scratch.capacity() < expected_len + 1 {
+                                scratch.reserve(expected_len + 1 - scratch.len());
                             }
                             ZlibDecoder::new(bytes)
-                                .take((size * size + 1) as u64)
-                                .read_to_end(&mut mask)
+                                .take((expected_len + 1) as u64)
+                                .read_to_end(scratch)
                                 .map_err(|e| e.to_string())?;
-                        } else {
-                            mask.extend_from_slice(bytes)
-                        }
-                        if mask.len() != size * size {
-                            return Err("invalid decoded mask size".into());
-                        }
-                        // Only downsample in the explicitly selected low-memory mode.
-                        if size == 256 && small_mask_atlas {
-                            let mut half = vec![0u8; 128 * 128];
-                            for y in 0..128 {
-                                for x in 0..128 {
-                                    let i = 2 * y * 256 + 2 * x;
-                                    half[y * 128 + x] = ((mask[i] as u32
-                                        + mask[i + 1] as u32
-                                        + mask[i + 256] as u32
-                                        + mask[i + 257] as u32
-                                        + 2)
-                                        / 4)
-                                        as u8;
+                            if scratch.len() != expected_len {
+                                return Err("invalid decoded mask size".into());
+                            }
+                            if size == 256 && small_mask_atlas {
+                                let mut half = vec![0u8; 128 * 128];
+                                for y in 0..128 {
+                                    for x in 0..128 {
+                                        let i = 2 * y * 256 + 2 * x;
+                                        half[y * 128 + x] = ((scratch[i] as u32
+                                            + scratch[i + 1] as u32
+                                            + scratch[i + 256] as u32
+                                            + scratch[i + 257] as u32
+                                            + 2)
+                                            >> 2)
+                                            as u8;
+                                    }
+                                }
+                                size = 128;
+                                Mask::raw(half)
+                            } else {
+                                Mask {
+                                    bytes: bytes.to_vec(),
+                                    compressed: true,
+                                    decoded: Default::default(),
                                 }
                             }
-                            packed = None;
-                            mask = half;
-                            size = 128;
+                        } else {
+                            if bytes.len() != expected_len {
+                                return Err("invalid decoded mask size".into());
+                            }
+                            if size == 256 && small_mask_atlas {
+                                let mut half = vec![0u8; 128 * 128];
+                                for y in 0..128 {
+                                    for x in 0..128 {
+                                        let i = 2 * y * 256 + 2 * x;
+                                        half[y * 128 + x] = ((bytes[i] as u32
+                                            + bytes[i + 1] as u32
+                                            + bytes[i + 256] as u32
+                                            + bytes[i + 257] as u32
+                                            + 2)
+                                            >> 2)
+                                            as u8;
+                                    }
+                                }
+                                size = 128;
+                                Mask::raw(half)
+                            } else {
+                                Mask::raw(bytes.to_vec())
+                            }
                         }
-                    }
-                    area.layers.push(Layer {
+                    };
+                    layers.push(Layer {
                         texture,
                         axis: *data.get(lp + 12).ok_or("truncated layer")?,
                         u: f32at(&data, lp + 16)?,
                         v: f32at(&data, lp + 20)?,
                         mask_size: size,
-                        mask: match packed {
-                            Some(bytes) => Mask {
-                                bytes,
-                                compressed: true,
-                                decoded: Default::default(),
-                            },
-                            None => Mask::raw(mask),
-                        },
+                        mask: mask_obj,
                     });
+                }
+                tile_areas.push((dst, layers));
+            }
+            Ok(tile_areas)
+        };
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(32)
+            .min(active_tiles.len().max(1));
+        if workers > 1 && active_tiles.len() >= 2 {
+            let chunk_size = (active_tiles.len() + workers - 1) / workers;
+            let parsed: Result<Vec<Vec<(usize, Vec<Layer>)>>, String> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(workers);
+                for chunk in active_tiles.chunks(chunk_size) {
+                    let parse_tile = &parse_tile;
+                    handles.push(
+                        s.spawn(move || -> Result<Vec<(usize, Vec<Layer>)>, String> {
+                            let mut scratch = Vec::with_capacity(256 * 256 + 1);
+                            let mut out = Vec::with_capacity(chunk.len() * sub_areas * sub_areas);
+                            for &(si, name) in chunk {
+                                out.extend(parse_tile(si, name, &mut scratch)?);
+                            }
+                            Ok(out)
+                        }),
+                    );
+                }
+                let mut all = Vec::with_capacity(handles.len());
+                for h in handles {
+                    all.push(h.join().unwrap()?);
+                }
+                Ok(all)
+            });
+            for chunk in parsed? {
+                for (dst, layers) in chunk {
+                    areas[dst].layers = layers;
+                }
+            }
+        } else {
+            let mut scratch = Vec::with_capacity(256 * 256 + 1);
+            for &(si, name) in &active_tiles {
+                for (dst, layers) in parse_tile(si, name, &mut scratch)? {
+                    areas[dst].layers = layers;
                 }
             }
         }

@@ -77,12 +77,12 @@ pub fn evaluate_controlled(
     controls: &[BoneControl],
     scales: &[BoneScale],
 ) -> Result<Pose, String> {
-    validate_hierarchy(skeleton)?;
     if controls.is_empty()
         && scales.is_empty()
         && skeleton.bones.iter().all(|b| b.flags == 0)
         && skeleton.joints.iter().all(|j| j.class == 15)
     {
+        validate_hierarchy(skeleton)?;
         return crate::skeleton_pose::evaluate(skeleton, tracks, seconds, model);
     }
     if !seconds.is_finite() || !model.is_finite() {
@@ -152,17 +152,16 @@ pub fn evaluate_controlled(
         *slot = Some(*scale);
     }
 
-    let mut children = vec![Vec::new(); count];
-    let mut queue = VecDeque::new();
+    let mut topo_ordered = true;
     for (index, bone) in skeleton.bones.iter().enumerate() {
-        if bone.parent == -1 {
-            queue.push_back(index);
-        } else {
+        if bone.parent != -1 {
             let parent = usize::try_from(bone.parent)
                 .ok()
                 .filter(|&i| i < count && i != index)
                 .ok_or("invalid character pose hierarchy")?;
-            children[parent].push(index);
+            if parent > index {
+                topo_ordered = false;
+            }
         }
         if !local[index].is_finite() || !Mat4::from_cols_array(&bone.initial).is_finite() {
             return Err("nonfinite character bone matrix".into());
@@ -182,8 +181,7 @@ pub fn evaluate_controlled(
     let mut absolute = vec![Mat4::IDENTITY; count];
     let mut skin = vec![Mat4::IDENTITY; count];
     let mut accumulated_whole = vec![Vec3::ONE; count];
-    let mut visited = 0;
-    while let Some(i) = queue.pop_front() {
+    let mut eval_bone = |i: usize| -> Result<(), String> {
         let parent = skeleton.bones[i].parent;
         let setting = scale_settings[i];
         let own_whole = match setting {
@@ -223,16 +221,42 @@ pub fn evaluate_controlled(
             local[i].w_axis.z *= offset_scale.z;
             up_to_root[parent] * local[i]
         };
-        absolute[i] = model * up_to_root[i] * Mat4::from_scale(own_local * accumulated_whole[i]);
-        skin[i] = absolute[i] * Mat4::from_cols_array(&skeleton.bones[i].initial);
-        if !absolute[i].is_finite() || !skin[i].is_finite() {
+        let bone_scale = own_local * accumulated_whole[i];
+        let abs_m = if bone_scale == Vec3::ONE {
+            model * up_to_root[i]
+        } else {
+            model * up_to_root[i] * Mat4::from_scale(bone_scale)
+        };
+        absolute[i] = abs_m;
+        skin[i] = abs_m * Mat4::from_cols_array(&skeleton.bones[i].initial);
+        if !abs_m.is_finite() || !skin[i].is_finite() {
             return Err("nonfinite composed character pose".into());
         }
-        queue.extend(children[i].iter().copied());
-        visited += 1;
-    }
-    if visited != count {
-        return Err("cyclic character pose hierarchy".into());
+        Ok(())
+    };
+    if topo_ordered {
+        for i in 0..count {
+            eval_bone(i)?;
+        }
+    } else {
+        let mut children = vec![Vec::new(); count];
+        let mut queue = VecDeque::with_capacity(count);
+        for (index, bone) in skeleton.bones.iter().enumerate() {
+            if bone.parent == -1 {
+                queue.push_back(index);
+            } else {
+                children[bone.parent as usize].push(index);
+            }
+        }
+        let mut visited = 0;
+        while let Some(i) = queue.pop_front() {
+            eval_bone(i)?;
+            queue.extend(children[i].iter().copied());
+            visited += 1;
+        }
+        if visited != count {
+            return Err("cyclic character pose hierarchy".into());
+        }
     }
     Ok(Pose {
         absolute,

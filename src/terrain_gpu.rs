@@ -239,18 +239,27 @@ fn terrain_pass_fog(linear:vec3<f32>,world:vec3<f32>,transmittance:f32)->vec3<f3
  // matrix `0x7b4b00` writes) is produced. Register row: "terrain day/night
  // factor".
  let lightmapped=camera.sun.w>=0.;
+ let fcoord=fract(coord);
  var color=vec3<f32>(0.);
  var baked=vec3<f32>(1.);
- if lightmapped {let id=ay*settings.areas.x+ax;let slot=id%settings.light.z;let page=id/settings.light.z;let side=f32(settings.light.x);let xy=vec2<f32>(f32(slot%settings.light.y),f32(slot/settings.light.y))*side;let loc=clamp(fract(coord)*side,vec2<f32>(0.5),vec2<f32>(side-0.5));let lmuv=(xy+loc)/vec2<f32>(textureDimensions(lightmaps));let day=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page),0.).rgb;let night=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page+settings.light.w),0.).rgb;
+ if lightmapped {let id=ay*settings.areas.x+ax;let slot=id%settings.light.z;let page=id/settings.light.z;let side=f32(settings.light.x);let xy=vec2<f32>(f32(slot%settings.light.y),f32(slot/settings.light.y))*side;let loc=clamp(fcoord*side,vec2<f32>(0.5),vec2<f32>(side-0.5));let inv_lm=1./vec2<f32>(textureDimensions(lightmaps));let lmuv=(xy+loc)*inv_lm;
   // t2_3layer_batch_14: `lrp_sat r5, c3.a, r5, r4` with t4 = day (r4), t5 = night
   // (r5): factor 0 selects the day map and 1 the night map, then `mul_x2` doubles
   // the encoded result into the 8-bit target.
   let factor=clamp(camera.fog_range.w,0.,1.);
+  var day=vec3<f32>(0.);var night=vec3<f32>(0.);
+  if factor<1. {day=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page),0.).rgb;}
+  if factor>0. {night=textureSampleLevel(lightmaps,mask_sampler,lmuv,i32(page+settings.light.w),0.).rgb;}
   baked=mix(day,night,factor)*2.;}
- for(var k=0u;k<a.count;k=k+1u){let l=layers[a.start+k];var v=vec2<f32>(i.world.x,-i.world.z);if l.axis==0u {v=vec2<f32>(i.world.z,-i.world.y);}else if l.axis==2u {v=vec2<f32>(i.world.x,-i.world.y);}
+ let mask_side=f32(settings.areas.y);
+ let mask_local=clamp(fcoord*mask_side,vec2<f32>(0.5),vec2<f32>(mask_side-0.5));
+ let inv_mask_atlas=1./4096.;
+ for(var k=0u;k<a.count;k=k+1u){let l=layers[a.start+k];
+ var alpha=1.;if k>0u {let slot=l.mask%settings.areas.w;let page=l.mask/settings.areas.w;let xy=vec2<f32>(f32(slot%settings.areas.z),f32(slot/settings.areas.z))*mask_side;alpha=textureSampleLevel(masks,mask_sampler,(xy+mask_local)*inv_mask_atlas,i32(page),0.).r;if alpha<0.002 {continue;}}
+ var v=vec2<f32>(i.world.x,-i.world.z);if l.axis==0u {v=vec2<f32>(i.world.z,-i.world.y);}else if l.axis==2u {v=vec2<f32>(i.world.x,-i.world.y);}
  var dx=vec2<f32>(wx.x,-wx.z);var dy=vec2<f32>(wy.x,-wy.z);
  if l.axis==0u {dx=vec2<f32>(wx.z,-wx.y);dy=vec2<f32>(wy.z,-wy.y);}else if l.axis==2u {dx=vec2<f32>(wx.x,-wx.y);dy=vec2<f32>(wy.x,-wy.y);}
- dx*=l.uv*camera.lod.y;dy*=l.uv*camera.lod.y;let kind=l.tex>>28u;let index=i32(l.tex & 0x0fffffffu);
+ let uv_scale=l.uv*camera.lod.y;dx*=uv_scale;dy*=uv_scale;let kind=l.tex>>28u;let index=i32(l.tex & 0x0fffffffu);
  // Pass the true screen-space gradient, not a scalar max-footprint LOD.
  // The sampler can then preserve detail along the minor axis at grazing angles.
  var tex:vec3<f32>;
@@ -263,7 +272,6 @@ fn terrain_pass_fog(linear:vec3<f32>,world:vec3<f32>,transmittance:f32)->vec3<f3
  else if kind==2u {tex=textureSampleGrad(terrain_full,terrain_sampler,v*l.uv,index,dx,dy).rgb;}
  else if kind==1u {tex=textureSampleGrad(terrain,terrain_sampler,v*l.uv,index,dx,dy).rgb;}
  else {tex=textureSampleGrad(terrain_small,terrain_sampler,v*l.uv,index,dx,dy).rgb;}
- var alpha=1.;if k>0u {let slot=l.mask%settings.areas.w;let page=l.mask/settings.areas.w;let side=f32(settings.areas.y);let xy=vec2<f32>(f32(slot%settings.areas.z),f32(slot/settings.areas.z))*side;let local=clamp(fract(coord)*side,vec2<f32>(0.5),vec2<f32>(side-0.5));alpha=textureSampleLevel(masks,mask_sampler,(xy+local)/4096.,i32(page),0.).r;}
  if !lightmapped {tex=to_linear(tex);}
  color=mix(color,tex,alpha);}
  // t2_3layer_batch_14 composite: `mul r0, r0, v0` with v0 = c0.x = 1.0 and
@@ -451,7 +459,19 @@ impl TerrainGpu {
         let small_tex = create_array(256, count_small);
         let tex = create_array(TEX, count_large);
         let full_tex = create_array(1024, count_full);
+        enum TexSlot {
+            Native {
+                group: usize,
+                index: u32,
+            },
+            Fallback {
+                base_side: usize,
+                index: u32,
+                kind: u32,
+            },
+        }
         let mut tex_map = Vec::with_capacity(m.textures.len());
+        let mut tex_slots = Vec::with_capacity(m.textures.len());
         let mut small_n = 0u32;
         let mut large_n = 0u32;
         let mut full_n = 0u32;
@@ -461,92 +481,212 @@ impl TerrainGpu {
                 let index = native_n[group];
                 native_n[group] += 1;
                 tex_map.push(index | ((group as u32 + 3) << 28));
-                crate::terrain_upload::upload(queue, &native_textures[group], &img.source, index)?;
-                // A submit bounds upload staging; a wait every eight sources
-                // also caps in-flight allocations on shared-memory adapters.
-                if image_number % 8 == 7 || image_number + 1 == m.textures.len() {
-                    queue.submit(std::iter::empty());
-                    device.poll(wgpu::Maintain::Wait);
-                }
-                continue;
-            }
-            let (image, base_side, index, kind) = if img.w > 512 || img.h > 512 {
-                let i = full_n;
+                tex_slots.push(TexSlot::Native { group, index });
+            } else if img.w > 512 || img.h > 512 {
+                let index = full_n;
                 full_n += 1;
-                (&full_tex, 1024, i, 2u32)
+                tex_map.push(index | (2u32 << 28));
+                tex_slots.push(TexSlot::Fallback {
+                    base_side: 1024,
+                    index,
+                    kind: 2,
+                });
             } else if img.w > 256 || img.h > 256 {
-                let i = large_n;
+                let index = large_n;
                 large_n += 1;
-                (&tex, TEX, i, 1u32)
+                tex_map.push(index | (1u32 << 28));
+                tex_slots.push(TexSlot::Fallback {
+                    base_side: TEX,
+                    index,
+                    kind: 1,
+                });
             } else {
-                let i = small_n;
+                let index = small_n;
                 small_n += 1;
-                (&small_tex, 256, i, 0u32)
-            };
-            tex_map.push(index | (kind << 28));
-            // Copy the authored chain level by level. Level 0 is fitted into the
-            // array slot; every later level is taken straight from the file, so the
-            // client's authored reductions survive. The client uploads what the DDS
-            // carries (`0x7f7ef1`) and only generates a chain when the source has a
-            // single level, which is the `generates_mips` case below.
-            let decoded = img.decode()?;
-            let mut level = fit_level(&decoded[0], base_side);
-            let mut side = base_side;
-            for mip in 0..=base_side.ilog2() {
-                queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: image,
-                        mip_level: mip,
-                        origin: wgpu::Origin3d {
-                            x: 0,
-                            y: 0,
-                            z: index,
-                        },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &level,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some((side * 4) as u32),
-                        rows_per_image: Some(side as u32),
-                    },
-                    wgpu::Extent3d {
-                        width: side as u32,
-                        height: side as u32,
-                        depth_or_array_layers: 1,
-                    },
-                );
-                if side <= 1 {
-                    break;
-                }
-                let next = side / 2;
-                level = match decoded.get(mip as usize + 1) {
-                    // Authored level: use it as-is when it matches the slot size.
-                    Some(authored)
-                        if authored.width as usize == next && authored.height as usize == next =>
-                    {
-                        authored.rgba.clone()
-                    }
-                    Some(authored) => {
-                        // Authored but non-square or smaller than the slot requests:
-                        // fit it rather than silently box-filter it, and keep the
-                        // authored reduction where the size already matches.
-                        fit_level(authored, next)
-                    }
-                    None => box_half(&level, next),
-                };
-                side = next;
-            }
-            // wgpu keeps write_texture staging alive until submission. Bound
-            // peak memory even when maximum-quality terrain uses 1024px images.
-            if image_number % 8 == 7 || image_number + 1 == m.textures.len() {
-                queue.submit(std::iter::empty());
-                device.poll(wgpu::Maintain::Wait);
+                tex_map.push(index);
+                tex_slots.push(TexSlot::Fallback {
+                    base_side: 256,
+                    index,
+                    kind: 0,
+                });
             }
         }
-        let masks = upload_masks(device, queue, m, &tex_map)?;
-        let (lighttex, light_side, light_per_row, light_per_page, light_pages, availability) =
-            load_lightmaps(device, queue, t, m, mask_side)?;
+        // Run terrain texture array uploads (with parallel CPU fallback decode),
+        // mask atlas decode/upload, and day/night lightmap decode/upload
+        // concurrently so Renderer::new overlaps all three heavy GPU init stages.
+        let (
+            masks,
+            (lighttex, light_side, light_per_row, light_per_page, light_pages, availability),
+        ) = std::thread::scope(|s| -> Result<_, String> {
+            let tex_map_ref = &tex_map;
+            let masks_task = s.spawn(move || upload_masks(device, queue, m, tex_map_ref));
+            let lightmaps_task = s.spawn(move || load_lightmaps(device, queue, t, m, mask_side));
+
+            let mut fallback_jobs: Vec<(usize, usize, u32, u32)> = Vec::new();
+            for (image_number, slot) in tex_slots.iter().enumerate() {
+                match *slot {
+                    TexSlot::Native { group, index } => {
+                        crate::terrain_upload::upload(
+                            queue,
+                            &native_textures[group],
+                            &m.textures[image_number].source,
+                            index,
+                        )?;
+                        if image_number % 32 == 31 || image_number + 1 == m.textures.len() {
+                            queue.submit(std::iter::empty());
+                            device.poll(wgpu::Maintain::Poll);
+                        }
+                    }
+                    TexSlot::Fallback {
+                        base_side,
+                        index,
+                        kind,
+                    } => {
+                        fallback_jobs.push((image_number, base_side, index, kind));
+                    }
+                }
+            }
+            if !fallback_jobs.is_empty() {
+                let workers = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(16);
+                // Process fallback textures in bounded parallel batches so CPU
+                // DXT decoding & mip generation scale across cores without
+                // spiking RAM.
+                for batch in fallback_jobs.chunks(16) {
+                    let prepared: Vec<(usize, u32, u32, Vec<Vec<u8>>)> = if workers > 1
+                        && batch.len() >= 2
+                    {
+                        let chunk_size = batch.len().div_ceil(workers);
+                        std::thread::scope(|ps| -> Result<Vec<_>, String> {
+                            let handles: Vec<_> = batch
+                                .chunks(chunk_size)
+                                .map(|chunk| {
+                                    let fit_level = &fit_level;
+                                    let box_half = &box_half;
+                                    ps.spawn(move || -> Result<Vec<_>, String> {
+                                        let mut out = Vec::with_capacity(chunk.len());
+                                        for &(image_number, base_side, index, kind) in chunk {
+                                            let decoded = m.textures[image_number].decode()?;
+                                            let mut levels =
+                                                Vec::with_capacity(base_side.ilog2() as usize + 1);
+                                            let mut level = fit_level(&decoded[0], base_side);
+                                            let mut side = base_side;
+                                            for mip in 0..=base_side.ilog2() {
+                                                let next_level = if side > 1 {
+                                                    let next = side / 2;
+                                                    Some(match decoded.get(mip as usize + 1) {
+                                                        Some(authored)
+                                                            if authored.width as usize == next
+                                                                && authored.height as usize
+                                                                    == next =>
+                                                        {
+                                                            authored.rgba.clone()
+                                                        }
+                                                        Some(authored) => fit_level(authored, next),
+                                                        None => box_half(&level, next),
+                                                    })
+                                                } else {
+                                                    None
+                                                };
+                                                levels.push(level);
+                                                if let Some(nl) = next_level {
+                                                    level = nl;
+                                                    side /= 2;
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                            out.push((base_side, index, kind, levels));
+                                        }
+                                        Ok(out)
+                                    })
+                                })
+                                .collect();
+                            let mut all = Vec::with_capacity(batch.len());
+                            for h in handles {
+                                all.extend(h.join().unwrap()?);
+                            }
+                            Ok(all)
+                        })?
+                    } else {
+                        let mut out = Vec::with_capacity(batch.len());
+                        for &(image_number, base_side, index, kind) in batch {
+                            let decoded = m.textures[image_number].decode()?;
+                            let mut levels = Vec::with_capacity(base_side.ilog2() as usize + 1);
+                            let mut level = fit_level(&decoded[0], base_side);
+                            let mut side = base_side;
+                            for mip in 0..=base_side.ilog2() {
+                                let next_level = if side > 1 {
+                                    let next = side / 2;
+                                    Some(match decoded.get(mip as usize + 1) {
+                                        Some(authored)
+                                            if authored.width as usize == next
+                                                && authored.height as usize == next =>
+                                        {
+                                            authored.rgba.clone()
+                                        }
+                                        Some(authored) => fit_level(authored, next),
+                                        None => box_half(&level, next),
+                                    })
+                                } else {
+                                    None
+                                };
+                                levels.push(level);
+                                if let Some(nl) = next_level {
+                                    level = nl;
+                                    side /= 2;
+                                } else {
+                                    break;
+                                }
+                            }
+                            out.push((base_side, index, kind, levels));
+                        }
+                        out
+                    };
+                    for (base_side, index, kind, levels) in prepared {
+                        let image = match kind {
+                            2 => &full_tex,
+                            1 => &tex,
+                            _ => &small_tex,
+                        };
+                        let mut side = base_side;
+                        for (mip, level) in levels.iter().enumerate() {
+                            queue.write_texture(
+                                wgpu::ImageCopyTexture {
+                                    texture: image,
+                                    mip_level: mip as u32,
+                                    origin: wgpu::Origin3d {
+                                        x: 0,
+                                        y: 0,
+                                        z: index,
+                                    },
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                level,
+                                wgpu::ImageDataLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some((side * 4) as u32),
+                                    rows_per_image: Some(side as u32),
+                                },
+                                wgpu::Extent3d {
+                                    width: side as u32,
+                                    height: side as u32,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                            side /= 2;
+                        }
+                    }
+                    queue.submit(std::iter::empty());
+                    device.poll(wgpu::Maintain::Poll);
+                }
+            }
+            let masks = masks_task.join().unwrap()?;
+            let lightmaps = lightmaps_task.join().unwrap()?;
+            Ok((masks, lightmaps))
+        })?;
         let settings = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("terrain world settings"),
             contents: bytemuck::bytes_of(&Settings {
@@ -864,6 +1004,19 @@ impl TerrainGpu {
             None => out.clear(),
         }
     }
+    pub fn visible_far_runs_rect_into(
+        &self,
+        matrix: glam::Mat4,
+        rect: [f32; 4],
+        out: &mut Vec<(u32, u32)>,
+    ) {
+        match &self.far {
+            Some(far) => {
+                crate::terrain_residency::visible_runs_rect_into(&far.spans, matrix, rect, out)
+            }
+            None => out.clear(),
+        }
+    }
     pub fn edge_mesh(&self) -> Option<(&wgpu::Buffer, &wgpu::Buffer, u32)> {
         self.far
             .as_ref()
@@ -919,7 +1072,7 @@ impl TerrainGpu {
                     runs,
                 );
             }
-        } else {
+        } else if !self.last_near_runs.is_empty() || self.near_records != 0 {
             self.last_near_runs.clear();
             self.near_records = 0;
         }
@@ -1083,36 +1236,10 @@ fn upload_masks(
             },
         view_formats: &[],
     });
-    let mut areas = Vec::new();
-    let mut layers = Vec::new();
-    let mut page = vec![0u8; MASK_PAGE * MASK_PAGE];
+    let mut areas = Vec::with_capacity(m.areas.len());
+    let mut layers = Vec::with_capacity(masks_count + m.areas.len());
+    let mut page_jobs: Vec<Vec<(usize, &crate::material::Layer)>> = vec![Vec::new(); pages];
     let mut layer_id = 0usize;
-    let mut page_id = 0usize;
-    let upload_page = |page: &[u8], id: usize| {
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &masktex,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: id as u32,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            page,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(MASK_PAGE as u32),
-                rows_per_image: Some(MASK_PAGE as u32),
-            },
-            wgpu::Extent3d {
-                width: MASK_PAGE as u32,
-                height: MASK_PAGE as u32,
-                depth_or_array_layers: 1,
-            },
-        )
-    };
     for a in &m.areas {
         areas.push(Area {
             start: layers.len() as u32,
@@ -1123,28 +1250,9 @@ fn upload_masks(
             let id = if j == 0 {
                 u32::MAX
             } else {
-                if layer_id / per_page != page_id {
-                    upload_page(&page, page_id);
-                    // Prevent queued 16 MiB mask pages from accumulating
-                    // alongside decoded terrain images and lightmaps.
-                    if page_id % 2 == 1 {
-                        queue.submit(std::iter::empty());
-                        device.poll(wgpu::Maintain::Wait);
-                    }
-                    page.fill(0);
-                    page_id += 1;
-                }
+                let p_id = layer_id / per_page;
                 let slot = layer_id % per_page;
-                let ox = slot % per_row * mask_side;
-                let oy = slot / per_row * mask_side;
-                let decoded_mask = l.mask.decode(l.mask_size)?;
-                for y in 0..mask_side {
-                    for x in 0..mask_side {
-                        let sx = x * l.mask_size / mask_side;
-                        let sy = y * l.mask_size / mask_side;
-                        page[(oy + y) * MASK_PAGE + ox + x] = decoded_mask[sy * l.mask_size + sx];
-                    }
-                }
+                page_jobs[p_id].push((slot, l));
                 let id = layer_id as u32;
                 layer_id += 1;
                 id
@@ -1159,9 +1267,96 @@ fn upload_masks(
             });
         }
     }
-    upload_page(&page, page_id);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(32);
+    let mut page = vec![0u8; MASK_PAGE * MASK_PAGE];
+    for (page_id, jobs) in page_jobs.iter().enumerate() {
+        page.fill(0);
+        if !jobs.is_empty() {
+            let decoded: Vec<(usize, usize, std::borrow::Cow<'_, [u8]>)> =
+                if workers > 1 && jobs.len() >= 8 {
+                    let chunk_size = (jobs.len() + workers - 1) / workers;
+                    std::thread::scope(|s| -> Result<Vec<_>, String> {
+                        let handles: Vec<_> = jobs
+                            .chunks(chunk_size)
+                            .map(|chunk| {
+                                s.spawn(move || -> Result<Vec<_>, String> {
+                                    let mut out = Vec::with_capacity(chunk.len());
+                                    for &(slot, l) in chunk {
+                                        out.push((slot, l.mask_size, l.mask.decode(l.mask_size)?));
+                                    }
+                                    Ok(out)
+                                })
+                            })
+                            .collect();
+                        let mut all = Vec::with_capacity(jobs.len());
+                        for h in handles {
+                            all.extend(h.join().unwrap()?);
+                        }
+                        Ok(all)
+                    })?
+                } else {
+                    let mut out = Vec::with_capacity(jobs.len());
+                    for &(slot, l) in jobs {
+                        out.push((slot, l.mask_size, l.mask.decode(l.mask_size)?));
+                    }
+                    out
+                };
+            for (slot, src_size, decoded_mask) in decoded {
+                let ox = (slot % per_row) * mask_side;
+                let oy = (slot / per_row) * mask_side;
+                if src_size == mask_side {
+                    for y in 0..mask_side {
+                        let dst = (oy + y) * MASK_PAGE + ox;
+                        let src = y * mask_side;
+                        page[dst..dst + mask_side]
+                            .copy_from_slice(&decoded_mask[src..src + mask_side]);
+                    }
+                } else {
+                    for y in 0..mask_side {
+                        let sy = y * src_size / mask_side;
+                        let dst_row = (oy + y) * MASK_PAGE + ox;
+                        let src_row = sy * src_size;
+                        for x in 0..mask_side {
+                            let sx = x * src_size / mask_side;
+                            page[dst_row + x] = decoded_mask[src_row + sx];
+                        }
+                    }
+                }
+            }
+        }
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &masktex,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: page_id as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &page,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(MASK_PAGE as u32),
+                rows_per_image: Some(MASK_PAGE as u32),
+            },
+            wgpu::Extent3d {
+                width: MASK_PAGE as u32,
+                height: MASK_PAGE as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+        if page_id % 4 == 3 {
+            queue.submit(std::iter::empty());
+            device.poll(wgpu::Maintain::Poll);
+        }
+    }
     queue.submit(std::iter::empty());
-    device.poll(wgpu::Maintain::Wait);
+    device.poll(wgpu::Maintain::Poll);
     drop(page);
     let area_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("terrain areas"),
@@ -1318,57 +1513,47 @@ fn load_lightmaps(
     // as the day/night fallback the night slot uses.
     let mut availability = vec![crate::terrain_lightmaps::Availability::Unbound; m.areas.len()];
     let mut unbound = Vec::new();
-    for (si, name) in t.subterrain_names.iter().enumerate() {
-        let base = t.element.join("maps/world");
-        let pair = match crate::terrain_lightmaps::Pair::read_optional(
+    let base = t.element.join("maps/world");
+    let lm_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(32);
+    struct PreparedStrip {
+        x: u32,
+        y: u32,
+        page: u32,
+        width: u32,
+        bytes_per_row: u32,
+        rows_per_image: u32,
+        data: Vec<u8>,
+    }
+    struct PreparedSubtile {
+        si: usize,
+        availability: Option<crate::terrain_lightmaps::Availability>,
+        strips: Vec<PreparedStrip>,
+    }
+    let prepare_subtile = |si: usize, name: &str| -> Result<PreparedSubtile, String> {
+        let Some(pair) = crate::terrain_lightmaps::Pair::read_optional(
             &base.join(format!("{name}.t2lm")),
             &base.join(format!("{name}.t2lm1")),
-        )? {
-            Some(pair) => pair,
-            None => {
-                for j in 0..crate::terrain_lightmaps::TILES {
-                    unbound.push(layout.area(si, j).unwrap());
-                }
-                continue;
-            }
+        )?
+        else {
+            return Ok(PreparedSubtile {
+                si,
+                availability: None,
+                strips: Vec::new(),
+            });
         };
+        let avail = pair.availability();
+        let tile_row_bytes = if bc { side / 4 * 8 } else { side * 4 };
+        let tile_rows = if bc { side / 4 } else { side };
+        let mut strips = Vec::with_capacity(8);
         for (which, ext) in ["t2lm", "t2lm1"].iter().enumerate() {
-            let path = t.element.join("maps/world").join(format!("{name}.{ext}"));
+            let path = base.join(format!("{name}.{ext}"));
             let tiles = crate::terrain_lightmaps::Tiles::parse(pair.bytes(which == 1))
                 .map_err(|e| format!("lightmap {}: {e}", path.display()))?;
-            for j in 0..crate::terrain_lightmaps::TILES {
+            let decode_tile = |j: usize| -> Result<std::borrow::Cow<'_, [u8]>, String> {
                 let raw = tiles.tile(j).unwrap();
-                let id = layout.area(si, j).unwrap();
-                availability[id] = pair.availability();
-                let slot = id % per_page;
-                let page = id / per_page + which * pages;
-                let x = (slot % per_row) * side;
-                let y = (slot / per_row) * side;
-                let write_tile = |data: &[u8], bytes_per_row: u32, rows_per_image: u32| {
-                    queue.write_texture(
-                        wgpu::ImageCopyTexture {
-                            texture: &texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d {
-                                x: x as u32,
-                                y: y as u32,
-                                z: page as u32,
-                            },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        data,
-                        wgpu::ImageDataLayout {
-                            offset: 0,
-                            bytes_per_row: Some(bytes_per_row),
-                            rows_per_image: Some(rows_per_image),
-                        },
-                        wgpu::Extent3d {
-                            width: side as u32,
-                            height: side as u32,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                };
                 let dds = crate::model_dds::Dds::parse(raw)
                     .map_err(|e| format!("lightmap {}: {e}", path.display()))?;
                 if dds.format != crate::model_dds::Format::Dxt1
@@ -1378,9 +1563,8 @@ fn load_lightmaps(
                 {
                     return Err(format!("Unsupported lightmap DDS in {}", path.display()));
                 }
-                // Both upload backends must accept exactly the same records.
                 if bc {
-                    write_tile(dds.mips[0].bytes, (side / 4 * 8) as u32, (side / 4) as u32);
+                    Ok(std::borrow::Cow::Borrowed(dds.mips[0].bytes))
                 } else {
                     let img = image::load_from_memory_with_format(raw, image::ImageFormat::Dds)
                         .map_err(|e| format!("lightmap {}: {e}", path.display()))?
@@ -1398,16 +1582,147 @@ fn load_lightmaps(
                             image::imageops::FilterType::Triangle,
                         )
                     };
-                    write_tile(img.as_raw(), (side * 4) as u32, side as u32);
+                    Ok(std::borrow::Cow::Owned(img.into_raw()))
+                }
+            };
+            // Each subtile is a 4x4 grid of mask areas. Pack every contiguous
+            // 4-tile horizontal row into one staging strip when it stays within
+            // one atlas page row, slashing queue.write_texture calls by 4x.
+            for row in 0..4usize {
+                let j0 = row * 4;
+                let id0 = layout.area(si, j0).unwrap();
+                let slot0 = id0 % per_page;
+                let page0 = id0 / per_page + which * pages;
+                let col0 = slot0 % per_row;
+                let row0 = slot0 / per_row;
+                let contiguous = (1..4).all(|k| {
+                    let idk = layout.area(si, j0 + k).unwrap();
+                    let slotk = idk % per_page;
+                    idk / per_page + which * pages == page0
+                        && slotk / per_row == row0
+                        && slotk % per_row == col0 + k
+                });
+                if contiguous {
+                    let strip_row_bytes = tile_row_bytes * 4;
+                    let mut strip = vec![0u8; strip_row_bytes * tile_rows];
+                    for k in 0..4 {
+                        let tile_data = decode_tile(j0 + k)?;
+                        for r in 0..tile_rows {
+                            let src = r * tile_row_bytes;
+                            let dst = r * strip_row_bytes + k * tile_row_bytes;
+                            strip[dst..dst + tile_row_bytes]
+                                .copy_from_slice(&tile_data[src..src + tile_row_bytes]);
+                        }
+                    }
+                    strips.push(PreparedStrip {
+                        x: (col0 * side) as u32,
+                        y: (row0 * side) as u32,
+                        page: page0 as u32,
+                        width: (side * 4) as u32,
+                        bytes_per_row: strip_row_bytes as u32,
+                        rows_per_image: tile_rows as u32,
+                        data: strip,
+                    });
+                } else {
+                    for k in 0..4 {
+                        let j = j0 + k;
+                        let id = layout.area(si, j).unwrap();
+                        let slot = id % per_page;
+                        let page = id / per_page + which * pages;
+                        let tile_data = decode_tile(j)?;
+                        strips.push(PreparedStrip {
+                            x: ((slot % per_row) * side) as u32,
+                            y: ((slot / per_row) * side) as u32,
+                            page: page as u32,
+                            width: side as u32,
+                            bytes_per_row: tile_row_bytes as u32,
+                            rows_per_image: tile_rows as u32,
+                            data: tile_data.into_owned(),
+                        });
+                    }
                 }
             }
         }
-        // write_texture staging belongs to wgpu until the next submission.
-        // Wait periodically to cap temporary upload memory on slower GPUs.
-        if si % 4 == 3 || si + 1 == t.subterrain_names.len() {
-            queue.submit(std::iter::empty());
-            device.poll(wgpu::Maintain::Wait);
+        Ok(PreparedSubtile {
+            si,
+            availability: Some(avail),
+            strips,
+        })
+    };
+    // Read, parse DDS, decode (if RGBA), and pack 4-tile strips in parallel
+    // batches of 16 subtiles across all CPU cores while bounding peak RAM.
+    for batch_start in (0..t.subterrain_names.len()).step_by(16) {
+        let batch_end = (batch_start + 16).min(t.subterrain_names.len());
+        let batch_names = &t.subterrain_names[batch_start..batch_end];
+        let prepared: Vec<PreparedSubtile> = if lm_workers > 1 && batch_names.len() >= 2 {
+            let chunk_size = batch_names.len().div_ceil(lm_workers);
+            let prepare_subtile = &prepare_subtile;
+            std::thread::scope(|s| -> Result<Vec<_>, String> {
+                let handles: Vec<_> = batch_names
+                    .chunks(chunk_size)
+                    .enumerate()
+                    .map(|(ci, chunk)| {
+                        let offset = batch_start + ci * chunk_size;
+                        s.spawn(move || -> Result<Vec<_>, String> {
+                            let mut out = Vec::with_capacity(chunk.len());
+                            for (k, name) in chunk.iter().enumerate() {
+                                out.push(prepare_subtile(offset + k, name)?);
+                            }
+                            Ok(out)
+                        })
+                    })
+                    .collect();
+                let mut all = Vec::with_capacity(batch_names.len());
+                for h in handles {
+                    all.extend(h.join().unwrap()?);
+                }
+                Ok(all)
+            })?
+        } else {
+            let mut out = Vec::with_capacity(batch_names.len());
+            for (k, name) in batch_names.iter().enumerate() {
+                out.push(prepare_subtile(batch_start + k, name)?);
+            }
+            out
+        };
+        for sub in prepared {
+            let Some(avail) = sub.availability else {
+                for j in 0..crate::terrain_lightmaps::TILES {
+                    unbound.push(layout.area(sub.si, j).unwrap());
+                }
+                continue;
+            };
+            for j in 0..crate::terrain_lightmaps::TILES {
+                availability[layout.area(sub.si, j).unwrap()] = avail;
+            }
+            for strip in sub.strips {
+                queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: strip.x,
+                            y: strip.y,
+                            z: strip.page,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &strip.data,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(strip.bytes_per_row),
+                        rows_per_image: Some(strip.rows_per_image),
+                    },
+                    wgpu::Extent3d {
+                        width: strip.width,
+                        height: side as u32,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
         }
+        queue.submit(std::iter::empty());
+        device.poll(wgpu::Maintain::Poll);
     }
     // An unbound area still owns an atlas slot, so fill it with a neutral tile
     // rather than the texture's zero-initialised contents. The shader keeps
@@ -1449,7 +1764,7 @@ fn load_lightmaps(
             }
         }
         queue.submit(std::iter::empty());
-        device.poll(wgpu::Maintain::Wait);
+        device.poll(wgpu::Maintain::Poll);
     }
     eprintln!(
         "Loaded {} terrain lightmap areas ({} with authored night maps, {} day-only, {} unbound) at {}px ({})",
@@ -1523,7 +1838,9 @@ fn far_indices(
     let mut indices = Vec::with_capacity((cols - 1) * (rows - 1) * 6);
     // Preserve every original triangle, but group index ranges into bounded
     // patches so the main view never transforms the entire off-screen world.
-    let mut spans = Vec::new();
+    let patch_x = (cols - 1 + 31) / 32;
+    let patch_y = (rows - 1 + 31) / 32;
+    let mut spans = Vec::with_capacity(patch_x * patch_y);
     for py in (0..rows - 1).step_by(32) {
         for px in (0..cols - 1).step_by(32) {
             let end_x = (px + 32).min(cols - 1);

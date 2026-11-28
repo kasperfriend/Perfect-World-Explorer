@@ -218,7 +218,7 @@ fn without_variant_suffix(path: &str) -> String {
     let Some((head, folder)) = dir.rsplit_once('/') else {
         return path.to_string();
     };
-    if folder.len() <= 3 || !folder.to_lowercase().ends_with("amd") {
+    if folder.len() <= 3 || !folder.as_bytes()[folder.len() - 3..].eq_ignore_ascii_case(b"amd") {
         return path.to_string();
     }
     let base = &folder[..folder.len() - 3];
@@ -421,7 +421,7 @@ impl ModelAsset {
             // after native missing-SKI omissions.
             model.skins = loaded_skin_paths;
         }
-        let mut tracks = Vec::new();
+        let mut tracks = Vec::with_capacity(model.actions.len());
         for action in &model.actions {
             let set = if let Some(path) =
                 model.action_track_path(&descriptor.skin_model_path, action)
@@ -669,7 +669,8 @@ impl ModelAsset {
         hook_matrix(&self.skeleton, pose, name)
     }
     pub fn meshes_from_pose(&self, pose: &skeleton_pose::Pose) -> Result<Vec<PosedMesh>, String> {
-        let mut meshes = Vec::new();
+        let total: usize = self.skins.iter().map(|s| s.data.meshes.len()).sum();
+        let mut meshes = Vec::with_capacity(total);
         for (skin, asset) in self.skins.iter().enumerate() {
             // Bind/validate all SKI names even for a rigid-only skin. Rigid
             // vertices below do not use this remapped weighted palette.
