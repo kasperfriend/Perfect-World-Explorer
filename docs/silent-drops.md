@@ -86,8 +86,8 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/gpu.rs` | 4244 | `let-underscore` | **unreachable** | `let _ = self.raywatcher_harvest.poll_background_build();` |
 | `src/gpu.rs` | 4260 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
 | `src/gpu.rs` | 4326 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
-| `src/gpu.rs` | 4326 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
-| `src/gpu.rs` | 4326 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
+| `src/gpu.rs` | 4340 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
+| `src/gpu.rs` | 4345 | `let-underscore` | **unreachable** | `let _ = writeln!(` |
 | `src/gpu.rs` | 4545 | `let-underscore` | **unreachable** | `let _ = tx.send(result);` |
 | `src/gpu.rs` | 5545 | `let-underscore` | **unreachable** | `let _ = e.begin_render_pass(&wgpu::RenderPassDescriptor {` |
 | `src/gpu.rs` | 7763 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
