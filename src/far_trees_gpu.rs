@@ -624,10 +624,14 @@ fn water_transmittance(world:vec3<f32>)->f32 {
  return exp2(-0.075*depth*distance/delta.y);
 }
 fn fogged(linear:vec3<f32>,world:vec3<f32>)->vec3<f32> {
- if camera.fog_range.z<0.5 {return linear;}
- let view_z=fog_view_depth(world);
- let span=camera.fog_range.y-camera.fog_range.x;
- let f=select(clamp((view_z-camera.fog_range.x)/select(span,0.001,abs(span)<0.001),0.,1.),select(0.,1.,view_z>=camera.fog_range.y),abs(span)<0.001);
+ var f=0.;
+ if camera.fog_range.z>0.5 {
+  let view_z=fog_view_depth(world);
+  let span=camera.fog_range.y-camera.fog_range.x;
+  f=select(clamp((view_z-camera.fog_range.x)/select(span,0.001,abs(span)<0.001),0.,1.),select(0.,1.,view_z>=camera.fog_range.y),abs(span)<0.001);
+ }
+ // Water transmission is independent of regional distance fog: even when a
+ // region has no table-fog record, submerged tree colour still absorbs light.
  let water=water_transmittance(world);
  let combined_fog=1.-(1.-f)*water;
  let c=max(linear,vec3<f32>(0.));let encoded=select(c*12.92,1.055*pow(c,vec3<f32>(1./2.4))-0.055,c>vec3<f32>(0.0031308));
