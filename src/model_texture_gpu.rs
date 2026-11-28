@@ -302,6 +302,35 @@ mod tests {
     }
 
     #[test]
+    fn preview_decoder_reads_uncompressed_bgra_dds_pixels() {
+        let mut bytes = vec![0; 128];
+        bytes[..4].copy_from_slice(b"DDS ");
+        for (offset, value) in [
+            (4, 124u32),
+            (12, 1),
+            (16, 2),
+            (28, 1),
+            (76, 32),
+            (80, 0x41),
+            (88, 32),
+            (92, 0xff0000),
+            (96, 0xff00),
+            (100, 0xff),
+            (104, 0xff000000),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        // Two BGRA pixels: opaque red and half-transparent green.
+        bytes.extend_from_slice(&[0, 0, 255, 255, 0, 255, 0, 128]);
+        let image = decode_preview_rgba(&bytes).unwrap();
+        assert_eq!(image.dimensions(), (2, 1));
+        assert_eq!(
+            image.into_raw(),
+            [255, 0, 0, 255, 0, 255, 0, 128]
+        );
+    }
+
+    #[test]
     fn tiny_bc1_alpha_mip_keeps_its_authored_transparency() {
         let mut bytes = vec![0; 128];
         bytes[..4].copy_from_slice(b"DDS ");
