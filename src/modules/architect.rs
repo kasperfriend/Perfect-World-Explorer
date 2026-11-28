@@ -1403,8 +1403,9 @@ impl Architect {
         let path = asset.to_ascii_lowercase();
         let (half_x, half_y, half_z) = if path.contains("tree") {
             (2.0, 10.0, 2.0)
-        } else if path.contains("litmodels/") || path.contains("building")
-            || path.contains("house") || path.contains("gate") || path.contains("wall")
+        } else if path.contains("litmodels/") || path.ends_with(".bmd")
+            || path.contains("building") || path.contains("house")
+            || path.contains("gate") || path.contains("wall")
         {
             (6.0, 8.0, 6.0)
         } else if path.ends_with(".gfx") || path.contains("effect") {
@@ -4455,7 +4456,7 @@ mod tests {
 
     #[test]
     fn fallback_selection_bounds_keep_buildings_pickable_before_mesh_load() {
-        let building = Architect::fallback_selection_bounds("litmodels/a01/castle.bmd");
+        let building = Architect::fallback_selection_bounds("1/litmodel_1399.bmd");
         let ordinary = Architect::fallback_selection_bounds("models/props/barrel.ecm");
         let tree = Architect::fallback_selection_bounds("trees/forest/oak.ecm");
         assert!(building.1[0] - building.0[0] > ordinary.1[0] - ordinary.0[0]);
