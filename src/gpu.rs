@@ -627,7 +627,7 @@ pub(crate) fn editor_bmd_vertex_transform(
     let world_normal = (instance_x * (local_normal.x / instance_scale[0].max(1e-4))
         + instance_y * (local_normal.y / instance_scale[1].max(1e-4))
         + instance_z * (local_normal.z / instance_scale[2].max(1e-4)))
-        .normalize_or_zero();
+    .normalize_or_zero();
     (world_position, world_normal)
 }
 
@@ -663,14 +663,20 @@ mod editor_bmd_transform_tests {
             day_diffuse: 0,
             night_diffuse: 0,
         };
-        let (position, normal) = editor_bmd_vertex_transform(&model, &ornament, &vertex, [2.0, 3.0, 4.0]);
+        let (position, normal) =
+            editor_bmd_vertex_transform(&model, &ornament, &vertex, [2.0, 3.0, 4.0]);
         assert!((position.x - 10.0).abs() < 0.0001);
         assert!((position.y - 20.0).abs() < 0.0001);
         assert!((position.z - 28.0).abs() < 0.0001);
         assert!((normal.x - 0.0).abs() < 0.0001);
         assert!((normal.z + 1.0).abs() < 0.0001);
-        let y_vertex = crate::bmd::Vertex { position: [0.0, 1.0, 0.0], normal: [0.0, 1.0, 0.0], ..vertex.clone() };
-        let (y_position, _) = editor_bmd_vertex_transform(&model, &ornament, &y_vertex, [2.0, 3.0, 4.0]);
+        let y_vertex = crate::bmd::Vertex {
+            position: [0.0, 1.0, 0.0],
+            normal: [0.0, 1.0, 0.0],
+            ..vertex.clone()
+        };
+        let (y_position, _) =
+            editor_bmd_vertex_transform(&model, &ornament, &y_vertex, [2.0, 3.0, 4.0]);
         assert!((y_position.y - 23.0).abs() < 0.0001);
     }
 }
