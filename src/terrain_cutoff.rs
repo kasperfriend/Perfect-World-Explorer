@@ -94,7 +94,6 @@ mod residency_tests {
     }
 }
 
-
 /// Conservative view-space fog limit for the resident XZ rectangle. Account
 /// for the screen-corner ray, not just the centre ray, so the entire visible
 /// boundary is covered by the fitted fog interval. This is a viewer adaptation,
