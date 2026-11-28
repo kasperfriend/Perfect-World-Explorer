@@ -1298,7 +1298,10 @@ impl Architect {
         let portable = if portable.contains("::") {
             portable
         } else {
-            portable.strip_prefix("element/").unwrap_or(&portable).to_owned()
+            portable
+                .strip_prefix("element/")
+                .unwrap_or(&portable)
+                .to_owned()
         };
         Self::renderer_asset_path(&portable)
     }
