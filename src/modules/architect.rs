@@ -104,6 +104,7 @@ pub struct Architect {
     archive_details: Vec<(String, u32, u32)>,
     archive_choices: Vec<PathBuf>,
     archive_view_filter: usize,
+    asset_browser_open: bool,
     project_name: String,
     selected_project: Option<usize>,
     selected_map: String,
@@ -220,6 +221,7 @@ impl Architect {
             archive_details: Vec::new(),
             archive_choices: Vec::new(),
             archive_view_filter: 0,
+            asset_browser_open: true,
             project_name: "Untitled World".into(),
             selected_project: None,
             selected_map: "__empty__".into(),
@@ -1512,11 +1514,22 @@ impl Architect {
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("pck"))
                     {
                         self.open_archive(child.clone());
+                        self.asset_browser_open = true;
                     } else {
                         self.select_asset_for_placement(child.to_string_lossy().into_owned());
                     }
                 }
                 response.context_menu(|ui| {
+                    if child
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("pck"))
+                        && ui.button("Open in Asset Browser").clicked()
+                    {
+                        self.open_archive(child.clone());
+                        self.asset_browser_open = true;
+                        ui.close_menu();
+                    }
                     if ui.button("Pin to quick bar").clicked() {
                         self.pin(child.to_string_lossy().into_owned());
                         ui.close_menu();
@@ -2047,6 +2060,36 @@ impl Architect {
         placements
     }
 
+    /// Place the supplied asset at the camera's horizontal location, snapped
+    /// onto the active terrain. Do not rely on a previous selection or the
+    /// current Place cursor: context-menu and preview actions call this directly.
+    fn place_asset_at_camera(&mut self, asset: String, camera: Vec3) {
+        if !camera.is_finite() {
+            self.status = "Cannot place an asset: camera position is not finite.".into();
+            return;
+        }
+        if !self.renderer_placeable_asset(&asset) {
+            self.status = format!(
+                "Cannot place '{}': this file has no native placement adapter.",
+                Path::new(&asset)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| asset.clone())
+            );
+            return;
+        }
+        self.selected_asset = Some(asset);
+        self.snap = SnapMode::Terrain;
+        let mut position = camera.to_array();
+        if let Some(map) = &self.map {
+            let ground = map.ground(position[0], position[2]);
+            if ground.is_finite() {
+                position[1] = ground + 0.5;
+            }
+        }
+        self.add_selected_asset_at_position(position);
+    }
+
     fn add_selected_asset_at_camera(&mut self, camera: Vec3) {
         let position = self.placement_position(camera);
         self.add_selected_asset_at_position(position);
@@ -2549,6 +2592,15 @@ impl Architect {
                             .strong()
                             .color(egui::Color32::from_rgb(120, 190, 255)),
                     );
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("ASSET BROWSER").strong())
+                                .fill(egui::Color32::from_rgb(42, 92, 145)),
+                        )
+                        .clicked()
+                    {
+                        self.asset_browser_open = true;
+                    }
                     ui.separator();
                     ui.selectable_value(&mut self.cursor, CursorMode::Select, "Select");
                     ui.selectable_value(&mut self.cursor, CursorMode::MultiSelect, "Multi-select");
@@ -3048,8 +3100,9 @@ impl Architect {
         let asset_pos = Self::dock_position(self.right_dock, screen, 340., 600.);
         let asset_dock_changed = self.right_dock != self.applied_right_dock;
         self.applied_right_dock = self.right_dock;
-        let mut asset_panel = egui::Window::new("Client assets")
+        let mut asset_panel = egui::Window::new("Asset Browser")
             .id(egui::Id::new("architect_asset_panel"))
+            .open(&mut self.asset_browser_open)
             .default_pos(asset_pos)
             .default_size(egui::vec2(340., 600.))
             .min_size(egui::vec2(250., 300.))
@@ -3242,8 +3295,7 @@ impl Architect {
                                                 )
                                                 .clicked()
                                             {
-                                                self.select_asset_for_placement(asset.clone());
-                                                self.add_selected_asset_at_camera(camera);
+                                                self.place_asset_at_camera(asset.clone(), camera);
                                                 ui.close_menu();
                                             }
                                         });
@@ -3260,7 +3312,7 @@ impl Architect {
                     ui.label(egui::RichText::new(&asset).small().strong());
                     if ui.button("Add to quick bar").clicked() { self.pin(asset.clone()); }
                     if ui.button("Place at camera").clicked() {
-                        self.add_selected_asset_at_camera(camera);
+                        self.place_asset_at_camera(asset.clone(), camera);
                     }
                 }
             });
@@ -3355,11 +3407,17 @@ impl Architect {
                             self.select_asset_for_placement(asset);
                         }
                     }
-                    if ui.button("Place selected asset").clicked() {
-                        if let Some(asset) = self.selected_asset.clone() {
-                            self.select_asset_for_placement(asset);
+                    if ui.button("Place at camera").clicked() {
+                        if let Some(asset) = self
+                            .hovered_asset
+                            .clone()
+                            .or_else(|| previous_hovered_asset.clone())
+                            .or_else(|| self.selected_asset.clone())
+                        {
+                            self.place_asset_at_camera(asset, camera);
+                        } else {
+                            self.status = "Select an asset in the Asset Browser before placing it.".into();
                         }
-                        self.add_selected_asset_at_camera(camera);
                     }
                 });
             preview_window_hovered = preview_response
