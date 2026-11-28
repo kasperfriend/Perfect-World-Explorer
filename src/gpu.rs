@@ -3102,8 +3102,25 @@ impl Renderer {
             } else {
                 1.
             });
-        // All passes read the same camera-relative fog via active_fog().
-        let active_fog = camera.active_fog();
+        // Fit authored air fog to the finite resident terrain window when the
+        // original-game cutoff is enabled. Without this, the fog start can sit
+        // beyond nearly all resident geometry and the transition appears only
+        // at the window edge. Keep the same fitted state for every render pass.
+        let mut active_fog = camera.active_fog();
+        if active_fog.enabled && camera.underwater_depth <= 0. {
+            if let Some(cap) = self.resident_bounds().and_then(|bounds| {
+                crate::terrain_cutoff::fog_cap(
+                    bounds,
+                    camera.pos.to_array(),
+                    w as f32 / h.max(1) as f32,
+                )
+            }) {
+                let [start, end] =
+                    crate::terrain_cutoff::fit_fog(active_fog.start, active_fog.end, cap);
+                active_fog.start = start;
+                active_fog.end = end;
+            }
+        }
         let (mut fog_range, fog_color) = (active_fog.range(), active_fog.color4());
         // Uniform fog_range.w is the terrain day/night factor; the shader reads
         // it instead of overloading sun.w (the lightmap-availability flag).
@@ -6083,9 +6100,10 @@ impl Camera {
             enabled: true,
         }
     }
-    /// Outdoor fog used by the camera and the below-surface scene pass.
+    /// The selected region's authored atmosphere. Finite-residency fitting
+    /// happens later, where the renderer knows the resident bounds and viewport.
     fn outdoor_fog(&self) -> crate::fog_matrix::Fog {
-        crate::fog_matrix::camera_relative_outdoor_fog(self.authored_air_fog())
+        self.authored_air_fog()
     }
     fn active_fog(&self) -> crate::fog_matrix::Fog {
         // Every pass obtains the same camera-relative air horizon here. Water
