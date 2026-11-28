@@ -1171,6 +1171,7 @@ mod tests {
             direction: [0.0, 0.0, 1.0],
             up: [0.0, 1.0, 0.0],
             scale: 2.5,
+            scale_axes: [1.; 3],
             map_id: "a01".into(),
         };
 
@@ -1181,6 +1182,7 @@ mod tests {
         assert_eq!(objects.ornaments[1].path, "litmodels/a01/1/editor.bmd");
         assert_eq!(objects.placement_scale(0), 1.0);
         assert_eq!(objects.placement_scale(1), 2.5);
+        assert_eq!(objects.placement_scale_axes(1), [2.5; 3]);
         assert!(!objects.set_editor_ornaments(std::slice::from_ref(&placement)));
 
         assert!(objects.set_editor_ornaments(&[]));
