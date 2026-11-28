@@ -3140,20 +3140,31 @@ impl Populator {
             live.visible = on_screen(view_projection, live.position, live.head);
             let dist_sq = (live.position - eye).length_squared();
             if dist_sq > (POPULATOR_RT_RADIUS + 8.0) * (POPULATOR_RT_RADIUS + 8.0)
-                && !live.rt_verts.is_empty() { live.rt_verts.clear(); }
+                && !live.rt_verts.is_empty()
+            {
+                live.rt_verts.clear();
+            }
             if !live.visible {
                 // Retain nearby off-screen geometry for Raywatcher shadows/reflections.
                 if dist_sq <= POPULATOR_RT_OFFSCREEN_RADIUS * POPULATOR_RT_OFFSCREEN_RADIUS
-                    && (live.rt_verts.is_empty() || (time_advanced && pose_due(frame_index, live.spawn, 4)))
+                    && (live.rt_verts.is_empty()
+                        || (time_advanced && pose_due(frame_index, live.spawn, 4)))
                 {
                     if let Ok(meshes) = live.pose() {
-                        extract_actor_rt_verts(&live.asset, &meshes, &mut live.rt_verts, POPULATOR_RT_TRIS_PER_ACTOR);
+                        extract_actor_rt_verts(
+                            &live.asset,
+                            &meshes,
+                            &mut live.rt_verts,
+                            POPULATOR_RT_TRIS_PER_ACTOR,
+                        );
                     }
                 }
                 continue;
             }
             any_visible = true;
-            if live.pose_index == Some(frame_index) { continue; }
+            if live.pose_index == Some(frame_index) {
+                continue;
+            }
             // Nothing advanced: the pose on the GPU is still this frame's pose.
             if !time_advanced && live.pose_index.is_some() {
                 continue;
@@ -3171,9 +3182,16 @@ impl Populator {
                     live.pose_stamp = Some(signature);
                     live.pose_index = Some(frame_index);
                     if dist_sq <= POPULATOR_RT_RADIUS * POPULATOR_RT_RADIUS {
-                        extract_actor_rt_verts(&live.asset, &meshes, &mut live.rt_verts, POPULATOR_RT_TRIS_PER_ACTOR);
+                        extract_actor_rt_verts(
+                            &live.asset,
+                            &meshes,
+                            &mut live.rt_verts,
+                            POPULATOR_RT_TRIS_PER_ACTOR,
+                        );
                     }
-                    if posed.is_empty() { posed.resize_with(self.live.len(), || None); }
+                    if posed.is_empty() {
+                        posed.resize_with(self.live.len(), || None);
+                    }
                     posed[index] = Some(meshes);
                 }
                 Err(error) => live.failure = Some(error),
