@@ -803,6 +803,10 @@ impl World {
             self.update_effects(device, queue, frame, delta_ms);
             self.grid.update(lights, center);
             self.publications.consume_into(&mut self.grid);
+        } else {
+            // Reflection/refraction reuse the current effect geometry and clocks,
+            // but must bind this view's matrix, clip and water-absorption state.
+            self.update_effect_frame(queue, frame);
         }
         self.draw_models(device, queue, frame, night);
         if advance {
@@ -974,6 +978,7 @@ impl World {
             direction: frame.direction,
             fog_range: frame.fog_range,
             fog_color: frame.fog_color,
+            water_fog: frame.water_fog,
             // `A3DGFXModel::ChangeModel` enables specular on every effect model,
             // so the pass needs the light's specular colour and the eye the
             // Blinn half-vector is built from.
@@ -991,6 +996,37 @@ impl World {
             &mut **read,
         ) {
             reported.push(format!("world effects: {error}"));
+        }
+    }
+
+    /// Update only the current view's constants for already-advanced effects.
+    /// Secondary views never tick particles or rebuild their world-space geometry.
+    fn update_effect_frame(&mut self, queue: &wgpu::Queue, frame: Frame) {
+        let Some(draw) = self.effects.as_mut() else {
+            return;
+        };
+        let light = gfx_effect_gpu::EffectLight {
+            lighting: frame.lighting,
+            direction: frame.direction,
+            fog_range: frame.fog_range,
+            fog_color: frame.fog_color,
+            water_fog: frame.water_fog,
+            directional_specular: frame.directional_specular,
+            eye_direction: frame.eye_direction,
+        };
+        if let Err(error) = draw.update_frame(
+            queue,
+            frame.matrix,
+            frame.clip_plane,
+            [
+                frame.eye_position[0],
+                frame.eye_position[1],
+                frame.eye_position[2],
+                0.,
+            ],
+            Some(light),
+        ) {
+            self.reported.push(format!("world effects frame: {error}"));
         }
     }
 

@@ -612,13 +612,26 @@ fn fog_view_depth(world:vec3<f32>)->f32 {
  // Re-evaluate clip-space W from the perspective-correct world position.
  return max((camera.matrix*vec4<f32>(world,1.)).w,0.);
 }
+fn water_transmittance(world:vec3<f32>)->f32 {
+ // Existing camera clip/eye constants are populated for every render view.
+ // Only clipped refraction from an above-water camera consumes water.
+ if camera.clip.y>=-0.5 || camera.grass_eye.y<=camera.clip.x {return 1.;}
+ let depth=max(camera.clip.x-world.y,0.);
+ if depth<=0. {return 1.;}
+ let delta=camera.grass_eye.xyz-world;
+ let distance=length(delta);
+ if delta.y<=0.000001 || distance<=0.000001 {return 0.;}
+ return exp2(-0.075*depth*distance/delta.y);
+}
 fn fogged(linear:vec3<f32>,world:vec3<f32>)->vec3<f32> {
  if camera.fog_range.z<0.5 {return linear;}
  let view_z=fog_view_depth(world);
  let span=camera.fog_range.y-camera.fog_range.x;
  let f=select(clamp((view_z-camera.fog_range.x)/select(span,0.001,abs(span)<0.001),0.,1.),select(0.,1.,view_z>=camera.fog_range.y),abs(span)<0.001);
+ let water=water_transmittance(world);
+ let combined_fog=1.-(1.-f)*water;
  let c=max(linear,vec3<f32>(0.));let encoded=select(c*12.92,1.055*pow(c,vec3<f32>(1./2.4))-0.055,c>vec3<f32>(0.0031308));
- let v=mix(encoded,camera.fog_color.rgb,f);
+ let v=mix(encoded,camera.fog_color.rgb,combined_fog);
  return select(v/12.92,pow((max(v,vec3<f32>(0.))+0.055)/1.055,vec3<f32>(2.4)),v>vec3<f32>(0.04045));
 }
 struct In {@builtin(vertex_index) vertex_id:u32,@location(0) pos:vec3<f32>,@location(1) normal:vec3<f32>,@location(2) uv:vec2<f32>,@location(3) color:vec4<f32>,@location(4) kind:f32,@location(5) instance:vec3<f32>,@location(6) info:vec2<f32>,@location(7) tex_h:u32,@location(8) alpha_ref:u32};

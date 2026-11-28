@@ -65,6 +65,8 @@ pub struct EffectLight {
     pub fog_range: [f32; 4],
     /// Linear fog colour, `rgb` only.
     pub fog_color: [f32; 4],
+    /// Water plane Y, absorption density, enabled for clipped refraction, reserved.
+    pub water_fog: [f32; 4],
     /// The frame's `directional_specular`: the light's specular colour, which
     /// `bind_specular` binds against each material's own specular colour.
     pub directional_specular: [f32; 4],
@@ -91,6 +93,7 @@ struct Params {
     /// `fog_range` the scenery model shader reads.
     fog_range: [f32; 4],
     fog_color: [f32; 4],
+    water_fog: [f32; 4],
     /// `xyz` is the camera's forward direction for the model Blinn term.
     eye: [f32; 4],
     /// The unjittered view-projection the sheet motion pass reprojects with, and
@@ -327,6 +330,7 @@ impl Draw {
                 light: [0.; 4],
                 fog_range: [0.; 4],
                 fog_color: [0.; 4],
+                water_fog: [0.; 4],
                 eye: [0.; 4],
                 mv_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
                 prev_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
@@ -478,6 +482,59 @@ impl Draw {
         self.order.iter().map(|(_, count)| *count as usize).sum()
     }
 
+    /// Update only view-dependent constants. Secondary views call this instead
+    /// of advancing their effect graph or rebuilding its vertex buffers.
+    pub fn update_frame(
+        &mut self,
+        queue: &wgpu::Queue,
+        matrix: [[f32; 4]; 4],
+        clip_plane: [f32; 4],
+        camera: [f32; 4],
+        light: Option<EffectLight>,
+    ) -> Result<(), String> {
+        if matrix
+            .iter()
+            .flatten()
+            .chain(clip_plane.iter())
+            .chain(camera.iter())
+            .any(|value| !value.is_finite())
+        {
+            return Err("non-finite GFX effect frame constants".into());
+        }
+        let direction = light.map_or([0.; 3], |light| light.direction);
+        let eye = light.map_or([0.; 3], |light| light.eye_direction);
+        let (fog_range, fog_color, water_fog) = light.map_or(
+            ([0.; 4], [0.; 4], [0.; 4]),
+            |light| (light.fog_range, light.fog_color, light.water_fog),
+        );
+        if direction.iter().chain(eye.iter()).any(|value| !value.is_finite())
+            || fog_range
+                .iter()
+                .chain(fog_color.iter())
+                .chain(water_fog.iter())
+                .any(|value| !value.is_finite())
+        {
+            return Err("non-finite GFX effect lighting/fog constants".into());
+        }
+        let params = Params {
+            matrix,
+            clip_plane,
+            camera,
+            light: [direction[0], direction[1], direction[2], 0.],
+            fog_range,
+            fog_color,
+            water_fog,
+            eye: [eye[0], eye[1], eye[2], 0.],
+            // Filled in by `draw_motion`, which is the only reader.
+            mv_matrix: matrix,
+            prev_matrix: matrix,
+            mv_size: [0.; 4],
+        };
+        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
+        self.last_params = Some(params);
+        Ok(())
+    }
+
     /// Refill every group from this frame's quads. `read` resolves an archive
     /// path to bytes and is only called for textures the pass has not seen.
     pub fn update(
@@ -491,42 +548,7 @@ impl Draw {
         light: Option<EffectLight>,
         read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
     ) -> Result<(), String> {
-        if matrix
-            .iter()
-            .flatten()
-            .chain(clip_plane.iter())
-            .chain(camera.iter())
-            .any(|value| !value.is_finite())
-        {
-            return Err("non-finite GFX effect frame constants".into());
-        }
-        let direction = light.map_or([0.; 3], |light| light.direction);
-        if direction.iter().any(|value| !value.is_finite()) {
-            return Err("non-finite GFX effect light direction".into());
-        }
-        // No light means no fog either: both come from the same frame.
-        let (fog_range, fog_color) = light.map_or(([0.; 4], [0.; 4]), |light| {
-            (light.fog_range, light.fog_color)
-        });
-        let eye = light.map_or([0.; 3], |light| light.eye_direction);
-        if eye.iter().any(|value| !value.is_finite()) {
-            return Err("non-finite GFX effect eye direction".into());
-        }
-        let params = Params {
-            matrix,
-            clip_plane,
-            camera,
-            light: [direction[0], direction[1], direction[2], 0.],
-            fog_range,
-            fog_color,
-            eye: [eye[0], eye[1], eye[2], 0.],
-            // Filled in by `draw_motion`, which is the only reader.
-            mv_matrix: matrix,
-            prev_matrix: matrix,
-            mv_size: [0.; 4],
-        };
-        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
-        self.last_params = Some(params);
+        self.update_frame(queue, matrix, clip_plane, camera, light)?;
 
         // No sheets this frame — switched off, none admitted yet, nothing
         // visible — means the previous vector has no successor. Dropping it makes
@@ -970,7 +992,7 @@ impl Draw {
 }
 
 const WGSL: &str = r#"
-struct Params { matrix:mat4x4<f32>, clip_plane:vec4<f32>, camera:vec4<f32>, light:vec4<f32>, fog_range:vec4<f32>, fog_color:vec4<f32>, eye:vec4<f32>, mv_matrix:mat4x4<f32>, prev_matrix:mat4x4<f32>, mv_size:vec4<f32> };
+struct Params { matrix:mat4x4<f32>, clip_plane:vec4<f32>, camera:vec4<f32>, light:vec4<f32>, fog_range:vec4<f32>, fog_color:vec4<f32>, water_fog:vec4<f32>, eye:vec4<f32>, mv_matrix:mat4x4<f32>, prev_matrix:mat4x4<f32>, mv_size:vec4<f32> };
 @group(0) @binding(0) var<uniform> p:Params;
 @group(0) @binding(1) var image:texture_2d<f32>;
 @group(0) @binding(2) var image_sampler:sampler;
@@ -1023,15 +1045,18 @@ struct Output {
  // near plane, the same formula a scenery skin model uses. `m_enumFogFlag`
  // selects the colour rather than the yes/no: `GFX_FOG_CURRENT` (1) fades to the
  // frame's fog colour and `GFX_FOG_ZERO` (2, additive slots) fades to black.
+ var keep=1.;
  if p.fog_range.z>0.5 && v.fog>0.5 {
   let depth=1./max(v.position.w,0.0000001);
   let span=p.fog_range.y-p.fog_range.x;
-  var keep:f32;
   if abs(span)<0.001 {keep=select(1.,0.,depth>=p.fog_range.y);}
   else {keep=clamp((p.fog_range.y-depth)/span,0.,1.);}
-  let fog_rgb=select(p.fog_color.rgb,vec3<f32>(0.),v.fog>1.5);
-  rgb=mix(fog_rgb,rgb,keep);
  }
+ let fog_rgb=select(p.fog_color.rgb,vec3<f32>(0.),v.fog>1.5);
+ if p.water_fog.z>0.5 && v.fog>0.5 {
+  keep*=model_water_transmittance(v.world,p.camera.xyz,p.water_fog.x,p.water_fog.y);
+ }
+ rgb=mix(fog_rgb,rgb,keep);
  return vec4<f32>(rgb,opacity);
 }
 // The sheet's own motion, for the shared motion-vector pass, written into the
@@ -1131,6 +1156,7 @@ mod tests {
             // Fog off, so the shading assertions read the light alone.
             fog_range: [0.; 4],
             fog_color: [0.; 4],
+            water_fog: [0.; 4],
             // No specular light, so the diffuse assertions stay exact; the
             // specular test raises this itself.
             directional_specular: [0.; 4],
@@ -1235,13 +1261,33 @@ mod tests {
         light: Option<EffectLight>,
         read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
     ) -> [f32; 4] {
+        render_with_camera(
+            draw,
+            harness,
+            background,
+            quads,
+            [0., 0., 0., 100.],
+            light,
+            read,
+        )
+    }
+
+    fn render_with_camera(
+        draw: &mut Draw,
+        harness: &Harness,
+        background: f64,
+        quads: &[EffectQuad],
+        camera: [f32; 4],
+        light: Option<EffectLight>,
+        read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+    ) -> [f32; 4] {
         draw.update(
             &harness.device,
             &harness.queue,
             quads,
             glam::Mat4::IDENTITY.to_cols_array_2d(),
             [0.; 4],
-            [0., 0., 0., 100.],
+            camera,
             light,
             read,
         )
@@ -1779,6 +1825,35 @@ mod tests {
         assert!(
             (current[0] - 0.625).abs() <= 0.02 && (current[1] - 0.125).abs() <= 0.02,
             "a non-additive quad must fade to the current fog colour: {current:?}"
+        );
+
+        // The whole test sheet is below y=2 while the eye is above it at y=3.
+        // A deliberately strong density makes water absorption visible in this
+        // tiny GPU fixture without changing the production density of 0.075.
+        let mut water_light = effect_light();
+        water_light.fog_range = [0., 100., 1., 0.];
+        water_light.fog_color = [0.; 4];
+        let sheet = quad("a.png", 5, 6, 0, false, [1.; 4]);
+        let dry = {
+            let png = grey_png();
+            let mut read = |_: &str| Ok(png.clone());
+            render_with_camera(
+                &mut draw, &harness, 0., &[sheet.clone()], [0., 3., 0., 100.],
+                Some(water_light), &mut read,
+            )
+        };
+        water_light.water_fog = [2., 2., 1., 0.];
+        let absorbed = {
+            let png = grey_png();
+            let mut read = |_: &str| Ok(png.clone());
+            render_with_camera(
+                &mut draw, &harness, 0., &[sheet], [0., 3., 0., 100.],
+                Some(water_light), &mut read,
+            )
+        };
+        assert!(
+            absorbed[0] < dry[0] * 0.5,
+            "submerged effect did not absorb through water: dry={dry:?}, absorbed={absorbed:?}"
         );
     }
 

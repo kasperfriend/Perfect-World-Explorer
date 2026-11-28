@@ -22,11 +22,14 @@ pub struct Frame {
     pub point_position: [f32; 3],
     pub attenuation: [f32; 3],
     pub eye_direction: [f32; 3],
+    pub eye_position: [f32; 3],
     pub directional_specular: [f32; 4],
     pub specular_variant: bool,
     pub vertex_fog: f32,
     pub fog_color: [f32; 4],
     pub fog_range: [f32; 4],
+    /// Water plane Y, absorption density, enabled for clipped refraction, reserved.
+    pub water_fog: [f32; 4],
     pub clip_plane: [f32; 4],
     pub reverse_front: bool,
     /// Zero disables alpha testing; 1..8 are the source D3DCMPFUNC values.
@@ -141,6 +144,8 @@ impl Frame {
             ],
             fog_color: self.fog_color,
             fog_range: self.fog_range,
+            eye_position: vector(self.eye_position),
+            water_fog: self.water_fog,
             clip_plane: self.clip_plane,
             raster: [
                 u32::from(material.two_sided) as f32,

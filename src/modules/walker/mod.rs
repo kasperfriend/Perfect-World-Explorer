@@ -1186,6 +1186,13 @@ impl Walker {
         if !self.is_active() || self.gpu_failed {
             return;
         }
+        // Walker armor/fashion uses the ordinary diffuse skin path. Do not add
+        // the directional Blinn highlight that made these materials reflective.
+        // GFX effects keep their independent native specular behavior.
+        let frame = model_draw_gpu::Frame {
+            specular_variant: false,
+            ..frame
+        };
         if self.gpu.is_none() {
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("Walker character sampler"),
@@ -1362,6 +1369,7 @@ impl Walker {
                         direction: frame.direction,
                         fog_range: frame.fog_range,
                         fog_color: frame.fog_color,
+                        water_fog: frame.water_fog,
                         directional_specular: frame.directional_specular,
                         eye_direction: frame.eye_direction,
                     };
@@ -1382,6 +1390,36 @@ impl Walker {
                 Ok(_) => {}
                 Err(error) => {
                     self.last_error = Some(format!("Walker effects: {error}"));
+                }
+            }
+        }
+        if pose_uploaded {
+            // The effect graph was already advanced for this frame. Rebind only
+            // this view's constants so clipped refraction absorbs it through
+            // water without advancing its emitters a second time.
+            let light = gfx_effect_gpu::EffectLight {
+                lighting: frame.lighting,
+                direction: frame.direction,
+                fog_range: frame.fog_range,
+                fog_color: frame.fog_color,
+                water_fog: frame.water_fog,
+                directional_specular: frame.directional_specular,
+                eye_direction: frame.eye_direction,
+            };
+            if let Some(gpu) = self.gpu.as_mut() {
+                if let Err(error) = gpu.effects.update_frame(
+                    queue,
+                    frame.matrix,
+                    frame.clip_plane,
+                    [
+                        frame.eye_position[0],
+                        frame.eye_position[1],
+                        frame.eye_position[2],
+                        0.,
+                    ],
+                    Some(light),
+                ) {
+                    self.last_error = Some(format!("Walker effects frame: {error}"));
                 }
             }
         }
