@@ -136,6 +136,7 @@ fn editor_transform_changed(previous: &EditorPlacement, next: &EditorPlacement) 
     previous.position != next.position
         || previous.rotation != next.rotation
         || previous.scale != next.scale
+        || previous.scale_axes != next.scale_axes
 }
 
 fn editor_scene_transform(
@@ -1931,6 +1932,7 @@ mod architect_placement_tests {
             position: [12., 3., -8.],
             rotation: [0., std::f32::consts::FRAC_PI_2, 0.],
             scale: 2.5,
+            scale_axes: [1.; 3],
         };
         let (scene, matrix) = editor_scene_transform(&placement, 7).unwrap();
         assert_eq!(scene.export_id, 7);
