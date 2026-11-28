@@ -4732,6 +4732,28 @@ mod tests {
     }
 
     #[test]
+    fn catalogued_gfx_effects_can_be_selected_and_committed_as_project_objects() {
+        let mut editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
+        editor.enabled = true;
+        editor.effect_catalog = Some(crate::gfx_catalog::Catalog::from_directory(vec![(
+            "gfx/scene/waterfall.gfx",
+            128,
+        )]));
+        let asset = "element/gfx.pck::gfx/scene/waterfall.gfx";
+
+        assert!(editor.renderer_placeable_asset(asset));
+        editor.select_asset_for_placement(asset.into());
+        assert_eq!(editor.cursor, CursorMode::Place);
+        editor.add_selected_asset_at_position([12.0, 3.0, 24.0]);
+
+        let effects = editor.renderer_effect_placements();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].key, 0);
+        assert_eq!(effects[0].path, "gfx/scene/waterfall.gfx");
+        assert_eq!(effects[0].position, [12.0, 3.0, 24.0]);
+    }
+
+    #[test]
     fn renderer_tree_placements_export_tree_type_yaw_and_scale() {
         let mut editor = Architect::new(PathBuf::from("/client/element"), None, "a01".into());
         editor.enabled = true;
