@@ -1424,7 +1424,9 @@ impl Architect {
     /// Project GFX roots for the native effect-owner queue. Effects are
     /// synchronized only after a transform gesture ends so dragging does not
     /// repeatedly destroy and reload the live effect.
-    pub fn renderer_effect_placements(&self) -> Vec<crate::world_models_gpu::EditorEffectPlacement> {
+    pub fn renderer_effect_placements(
+        &self,
+    ) -> Vec<crate::world_models_gpu::EditorEffectPlacement> {
         if !self.enabled
             || (!self.project.source_map.is_empty()
                 && !self.current_map_id.is_empty()
