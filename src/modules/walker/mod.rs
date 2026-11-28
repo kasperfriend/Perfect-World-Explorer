@@ -1407,7 +1407,7 @@ impl Walker {
                 eye_direction: frame.eye_direction,
             };
             if let Some(gpu) = self.gpu.as_mut() {
-                if let Err(error) = gpu.effects.update_frame(
+                if let Err(error) = gpu.effects.update_view_frame(
                     queue,
                     frame.matrix,
                     frame.clip_plane,

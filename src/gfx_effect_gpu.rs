@@ -484,6 +484,7 @@ impl Draw {
 
     /// Update only view-dependent constants. Secondary views call this instead
     /// of advancing their effect graph or rebuilding its vertex buffers.
+    /// Update a normal/main view and retain its constants for draw_motion.
     pub fn update_frame(
         &mut self,
         queue: &wgpu::Queue,
@@ -491,6 +492,30 @@ impl Draw {
         clip_plane: [f32; 4],
         camera: [f32; 4],
         light: Option<EffectLight>,
+    ) -> Result<(), String> {
+        self.write_frame(queue, matrix, clip_plane, camera, light, true)
+    }
+
+    /// Update a secondary view without replacing the main-view motion snapshot.
+    pub fn update_view_frame(
+        &mut self,
+        queue: &wgpu::Queue,
+        matrix: [[f32; 4]; 4],
+        clip_plane: [f32; 4],
+        camera: [f32; 4],
+        light: Option<EffectLight>,
+    ) -> Result<(), String> {
+        self.write_frame(queue, matrix, clip_plane, camera, light, false)
+    }
+
+    fn write_frame(
+        &mut self,
+        queue: &wgpu::Queue,
+        matrix: [[f32; 4]; 4],
+        clip_plane: [f32; 4],
+        camera: [f32; 4],
+        light: Option<EffectLight>,
+        remember_motion: bool,
     ) -> Result<(), String> {
         if matrix
             .iter()
@@ -534,7 +559,9 @@ impl Draw {
             mv_size: [0.; 4],
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
-        self.last_params = Some(params);
+        if remember_motion {
+            self.last_params = Some(params);
+        }
         Ok(())
     }
 

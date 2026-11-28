@@ -1014,7 +1014,7 @@ impl World {
             directional_specular: frame.directional_specular,
             eye_direction: frame.eye_direction,
         };
-        if let Err(error) = draw.update_frame(
+        if let Err(error) = draw.update_view_frame(
             queue,
             frame.matrix,
             frame.clip_plane,
