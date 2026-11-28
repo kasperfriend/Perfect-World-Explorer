@@ -4042,10 +4042,12 @@ impl Architect {
                 && self.cursor == CursorMode::Select
                 && self.selected_placement.is_none()
             {
-                if let Some(position) = self.selected_scene_transform {
+                if let Some(position) = source_gizmo_position {
                     self.add_selected_asset_at_position(position);
                 }
             }
+            let source_gizmo_position =
+                axis_pick.and_then(|_| self.selected_scene_transform);
             let mut nearest: Option<(usize, f32, f32)> = None;
             if axis_pick.is_none() {
                 if let Some(pointer) = pointer {
