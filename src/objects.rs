@@ -461,14 +461,21 @@ impl Objects {
                 path: placement.path.clone(),
                 map_id: placement.map_id.clone(),
             });
-            if placement.scale.is_finite() && placement.scale > 0.0
-                && placement.scale_axes.iter().all(|v| v.is_finite() && (0.001..=1000.0).contains(v))
+            if placement.scale.is_finite()
+                && placement.scale > 0.0
+                && placement
+                    .scale_axes
+                    .iter()
+                    .all(|v| v.is_finite() && (0.001..=1000.0).contains(v))
             {
-                self.editor_scales.insert(base + offset, [
-                    placement.scale * placement.scale_axes[0],
-                    placement.scale * placement.scale_axes[1],
-                    placement.scale * placement.scale_axes[2],
-                ]);
+                self.editor_scales.insert(
+                    base + offset,
+                    [
+                        placement.scale * placement.scale_axes[0],
+                        placement.scale * placement.scale_axes[1],
+                        placement.scale * placement.scale_axes[2],
+                    ],
+                );
             }
         }
         self.ornaments = combined.into();
