@@ -435,6 +435,7 @@ impl BmdPreview {
             map_id: String::new(),
         };
         let mut vertices = Vec::new();
+        let mut valid_vertices = Vec::new();
         let mut triangles = Vec::new();
         let mut min = Vec3::splat(f32::INFINITY);
         let mut max = Vec3::splat(f32::NEG_INFINITY);
@@ -450,6 +451,7 @@ impl BmdPreview {
                         normal: Vec3::Y,
                         color: Vec3::ZERO,
                     });
+                    valid_vertices.push(false);
                     continue;
                 }
                 min = min.min(position);
@@ -480,6 +482,7 @@ impl BmdPreview {
                     },
                     color,
                 });
+                valid_vertices.push(true);
             }
             for face in mesh.indices.chunks_exact(3) {
                 let a = face[0] as usize;
@@ -488,6 +491,9 @@ impl BmdPreview {
                 if a < mesh.vertices.len()
                     && b < mesh.vertices.len()
                     && c < mesh.vertices.len()
+                    && valid_vertices[base + a]
+                    && valid_vertices[base + b]
+                    && valid_vertices[base + c]
                 {
                     triangles.push([base + a, base + b, base + c]);
                 }
@@ -554,7 +560,7 @@ impl BmdPreview {
         }
         let rotation =
             glam::Quat::from_rotation_y(self.yaw) * glam::Quat::from_rotation_x(self.pitch);
-        let distance = self.radius * 3.2 / self.zoom.clamp(0.3, 5.0);
+        let distance = self.radius * 3.2 / self.zoom.clamp(0.3, 2.8);
         let focal = side as f32 * 1.12;
         let center = side as f32 * 0.5;
         let pan_scale = self.radius * 2.0 / side as f32;
@@ -672,7 +678,7 @@ impl BmdPreview {
         if response.hovered() {
             let wheel = ui.input(|input| input.smooth_scroll_delta.y);
             if wheel.abs() > f32::EPSILON {
-                self.zoom = (self.zoom * (-wheel * 0.002).exp()).clamp(0.3, 5.0);
+                self.zoom = (self.zoom * (-wheel * 0.002).exp()).clamp(0.3, 2.8);
                 self.dirty = true;
             }
         }
