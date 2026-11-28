@@ -21,6 +21,17 @@ pub struct EditorPlacement {
     pub rotation: [f32; 3],
     pub scale: f32,
 }
+
+/// A project-owned GFX root, synchronized through the same native effect
+/// owner, player and light-publication machinery as authored world effects.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorEffectPlacement {
+    pub key: u64,
+    pub path: String,
+    pub position: [f32; 3],
+    pub rotation: [f32; 3],
+    pub scale: f32,
+}
 #[path = "terrain_cutoff.rs"]
 mod cutoff_residency;
 
@@ -212,6 +223,8 @@ pub struct World {
     native_instance_count: usize,
     editor_placements: Vec<EditorPlacement>,
     editor_asset_cache: HashMap<String, usize>,
+    /// Project effect key -> (catalog path, last committed transform, owner id).
+    editor_effects: HashMap<u64, (String, [f32; 16], u64)>,
 }
 
 impl World {
@@ -344,6 +357,7 @@ impl World {
             native_instance_count,
             editor_placements: Vec::new(),
             editor_asset_cache: HashMap::new(),
+            editor_effects: HashMap::new(),
         })
     }
     /// Replace Architect's transient project layer without disturbing native map
@@ -670,6 +684,80 @@ impl World {
         self.owners.insert(request)?;
         self.catalog_spawns += 1;
         Ok(identity)
+    }
+
+    /// Reconcile Architect's persistent GFX placements with the native owner
+    /// queue. A changed transform replaces only that project's owner; deleting
+    /// or hiding an object removes its owner and any lights it published.
+    pub fn sync_editor_effects(&mut self, placements: &[EditorEffectPlacement]) {
+        let mut desired = HashMap::new();
+        for placement in placements {
+            if !placement.position.iter().all(|value| value.is_finite())
+                || !placement.rotation.iter().all(|value| value.is_finite())
+                || !placement.scale.is_finite()
+                || !(0.001..=1000.0).contains(&placement.scale)
+            {
+                continue;
+            }
+            let rotation = glam::Quat::from_euler(
+                glam::EulerRot::XYZ,
+                placement.rotation[0],
+                placement.rotation[1],
+                placement.rotation[2],
+            );
+            let direction = (rotation * glam::Vec3::Z).to_array();
+            let up = (rotation * glam::Vec3::Y).to_array();
+            match gfx_owner::placement_transform(
+                placement.position,
+                direction,
+                up,
+                placement.scale,
+            ) {
+                Ok(transform) => {
+                    desired.insert(placement.key, (placement.path.clone(), transform));
+                }
+                Err(error) => self.reported.push(format!(
+                    "Architect effect {} ({}): {error}",
+                    placement.key, placement.path
+                )),
+            }
+        }
+
+        let stale = self
+            .editor_effects
+            .iter()
+            .filter(|(key, (path, transform, _))| {
+                desired
+                    .get(key)
+                    .is_none_or(|(next_path, next_transform)| {
+                        next_path != path || next_transform != transform
+                    })
+            })
+            .map(|(key, (_, _, identity))| (*key, *identity))
+            .collect::<Vec<_>>();
+        for (key, identity) in stale {
+            self.owners.remove(identity, &mut self.publications);
+            self.editor_effects.remove(&key);
+        }
+
+        for (key, (path, transform)) in desired {
+            if self.editor_effects.contains_key(&key) {
+                continue;
+            }
+            let origin = format!("Architect project placement {key}");
+            match self.spawn_catalog_effect(&path, transform, &origin) {
+                Ok(identity) => {
+                    self.editor_effects
+                        .insert(key, (path, transform, identity));
+                }
+                Err(error) => {
+                    let message = format!("{origin} ({path}): {error}");
+                    if !self.reported.contains(&message) {
+                        self.reported.push(message);
+                    }
+                }
+            }
+        }
     }
 
     /// Install the actual ECWLD effect placements as scene-light producers.
