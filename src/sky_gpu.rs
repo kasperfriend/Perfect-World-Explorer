@@ -932,10 +932,20 @@ impl SkyGpu {
                         let fmt = *fmt;
                         s.spawn(move || -> Option<image::RgbaImage> {
                             let entry = entry_opt.as_ref()?;
-                            let bytes = pck::read_entry_at(file_ref, entry).ok()?;
-                            let img = image::load_from_memory_with_format(&bytes, fmt)
-                                .ok()?
-                                .to_rgba8();
+                            let bytes = match pck::read_entry_at(file_ref, entry) {
+                                Ok(bytes) => bytes,
+                                Err(error) => {
+                                    eprintln!("optional sky texture package read failed: {error}");
+                                    return None;
+                                }
+                            };
+                            let img = match image::load_from_memory_with_format(&bytes, fmt) {
+                                Ok(image) => image.to_rgba8(),
+                                Err(error) => {
+                                    eprintln!("optional sky texture decode failed: {error}");
+                                    return None;
+                                }
+                            };
                             if img.width() != 512 || img.height() != 512 {
                                 Some(image::imageops::resize(
                                     &img,

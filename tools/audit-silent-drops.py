@@ -248,16 +248,11 @@ def main():
         try:
             with open(report, encoding="utf-8") as f:
                 if f.read() != text:
-                    print("docs/silent-drops.md is stale; showing generated diff:", file=sys.stderr)
-                    import difflib
-                    with open(report, encoding="utf-8") as current_file:
-                        current_text = current_file.read()
-                    sys.stderr.writelines(difflib.unified_diff(
-                        current_text.splitlines(keepends=True),
-                        text.splitlines(keepends=True),
-                        fromfile="committed docs/silent-drops.md",
-                        tofile="generated docs/silent-drops.md",
-                    ))
+                    print(
+                        "docs/silent-drops.md is stale -- run "
+                        "`python3 tools/audit-silent-drops.py` and commit it",
+                        file=sys.stderr,
+                    )
                     return 1
         except FileNotFoundError:
             print("docs/silent-drops.md is missing", file=sys.stderr)

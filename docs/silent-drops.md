@@ -6,7 +6,7 @@ Every place a loader can lose a value without saying so, classified. Generated b
 |---|---|
 | named | 8 |
 | unreachable | 123 |
-| fix | 2 |
+| fix | 0 |
 | ? | 0 |
 
 ## Sites
@@ -20,7 +20,7 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/client_detect.rs` | 183 | `ok-question` | **probe** | `let word = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 184 | `ok-question` | **probe** | `let timestamp = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 186 | `ok-question` | **probe** | `short: u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?),` |
-| `src/client_detect.rs` | 702 | `ok-question` | **probe** | `let matched = fs::read_dir(&current).ok()?.flatten().find(\\|entry\\| {` |
+| `src/client_detect.rs` | 702 | `ok-question` | **probe** | `let matched = fs::read_dir(&current).ok()?.flatten().find(\|entry\| {` |
 | `src/client_detect.rs` | 727 | `ok-question` | **probe** | `.ok()?` |
 | `src/client_detect.rs` | 875 | `ok-question` | **probe** | `let text = String::from_utf8(bytes.to_vec()).ok()?;` |
 | `src/client_detect.rs` | 887 | `ok-question` | **probe** | `let mut file = fs::File::open(&pack_path).ok()?;` |
@@ -112,12 +112,10 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/pck.rs` | 611 | `ok-question` | **probe** | `let file = File::open(&pkx).ok()?;` |
 | `src/pck.rs` | 612 | `ok-question` | **probe** | `let len = file.metadata().ok()?.len();` |
 | `src/pck.rs` | 1033 | `unwrap_or_default` | **unreachable** | `let mut name = self.path.file_stem().unwrap_or_default().to_os_string();` |
-| `src/sky_gpu.rs` | 935 | `ok-question` | **fix** | `let bytes = pck::read_entry_at(file_ref, entry).ok()?;` |
-| `src/sky_gpu.rs` | 937 | `ok-question` | **fix** | `.ok()?` |
-| `src/sky_gpu.rs` | 1575 | `ok-question` | **probe** | `let mut file = File::open(element.join("configs.pck")).ok()?;` |
-| `src/sky_gpu.rs` | 1576 | `ok-question` | **probe** | `let entries = crate::angelica_pck::directory(&mut file).ok()?;` |
-| `src/sky_gpu.rs` | 1583 | `ok-question` | **probe** | `let list_bytes = pck::read_entry(&mut file, list).ok()?;` |
-| `src/sky_gpu.rs` | 1584 | `ok-question` | **probe** | `let parsed = crate::sky_config::parse_sky_list(&list_bytes).ok()?;` |
+| `src/sky_gpu.rs` | 1585 | `ok-question` | **probe** | `let mut file = File::open(element.join("configs.pck")).ok()?;` |
+| `src/sky_gpu.rs` | 1586 | `ok-question` | **probe** | `let entries = crate::angelica_pck::directory(&mut file).ok()?;` |
+| `src/sky_gpu.rs` | 1593 | `ok-question` | **probe** | `let list_bytes = pck::read_entry(&mut file, list).ok()?;` |
+| `src/sky_gpu.rs` | 1594 | `ok-question` | **probe** | `let parsed = crate::sky_config::parse_sky_list(&list_bytes).ok()?;` |
 | `src/speedtree_version.rs` | 56 | `ok-question` | **probe** | `let at = usize::try_from(u32::from_le_bytes(bytes.get(0x3c..0x40)?.try_into().ok()?)).ok()?;` |
 | `src/speedtree_version.rs` | 61 | `ok-question` | **probe** | `bytes.get(at + 4..at + 6)?.try_into().ok()?,` |
 | `src/terrain_store.rs` | 412 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
@@ -194,7 +192,7 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/world_page_cache.rs` | 130 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
 | `src/world_page_cache.rs` | 243 | `let-underscore` | **unreachable** | `let _ = fs::remove_dir_all(&self.temp);` |
 | `src/world_page_cache.rs` | 261 | `ok-question` | **probe** | `let bytes = fs::read(dir.join("manifest.bin")).ok()?;` |
-| `src/world_page_cache.rs` | 269 | `ok-question` | **probe** | `if &bytes[8..40] != key \\|\\| u64::from_le_bytes(bytes[40..48].try_into().ok()?) != FORMAT {` |
+| `src/world_page_cache.rs` | 269 | `ok-question` | **probe** | `if &bytes[8..40] != key \|\| u64::from_le_bytes(bytes[40..48].try_into().ok()?) != FORMAT {` |
 | `src/world_page_cache.rs` | 272 | `ok-question` | **probe** | `let pages = usize::try_from(u64::from_le_bytes(bytes[48..56].try_into().ok()?)).ok()?;` |
 | `src/world_page_cache.rs` | 276 | `ok-question` | **probe** | `let processed = usize::try_from(u64::from_le_bytes(bytes[56..64].try_into().ok()?)).ok()?;` |
 | `src/world_page_cache.rs` | 277 | `ok-question` | **probe** | `let skipped = usize::try_from(u64::from_le_bytes(bytes[64..72].try_into().ok()?)).ok()?;` |
